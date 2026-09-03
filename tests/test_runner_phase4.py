@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import stat
@@ -244,3 +245,82 @@ def test_the_runner_raises_the_subprocess_stream_buffer() -> None:
     from harbor.runner.base import STREAM_BUFFER_LIMIT
 
     assert STREAM_BUFFER_LIMIT >= 1024 * 1024, "64 KiB default is far too small for Codex events"
+
+
+def test_restart_terminates_a_still_live_process_group() -> None:
+    """AC-7, the load-bearing half: a restart must not leave the old builder running.
+
+    The previous coverage reaped a row whose pid was already dead, which
+    never exercises the termination path. A real Harbor restart finds a LIVE
+    process it cannot claim, and leaving it alive is the duplicate-dispatch
+    window the reaper exists to close.
+    """
+
+    import os
+    import signal as signal_module
+    import subprocess
+
+    from harbor.runner.base import process_alive
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    try:
+        assert process_alive(child.pid), "the stand-in builder must actually be running"
+        pgid = os.getpgid(child.pid)
+
+        connection = runs_db()
+        connection.execute(
+            "INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES (?, ?, ?, ?, ?, ?)",
+            ("run-live", "HAN-42", "builder", "running", child.pid, pgid),
+        )
+        connection.commit()
+
+        orphaned = asyncio.run(reap_orphan_runs(connection, grace_seconds=2.0))
+        assert orphaned == ["run-live"]
+
+        for _ in range(100):
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert child.poll() is not None, "the reaper must terminate the live process group"
+        assert connection.execute(
+            "SELECT status FROM runs WHERE id='run-live'"
+        ).fetchone()[0] == RunState.ORPHANED.value
+    finally:
+        if child.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(child.pid), signal_module.SIGKILL)
+            child.wait(timeout=5)
+
+
+def test_an_orphaned_run_does_not_cause_a_second_dispatch() -> None:
+    """AC-7's other half: reaping must not re-open the ticket for a fresh build."""
+
+    from harbor.wake import WakeDecider, apply_phase3_migration
+
+    connection = runs_db()
+    connection.execute(
+        "CREATE TABLE tickets (identifier TEXT PRIMARY KEY, owned INTEGER DEFAULT 0, "
+        "hold INTEGER DEFAULT 1, bot_rework_rounds INTEGER DEFAULT 0)"
+    )
+    connection.execute("INSERT INTO tickets(identifier, owned) VALUES ('HAN-42', 1)")
+    connection.execute(
+        "INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES "
+        "('run-1', 'HAN-42', 'builder', 'running', 999999, 999999)"
+    )
+    connection.commit()
+    apply_phase3_migration(connection)
+
+    asyncio.run(reap_orphan_runs(connection))
+    assert connection.execute("SELECT status FROM runs WHERE id='run-1'").fetchone()[0] == RunState.ORPHANED.value
+
+    # An orphaned run is finished, not waiting: it must not be resumed, and an
+    # owned ticket must not be rebuilt from scratch behind the operator's back.
+    decider = WakeDecider(connection, shadow=True)
+    wake = decider.decide(
+        {"identifier": "HAN-42", "state": "In Progress", "owned": True},
+        {"prs": [{"number": 1, "head_sha": "abc", "merged": False}], "head_sha": "abc", "threads": []},
+    )
+    assert wake is None, f"an orphaned run must not produce a second dispatch, got {wake}"
