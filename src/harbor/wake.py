@@ -595,7 +595,67 @@ HOLD_OFF_CONTRACT = (
 )
 
 
-def build_instruction(ticket: Mapping[str, Any]) -> str:
+def detect_delivery_tools(env: Mapping[str, str] | None = None) -> dict[str, bool]:
+    """Probe which delivery tools a builder could actually use.
+
+    Read-only and cheap: a PATH lookup plus a token presence check.  It never
+    contacts GitHub, so it cannot itself be a mutation, and it reports only
+    what the environment offers.
+    """
+
+    import os
+    import shutil
+
+    environ = dict(env if env is not None else os.environ)
+    has_token = bool(environ.get("GH_TOKEN") or environ.get("GITHUB_TOKEN"))
+    tools: dict[str, bool] = {
+        "git": shutil.which("git") is not None,
+        # ``gh`` needs both the binary and a token; without one it prompts,
+        # which a non-interactive run can never answer.
+        "gh": shutil.which("gh") is not None and has_token,
+    }
+    if shutil.which("gh") is not None and not has_token:
+        tools["gh (no GH_TOKEN/GITHUB_TOKEN in this run)"] = False
+    return tools
+
+
+def delivery_tools_fact(tools: Mapping[str, Any] | None = None) -> str:
+    """Report which delivery tools are usable inside the builder's sandbox.
+
+    Harbor knows things about the run environment that the builder cannot
+    discover cheaply, and reporting them is the same kind of fact as CI state
+    -- it says what IS, never what to do.
+
+    This exists because of a real failure: a builder abandoned an approved
+    merge reporting "gh-axi returned api.github.com UNKNOWN" and "MCP tool
+    call requires approval, but approval policy is never", while plain ``gh``
+    was authenticated and working in that very sandbox the whole time.  A
+    non-interactive ``codex exec`` refuses any MCP call that wants approval,
+    so an agent that reaches only for MCP or a wrapper strands itself.
+    """
+
+    values = dict(tools or {})
+    available = [name for name, ok in sorted(values.items()) if ok]
+    unavailable = [name for name, ok in sorted(values.items()) if not ok]
+    if not available and not unavailable:
+        return ""
+    parts = []
+    if available:
+        parts.append(f"Available and authenticated in your sandbox: {', '.join(available)}.")
+    if unavailable:
+        parts.append(f"Not usable in this run: {', '.join(unavailable)}.")
+    parts.append(
+        "This run is non-interactive, so any MCP tool that requests approval "
+        "is refused; prefer a shell tool listed as available."
+    )
+    return " ".join(parts)
+
+
+def build_instruction(
+    ticket: Mapping[str, Any],
+    *,
+    delivery_tools: Mapping[str, Any] | None = None,
+) -> str:
     identifier = _identifier(ticket)
     title = str(_value(ticket, "title", default="") or "").strip()
     state = str(_value(ticket, "state", default="") or "")
@@ -604,8 +664,13 @@ def build_instruction(ticket: Mapping[str, Any]) -> str:
         f"Build ticket {identifier}: {title}".rstrip(),
         f"Linear state: {state}.",
         HOLD_ON_CONTRACT if held else HOLD_OFF_CONTRACT,
-        "Continue the configured delivery skill for this ticket. Report a schema-valid final status; Harbor owns no implementation or merge decisions.",
     ]
+    environment = delivery_tools_fact(delivery_tools)
+    if environment:
+        lines.append(environment)
+    lines.append(
+        "Continue the configured delivery skill for this ticket. Report a schema-valid final status; Harbor owns no implementation or merge decisions."
+    )
     return "\n".join(lines)
 
 

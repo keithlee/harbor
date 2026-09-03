@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable
 
 from harbor.db import HarborDB
 from harbor.digest import render_digest
+from harbor.wake import delivery_tools_fact, detect_delivery_tools
 from harbor.heartbeat import Heartbeat, HeartbeatEvent
 from harbor.poll.linear_poller import LinearPoller, PollResult
 from harbor.runner.base import apply_phase4_migration, reap_orphan_runs
@@ -173,9 +174,17 @@ class WorktreeDispatcher:
             return
 
     def _initial_wake(self, wake: Wake) -> Wake:
-        if not self.builder_prompt or wake.action != "build":
+        # Report which delivery tools actually work in the builder's sandbox.
+        # A builder that reaches only for an MCP tool strands an approved
+        # merge, because a non-interactive run refuses any MCP call that wants
+        # approval -- even while plain `gh` is authenticated right there.
+        environment = delivery_tools_fact(detect_delivery_tools())
+        base = self.builder_prompt
+        if environment and wake.action == "build":
+            base = f"{base}\n\n{environment}" if base else environment
+        if not base or wake.action != "build":
             return wake
-        instruction = f"{self.builder_prompt}\n\n{wake.instruction}" if wake.instruction else self.builder_prompt
+        instruction = f"{base}\n\n{wake.instruction}" if wake.instruction else base
         return Wake(
             ticket=wake.ticket,
             action=wake.action,
