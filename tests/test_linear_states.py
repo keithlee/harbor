@@ -1,0 +1,173 @@
+"""Linear workflow-state writes (plan section 1.4, section 7 AC-7/AC-9).
+
+`issueUpdate` takes a workflow state UUID, never a name.  Harbor's config and
+the plan both speak in names ("Blocked", "Human Review"), so passing a name
+straight through produced Linear's opaque "Argument Validation Error" and the
+park path could never work without hand-configured UUIDs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import httpx
+import pytest
+
+from harbor.clients.linear import LinearClient, LinearClientError
+
+HUMAN_REVIEW = "c845aec8-ce2d-4d6b-971c-566efe72167a"
+BLOCKED = "6876f9e0-76aa-4dac-ac4f-fabeceb1d54f"
+
+
+def transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        if "HarborStates" in body["query"]:
+            return httpx.Response(200, json={"data": {"issue": {"id": "u", "team": {
+                "id": "t", "name": "HAN", "states": {"nodes": [
+                    {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"},
+                    {"id": BLOCKED, "name": "Blocked", "type": "started"},
+                ]}}}}})
+        return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {
+            "id": "u", "identifier": "HAN-32", "state": {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"}}}}})
+
+    return httpx.MockTransport(handler)
+
+
+def test_a_state_name_is_resolved_to_its_id_before_the_mutation() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=transport(calls))
+        try:
+            await client.update_issue_state("HAN-32", "Human Review")
+        finally:
+            await client.close()
+        assert "HarborStates" in calls[0]["query"], "the name must be resolved first"
+        assert calls[1]["variables"]["stateId"] == HUMAN_REVIEW, "a name must never be sent as stateId"
+
+    asyncio.run(scenario())
+
+
+def test_a_uuid_is_sent_straight_through_without_a_lookup() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=transport(calls))
+        try:
+            await client.update_issue_state("HAN-32", BLOCKED)
+        finally:
+            await client.close()
+        assert len(calls) == 1, "a configured UUID needs no resolution request"
+        assert calls[0]["variables"]["stateId"] == BLOCKED
+
+    asyncio.run(scenario())
+
+
+def test_the_resolved_id_is_cached_across_calls() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=transport(calls))
+        try:
+            await client.update_issue_state("HAN-32", "Human Review")
+            await client.update_issue_state("HAN-32", "Blocked")
+        finally:
+            await client.close()
+        assert sum("HarborStates" in c["query"] for c in calls) == 1, "one lookup populates every state"
+
+    asyncio.run(scenario())
+
+
+def test_an_unknown_state_name_fails_loudly() -> None:
+    async def scenario() -> None:
+        client = LinearClient(token="k", transport=transport([]))
+        try:
+            with pytest.raises(LinearClientError, match="no Linear workflow state"):
+                await client.update_issue_state("HAN-32", "Not A State")
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", ["Done", "done", "Completed", "Canceled", "Duplicate done"])
+def test_harbor_never_writes_a_terminal_state(state: str) -> None:
+    """The builder's skill owns the Done transition; Harbor never writes it."""
+
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=transport(calls))
+        try:
+            with pytest.raises(ValueError, match="terminal"):
+                await client.update_issue_state("HAN-32", state)
+        finally:
+            await client.close()
+        assert calls == [], "a terminal state must be refused before any network call"
+
+    asyncio.run(scenario())
+
+
+def comment_transport(posts: list[dict[str, Any]]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": {"commentCreate": {
+            "success": True, "comment": {"id": f"c{len(posts)}"}}}})
+
+    return httpx.MockTransport(handler)
+
+
+def test_an_identical_comment_body_is_posted_only_once() -> None:
+    """Plan section 4: dedupe on (issue_id, sha256(body)) BEFORE the POST.
+
+    HAN-7 already carries two duplicate "Applied... PR #217..." comments a
+    minute apart, and a duplicate Linear comment is an explicit abort
+    condition for the acceptance run.
+    """
+
+    from harbor.db import HarborDB
+
+    async def scenario() -> None:
+        posts: list[dict[str, Any]] = []
+        db = HarborDB(":memory:")
+        client = LinearClient(token="k", transport=comment_transport(posts))
+        body = "[harbor] Blocked HAN-32 after deterministic remediation and rung-1 triage."
+        try:
+            await client.create_comment_once("u-32", body, db=db)
+            await client.create_comment_once("u-32", body, db=db)
+            await client.create_comment_once("u-32", body + " (updated)", db=db)
+            # A different issue with the same body is a different receipt.
+            await client.create_comment_once("u-99", body, db=db)
+        finally:
+            await client.close()
+            db.close()
+        bodies = [p["variables"]["body"] for p in posts]
+        assert bodies.count(body) == 2, "once per issue, never twice for the same issue"
+        assert len(posts) == 3
+
+    asyncio.run(scenario())
+
+
+def test_dedupe_depends_on_the_receipt_ledger_surviving() -> None:
+    """A fresh ledger cannot suppress a repeat: the receipts ARE the guard.
+
+    Wiping harbor.db between runs re-posts every prior comment, which is how a
+    duplicate reaches the board even though the dedupe itself is correct.
+    """
+
+    from harbor.db import HarborDB
+
+    async def scenario() -> None:
+        posts: list[dict[str, Any]] = []
+        body = "[harbor] parked"
+        for _ in range(2):
+            db = HarborDB(":memory:")  # a new ledger each time, as `rm harbor.db` would
+            client = LinearClient(token="k", transport=comment_transport(posts))
+            try:
+                await client.create_comment_once("u-32", body, db=db)
+            finally:
+                await client.close()
+                db.close()
+        assert len(posts) == 2, "this documents the failure mode, it is not desired behavior"
+
+    asyncio.run(scenario())
