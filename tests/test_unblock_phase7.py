@@ -287,3 +287,122 @@ def test_a_parked_merge_ready_run_goes_to_human_review_not_blocked():
     assert _is_parked_for_human({"outcome": "no_pr", "waiting_on": "human"}) is False
     assert _is_parked_for_human({}) is False
     assert _is_parked_for_human(None) is False
+
+
+def test_ticket_c_cites_ticket_bs_resolution_and_pages_nobody():
+    """Plan section 6, tickets B and C, as a matched pair.
+
+    C proves the citation came from the `resolutions` ledger and nowhere
+    else: with B's answer stored, the same question resolves at rung 1 with
+    nobody paged; with the ledger truncated, the SAME question pages the
+    operator at rung 2 and cites nothing.
+    """
+
+    from harbor.db import HarborDB
+    from harbor.unblock import UnblockLadder
+
+    question = "Which team owns the pipeline concurrency limits?"
+
+    class Terra:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ask(self, *args, **kwargs):
+            self.calls += 1
+            return "ESCALATE: no authoritative source answers this."
+
+        __call__ = ask
+
+    class Pager:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def notify(self, reason: str) -> None:
+            self.sent.append(reason)
+
+    async def exercise(seed: bool):
+        db = HarborDB(":memory:")
+        try:
+            if seed:
+                db.record_resolution("product_decision", question, "Keith owns it.", "AGENTS.md:12", source_ticket="HAN-B")
+            terra, pager = Terra(), Pager()
+            ladder = UnblockLadder(db, linear=None, first_mate=terra, notifier=pager, repo_path=".")
+            result = await ladder.handle(
+                {"identifier": "HAN-C", "id": "uuid-c"},
+                {"id": "builder-c"},
+                {"status": "blocked", "summary": "s",
+                 "blocker": {"kind": "product_decision", "question": question}},
+            )
+            return result, terra, pager
+        finally:
+            db.close()
+
+    # Ticket C, with B's answer on file: resolved at rung 1, nobody paged.
+    result, terra, pager = run(exercise(seed=True))
+    assert result.action == "resume"
+    assert result.rung == 1
+    assert result.citation == "AGENTS.md:12"
+    assert result.notified is False and pager.sent == []
+    assert terra.calls == 0, "a stored resolution is authority; Terra is not needed"
+
+    # The control: cold ledger, same question -> paged again, nothing cited.
+    cold, _, cold_pager = run(exercise(seed=False))
+    assert cold.action != "resume"
+    assert cold.rung == 2
+    assert cold.citation == ""
+    assert cold.notified is True and len(cold_pager.sent) == 1
+
+
+def test_a_protected_path_is_never_auto_resolved_even_with_a_stored_answer():
+    """The protected-path bar is absolute; the resolutions ledger cannot lift it.
+
+    Ticket C's reordering lets a stored answer clear a product decision. This
+    pins the line that reordering must NOT cross.
+    """
+
+    from harbor.db import HarborDB
+    from harbor.unblock import UnblockLadder
+
+    question = "May I change the deploy pipeline?"
+
+    async def exercise():
+        db = HarborDB(":memory:")
+        try:
+            db.record_resolution("product_decision", question, "Yes, go ahead.", "AGENTS.md:1", source_ticket="HAN-B")
+            ladder = UnblockLadder(db, linear=None, notifier=None, repo_path=".", protected_paths=("deploy/",))
+            return await ladder.handle(
+                {"identifier": "HAN-P"}, {"id": "b"},
+                {"status": "blocked", "summary": "s",
+                 "blocker": {"kind": "product_decision", "question": question,
+                             "paths": ["deploy/prod.yml"]}},
+            )
+        finally:
+            db.close()
+
+    result = run(exercise())
+    assert result.action != "resume", "a protected path must never auto-resolve"
+    assert result.rung == 2
+
+
+def test_a_protected_directory_covers_the_files_inside_it():
+    """`deploy/` must guard `deploy/prod.yml`, and must not catch `deployment.md`.
+
+    fnmatch alone matches neither, so a protected directory used to guard
+    only itself -- the guarantee was silently empty for every real file.
+    """
+
+    from harbor.unblock import touches_protected_paths as touches
+
+    def check(path: str, pattern: str) -> bool:
+        return touches({"paths": [path]}, protected_paths=[pattern], repo_path=None)
+
+    assert check("deploy/prod.yml", "deploy/") is True
+    assert check("deploy/prod.yml", "deploy") is True
+    assert check("apps/web/deploy/x.ts", "deploy/") is True
+    assert check("deploy", "deploy/") is True
+    assert check("src/a.ts", "src/*.ts") is True
+
+    # Segment-wise matching: a prefix lookalike is not inside the directory.
+    assert check("deployment.md", "deploy/") is False
+    assert check("x/deployment.md", "deploy") is False
+    assert check("docs/readme.md", "deploy/") is False

@@ -404,6 +404,20 @@ def touches_protected_paths(
         for pattern in configured:
             if path == pattern or fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, f"*/{pattern}"):
                 return True
+            # A directory pattern must protect everything under it.  Plain
+            # fnmatch cannot do this: "deploy/prod.yml" matches neither
+            # "deploy/" nor "deploy", so a protected directory would guard
+            # only itself and none of its files.  Matching is on whole path
+            # segments, so "deploy/" must not catch "deployment.md".
+            directory = pattern.rstrip("/")
+            if directory and (
+                path == directory
+                or path.startswith(f"{directory}/")
+                or f"/{directory}/" in f"/{path}/"
+                or fnmatch.fnmatch(path, f"{directory}/*")
+                or fnmatch.fnmatch(path, f"*/{directory}/*")
+            ):
+                return True
     return False
 
 
@@ -611,13 +625,25 @@ async def triage(
     )
     protected = touches_protected_paths(blocker, protected_paths=configured_protected, repo_path=repo_path)
     product = is_product_decision(blocker)
-    if protected or product:
+    # A protected path is an absolute bar: never auto-resolved, whatever the
+    # ledger says.  A product decision is different -- it is refused because
+    # it is NEW, and a question the operator has already answered is not new.
+    # The plan lists Harbor's own resolutions table among the authorities, so
+    # that lookup has to come before the product-decision refusal or ticket C
+    # (which cites ticket B's answer) could never resolve.
+    if protected:
         return TriageResult(
             "escalate",
             searched=tuple(source.citation for source in sources),
-            reason="protected path or genuinely new product decision",
+            reason="protected path",
         )
     resolution = next((source for source in sources if source.kind == "resolution"), None)
+    if product and resolution is None:
+        return TriageResult(
+            "escalate",
+            searched=tuple(source.citation for source in sources),
+            reason="genuinely new product decision",
+        )
     if resolution is not None:
         text = resolution.text
         answer, _, citation = text.partition("\nCitation:")
