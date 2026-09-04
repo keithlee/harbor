@@ -153,6 +153,7 @@ def parse_pull_request(
         merged = True
     facts: dict[str, Any] = {
         "number": number,
+        "body": pull_request.get("body"),
         "head_sha": head_sha,
         "mergeable": pull_request.get("mergeable"),
         "merged": merged,

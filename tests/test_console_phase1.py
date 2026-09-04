@@ -42,6 +42,26 @@ def test_console_lifecycle_commands_work_without_agents(tmp_path: Path) -> None:
     assert supervisor.lifecycle == Lifecycle.STOPPED
 
 
+def test_console_banner_reports_live_and_shadow_mode(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+
+    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    client = LinearClient(transport=httpx.MockTransport(handler))
+    live = Supervisor(LinearPoller(client, config))
+    shadow = Supervisor(LinearPoller(client, config), shadow=True)
+    try:
+        live_banner = Console(live).banner()
+        shadow_banner = Console(shadow).banner()
+    finally:
+        run(live.exit())
+        run(shadow.exit())
+        run(client.close())
+
+    assert "(live mode)" in live_banner
+    assert "(shadow mode)" in shadow_banner
+
+
 def test_free_form_input_is_not_dispatched_in_phase_one(tmp_path: Path) -> None:
     calls: list[httpx.Request] = []
 

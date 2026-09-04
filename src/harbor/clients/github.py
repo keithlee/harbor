@@ -53,6 +53,7 @@ def build_pull_requests_query(owner: str, repo: str, numbers: Iterable[int]) -> 
         number
         url
         title
+        body
         state
         merged
         mergedAt

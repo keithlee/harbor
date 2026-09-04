@@ -186,6 +186,12 @@ def render_digest(source: Any) -> str:
             line += f"  session {session}"
         if waiting:
             line += f"  waiting on {waiting}"
+        outcome = _get(run, "outcome", default=None)
+        if outcome:
+            line += f"  outcome={_text(outcome).casefold()}"
+        pr_url = _get(run, "pr_url", "pull_request_url", default=None)
+        if pr_url:
+            line += f"  pr_url={_text(pr_url)}"
         lines.append(line)
 
     # These fields are optional and are emitted only when a richer Phase 3+

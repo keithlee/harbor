@@ -48,6 +48,51 @@ _MIGRATION_NAME = "003_phase3_wake.sql"
 _PHASE6_MIGRATION_NAME = "005_phase6_reengagement.sql"
 
 
+@dataclass(frozen=True)
+class TicketScope:
+    """Invocation-local exact ticket selector.
+
+    A scope is deliberately not part of the Harbor ledger.  It is a custody
+    boundary for one supervisor invocation: observations may still include
+    the complete project fleet, but only the selected Linear identifier may
+    enter a wake decision or any downstream builder path.  Matching trims
+    surrounding whitespace and folds case; it never performs substring or
+    prefix matching.
+    """
+
+    selector: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.selector is not None and not str(self.selector).strip():
+            raise ValueError("ticket selector must not be blank")
+
+    @property
+    def normalized(self) -> str | None:
+        if self.selector is None:
+            return None
+        return str(self.selector).strip().casefold()
+
+    def matches(self, value: Any) -> bool:
+        """Return whether *value* is exactly the selected identifier."""
+
+        wanted = self.normalized
+        if wanted is None:
+            return True
+        identifier = value if isinstance(value, str) else _identifier(value)
+        return bool(identifier and identifier.strip().casefold() == wanted)
+
+    def __bool__(self) -> bool:
+        return self.normalized is not None
+
+
+def ticket_scope(selector: str | TicketScope | None) -> TicketScope:
+    """Normalize a selector while keeping ``None`` as an unrestricted scope."""
+
+    if isinstance(selector, TicketScope):
+        return selector
+    return TicketScope(selector)
+
+
 def _value(value: Any, *names: str, default: Any = None) -> Any:
     """Read a field from either a mapping or a small object."""
 
@@ -733,11 +778,13 @@ class WakeDecider:
         dispatch_states: Iterable[str] = DISPATCH_STATES,
         bot_rework_cap: int = 1,
         shadow: bool = False,
+        ticket_scope: str | TicketScope | None = None,
     ) -> None:
         self.db = db
         self.dispatch_states = frozenset(str(value) for value in dispatch_states)
         self.bot_rework_cap = max(0, _as_int(bot_rework_cap, 1))
         self.shadow = shadow
+        self.ticket_scope = ticket_scope if isinstance(ticket_scope, TicketScope) else TicketScope(ticket_scope)
         # Shadow mode has no ledger writes, so this tiny process-local set is
         # the only state needed to make two consecutive cycles idempotent.
         self._shadow_idems: set[str] = set()
@@ -777,6 +824,11 @@ class WakeDecider:
         facts = facts or {}
         identifier = _identifier(ticket)
         if not identifier:
+            return None
+        # Defense in depth for embedders that call the decider directly.  The
+        # supervisor gates before reaching this method because deciding can
+        # enqueue and claim a ticket in the local ledger.
+        if not self.ticket_scope.matches(identifier):
             return None
         # An explicitly observed/pre-existing ticket is displayed, never
         # adopted.  Normal Phase 1 observations simply omit this flag and are
@@ -1025,6 +1077,7 @@ def decide(
     shadow: bool = False,
     dispatch_states: Iterable[str] = DISPATCH_STATES,
     bot_rework_cap: int = 1,
+    ticket_scope: str | TicketScope | None = None,
 ) -> Wake | None:
     """One-shot convenience wrapper around :class:`WakeDecider`."""
 
@@ -1033,6 +1086,7 @@ def decide(
         dispatch_states=dispatch_states,
         bot_rework_cap=bot_rework_cap,
         shadow=shadow,
+        ticket_scope=ticket_scope,
     ).decide(ticket, facts)
 
 
@@ -1107,7 +1161,13 @@ def observe_pr_facts(db: Any, ticket: str | Mapping[str, Any], facts: Mapping[st
                 "UPDATE prs SET url = COALESCE(?, url), head_sha = COALESCE(?, head_sha), "
                 "ci_state = COALESCE(?, ci_state), merged = COALESCE(?, merged), observed_at = CURRENT_TIMESTAMP "
                 "WHERE number = ?",
-                (pr.get("url"), pr.get("head_sha", pr.get("headRefOid")), pr.get("ci_state"), int(_as_bool(pr.get("merged"))) if "merged" in pr else None, number),
+                (
+                    pr.get("url"),
+                    pr.get("head_sha", pr.get("headRefOid")),
+                    pr.get("ci_state"),
+                    int(_as_bool(pr.get("merged"))) if "merged" in pr else None,
+                    number,
+                ),
             )
             threads = pr.get("threads", pr.get("review_threads", ()))
             if isinstance(threads, Mapping):
@@ -1141,6 +1201,7 @@ __all__ = [
     "DISPATCH_STATES",
     "LIVE_QUEUE_STATUSES",
     "StopAndNotify",
+    "TicketScope",
     "Wake",
     "WakeDecider",
     "apply_phase3_migration",
@@ -1157,4 +1218,5 @@ __all__ = [
     "record_push",
     "record_review_facts",
     "reengage_instruction",
+    "ticket_scope",
 ]

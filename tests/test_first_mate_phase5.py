@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from typing import Any
 
 import pytest
 
 from harbor.digest import render_digest
-from harbor.first_mate import DEFAULT_MODEL, FirstMate, build_command
+from harbor.console import Console
+from harbor.first_mate import CodexExecRunner, DEFAULT_MODEL, FirstMate, build_command
 from harbor.notify import Notifier, build_notification_command
+from harbor.poll.linear_poller import PollResult
+from harbor.config.projects import ProjectConfig
+from harbor.supervisor import Lifecycle, Supervisor
 
 
 def run(awaitable: Any) -> Any:
@@ -101,6 +107,209 @@ def test_cancellation_targets_only_active_answer() -> None:
         assert mate.cancel_active_answer() is False
 
     run(exercise())
+
+
+def test_console_ctrl_c_cancels_answer_but_keeps_supervisor_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGINT delivered while an answer is active belongs to that answer."""
+
+    import harbor.console as console_module
+
+    class Poller:
+        project_name = "Bookgen"
+        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+
+        async def poll(self) -> PollResult:
+            return PollResult((), "empty", False, ())
+
+    class Session:
+        prompts = ("why is this waiting?", "/status", "/exit")
+        calls = 0
+
+        def __init__(self) -> None:
+            self.index = 0
+
+        async def prompt_async(self, prompt: str) -> str:
+            del prompt
+            type(self).calls += 1
+            value = self.prompts[self.index]
+            self.index += 1
+            return value
+
+    async def exercise() -> tuple[list[str], Lifecycle, bool, bool, int]:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def runner(command: list[str], prompt: str) -> str:
+            del command, prompt
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return "unreachable"
+
+        supervisor = Supervisor(Poller())
+        mate = FirstMate(supervisor, runner=runner)
+        output: list[str] = []
+        console = Console(supervisor, first_mate=mate, output=output.append)
+        monkeypatch.setattr(console_module, "PromptSession", Session)
+        await supervisor.start()
+        try:
+            foreground = asyncio.create_task(console.run())
+            await started.wait()
+            # The temporary answer handler must turn the terminal SIGINT into
+            # answer-only cancellation instead of letting asyncio.run cancel
+            # the foreground task and exit the process with status 130.
+            os.kill(os.getpid(), signal.SIGINT)
+            await foreground
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            return output, supervisor.lifecycle, mate.active_answer is None, console._answer_task is None, Session.calls
+        finally:
+            await supervisor.exit()
+
+    output, lifecycle, mate_idle, console_idle, prompts = run(exercise())
+    # ``/status`` ran after cancellation and reported RUNNING before the test's
+    # final ``/exit`` prompt stopped the fixture supervisor.
+    assert any("Harbor: RUNNING" in line for line in output)
+    assert "Harbor: answer cancelled" in output
+    assert prompts == 3
+    assert lifecycle == Lifecycle.STOPPED
+    assert mate_idle is True
+    assert console_idle is True
+
+
+def test_console_host_cancellation_propagates_after_answer_cleanup() -> None:
+    class Poller:
+        project_name = "Bookgen"
+        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+
+        async def poll(self) -> PollResult:
+            return PollResult((), "empty", False, ())
+
+    async def exercise() -> tuple[Lifecycle, bool, bool]:
+        started = asyncio.Event()
+
+        async def runner(command: list[str], prompt: str) -> str:
+            del command, prompt
+            started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+        supervisor = Supervisor(Poller())
+        mate = FirstMate(supervisor, runner=runner)
+        console = Console(supervisor, first_mate=mate)
+        await supervisor.start()
+        try:
+            host_task = asyncio.create_task(console.handle_command("host timeout"))
+            await started.wait()
+            host_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await host_task
+            return supervisor.lifecycle, mate.active_answer is None, console._answer_task is None
+        finally:
+            await supervisor.exit()
+
+    lifecycle, mate_idle, console_idle = run(exercise())
+    assert lifecycle == Lifecycle.RUNNING
+    assert mate_idle is True
+    assert console_idle is True
+
+
+def test_answer_restores_prior_sigint_handler_when_idle() -> None:
+    class Poller:
+        project_name = "Bookgen"
+        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+
+        async def poll(self) -> PollResult:
+            return PollResult((), "empty", False, ())
+
+    async def exercise() -> tuple[str | None, Lifecycle, bool]:
+        loop = asyncio.get_running_loop()
+        previous_seen = asyncio.Event()
+
+        def previous_handler() -> None:
+            previous_seen.set()
+
+        # Install a real loop handler so the test detects whether the
+        # answer-only handler was restored after the first SIGINT.
+        loop.add_signal_handler(signal.SIGINT, previous_handler)
+        started = asyncio.Event()
+
+        async def runner(command: list[str], prompt: str) -> str:
+            del command, prompt
+            started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+        supervisor = Supervisor(Poller())
+        mate = FirstMate(supervisor, runner=runner)
+        console = Console(supervisor, first_mate=mate)
+        await supervisor.start()
+        try:
+            answer = asyncio.create_task(console.handle_command("why?"))
+            await started.wait()
+            os.kill(os.getpid(), signal.SIGINT)
+            response = await answer
+            assert response == "Harbor: answer cancelled"
+
+            # The answer is now idle.  A second real SIGINT must reach the
+            # prior handler instead of the stale answer callback.
+            os.kill(os.getpid(), signal.SIGINT)
+            await asyncio.wait_for(previous_seen.wait(), timeout=1)
+            return response, supervisor.lifecycle, mate.active_answer is None
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
+            await supervisor.exit()
+
+    response, lifecycle, mate_idle = run(exercise())
+    assert response == "Harbor: answer cancelled"
+    assert lifecycle == Lifecycle.RUNNING
+    assert mate_idle is True
+
+
+def test_codex_runner_kills_and_reaps_only_cancelled_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Process:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.killed = 0
+            self.waited = 0
+
+        async def communicate(self, prompt: bytes) -> tuple[bytes, bytes]:
+            del prompt
+            await asyncio.Event().wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed += 1
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            self.waited += 1
+            return self.returncode or -9
+
+    process = Process()
+
+    async def create_process(*command: str, **kwargs: object) -> Process:
+        assert command[:2] == ("codex", "exec")
+        assert kwargs["stdin"] is asyncio.subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(CodexExecRunner()(build_command(), "question"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(exercise())
+    assert process.killed == 1
+    assert process.waited == 1
 
 
 def test_notification_command_and_executor_are_injectable() -> None:

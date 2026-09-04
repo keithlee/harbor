@@ -39,13 +39,16 @@ At 60s: 2,700 complexity/hr against Linear's 3,000,000 (0.09%); ~120 GitHub call
 - Agents work in a **git worktree**, never in your main checkout.
 - **Shadow mode first:** every ticket carries a `hold`, which any reasonable skill honours as
   "don't merge" (`work-pipeline` §6 checks it explicitly). Lift it when you trust the loop.
+- **MVP completion:** a reviewed and merged PR plus a `Done` Linear ticket is the terminal
+  contract. Harbor reports that external state; it does not perform a second reconciliation
+  sweep after the ticket leaves the configured poll states.
 
 ```python
 POLL_STATES     = ["Todo", "In Progress", "In Review", "Blocked", "Human Review"]
 DISPATCH_STATES = ["Todo"]
 ```
 
-### Day-one board
+### Day-one board (historical planning snapshot)
 
 | Linear | State | PR | CI | Unresolved (all `chatgpt-codex-connector`) |
 |---|---|---|---|---|
@@ -54,7 +57,9 @@ DISPATCH_STATES = ["Todo"]
 | HAN-17 | In Review | #218 | SUCCESS | 1×P1 |
 | HAN-7 | In Progress (15 comments) | #217 | **FAILURE** | 0 |
 
-All four are `(observed)` on day one. Harbor touches none of them.
+All four were `(observed)` on day one. Harbor touched none of them. Ticket and
+PR counts are expected to change; acceptance checks compare Harbor with a
+same-minute Linear/GitHub observation rather than hard-coding this snapshot.
 
 ---
 
@@ -112,10 +117,9 @@ is the same shape for every skill: the ticket, the PR, and what changed since th
 | `medium` / `high` | **resolves every comment first**, gets CI green and review approved | parks a merge-ready PR — `outcome=parked`, `waiting_on=human` | `Human Review` |
 
 A ticket in `Human Review` is one where *all the work is done* and only the merge click is yours.
-When you merge it, Harbor sees the PR flip to `merged` on an owned ticket whose run ended
-`waiting_on=human`, and re-engages the builder with that fact; the skill then finishes its own
-workflow — `Done`, worktree removed. Harbor still never merges, never moves a ticket to `Done`,
-and never judges risk.
+After the PR is reviewed and merged, the skill or the GitHub/Linear integration moves the ticket
+to `Done`; that external state is sufficient for the MVP. Harbor still never merges, never moves
+a ticket to `Done`, and never judges risk.
 
 ## 1.1 Ticket lifecycle
 
@@ -160,7 +164,6 @@ flowchart TD
         WATCH{"what changed<br/>since the run ended?"}
         WATCH -->|"nothing"| WATCH
         WATCH -->|"CI finished"| WAKE["resume builder:<br/>facts + 'continue your workflow'"]
-        WATCH -->|"you merged the PR"| WAKE
         WATCH -->|"new threads at ≤ P2<br/>not seen at this head"| CAP{"bot_rework ≥ 1?"}
         WATCH -->|"P3 nits only"| WATCH
         CAP -->|"no"| WAKE
@@ -172,6 +175,18 @@ flowchart TD
 
 Tokens are spent in exactly two places: `B` and `RUNG1`. The poll, the diff, the wake decision,
 and the caps are Python.
+
+### Startup and operator custody
+
+`harbor start <project>` performs the initial Linear/GitHub observation, then
+opens the same `first-mate>` terminal while builder dispatch/re-engagement is
+scheduled as a background task. This keeps `/status`, `/pause`, `/resume`,
+`/hold on|off <ticket>`, and plain First Mate questions available while a
+builder is running. `/pause` suspends new dispatch/resume and deadline
+accounting for the whole supervisor; it does not erase the run or worktree.
+`/exit` stops supervision and active dispatches without creating a replacement
+agent. A heartbeat loop publishes model-free liveness/activity events at the
+configured interval (60 seconds by default).
 
 ## 1.2 Re-engagement — how a bot comment reaches the agent
 
@@ -368,8 +383,9 @@ table** (you answered this before); active policies. Confidence is not authority
 resolves anything that touches `protected_paths` or a genuinely new product decision. Capped at 2
 attempts per ticket; every resolution posts its citation and shows in `/status` with `[override]`.
 
-**Park and notify, only now** — `Blocked` for environment, `Human Review` for a decision; the
-notification says what was already tried.
+**Park and surface, only now** — `Blocked` for environment, `Human Review` for a decision; the
+console status and Linear escalation comment say what was already tried. Visible macOS
+notifications are not part of the MVP.
 
 **You answer** — in the console, `harbor answer <id> <text>`, or `/harbor answer …` as a Linear
 comment. Exact option matches cost 0; free prose costs one small mapping call. Every answer
@@ -448,7 +464,12 @@ first-mate> /pause Stopping for the evening
 ```
 
 Console: `/help /status /hold on|off <ticket> /pause /resume /kill /exit`. Everything else goes
-to the First Mate.
+to the First Mate in this same terminal; there is no separate `harbor ask`
+command or project-name prefix. `/status` is the shared deterministic digest
+used as context for a plain question. `/hold on|off <ticket>` changes one
+ticket's durable merge hold and does not pause the fleet. `/pause [reason]`
+pauses dispatch/resume for the whole supervisor, `/resume` polls again, and
+`/exit` stops supervision.
 
 ---
 
@@ -461,9 +482,12 @@ to the First Mate.
 ├── supervisor.py     60s cycle: poll → facts → wake → dispatch · pause suspends deadlines
 ├── db.py             schema, single-writer task, WAL
 ├── digest.py         ONE digest for /status and the First Mate
-├── notify.py         osascript → Notification Center
+├── heartbeat.py      configurable model-free liveness/activity events
+├── notify.py         optional future host notification adapter (unused by MVP gates)
 ├── worktree.py       create · pnpm install · confine · remove on merge
 ├── wake.py           build dispatch + re-engagement decision + caps
+├── reengagement.py   bounded same-session wake instructions from changed facts
+├── pr_events.py      PR/comment receipts and builder-owned comment handling
 ├── unblock.py        rung 0/1/2
 ├── first_mate.py     codex exec -m terra -s read-only --ephemeral · digest + question
 ├── config/           projects.py · pipeline.py · profile.py
@@ -492,7 +516,8 @@ PRFacts = {"number","head_sha","mergeable","merged",
                        "seen_at_sha"}]}
 Wake    = {"ticket","action":"build|reengage","resume":"<run_id|None>",
            "instruction":"<~1 KB>","idem_key"}
-RunResult = {"run_id","status","cost_usd","final":{...FINAL_SCHEMA...}}
+RunResult = {"run_id","status","cost_usd","final":{...FINAL_SCHEMA...},
+             "merge_verified","merge_commit_sha","cleanup_at"}
 ```
 
 CI is `green` only when the **named** required checks are present *and* `SUCCESS`. A `null`
@@ -511,6 +536,130 @@ Record every comment id Harbor creates; dedupe on `(issue_id, sha256(body))` bef
 Each phase ends with proof under `~/.harbor/proof/phase-N/`. Tests are necessary, never
 sufficient.
 
+## Implementation and proof status — 2026-09-03
+
+This is a partial, evidence-backed checkpoint. It does not check off every
+phase or acceptance criterion. The original design rationale and phase gates
+remain the target contract.
+
+Verified so far:
+
+- The real low-risk, comment-only HAN-33 ticket completed the configured
+  builder path. Bookgen PR #226 was risk-classified low, squash-merged, and
+  Linear HAN-33 was moved to `Done` only after the merge.
+- The exact final result was reconciled against a read-only GitHub PR
+  observation. The merge receipt is persisted and verified cleanup removes the
+  retained HAN-33 worktree; an unobserved `outcome=merged` claim remains
+  fail-closed.
+- The Harbor test suite reports 246 passing tests, including
+  `tests/test_async_console_start.py`, `tests/test_hold_command.py`, and
+  `tests/test_han33_merge_receipt.py`, plus the exact-ticket and whole-run
+  shadow proofs in `tests/test_ticket_scope.py` and
+  `tests/test_shadow_readonly_e2e.py`. These cover background dispatch with an
+  available console/heartbeat callback, ticket-scoped hold corrections, and
+  merge receipt/restart reconciliation. The shadow transport test fails on
+  any GraphQL mutation attempt while exercising the real Linear/GitHub
+  clients and pollers.
+
+Still open before the corresponding live acceptance criteria can be crossed:
+
+- Complete the multi-ticket unblock-ladder and risk-gated human-review
+  scenarios, including the operator-answer/resume path.
+
+No phase is marked complete solely because these unit/regression tests pass;
+the live proof artifacts must be recorded under the phase-specific proof
+directories.
+
+### Acceptance-criterion ledger
+
+`[x]` means the criterion is proven at the scope it asks for. `[ ] Partial`
+means implementation/tests or one behavioral shape exist, but the required
+live proof is incomplete. `[ ] Missing` means the required scenario has not
+been exercised. This ledger is the checklist of record; details remain in the
+phase tables below.
+
+| Phase | Checked criteria | Still open |
+|---|---|---|
+| 1 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-4, [x] AC-5, [x] AC-6, [x] AC-7, [x] AC-8 | — |
+| 2 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-4 | — |
+| 3 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-4, [x] AC-5, [x] AC-6, [x] AC-7, [x] AC-8, [x] AC-9 | — |
+| 4 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-5, [x] AC-6, [x] AC-7, [x] AC-8, [x] AC-9 | [ ] **Missing AC-4:** HAN-34 parked on an environment blocker before any commit or PR, so the held open-PR final criterion is not met. |
+| 5 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-4 | — (host-specific notification UI proof is out of scope) |
+| 6 | [x] AC-1, [x] AC-2, [x] AC-3, [x] AC-4, [x] AC-5, [x] AC-6, [x] AC-7 | [ ] **Partial AC-8:** structural/fake proof exists, but no whole-run outbound HTTP log. |
+| 7 | [x] AC-1, [x] AC-2, [x] AC-4, [x] AC-5, [x] **AC-8** | [ ] **Partial AC-3/6:** tests or historical artifacts exist, but current live escalation/resolution rows do not. [ ] **Missing AC-7:** PR #225 still has an unresolved thread, so the parked all-comments-resolved criterion is contradicted. [ ] **Partial AC-9:** protected-path behavior is fixture-tested only. |
+
+Phase 7 AC-8 is now crossed from a real external run, not merely the stub:
+HAN-33 was implemented by the configured Luna builder, PR #226 recorded low
+risk and passed both named checks, the implementer squash-merged it, Linear
+reports `Done`, Harbor independently observed the exact PR as merged,
+persisted `merge_verified=1`, and removed the retained worktree. See
+`~/.harbor/proof/phase-7/han33-live-low-risk-merge.txt`.
+
+HAN-34 now supplies the live Phase 6 AC-1/4 evidence: First Mate observed real
+valid and invalid review comments on PR #227, automatically resumed the same
+Luna session `01a06a9e-cf9d-7ac1-906a-e9254a6f2ae1`, the valid finding was
+fixed, every observed comment was replied to, both threads were resolved, the
+head moved from `00758f2...` to `79b8d4e...`, and `bot_rework_rounds` became
+1. The low-risk PR then passed 2/2 required checks and the fresh Luna xhigh
+proof audit before squash merge. See
+`~/.harbor/proof/phase-6/han34-live-review-loop.txt`.
+
+The three-ticket acceptance sequence in §6 is still open. Its A/B/C
+behaviors have partial historical or fixture evidence, but no evidence proves
+three fresh tickets each completed all ten steps in sequence. HAN-34 proves
+the seeded-comment and same-session review loop on one live PR; the B/C
+rung-2 then stored rung-1 sequence remains missing.
+
+Phases 1, 2, and 3 are now crossed as complete. Phase 1's final PTY gate is
+recorded in `~/.harbor/proof/phase-1/partial-line-heartbeat.typescript`: `/sta`
+was typed, a heartbeat arrived, then `tus` completed the still-buffered
+`/status` command successfully. Phase 3's final gate is backed by
+the real-client, write-stubbed whole-run test and the current live read-only
+shadow observation in `~/.harbor/proof/phase-3/shadow-readonly-current.txt`.
+No other phase is crossed as a whole. A checked sub-criterion is not a claim
+that its enclosing phase passed; each remaining phase closes only when all its
+rows and its specified live proof are present for the current implementation.
+The strict audit of record is `~/.harbor/proof/CURRENT-AUDIT.md`; older
+`SUMMARY.md` and `AUDIT.md` files are historical evidence indexes.
+
+Phase 5 AC-2 is crossed from a fresh, live 10-minute idle console run. A
+fail-on-call `codex` sentinel remained absent, the fresh ledger contained zero
+runs and `$0.00` total cost, and healthy one-minute heartbeats continued for
+10 minutes 13 seconds. See
+`~/.harbor/proof/phase-5/idle-10m-zero-cost.txt`.
+
+Phase 5 AC-3 is crossed from a real Terra invocation whose process banner
+reported `approval: never` and `sandbox: read-only`. The operator requested a
+file mutation; First Mate returned only the supplied fleet status, and the
+target file remained absent. See
+`~/.harbor/proof/phase-5/first-mate-readonly-refusal.txt`.
+
+Phase 5 AC-1 is crossed from the real interactive console with a controlled
+PATH-injected model-call counter: `/status` left the count at zero, one plain
+question moved it to exactly one, and a second `/status` left it at one. See
+`~/.harbor/proof/phase-5/status-question-call-count.txt`.
+
+Phase 5 AC-4 is crossed after a live PTY reproduction, repair, and independent
+Luna xhigh review. Ctrl+C cancels and reaps only the active answer, `/status`
+still reports RUNNING, host cancellation still propagates, and the restored
+idle SIGINT handler exits normally. See
+`~/.harbor/proof/phase-5/ctrl-c-answer-only.txt`.
+
+Phase 4 AC-6 is crossed from a current production-runner process harness. The
+builder parent and its real child were alive in the same process group before
+termination; afterward both PIDs were gone and the runner reported
+`terminated`. See `~/.harbor/proof/phase-4/killpg-process-tree.txt`.
+
+Phase 4 AC-7 is crossed from a current abrupt-host-exit harness. A restarted
+process reaped the still-live builder group, persisted `orphaned` with the
+literal restart reason, retained one queue receipt, and produced no second
+build wake. See `~/.harbor/proof/phase-4/restart-mid-run.txt`.
+
+Phase 4 AC-3 is crossed from a real network-disabled Luna xhigh invocation in
+HAN-34's worktree. Its inside marker succeeded; an attempted marker in the
+operator's Bookgen checkout was rejected as outside the project and remained
+absent. See `~/.harbor/proof/phase-4/worktree-write-boundary.txt`.
+
 ## Phase 1 — Console + Linear poller
 
 **Files:** `cli.py`, `console.py`, `supervisor.py`, `db.py`, `config/projects.py`,
@@ -519,22 +668,25 @@ sufficient.
 | | Acceptance criteria |
 |---|---|
 | AC-1 | `harbor start Bookgen` opens `first-mate>` and reports Linear health |
-| AC-2 | `/status` lists the four live HAN tickets with true states, tagged `(observed)` |
+| AC-2 | `/status` matches every ticket returned by the same-minute scoped Linear poll, with true states and every pre-existing ticket tagged `(observed)` |
 | AC-3 | `Backlog` never appears |
 | AC-4 | An unchanged cycle writes **zero** `events` rows |
 | AC-5 | Background output does not corrupt a partially typed line |
 | AC-6 | Zero LLM calls exist |
 | AC-7 | `/pause`, `/resume`, `/exit` work with no agents |
+| AC-8 | Initial builder dispatch runs in the background: the console and heartbeat callback are available before the builder completes |
 
 **Tests**
 ```bash
 uv run harbor doctor Bookgen && uv run harbor start Bookgen
 sqlite3 ~/.harbor/harbor.db "select count(*) from events where at > datetime('now','-3 minutes')"  # 0
 pytest tests/test_poller_states.py
+pytest tests/test_async_console_start.py tests/test_hold_command.py
 grep -rniE 'anthropic|openai|codex' src/harbor/ | grep -v runner/    # empty
 ```
 
-**Proof** — `/status` screenshot beside a same-minute Linear screenshot; `events` count before and
+**Proof** — `/status` screenshot beside a same-minute Linear screenshot (matching the current
+set, not the historical day-one count); `events` count before and
 after 3 idle minutes; asciinema of typing through a background event; the empty `grep`.
 
 ## Phase 2 — GitHub poller + facts
@@ -568,7 +720,7 @@ pytest tests/test_ci.py tests/test_threads.py
 
 | | Acceptance criteria |
 |---|---|
-| AC-1 | First start against the live board: **zero** WOULD WAKE; all four tickets `(observed)` |
+| AC-1 | First start against the live board: **zero** WOULD WAKE; every pre-existing polled ticket is `(observed)` |
 | AC-2 | A fixture `Todo` ticket → WOULD WAKE `build`, `idem_key == "<id>@build"` |
 | AC-3 | Two consecutive cycles → zero duplicate rows |
 | AC-4 | Posting a Linear comment on a Todo ticket with a live build row inserts zero rows |
@@ -584,7 +736,8 @@ uv run harbor start Bookgen --shadow          # prints WOULD WAKE / silent, muta
 pytest tests/test_wake.py                     # table-driven over AC-2..8
 ```
 
-**Proof** — screenshot of shadow output showing zero wakes on the live board; `diff` of two
+**Proof** — screenshot of shadow output showing zero wakes and every current pre-existing ticket
+as `(observed)` on the live board; `diff` of two
 consecutive shadow runs (empty); the AC-6 fixture output showing wake → STOP; a write-stubbed run
 proving zero POST/PATCH for AC-9.
 
@@ -627,10 +780,11 @@ open PR; `runs.cost_usd` beside the harness's own figure; `ps` before/after `kil
 | AC-2 | Ten idle minutes add zero cost |
 | AC-3 | First Mate runs `-s read-only --ephemeral`; a prompt asking it to edit a file fails |
 | AC-4 | Ctrl+C during generation cancels only that answer |
-| AC-5 | A park fires a Notification Center notification with the literal reason |
 
 **Proof** — screen recording of `/status` → question → answer with `runs` queried around each
-(0 / +1 / +0); the notification screenshot; a 10-minute `$0.00` delta.
+(0 / +1 / +0) and a 10-minute `$0.00` delta. The notifier command remains
+unit-tested for literal-reason preservation; host-specific Notification Center
+rendering is intentionally out of scope.
 
 ## Phase 6 — Re-engagement
 
@@ -642,7 +796,7 @@ open PR; `runs.cost_usd` beside the harness's own figure; `ps` before/after `kil
 | AC-2 | The resume instruction is < 2 KB, loads no skill, and contains the thread bodies fenced `<untrusted-review-comment>` |
 | AC-3 | Outdated threads are passed with `path` and `outdated: true`, not a line |
 | AC-4 | After the builder pushes, `seen_at_sha` moves to the new head and `bot_rework_rounds == 1` |
-| AC-5 | A second wave of bot threads → no wake, one notification |
+| AC-5 | A second wave of bot threads → no wake, one recorded escalation event |
 | AC-6 | CI finishing on a run that ended `waiting_on=ci` → one resume |
 | AC-7 | **Portability:** swap `skill:` for a stub that opens an empty PR and ends `waiting_on=review`; Harbor still re-engages it identically |
 | AC-8 | Harbor's outbound log contains zero GitHub mutations across the whole run |
@@ -658,22 +812,20 @@ reads.
 
 | | Acceptance criteria |
 |---|---|
-| AC-1 | Rung 0 fixes a `Cannot find module` block, resumes the same session, notifies nobody |
+| AC-1 | Rung 0 fixes a `Cannot find module` block, resumes the same session, pages nobody |
 | AC-2 | Rung 1 resolves a question answered in `DISCOVERIES.md`, citing it, without paging you |
 | AC-3 | Rung 1 **refuses** a novel product question and escalates, listing what it searched |
 | AC-4 | A resolution with an empty citation is never accepted |
 | AC-5 | Same-kind block twice after a rung-1 answer escalates on the third |
 | AC-6 | `harbor answer` writes a `resolutions` row; a later identical question resolves at rung 1 |
-| AC-7 | **Low risk, `hold` on:** the implementer resolves every comment, gets CI green and review approved, then parks — `outcome=parked`, `waiting_on=human`, Linear `Human Review`, PR open and merge-ready; your notification carries the implementer's reason |
+| AC-7 | **Low risk, `hold` on:** the implementer resolves every comment, gets CI green and review approved, then parks — `outcome=parked`, `waiting_on=human`, Linear `Human Review`, PR open and merge-ready; `/status` and the Linear escalation carry the implementer's reason |
 | AC-8 | **Low risk, `hold` off:** the implementer squash-merges — `outcome=merged`, Linear `Done`, worktree removed. Harbor's outbound log shows no mutation |
 | AC-9 | **Medium/high risk:** same as AC-7 regardless of `hold` — comments resolved *first*, then `Human Review`. Test with a ticket touching a `protected_paths` file |
-| AC-10 | **You merge a `Human Review` PR by hand:** next poll sees `merged` on an owned ticket with `waiting_on=human` → Harbor resumes the builder → the skill sets `Done` and the worktree is removed. Harbor itself never writes `Done` |
 
-**Proof** — `escalations` rows for AC-1/2/3 with `rung_resolved` 0/1/2 and notification counts
+**Proof** — `escalations` rows for AC-1/2/3 with `rung_resolved` 0/1/2 and operator-page counts
 0/0/1; the Linear comment with the rung-1 citation; for AC-7/9 a screenshot of the ticket in
 `Human Review` beside the PR showing 0 unresolved threads and green checks; for AC-8 the merged PR
-and `Done` ticket; for AC-10 the resume command line fired after your manual merge, and the
-`Done` transition authored by the builder, not Harbor.
+and `Done` ticket. The post-merge manual-resume tail is not an MVP gate.
 
 ---
 
@@ -697,8 +849,8 @@ harbor doctor Bookgen && git -C ~/Projects/Bookgen rev-parse HEAD > /tmp/main-be
 |---|---|---|
 | 1 | Poller picks up A ≤ 60s | `events` row; `/status` → `WAKE build` |
 | 2 | Worktree + dispatch | `~/.harbor/wt/Bookgen/HAN-A`; skill loaded **once** in the stream |
-| 3 | Escalation *(optional on A; mandatory on B, C)* | `escalations` row; no park, no notification before rung 1 |
-| 4 | Ladder | A: whatever occurred; **B: `rung_resolved=2`, 1 notification**; **C: `rung_resolved=1`, citation = B's row, 0 notifications** |
+| 3 | Escalation *(optional on A; mandatory on B, C)* | `escalations` row; no park or operator page before rung 1 |
+| 4 | Ladder | A: whatever occurred; **B: `rung_resolved=2`, 1 operator page in console/Linear**; **C: `rung_resolved=1`, citation = B's row, 0 operator pages** |
 | 5 | Change made | resumed run shares the builder `run_id`; one commit, one file, in the worktree |
 | 6 | PR opened, run ends `waiting_on=review` | Linear attachment; `runs.final.waiting_on` |
 | 7 | Connector comments | `review_threads` rows with severity |
@@ -711,7 +863,7 @@ seed one by hand with a `P2` badge — steps 8–9 must still run. Step 3 is nev
 B and C contain a question the repo cannot answer, which real tickets do. If B invents a team name
 instead of escalating, that is a finding against `FINAL_SCHEMA` or the skill's own review.
 
-**Abort on:** a duplicate Linear comment; a notification at step 4 on C; an accepted resolution
+**Abort on:** a duplicate Linear comment; an operator page at step 4 on C; an accepted resolution
 with no citation; Harbor's outbound log showing a GitHub mutation; `/tmp/main-before` no longer
 matching your checkout's HEAD.
 
@@ -754,7 +906,14 @@ but never restate its value. Risk budget, protected paths, commands, proof requi
 `AGENTS.md` and are read by the *skill*, not by Harbor.
 
 **State.** Linear and GitHub are authoritative for ticket and PR state; SQLite for Harbor's
-runtime state only.
+runtime state only. Harbor reads the current ticket/PR state directly from
+Linear/GitHub on each observation; it does not use SQLite as a mirror to
+decide whether a ticket or PR is actually complete. When the unblock ladder
+must park an owned ticket, it writes the allowed `Blocked`/`Human Review`
+state and citation comment directly to Linear. The builder skill writes normal
+progress and `Done` after its merge gate. SQLite retains only the local
+operational custody needed for idempotency, same-session resume, heartbeat,
+escalation history, and verified cleanup receipts.
 
 ```
 tickets(identifier PK, owned, hold, unblock_attempts, bot_rework_rounds)
@@ -766,6 +925,8 @@ work_queue(id, ticket, action, idem_key UNIQUE where live, attempts)
 escalations(id, run_id, kind, question, rung_resolved, citation, answer)
 resolutions(id, kind, question_hash, answer, citation, source_ticket)
 comment_receipts(issue_id, body_hash PK) · events(append-only)
+github_pr_states(pr_key PK, project, ticket, pr_number, head_sha, risk_status,
+                 comment/review receipts, and current event state)
 ```
 
 **Pause** = stop dispatching, stop resuming, suspend deadlines. A running builder finishes its
@@ -793,8 +954,10 @@ CI finishes — acceptable, bounded by `deadline_minutes`. A skill that ends its
 `waiting_on=ci`; if it says `completed` with a PR open and nothing merged, Harbor treats it as
 `waiting_on=review` and re-engages on the next change. Verify which `work-pipeline` does in Phase 4.
 
-**Terminal-bound.** Closing the console stops supervision; notifications still reach you. Keep
-`supervisor.py` and `console.py` separate so a socket seam can be added without a rewrite.
+**Terminal-bound.** Closing the console stops supervision. For the MVP, fleet status and
+escalations are visible only in that terminal and in Linear/GitHub; no visible macOS notification
+is required. Keep `supervisor.py` and `console.py` separate so a socket or optional host-notifier
+seam can be added without a rewrite.
 
 **Disk.** 2 GB `node_modules`, ~90 GB free, 20 worktrees already. pnpm hardlinks; the 25 GB floor
 and `git worktree prune` at every create are load-bearing.
@@ -819,8 +982,29 @@ A plaintext Linear API key sits in `~/.claude/file-history/a5c3ab2f-…/d03baed6
 `LINEAR_API_KEY` is plaintext in `~/.zshrc` line 22. I did not read either value. **Rotate the
 key**, keep the new one in Keychain only, never in a LaunchAgent plist.
 
+## Nice-to-haves / future hardening
+
+These are deliberately excluded from the MVP goal and should be implemented only after the
+reviewed-PR → merged-PR → `Done` Linear path is stable:
+
+- Isolate historical PRs when a ticket has multiple local PR records, so an old open PR cannot
+  mask the current merged PR.
+- Avoid GitHub polling for terminal tickets that Harbor does not own.
+- Make retained-run selection deterministic when historical `runs` rows have nullable timestamps.
+- Reconcile a retained Harbor run after a merge when Linear's GitHub integration moves the
+  ticket to `Done` before Harbor's next GitHub poll. The future implementation should preserve
+  the same run/session, record the merge receipt, and clean the worktree without redispatching.
+- Add an optional visible macOS notification adapter after the terminal/Linear escalation flow is
+  stable. Enabling Script Editor notifications is an operator-controlled system setting and is
+  not required for MVP implementation or proof.
+
 ## Open items
 
 - Name/location — assumes `~/Projects/harbor`.
 - ~16 legacy open PRs with no Linear ticket: adopt or close. They never enter Harbor.
 - Verify in Phase 4 whether `work-pipeline` under `codex exec` waits for CI or ends its run.
+- Run the async-console acceptance flow with operator authorization, capturing
+  `/status` and the activity-bearing heartbeat while a real builder is active.
+- Finish the B/C multi-ticket unblock-ladder and medium/high-risk human-review
+  proofs; the implementation checkpoint above intentionally does not cross
+  those acceptance criteria.

@@ -17,6 +17,11 @@ from typing import Any, Awaitable, Callable, Mapping
 
 
 DEFAULT_HEARTBEAT_SECONDS = 60.0
+_ACTIVE_RUN_STATUSES = frozenset({"running", "waiting", "blocked", "parked"})
+_ACTIVE_RUN_ORDER = {
+    status: index
+    for index, status in enumerate(("running", "waiting", "blocked", "parked"))
+}
 
 
 def _get(value: Any, *names: str, default: Any = None) -> Any:
@@ -29,6 +34,97 @@ def _get(value: Any, *names: str, default: Any = None) -> Any:
         if hasattr(value, name):
             return getattr(value, name)
     return default
+
+
+def _safe_text(value: Any, default: str = "") -> str:
+    """Fold untrusted status values into one bounded, terminal-safe line."""
+
+    if value is None:
+        return default
+    try:
+        raw = str(value)
+    except Exception:
+        return default
+    # Newlines, tabs, and control characters must not let an externally
+    # supplied ticket/status value create a second terminal line or escape
+    # the heartbeat's deterministic shape.
+    clean = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in raw
+    )
+    text = " ".join(clean.split())
+    return text[:120] if text else default
+
+
+def _items(value: Any) -> tuple[Any, ...]:
+    if value is None or isinstance(value, (str, bytes)):
+        return ()
+    if isinstance(value, Mapping):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return ()
+
+
+def _healthy(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"0", "false", "no", "off", "unavailable", "red"}:
+            return False
+        if normalized in {"1", "true", "yes", "on", "healthy", "green"}:
+            return True
+    return bool(value)
+
+
+@dataclass(frozen=True)
+class HeartbeatRun:
+    """The small run fact needed to explain what the fleet is doing."""
+
+    ticket: str
+    status: str
+    waiting_on: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "ticket": self.ticket,
+            "status": self.status,
+            "waiting_on": self.waiting_on,
+        }
+
+
+def _active_runs(status: Any) -> tuple[HeartbeatRun, ...]:
+    """Extract only active run states in a stable operator-facing order."""
+
+    runs = _items(_get(status, "runs", "active_runs", default=()))
+    active: list[HeartbeatRun] = []
+    for run in runs:
+        state = _safe_text(_get(run, "status", "state", default="")).casefold()
+        outcome = _safe_text(_get(run, "outcome", default="")).casefold()
+        # Parked work is commonly persisted as a completed run with
+        # ``outcome=parked`` and ``waiting_on=human``.  Surface it as parked
+        # while keeping all other terminal runs out of a liveness heartbeat.
+        if state not in _ACTIVE_RUN_STATUSES:
+            if outcome != "parked":
+                continue
+            state = "parked"
+        ticket = _safe_text(
+            _get(run, "ticket", "identifier", "ticket_id", "ticketId", default="?"),
+            "?",
+        )
+        waiting_on = _safe_text(
+            _get(run, "waiting_on", "waitingOn", default="none"),
+            "none",
+        )
+        active.append(HeartbeatRun(ticket=ticket, status=state, waiting_on=waiting_on))
+    active.sort(
+        key=lambda run: (
+            _ACTIVE_RUN_ORDER.get(run.status, len(_ACTIVE_RUN_ORDER)),
+            run.ticket.casefold(),
+            run.waiting_on.casefold(),
+        )
+    )
+    return tuple(active)
 
 
 def _timestamp(value: Any, *, now: float) -> str | None:
@@ -73,10 +169,27 @@ class HeartbeatEvent:
     idle_seconds: float
     published_at: str
     snapshot_hash: str | None = None
+    active_runs: tuple[HeartbeatRun, ...] = ()
 
     @property
     def last_activity_at(self) -> str | None:
         return self.last_activity
+
+    @property
+    def fleet_status(self) -> str:
+        """Return the concise, deterministic fleet activity description."""
+
+        if not self.active_runs:
+            return "idle"
+        return "; ".join(
+            f"{run.ticket} {run.status} waiting_on={run.waiting_on}" for run in self.active_runs
+        )
+
+    @property
+    def fleet(self) -> str:
+        """Compatibility alias for integrations that call this fleet output."""
+
+        return self.fleet_status
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +201,8 @@ class HeartbeatEvent:
             "idle_seconds": self.idle_seconds,
             "published_at": self.published_at,
             "snapshot_hash": self.snapshot_hash,
+            "active_runs": [run.as_dict() for run in self.active_runs],
+            "fleet": self.fleet_status,
         }
 
 
@@ -154,7 +269,7 @@ class Heartbeat:
         last_activity = _timestamp(activity, now=now)
         # A monotonic activity timestamp may be supplied by lightweight fakes.
         idle = _idle_seconds(activity, monotonic_now=now)
-        healthy = bool(_get(status, "linear_healthy", "healthy", default=False))
+        healthy = _healthy(_get(status, "linear_healthy", "healthy", default=False))
         lifecycle = str(_get(status, "lifecycle", default="UNKNOWN"))
         event = HeartbeatEvent(
             project=str(_get(status, "project", "project_name", default=self.project)),
@@ -164,6 +279,7 @@ class Heartbeat:
             idle_seconds=idle,
             published_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             snapshot_hash=_get(status, "last_snapshot_hash", "snapshot_hash", default=None),
+            active_runs=_active_runs(status),
         )
         self.last_event = event
         if self.publisher is not None:
@@ -202,6 +318,7 @@ __all__ = [
     "DEFAULT_HEARTBEAT_SECONDS",
     "Heartbeat",
     "HeartbeatEvent",
+    "HeartbeatRun",
     "HeartbeatService",
     "SupervisorHeartbeat",
 ]

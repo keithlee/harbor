@@ -91,12 +91,12 @@ def _text_value(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     if isinstance(value, Mapping):
-        for key in ("text", "message", "content"):
+        for key in ("text", "message", "content", "output_text"):
             if key in value:
                 found = _text_value(value[key])
                 if found is not None:
                     return found
-        for key in ("item", "output", "result", "data"):
+        for key in ("item", "output", "result", "data", "payload", "response", "last_agent_message"):
             if key in value:
                 found = _text_value(value[key])
                 if found is not None:
@@ -164,6 +164,8 @@ _FINAL_TYPES = frozenset(
         "result",
         "final",
         "final_result",
+        "task_complete",
+        "task.completed",
         "turn.completed",
         "turn_complete",
         "session.completed",
@@ -172,22 +174,81 @@ _FINAL_TYPES = frozenset(
 )
 
 
+def _event_types(event: StreamEvent) -> frozenset[str]:
+    """Return envelope and nested event kinds carried by one stream line."""
+
+    if event.data is None:
+        return frozenset()
+    values: set[str] = {event.type.casefold()}
+    payload = event.data.get("payload")
+    if isinstance(payload, Mapping):
+        for key in ("type", "event", "kind"):
+            value = payload.get(key)
+            if value is not None:
+                values.add(str(value).casefold())
+    return frozenset(values)
+
+
+def _is_terminal_event(event: StreamEvent) -> bool:
+    """Whether *event* is an explicit Codex turn/task result envelope."""
+
+    if event.data is None:
+        return False
+    event_types = _event_types(event)
+    # A bare schema object is the compact result form used by a few runner
+    # adapters.  Real Codex progress messages carry an ``event_msg`` or
+    # ``response_item`` envelope, so an untyped object with the required result
+    # keys is safe to treat as terminal.
+    if event.type.casefold() == "unknown" and "status" in event.data and "summary" in event.data:
+        return True
+    return any(
+        value in _FINAL_TYPES
+        or (
+            value.endswith(".completed")
+            and value not in {"item.completed", "message.completed", "command.completed"}
+        )
+        for value in event_types
+    )
+
+
+def _text_payload(event: StreamEvent) -> Mapping[str, Any] | None:
+    """Parse a JSON result carried in an agent-message text block."""
+
+    candidate = _json_from_text(event.text)
+    if not isinstance(candidate, Mapping):
+        return None
+    nested = candidate.get("result")
+    if isinstance(nested, Mapping) and "status" in nested:
+        candidate = nested
+    if "status" in candidate and "summary" in candidate:
+        return dict(candidate)
+    return None
+
+
 def final_payload(event: StreamEvent) -> Mapping[str, Any] | None:
-    """Return a structured final result carried by *event*, if present."""
+    """Return a structured final result from an explicit terminal event.
+
+    Progress messages frequently contain schema-shaped JSON for operator
+    visibility.  They are held by :func:`extract_final` until a terminal
+    envelope arrives and must never be returned as the final result by
+    themselves.
+    """
 
     if event.data is None:
         return None
+    terminal = _is_terminal_event(event)
+    if not terminal:
+        return None
     if "status" in event.data and "summary" in event.data:
         return dict(event.data)
-    event_type = event.type.casefold()
     candidates: list[Any] = []
-    if event_type in _FINAL_TYPES or event_type.endswith(".completed"):
-        for key in ("result", "output", "final", "data"):
-            if key in event.data:
-                candidates.append(event.data[key])
-    # Some Codex versions put the final JSON in an agent-message text while the
-    # enclosing event remains ``item.completed``.
-    candidates.append(_json_from_text(event.text))
+    for key in ("result", "output", "final", "data", "payload"):
+        if key in event.data:
+            candidates.append(event.data[key])
+    # Some Codex versions put the final JSON in the terminal event's agent
+    # message text.  ``item.completed`` itself is not terminal; extract_final
+    # carries that text forward until ``turn.completed``/``task_complete``.
+    candidates.append(_text_payload(event))
     for candidate in candidates:
         if isinstance(candidate, Mapping):
             nested = candidate.get("result")
@@ -200,10 +261,20 @@ def final_payload(event: StreamEvent) -> Mapping[str, Any] | None:
 
 def extract_final(events: Iterable[StreamEvent]) -> Mapping[str, Any] | None:
     result: Mapping[str, Any] | None = None
+    pending: Mapping[str, Any] | None = None
     for event in events:
-        candidate = final_payload(event)
+        if _is_terminal_event(event):
+            candidate = final_payload(event) or pending
+            if candidate is not None:
+                result = candidate
+            pending = None
+            continue
+        # Keep schema-shaped text from nonterminal agent messages provisional.
+        # If the process is killed before Codex emits its terminal envelope,
+        # extract_final must return None instead of promoting progress JSON.
+        candidate = _text_payload(event)
         if candidate is not None:
-            result = candidate
+            pending = candidate
     return result
 
 

@@ -92,3 +92,22 @@ def test_non_completed_results_are_never_rewritten() -> None:
 def test_builder_self_report_alone_never_verifies_a_merge() -> None:
     assert merge_is_verified({"outcome": "merged"}) is False
     assert merge_is_verified({}, observed={"merged": True}) is True
+
+
+def test_builder_merge_receipt_fields_never_become_external_authority() -> None:
+    """The exact final JSON fields are claims, not PR observations."""
+
+    for claim in (
+        {"merge_verified": True},
+        {"merged_at": "2026-09-03T21:33:22Z"},
+        {"merge_commit_sha": "30f420dfe67be12ee76e3efc7acb80699eece557"},
+    ):
+        payload = {**MERGED, **claim}
+        assert merge_is_verified(payload) is False
+        normalized = normalize_final_result(payload)
+        assert normalized["merge_verified"] is False
+
+
+def test_only_a_positive_observed_pr_fact_verifies_a_merge() -> None:
+    assert merge_is_verified(MERGED, observed={"merged": "true"}) is False
+    assert merge_is_verified(MERGED, observed={"merged": True}) is True

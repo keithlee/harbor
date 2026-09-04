@@ -8,10 +8,12 @@ shadow contract: decide, report, mutate nothing.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+import harbor.cli as cli
 from harbor.cli import build_parser
 from harbor.config.projects import ProjectConfig
 from harbor.poll.linear_poller import PollResult
@@ -40,6 +42,19 @@ class RecordingDispatcher:
         self.calls.append("resume")
 
 
+class ShadowLinearClient:
+    def __init__(self, nodes: list[dict[str, Any]]) -> None:
+        self.nodes = nodes
+        self.fetches: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    async def fetch_issues(self, projects: tuple[str, ...], states: tuple[str, ...]) -> list[dict[str, Any]]:
+        self.fetches.append((projects, states))
+        return self.nodes
+
+    async def close(self) -> None:
+        return None
+
+
 def test_parser_exposes_facts_shadow_and_answer() -> None:
     parser = build_parser()
     assert parser.parse_args(["facts", "Bookgen", "--json"]).json is True
@@ -47,6 +62,43 @@ def test_parser_exposes_facts_shadow_and_answer() -> None:
     answer = parser.parse_args(["answer", "7", "Keith", "owns", "it", "--project", "Bookgen"])
     assert answer.escalation == "7"
     assert " ".join(answer.text) == "Keith owns it"
+
+
+def test_shadow_start_prints_observed_ticket_digest_without_dispatch(monkeypatch, tmp_path: Path, capsys) -> None:
+    node = {
+        "id": "linear-id-42",
+        "identifier": "HAN-42",
+        "title": "A ticket",
+        "state": {"name": "Todo", "type": "backlog"},
+        "attachments": {"nodes": []},
+        "comments": {"nodes": []},
+        "inverseRelations": {"nodes": []},
+    }
+    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    client = ShadowLinearClient([node])
+    dispatcher = RecordingDispatcher()
+    monkeypatch.setattr(cli, "get_project", lambda _: config)
+    monkeypatch.setattr(cli, "_db_path", lambda: tmp_path / "harbor.db")
+
+    result = asyncio.run(
+        cli._start(
+            "Bookgen",
+            shadow=True,
+            linear_client=client,
+            dispatcher=dispatcher,
+            first_mate=object(),
+            notifier=object(),
+            unblock_ladder=object(),
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "(shadow mode)" in output
+    assert "Harbor: RUNNING · Bookgen · Linear healthy\nHAN-42 (observed)  Todo  A ticket" in output
+    assert "WOULD WAKE build HAN-42 · idem_key=HAN-42@build" in output
+    assert dispatcher.calls == []
+    assert len(client.fetches) == 1
 
 
 def test_shadow_decides_a_build_but_never_dispatches() -> None:

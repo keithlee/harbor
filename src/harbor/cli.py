@@ -23,6 +23,7 @@ from harbor.poll.linear_poller import LinearPoller
 from harbor.pr_events import PREventProcessor
 from harbor.runner.codex import CodexRunner
 from harbor.supervisor import Supervisor, WorktreeDispatcher
+from harbor.wake import TicketScope
 from harbor.worktree import WorktreeManager
 
 
@@ -33,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("project")
     commands.choices["start"].add_argument("--once", action="store_true", help="poll once and print status")
+    commands.choices["start"].add_argument(
+        "--ticket",
+        metavar="IDENTIFIER",
+        help="limit builder custody to this exact ticket identifier (observations remain fleet-wide)",
+    )
     commands.choices["start"].add_argument(
         "--shadow",
         action="store_true",
@@ -100,6 +106,7 @@ def build_production_dispatcher(
     worktree_manager: Any | None = None,
     runner_factory: Any | None = None,
     builder_prompt: str = "",
+    ticket_scope: TicketScope | str | None = None,
 ) -> tuple[Any, Any, Any]:
     """Construct the real worktree manager, runner factory and dispatcher.
 
@@ -142,6 +149,7 @@ def build_production_dispatcher(
         db=db,
         project=config.name,
         builder_prompt=builder_prompt,
+        ticket_scope=ticket_scope,
     )
     return dispatcher, manager, factory
 
@@ -219,6 +227,7 @@ async def _start(
     *,
     once: bool = False,
     shadow: bool = False,
+    ticket: str | None = None,
     # Dependency seams keep CLI assembly testable and let a delivery skill
     # provide its own runner/worktree dispatcher without Harbor importing it.
     linear_client: Any | None = None,
@@ -235,6 +244,11 @@ async def _start(
     pr_event_processor: Any | None = None,
     notifier: Any | None = None,
 ) -> int:
+    try:
+        invocation_scope = TicketScope(ticket)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
     try:
         config = get_project(project_name)
     except ValueError as exc:
@@ -280,6 +294,7 @@ async def _start(
             worktree_manager=manager,
             runner_factory=runner_factory,
             builder_prompt=builder_prompt,
+            ticket_scope=invocation_scope,
         )
         # Retain the concrete seams for status and tests without changing the
         # Supervisor API's existing duck-typed injection behavior.
@@ -302,6 +317,7 @@ async def _start(
         worktree_manager=worktree_manager,
         runner_factory=runner_factory,
         pr_event_processor=event_processor,
+        ticket_scope=invocation_scope,
     )
     if isinstance(production_dispatcher, WorktreeDispatcher):
         production_dispatcher.push_recorder = supervisor.record_builder_push
@@ -337,13 +353,21 @@ async def _start(
             repo_path=config.repo_path,
             protected_paths=getattr(config, "protected_paths", ()) or (),
         )
+    # Install the operator callbacks before the first poll can wake a builder.
+    # ``Supervisor.start`` delivers started-mode wakes in the background, so
+    # heartbeat and observation output are visible from the first long run.
+    console = Console(supervisor, first_mate=mate)
     try:
         await supervisor.start()
-        console = Console(supervisor, first_mate=mate)
         if shadow:
             # Phase 3 proof surface: one decided cycle, printed, nothing done.
             print(console.banner())
             print("Shadow: decisions only · no dispatch, no resume, no queue row, no Linear/GitHub write")
+            # Keep the observed Linear ticket state beside the decisions so a
+            # one-shot shadow run can be compared directly with the source
+            # board.  ``status_text`` is a pure formatter over this poll's
+            # in-memory observation and performs no additional I/O.
+            print(console.status_text())
             print(_render_shadow(supervisor))
             return 0 if supervisor.linear_healthy else 1
         if once:
@@ -518,7 +542,7 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.command == "doctor":
         return await _doctor(args.project)
     if args.command == "start":
-        return await _start(args.project, once=args.once, shadow=args.shadow)
+        return await _start(args.project, once=args.once, shadow=args.shadow, ticket=args.ticket)
     if args.command == "facts":
         return await _facts(args.project, as_json=getattr(args, "json", True))
     if args.command == "answer":

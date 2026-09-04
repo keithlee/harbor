@@ -137,7 +137,14 @@ class CodexExecRunner:
         except asyncio.CancelledError:
             # Cancellation must not leave a Codex child behind.  This process
             # belongs to this answer only; no supervisor task is cancelled.
-            process.kill()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    # The child can exit between the return-code check and
+                    # kill.  It is still reaped below; do not turn a scoped
+                    # answer cancellation into a runner failure.
+                    pass
             await process.wait()
             raise
         output = stdout.decode("utf-8", errors="replace").strip()

@@ -145,6 +145,7 @@ def test_ac8_hold_off_the_skill_merges_and_harbor_removes_the_worktree(tmp_path:
                 ticket={"identifier": TICKET, "hold": False}, action="build",
                 instruction="Build HAN-32\nhold: OFF. Your own risk gate decides the merge.",
                 idem_key=f"{TICKET}@build",
+                facts={"number": 225, "url": "https://example.test/pr/225", "merged": True},
             )
             result = await supervisor.dispatcher.dispatch(wake)
             assert result["outcome"] == "merged"
@@ -200,7 +201,7 @@ def test_ac10_a_manual_merge_resumes_the_same_session_and_then_cleans_up(tmp_pat
             reengage = Wake(
                 ticket={"identifier": TICKET}, action="reengage", resume=run_id,
                 instruction="PR merged. Continue your workflow.",
-                facts={"merged": True, "head_sha": merged_head},
+                facts={"number": 225, "url": "https://example.test/pr/225", "merged": True, "head_sha": merged_head},
             )
             result = await supervisor.dispatcher.resume(reengage)
             assert result is not None, "the retained session must be resumed"

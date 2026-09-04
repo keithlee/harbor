@@ -12,6 +12,7 @@ authoritative systems for their respective state.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import inspect
@@ -37,6 +38,10 @@ _HARBOR_REPLY_MARKER = re.compile(
     r"(?:<!--\s*harbor(?:\b|[-_:])|\[harbor\]|(?:^|\s)harbor\s*:)",
     re.IGNORECASE,
 )
+_REPLY_MARKER_PREFIX = "<!-- harbor:reply:"
+_REPLY_MARKER_SUFFIX = " -->"
+_RISK_MARKER_PREFIX = "<!-- harbor:risk-sha:"
+_RISK_MARKER_SUFFIX = " -->"
 _DEFAULT_RISK_SKILL = "risk-analysis"
 _DEFAULT_MAX_INSTRUCTION_BYTES = 4096
 
@@ -157,8 +162,59 @@ def comment_version_key(comment: Mapping[str, Any]) -> str:
     return f"{comment_id or 'comment'}:{digest}"
 
 
+def comment_reply_marker(comment_or_version: Mapping[str, Any] | str) -> str:
+    """Return the deterministic receipt marker for one comment version.
+
+    The marker is deliberately derived from the *source* comment version, not
+    from the builder's reply text.  A builder includes it in the reply body;
+    the next read-only GitHub poll can then prove that this particular
+    external comment was answered without Harbor ever posting or editing the
+    reply itself.
+    """
+
+    version = (
+        comment_version_key(comment_or_version)
+        if isinstance(comment_or_version, Mapping)
+        else str(comment_or_version)
+    )
+    digest = hashlib.sha256(version.encode("utf-8")).hexdigest()[:24]
+    return f"{_REPLY_MARKER_PREFIX}{digest}{_REPLY_MARKER_SUFFIX}"
+
+
+# A descriptive alias makes the protocol easier for poller/runner adapters to
+# discover without coupling them to the implementation name.
+build_comment_reply_marker = comment_reply_marker
+
+
+def risk_analysis_marker(head_sha: str) -> str:
+    """Return the exact PR-body marker binding risk analysis to one SHA."""
+
+    return f"{_RISK_MARKER_PREFIX}{str(head_sha).strip()}{_RISK_MARKER_SUFFIX}"
+
+
 def _event_key(event_type: str, key: str) -> str:
     return f"{event_type}:{key}"
+
+
+def _risk_observation(facts: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract only current-head PR-body evidence for a risk receipt."""
+
+    head = _head(facts)
+    body = _value(facts, "body", "pr_body", "description", default=None)
+    if isinstance(body, str) and head and "## Risk Analysis" in body and risk_analysis_marker(head) in body:
+        return {"head_sha": head, "body": body}
+    risk = _value(facts, "risk", "risk_result", default=None)
+    if isinstance(risk, Mapping):
+        risk_body = _value(risk, "body", "pr_body", "description", default="")
+        risk_head = _value(risk, "head_sha", "headSha", "sha", default=head)
+        if (
+            isinstance(risk_body, str)
+            and risk_head
+            and "## Risk Analysis" in risk_body
+            and risk_analysis_marker(str(risk_head)) in risk_body
+        ):
+            return {"head_sha": risk_head, "body": risk_body}
+    return None
 
 
 def _risk_skill(profile: Any | None, skill: str | None = None) -> str:
@@ -213,7 +269,8 @@ def build_risk_instruction(
         f"{identifier} in the existing builder session {run_id}. "
         f"PR #{number} was just created at head SHA {head}. "
         f"Run the configured risk skill `{selected}` against that exact current SHA, "
-        "then write or update `## Risk Analysis` in the PR body at this SHA. "
+        f"then write or update `## Risk Analysis` in the PR body at this SHA and include "
+        f"the exact marker `{risk_analysis_marker(head)}`. "
         "If the head changes, stop and rerun risk analysis for the new SHA; report the result.",
         max_bytes,
     )
@@ -233,6 +290,8 @@ def build_comment_instruction(
     head = _head(facts) or "unknown"
     run_id = _run_id(ticket, facts, run) or "the existing builder session"
     body = html.escape(_text(_value(comment, "body", "text", default="")), quote=False)
+    version = comment_version_key(comment)
+    reply_marker = comment_reply_marker(version)
     surface = _text(_value(comment, "surface", "source", default="comment"))
     location = ""
     path = _value(comment, "path", default=None)
@@ -249,7 +308,9 @@ def build_comment_instruction(
         "</external-comment>\n"
         "Return a structured disposition: valid requires the fix and tests plus a reply; "
         "invalid or out-of-scope requires evidence plus a reply; ambiguous requires a "
-        "clarifying question or an explicit park decision plus a reply."
+        "clarifying question or an explicit park decision plus a reply. "
+        f"Post the reply on GitHub yourself and include this exact receipt marker "
+        f"verbatim in its body: {reply_marker}"
     )
     return _bounded(text, max_bytes)
 
@@ -451,6 +512,11 @@ class PREventProcessor:
         self._events: dict[str, dict[str, Any]] = {}
         self._offered: set[str] = set()
         self._replied: set[str] = set()
+        # PR polling and a slow builder run in separate supervisor tasks.  A
+        # per-processor in-flight guard prevents two polls from resuming the
+        # same retained session before the first handoff has returned.
+        self._delivery_lock = asyncio.Lock()
+        self._in_flight: set[str] = set()
         if db is not None:
             apply_phase8_migration(db)
 
@@ -587,6 +653,32 @@ class PREventProcessor:
             risk_head_sha=risk_head_sha,
         )
 
+        # GitHub PR body facts are read-only evidence for a risk analysis
+        # written by the builder.  Bind the receipt to this exact head so a
+        # push invalidates it on the next observation.
+        risk_evidence = _risk_observation(facts)
+        if risk_evidence is not None:
+            try:
+                validate_risk_result(risk_evidence, current_head=head_sha)
+            except RiskContractError:
+                pass
+            else:
+                self._save_state(
+                    state_key,
+                    identifier,
+                    number,
+                    head_sha,
+                    _value(facts, "created_at", "createdAt", default=None),
+                    risk_status="valid",
+                    risk_head_sha=head_sha,
+                )
+
+        if previous and previous.get("head_sha") != head_sha and risk_status != "valid":
+            # A new PR head requires the risk event to be offered again.  The
+            # event identity remains ticket+PR for idempotence, while this
+            # local flag reopens delivery after invalidation.
+            self._reset_pr_event_offer(state_key)
+
         events: list[PREvent] = []
         if previous is None or not self._comment_seen(_event_key(PR_CREATED, state_key)):
             payload = {
@@ -631,6 +723,7 @@ class PREventProcessor:
                     "head_sha": head_sha,
                     "comment": dict(source),
                     "comment_version": version,
+                    "reply_marker": comment_reply_marker(version),
                     "surface": _value(source, "surface", "source", default="comment"),
                 },
                 build_comment_instruction(ticket, facts, source, run=run),
@@ -639,13 +732,41 @@ class PREventProcessor:
             if self._insert_event(event):
                 events.append(event)
 
+        # A builder reply is an external side effect owned by the configured
+        # skill.  Harbor only records the local receipt after a later poll
+        # observes the exact marker in a *different* GitHub comment.  This is
+        # intentionally done after inserting this poll's events so a reply
+        # that races the first observation can still acknowledge its source.
+        self._acknowledge_reply_markers(facts)
+
         events.sort(key=lambda item: (0 if item.event_type == PR_CREATED else 1, item.event_key))
         return [event.as_dict() for event in events]
 
-    def events(self, *, pending_only: bool = False) -> list[dict[str, Any]]:
+    def events(
+        self,
+        *,
+        pending_only: bool = False,
+        project: str | None = None,
+        ticket: str | None = None,
+        pr_number: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return observed PR events, optionally scoped to one PR.
+
+        Durable pending recovery is invoked while processing one ticket.  A
+        Harbor database can contain receipts for other tickets (and, in a
+        shared database, other projects), so callers must be able to constrain
+        the recovery query before dispatching any builder work.
+        """
+
         connection = _connection(self.db)
         if connection is None:
             rows = list(self._events.values())
+            if project is not None and str(project) != self.project:
+                rows = []
+            if ticket is not None:
+                rows = [row for row in rows if _text(row.get("ticket")) == str(ticket)]
+            if pr_number is not None:
+                rows = [row for row in rows if row.get("pr_number") == pr_number]
             if pending_only:
                 rows = [
                     row
@@ -656,23 +777,72 @@ class PREventProcessor:
                     )
                     or (
                         _text(row.get("event_type") or row.get("type")) == PR_CREATED
-                        and _text(row.get("event_key")) not in self._offered
+                        and self.risk_status(
+                            {"identifier": row.get("ticket")},
+                            {"number": row.get("pr_number")},
+                        )
+                        != "valid"
                     )
                 ]
             return rows
         query = "SELECT payload_json FROM github_pr_events"
+        clauses: list[str] = []
+        parameters: list[Any] = []
         if pending_only:
-            query += " WHERE (event_type = 'NEW_COMMENT_VERSION' AND replied = 0) OR (event_type = 'PR_CREATED' AND offered = 0)"
+            # PR-created rows are filtered below against the risk state because
+            # an offered event can remain explicitly pending until the current
+            # PR body proves its risk heading/head pair.
+            clauses.append("((event_type = 'NEW_COMMENT_VERSION' AND replied = 0) OR event_type = 'PR_CREATED')")
+        if project is not None:
+            clauses.append("project = ?")
+            parameters.append(str(project))
+        if ticket is not None:
+            clauses.append("ticket = ?")
+            parameters.append(str(ticket))
+        if pr_number is not None:
+            clauses.append("pr_number = ?")
+            parameters.append(int(pr_number))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY id"
-        rows = connection.execute(query).fetchall()
-        return [json.loads(row[0]) for row in rows]
+        rows = connection.execute(query, parameters).fetchall()
+        values = [json.loads(row[0]) for row in rows]
+        if not pending_only:
+            return values
+        filtered: list[dict[str, Any]] = []
+        for value in values:
+            event_type = _text(value.get("event_type") or value.get("type"))
+            if event_type != PR_CREATED:
+                filtered.append(value)
+                continue
+            state = self._state_row(
+                pr_key(
+                    {"identifier": value.get("ticket")},
+                    {"number": value.get("pr_number")},
+                )
+            )
+            if not state or _text(state.get("risk_status"), "unknown") != "valid":
+                filtered.append(value)
+        return filtered
 
     def pending_comments(self) -> list[dict[str, Any]]:
-        return [
-            row
-            for row in self.events(pending_only=True)
-            if _text(row.get("event_type") or row.get("type")) == NEW_COMMENT_VERSION
-        ]
+        pending: list[dict[str, Any]] = []
+        for row in self.events(pending_only=True):
+            if _text(row.get("event_type") or row.get("type")) != NEW_COMMENT_VERSION:
+                continue
+            event_key = _text(row.get("event_key") or row.get("key"))
+            offered, replied = self._event_flags(event_key)
+            if replied:
+                continue
+            value = dict(row)
+            # This makes the no-marker case an explicit, queryable pending
+            # state rather than a silent terminal condition.  An offered event
+            # is not retried on every poll; the next observed marker closes it.
+            value["delivery_state"] = (
+                "awaiting_reply_observation" if offered else "awaiting_builder_delivery"
+            )
+            pending.append(value)
+        return pending
 
     def _mark_offered(self, event_key: str, *, replied: bool = False) -> None:
         connection = _connection(self.db)
@@ -687,6 +857,160 @@ class PREventProcessor:
                 (int(replied), event_key),
             )
             connection.commit()
+
+    def _reset_pr_event_offer(self, state_key: str) -> None:
+        """Reopen the ticket's PR-created event after a head invalidation."""
+
+        event_key = _event_key(PR_CREATED, state_key)
+        connection = _connection(self.db)
+        if connection is None:
+            self._offered.discard(event_key)
+            return
+        with _lock(self.db):
+            connection.execute(
+                "UPDATE github_pr_events SET offered=0 WHERE event_key=?",
+                (event_key,),
+            )
+            connection.commit()
+
+    def _event_flags(self, event_key: str) -> tuple[bool, bool]:
+        """Return ``(offered, replied)`` for one durable/local event."""
+
+        connection = _connection(self.db)
+        if connection is None:
+            row = self._events.get(event_key)
+            if row is None:
+                return False, event_key in self._replied
+            return event_key in self._offered, event_key in self._replied
+        row = connection.execute(
+            "SELECT offered, replied FROM github_pr_events WHERE event_key=? LIMIT 1",
+            (event_key,),
+        ).fetchone()
+        return (bool(row[0]), bool(row[1])) if row is not None else (False, False)
+
+    def _mark_replied(self, event_key: str) -> None:
+        """Record a reply receipt only after a read-only marker observation."""
+
+        connection = _connection(self.db)
+        if connection is None:
+            self._offered.add(event_key)
+            self._replied.add(event_key)
+            return
+        with _lock(self.db):
+            connection.execute(
+                "UPDATE github_pr_events SET offered=1, replied=1 WHERE event_key=?",
+                (event_key,),
+            )
+            connection.commit()
+
+    def _run_is_running(self, ticket: Any, run: Any | None) -> bool:
+        """Return whether delivery would race a live builder process.
+
+        ``run`` is normally the supervisor's latest durable run row.  The
+        ledger fallback covers direct integrations that omit it, and makes a
+        second poll fail closed during the small window before a dispatcher
+        has installed its in-memory runner.
+        """
+
+        status = _value(run, "status", "run_status", default=None)
+        if status is not None:
+            return _text(status).casefold() == "running"
+        connection = _connection(self.db)
+        identifier = _ticket_id(ticket)
+        if connection is None or not identifier or not _table_exists(connection, "runs"):
+            return False
+        row = connection.execute(
+            "SELECT status FROM runs WHERE ticket=? ORDER BY COALESCE(finished_at, started_at, id) DESC, id DESC LIMIT 1",
+            (identifier,),
+        ).fetchone()
+        return bool(row and _text(row[0]).casefold() == "running")
+
+    async def _begin_delivery(self, event: PREvent) -> bool:
+        """Reserve an event for one handoff, without holding a DB lock."""
+
+        async with self._delivery_lock:
+            if event.event_key in self._in_flight:
+                return False
+            offered, replied = self._event_flags(event.event_key)
+            if replied or offered:
+                return False
+            self._in_flight.add(event.event_key)
+            return True
+
+    async def _end_delivery(self, event_key: str) -> None:
+        async with self._delivery_lock:
+            self._in_flight.discard(event_key)
+
+    @staticmethod
+    def _looks_like_run_result(value: Any) -> bool:
+        """Recognize the normal Codex runner result, not a reply contract."""
+
+        status = _value(value, "status", default=None)
+        summary = _value(value, "summary", default=None)
+        return isinstance(status, str) and status in {"completed", "waiting", "blocked", "failed"} and isinstance(summary, str)
+
+    @staticmethod
+    def _response_dict(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return dict(value)
+        as_dict = getattr(value, "as_dict", None)
+        if callable(as_dict):
+            try:
+                converted = as_dict()
+            except TypeError:
+                converted = as_dict(include_metadata=False)
+            return dict(converted) if isinstance(converted, Mapping) else converted
+        return value
+
+    def _acknowledge_reply_markers(self, facts: Mapping[str, Any]) -> None:
+        """Acknowledge comment events from observed GitHub reply markers.
+
+        The source comment itself is excluded by id.  That prevents an edited
+        source comment containing a copied marker from becoming its own reply
+        receipt.  We do not require a particular author here because GitHub
+        installations expose bot identity differently; the unguessable,
+        source-version-bound marker is the portable evidence contract.
+        """
+
+        comments = _surface_comments(facts)
+        if not comments:
+            return
+        observed: list[tuple[str, str]] = []
+        for comment in comments:
+            body = _text(_value(comment, "body", "text", default=""))
+            comment_id = _text(_value(comment, "id", "comment_id", default=""))
+            # A receipt must be tied to a distinct GitHub comment object.  A
+            # body-only adapter cannot prove that a copied marker was posted
+            # separately from the source comment, so it is fail-closed.
+            if body and comment_id:
+                observed.append((comment_id, body))
+        if not observed:
+            return
+        for raw in self.events():
+            if _text(raw.get("event_type") or raw.get("type")) != NEW_COMMENT_VERSION:
+                continue
+            event_key = _text(raw.get("event_key") or raw.get("key"))
+            _, replied = self._event_flags(event_key)
+            if replied:
+                continue
+            payload = raw.get("payload")
+            payload = payload if isinstance(payload, Mapping) else raw
+            version = _text(payload.get("comment_version"), "")
+            if not version:
+                comment = payload.get("comment")
+                if isinstance(comment, Mapping):
+                    version = comment_version_key(comment)
+            if not version:
+                continue
+            marker = _text(payload.get("reply_marker"), "") or comment_reply_marker(version)
+            source = payload.get("comment")
+            source_id = _text(_value(source, "id", "comment_id", default="")) if isinstance(source, Mapping) else ""
+            for candidate_id, body in observed:
+                if source_id and candidate_id and source_id == candidate_id:
+                    continue
+                if marker in body:
+                    self._mark_replied(event_key)
+                    break
 
     def mark_risk_valid(self, ticket: Any, facts: Mapping[str, Any], result: Any) -> dict[str, Any]:
         normalized = validate_risk_result(result, current_head=_head(facts))
@@ -771,43 +1095,70 @@ class PREventProcessor:
         delivered: list[dict[str, Any]] = []
         for raw in source:
             event = raw if isinstance(raw, PREvent) else _event_from_dict(raw)
-            if event.event_type == PR_CREATED:
-                if target_builder is None:
-                    # Observation is still durable; delivery remains pending
-                    # until the supervisor wires the retained builder.
-                    continue
-                result = await self._invoke(target_builder, event)
-                # A builder can return a structured risk result.  If it does,
-                # record it only after proving current SHA + heading.  A
-                # runner may instead record it later with mark_risk_valid.
-                if isinstance(result, Mapping) and (
-                    _value(result, "risk", "risk_result", default=None) is not None
-                    or _value(result, "head_sha", "headSha", "sha", default=None) is not None
-                ):
-                    risk = _value(result, "risk", "risk_result", default=result)
-                    # The event receipt may have been observed on an older
-                    # poll.  Validate against the latest observed state, not
-                    # the stale event payload, before accepting risk.
-                    current = self._state_row(pr_key({"identifier": event.ticket}, {"number": event.pr_number}))
-                    current_head = _text(current.get("head_sha"), event.head_sha) if current else event.head_sha
-                    self.mark_risk_valid(
-                        {"identifier": event.ticket},
-                        {"number": event.pr_number, "head_sha": current_head},
-                        risk,
-                    )
-                self._mark_offered(event.event_key, replied=False)
-                delivered.append(event.as_dict())
-            elif event.event_type == NEW_COMMENT_VERSION:
-                if target_comments is None:
-                    continue
-                result = await self._invoke(target_comments, event)
-                normalized = normalize_comment_response(result)
-                self._mark_offered(event.event_key, replied=True)
-                delivered.append({**event.as_dict(), "response": normalized})
-            else:
-                # Unknown local events are not silently marked as delivered;
-                # this keeps future event types fail-closed.
-                raise PREventError(f"unsupported PR event type: {event.event_type}")
+            if not await self._begin_delivery(event):
+                # ``offered`` means the builder already received this event
+                # and Harbor is waiting for the next GitHub observation to
+                # prove its reply.  It must not resume the same session on
+                # every one-minute poll.
+                continue
+            try:
+                if event.event_type == PR_CREATED:
+                    if target_builder is None:
+                        # Observation is still durable; delivery remains pending
+                        # until the supervisor wires the retained builder.
+                        continue
+                    result = await self._invoke(target_builder, event)
+                    # A builder can return a structured risk result.  If it does,
+                    # record it only after proving current SHA + heading.  A
+                    # runner may instead record it later with mark_risk_valid.
+                    if isinstance(result, Mapping) and (
+                        _value(result, "risk", "risk_result", default=None) is not None
+                        or _value(result, "head_sha", "headSha", "sha", default=None) is not None
+                    ):
+                        risk = _value(result, "risk", "risk_result", default=result)
+                        # The event receipt may have been observed on an older
+                        # poll.  Validate against the latest observed state, not
+                        # the stale event payload, before accepting risk.
+                        current = self._state_row(pr_key({"identifier": event.ticket}, {"number": event.pr_number}))
+                        current_head = _text(current.get("head_sha"), event.head_sha) if current else event.head_sha
+                        self.mark_risk_valid(
+                            {"identifier": event.ticket},
+                            {"number": event.pr_number, "head_sha": current_head},
+                            risk,
+                        )
+                    self._mark_offered(event.event_key, replied=False)
+                    delivered.append(event.as_dict())
+                elif event.event_type == NEW_COMMENT_VERSION:
+                    if target_comments is None:
+                        continue
+                    result = await self._invoke(target_comments, event)
+                    if self._looks_like_run_result(result):
+                        # WorktreeDispatcher/CodexRunner returns the ordinary
+                        # run-result schema.  That proves only that the
+                        # instruction was handed to the builder; the reply is
+                        # receipted later from an observed marker on GitHub.
+                        self._mark_offered(event.event_key, replied=False)
+                        delivered.append(
+                            {
+                                **event.as_dict(),
+                                "response": self._response_dict(result),
+                                "reply_observed": False,
+                            }
+                        )
+                    else:
+                        normalized = normalize_comment_response(result)
+                        # Keep the explicit classification mapping used by
+                        # small/fake handlers for backwards compatibility.
+                        # Real retained runners use the branch above, so their
+                        # local receipt still requires the GitHub marker.
+                        self._mark_offered(event.event_key, replied=True)
+                        delivered.append({**event.as_dict(), "response": normalized})
+                else:
+                    # Unknown local events are not silently marked as delivered;
+                    # this keeps future event types fail-closed.
+                    raise PREventError(f"unsupported PR event type: {event.event_type}")
+            finally:
+                await self._end_delivery(event.event_key)
         return delivered
 
     async def process(
@@ -820,11 +1171,21 @@ class PREventProcessor:
         comment_handler: Any | None = None,
     ) -> list[dict[str, Any]]:
         new = self.observe(ticket, facts, run=run)
+        if self._run_is_running(ticket, run):
+            # The poll above intentionally remains durable/observable; only
+            # the resume is deferred until the current process has returned a
+            # waiting/completed/parked/blocked run result.
+            return []
         # A handler failure must not lose the receipt: observe() is
         # intentionally idempotent and therefore returns no duplicate event
         # on the next poll.  Include durable pending receipts so the same
         # builder gets another chance to produce the mandatory reply.
-        pending = self.events(pending_only=True)
+        pending = self.events(
+            pending_only=True,
+            project=self.project,
+            ticket=_ticket_id(ticket),
+            pr_number=_pr_number(facts),
+        )
         by_key = {_text(item.get("event_key") or item.get("key")): item for item in new}
         for item in pending:
             key = _text(item.get("event_key") or item.get("key"))
@@ -873,12 +1234,15 @@ __all__ = [
     "apply_phase8_migration",
     "apply_pr_events_migration",
     "build_comment_instruction",
+    "build_comment_reply_marker",
     "build_risk_instruction",
+    "comment_reply_marker",
     "comment_version_key",
     "detect_pr_events",
     "is_harbor_marked",
     "normalize_comment_response",
     "pr_key",
+    "risk_analysis_marker",
     "validate_comment_response",
     "validate_risk_result",
 ]

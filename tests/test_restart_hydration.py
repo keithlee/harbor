@@ -13,6 +13,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from harbor.pr_events import PREventError
 from harbor.supervisor import Wake, WorktreeDispatcher
 
 
@@ -119,6 +122,69 @@ def test_a_running_row_is_left_to_the_orphan_reap(tmp_path: Path) -> None:
         dispatcher, _, _ = build(tmp_path, "running")
         assert await dispatcher.resume(reengage_wake()) is None
         assert dispatcher.runners == {}
+
+    asyncio.run(scenario())
+
+
+def test_an_in_memory_runner_is_not_resumed_while_its_run_row_is_running(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, _, _ = build(tmp_path, "running")
+        runner = Runner(tmp_path / "wt" / "HAN-42", "run-1")
+        dispatcher.runners["HAN-42"] = runner
+        assert await dispatcher.resume(reengage_wake()) is None
+        assert runner.resumed == []
+        with pytest.raises(PREventError, match="still running"):
+            await dispatcher.handle_pr_event(
+                {"ticket": "HAN-42", "instruction": "new review", "run_id": "run-1"}
+            )
+        assert runner.resumed == []
+
+    asyncio.run(scenario())
+
+
+def test_pr_event_cannot_enter_the_pre_ledger_row_dispatch_window(tmp_path: Path) -> None:
+    """The runner is retained before BaseRunner inserts its running row."""
+
+    async def scenario() -> None:
+        root = tmp_path / "wt"
+        root.mkdir(parents=True, exist_ok=True)
+        manager = Manager(root)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        class BlockingRunner:
+            default_run_id = "run-window"
+
+            async def start(self, wake: Wake) -> dict[str, Any]:
+                del wake
+                started.set()
+                await release.wait()
+                return {"status": "waiting", "summary": "paused"}
+
+            async def resume(self, run_id: str, instruction: str) -> dict[str, Any]:
+                calls.append(f"{run_id}:{instruction}")
+                return {"status": "waiting", "summary": "resumed"}
+
+        runner = BlockingRunner()
+        dispatcher = WorktreeDispatcher(manager, lambda worktree, wake: runner)
+        build = asyncio.create_task(
+            dispatcher.dispatch(
+                Wake(ticket={"identifier": "HAN-window"}, action="build", instruction="build")
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert dispatcher.runners["HAN-window"] is runner
+        with pytest.raises(PREventError, match="already active"):
+            await dispatcher.handle_pr_event(
+                {"ticket": "HAN-window", "run_id": "run-window", "instruction": "review"}
+            )
+        assert await dispatcher.resume(
+            Wake(ticket={"identifier": "HAN-window"}, action="reengage", resume="run-window")
+        ) is None
+        assert calls == []
+        release.set()
+        await build
 
     asyncio.run(scenario())
 

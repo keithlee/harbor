@@ -144,19 +144,24 @@ def merge_is_verified(payload: Mapping[str, Any], observed: Mapping[str, Any] | 
     which is why ``observed`` is the primary source here.
     """
 
-    if observed:
-        if _present(observed.get("merged")) or _present(observed.get("merge_commit_sha")):
-            return True
-        if _present(observed.get("merged_at")) or _present(observed.get("mergedAt")):
-            return True
-    # An adapter may fold the observation into the payload before validation.
-    for key in ("merge_verified", "merged_verified", "verified_merged", "merge_confirmed"):
-        if key in payload and _present(payload.get(key)):
-            return True
-    if _present(payload.get("merged_at")) or _present(payload.get("merge_commit_sha")):
+    if not isinstance(observed, Mapping):
+        return False
+    # GitHubPoller emits a boolean merged flag.  A non-empty merge timestamp
+    # or commit SHA is also authoritative only when it came from that
+    # read-only PR observation.  Never inspect the builder payload here:
+    # ``merged_at``, ``merge_commit_sha`` and ``merge_verified`` in final JSON
+    # are all self-reported and cannot authorize cleanup.
+    merged = observed.get("merged")
+    if isinstance(merged, bool) and merged:
         return True
-    merged = payload.get("merged")
-    return isinstance(merged, bool) and merged
+    return bool(
+        isinstance(observed.get("merge_commit_sha"), str)
+        and observed.get("merge_commit_sha", "").strip()
+        or isinstance(observed.get("merged_at"), str)
+        and observed.get("merged_at", "").strip()
+        or isinstance(observed.get("mergedAt"), str)
+        and observed.get("mergedAt", "").strip()
+    )
 
 
 def _missing_artifact_blocker(*, reason: str) -> dict[str, str]:
@@ -497,21 +502,43 @@ def _call_store(db: Any, names: tuple[str, ...], *args: Any, **kwargs: Any) -> A
     return None
 
 
-def _update_run_sql(db: Any, run_id: str, values: Mapping[str, Any]) -> None:
+def _update_run_sql(
+    db: Any,
+    run_id: str,
+    values: Mapping[str, Any],
+    *,
+    expected_status: str | None = None,
+) -> int | None:
+    """Update one run row and optionally compare its current status.
+
+    Returning the affected-row count lets lifecycle recovery use a small
+    compare-and-set instead of overwriting a result that another supervisor
+    persisted while the reaper was waiting for a process group to exit.
+    ``None`` means this database exposes no SQLite connection and callers may
+    use their legacy adapter fallback.
+    """
+
     connection = _db_connection(db)
     if connection is None or not _table_exists(connection, "runs"):
-        return
+        return None
     columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
     updates = [(key, value) for key, value in values.items() if key in columns]
     if not updates:
-        return
+        return 0
+    where = "id = ?"
+    parameters: list[Any] = [value for _, value in updates]
+    parameters.append(run_id)
+    if expected_status is not None and "status" in columns:
+        where += " AND status = ?"
+        parameters.append(expected_status)
     lock = _db_lock(db)
     with lock:
-        connection.execute(
-            f"UPDATE runs SET {', '.join(f'{key} = ?' for key, _ in updates)} WHERE id = ?",
-            tuple(value for _, value in updates) + (run_id,),
+        cursor = connection.execute(
+            f"UPDATE runs SET {', '.join(f'{key} = ?' for key, _ in updates)} WHERE {where}",
+            tuple(parameters),
         )
         connection.commit()
+    return int(cursor.rowcount)
 
 
 def _insert_run(db: Any, values: Mapping[str, Any]) -> None:
@@ -536,9 +563,37 @@ def _insert_run(db: Any, values: Mapping[str, Any]) -> None:
         return
     columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
     selected = [(key, value) for key, value in values.items() if key in columns]
+    if not selected:
+        return
     with _db_lock(db):
+        names = ", ".join(key for key, _ in selected)
+        placeholders = ", ".join("?" for _ in selected)
+        # ``INSERT OR REPLACE`` deletes the old row before inserting its
+        # replacement.  A resumed run would therefore lose final/artifact
+        # fields that are not present in this startup record.  An UPSERT
+        # updates only the process-lifecycle fields supplied here and keeps
+        # durable evidence on the existing logical run.
+        updates = [
+            key
+            for key, _ in selected
+            if key not in {"id", "started_at", "finished_at", "final_json", "cost_usd"}
+        ]
+        assignments = [f"{key} = excluded.{key}" for key in updates]
+        if "session_id" in columns and "session_id" in {key for key, _ in selected}:
+            assignments = [
+                item for item in assignments if not item.startswith("session_id = ")
+            ]
+            assignments.append("session_id = COALESCE(excluded.session_id, runs.session_id)")
+        if "finished_at" in columns:
+            # A new process execution is active again; retain the original
+            # start timestamp but clear the prior attempt's finish marker.
+            assignments.append("finished_at = NULL")
+        if assignments:
+            conflict = f" ON CONFLICT(id) DO UPDATE SET {', '.join(assignments)}"
+        else:
+            conflict = " ON CONFLICT(id) DO NOTHING"
         connection.execute(
-            f"INSERT OR REPLACE INTO runs ({', '.join(key for key, _ in selected)}) VALUES ({', '.join('?' for _ in selected)})",
+            f"INSERT INTO runs ({names}) VALUES ({placeholders}){conflict}",
             tuple(value for _, value in selected),
         )
         connection.commit()
@@ -794,6 +849,7 @@ class BaseRunner:
                 "last_activity_at": iso_now(),
                 "session_id": context.session_id,
                 "started_at": started.isoformat(timespec="seconds"),
+                "terminal_reason": None,
             },
         )
 
@@ -974,7 +1030,11 @@ class BaseRunner:
         )
         queue_status = "waiting" if status == RunState.WAITING.value else "completed" if status == RunState.COMPLETED.value else "failed"
         self._queue_transition(context, queue_status, error=result.error)
-        if status == RunState.COMPLETED.value and result.outcome == "merged":
+        if (
+            status == RunState.COMPLETED.value
+            and result.outcome == "merged"
+            and result.merge_verified is True
+        ):
             await self.cleanup_after_merge(context, result)
         return result
 
@@ -1074,17 +1134,39 @@ def tracked_runs(db: Any) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-async def reap_orphan_runs(db: Any, *, terminate_alive: bool = True, grace_seconds: float = 1.0) -> list[str]:
-    """Mark every persisted running run as orphaned after a Harbor restart.
+def _run_in_ticket_scope(ticket: Any, scope: Any | None) -> bool:
+    """Match one persisted run without importing Harbor's wake layer."""
+
+    if scope is None:
+        return True
+    matcher = getattr(scope, "matches", None)
+    if callable(matcher):
+        return bool(matcher(str(ticket or "")))
+    selector = str(scope or "").strip().casefold()
+    return bool(selector and str(ticket or "").strip().casefold() == selector)
+
+
+async def reap_orphan_runs(
+    db: Any,
+    *,
+    terminate_alive: bool = True,
+    grace_seconds: float = 1.0,
+    ticket_scope: Any | None = None,
+) -> list[str]:
+    """Mark persisted running runs as orphaned after a Harbor restart.
 
     A restart cannot safely assume a process belongs to the newly-created
     supervisor, so an extant process group is terminated before its row is
-    closed.  This closes the duplicate-dispatch window.
+    closed.  This closes the duplicate-dispatch window.  When a supervisor
+    supplies ``ticket_scope``, only that exact invocation-local ticket is
+    touched; omitting it preserves the historical all-runs behavior.
     """
 
     orphaned: list[str] = []
     for row in tracked_runs(db):
         run_id = str(row.get("id") or row.get("run_id") or "")
+        if not _run_in_ticket_scope(row.get("ticket"), ticket_scope):
+            continue
         pid = int(row["pid"]) if row.get("pid") else None
         pgid = int(row["pgid"]) if row.get("pgid") else None
         if pid and process_alive(pid) and terminate_alive:
@@ -1095,8 +1177,46 @@ async def reap_orphan_runs(db: Any, *, terminate_alive: bool = True, grace_secon
             if process_group_alive(pgid):
                 signal_process_group(pid, pgid, sig=signal.SIGKILL)
         if run_id:
-            _call_store(db, ("finish_run", "mark_run_status"), run_id, status=RunState.ORPHANED.value, waiting_on="none", final_json=None)
-            _update_run_sql(db, run_id, {"status": RunState.ORPHANED.value, "waiting_on": "none", "finished_at": iso_now(), "terminal_reason": "Harbor restarted while run was active"})
+            changed = _update_run_sql(
+                db,
+                run_id,
+                {
+                    "status": RunState.ORPHANED.value,
+                    "waiting_on": "none",
+                    "finished_at": iso_now(),
+                    "terminal_reason": "Harbor restarted while run was active",
+                },
+                expected_status=RunState.RUNNING.value,
+            )
+            if changed is None:
+                # Stores without a SQLite connection cannot offer an atomic
+                # compare-and-set.  Preserve their adapter compatibility, but
+                # still refuse to overwrite an already-finished row.
+                current = _run_row(db, run_id)
+                if current is None or str(current.get("status") or "").casefold() != RunState.RUNNING.value:
+                    continue
+                _call_store(
+                    db,
+                    ("finish_run", "mark_run_status"),
+                    run_id,
+                    status=RunState.ORPHANED.value,
+                    waiting_on="none",
+                    final_json=None,
+                )
+            elif changed != 1:
+                # The runner completed (or another reaper won) while this
+                # process was waiting for termination.  Never overwrite that
+                # newer lifecycle result with a stale orphan marker.
+                continue
+            else:
+                _call_store(
+                    db,
+                    ("finish_run", "mark_run_status"),
+                    run_id,
+                    status=RunState.ORPHANED.value,
+                    waiting_on="none",
+                    final_json=None,
+                )
             orphaned.append(run_id)
     return orphaned
 

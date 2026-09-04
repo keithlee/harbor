@@ -51,11 +51,21 @@ def supervisor_with(tmp_path: Path) -> tuple[Supervisor, Manager, WorktreeDispat
     return supervisor, manager, dispatcher
 
 
-def wake() -> Wake:
-    return Wake(ticket={"identifier": "HAN-42"}, action="reengage")
+def wake(*, observed_merge: bool = True) -> Wake:
+    facts = (
+        {"number": 1, "url": "https://github.com/example/repo/pull/1", "merged": True}
+        if observed_merge
+        else {}
+    )
+    return Wake(ticket={"identifier": "HAN-42"}, action="reengage", facts=facts)
 
 
-MERGED = {"status": "completed", "outcome": "merged", "summary": "Merged", "pr_url": "https://x/1"}
+MERGED = {
+    "status": "completed",
+    "outcome": "merged",
+    "summary": "Merged",
+    "pr_url": "https://github.com/example/repo/pull/1",
+}
 
 
 def test_a_verified_merge_removes_the_worktree(tmp_path: Path) -> None:
@@ -75,9 +85,30 @@ def test_an_unverified_merge_claim_keeps_the_worktree(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         supervisor, manager, dispatcher = supervisor_with(tmp_path)
-        await supervisor._handle_runner_result(wake(), {**MERGED, "merge_verified": False})
+        await supervisor._handle_runner_result(wake(observed_merge=False), {**MERGED, "merge_verified": False})
         assert manager.removed == []
         assert "HAN-42" in dispatcher.runners
+
+    asyncio.run(scenario())
+
+
+def test_builder_true_merge_receipt_without_observed_fact_keeps_the_worktree(tmp_path: Path) -> None:
+    """A direct cleanup call cannot bypass Harbor's observed-receipt gate."""
+
+    async def scenario() -> None:
+        supervisor, manager, dispatcher = supervisor_with(tmp_path)
+        untrusted = {
+            **MERGED,
+            "merge_verified": True,
+            "merged_at": "2026-09-03T21:33:22Z",
+            "merge_commit_sha": "30f420dfe67be12ee76e3efc7acb80699eece557",
+        }
+        await supervisor._cleanup_merged_worktree(
+            Wake(ticket={"identifier": "HAN-42"}, action="reengage"),
+            untrusted,
+        )
+        assert manager.removed == []
+        assert "HAN-42" in dispatcher.worktrees
 
     asyncio.run(scenario())
 

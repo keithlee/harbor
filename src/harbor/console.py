@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
+import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TextIO
 
 try:  # prompt_toolkit is a runtime dependency, but a simple fallback helps embedders.
@@ -33,6 +35,143 @@ except ImportError:  # pragma: no cover - exercised only in minimal embeddings
 from harbor.supervisor import Supervisor
 from harbor.digest import render_digest
 from harbor.first_mate import FirstMate, FirstMateError
+
+
+_HEARTBEAT_ACTIVE_STATES = frozenset({"running", "waiting", "blocked", "parked"})
+_HEARTBEAT_STATE_ORDER = {
+    status: index
+    for index, status in enumerate(("running", "waiting", "blocked", "parked"))
+}
+
+
+def _heartbeat_text(value: Any, default: str = "") -> str:
+    """Keep externally supplied heartbeat facts on one bounded safe line."""
+
+    if value is None:
+        return default
+    try:
+        raw = str(value)
+    except Exception:
+        return default
+    clean = "".join(
+        character if ord(character) >= 32 and ord(character) != 127 else " "
+        for character in raw
+    )
+    text = " ".join(clean.split())
+    return text[:120] if text else default
+
+
+def _heartbeat_items(value: Any) -> tuple[Any, ...]:
+    if value is None or isinstance(value, (str, bytes)):
+        return ()
+    if isinstance(value, Mapping):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return ()
+
+
+def _heartbeat_field(value: Any, *names: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return default
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return default
+
+
+def _heartbeat_activity(event: Any) -> str:
+    """Render active run facts, or idle, without consulting live services."""
+
+    runs = _heartbeat_items(
+        getattr(event, "active_runs", getattr(event, "runs", None)),
+    )
+    active: list[tuple[str, str, str]] = []
+    for run in runs:
+        status = _heartbeat_text(_heartbeat_field(run, "status", "state", default="")).casefold()
+        outcome = _heartbeat_text(_heartbeat_field(run, "outcome", default="")).casefold()
+        if status not in _HEARTBEAT_ACTIVE_STATES:
+            if outcome != "parked":
+                continue
+            status = "parked"
+        ticket_value = _heartbeat_field(
+            run,
+            "ticket",
+            "identifier",
+            "ticket_id",
+            "ticketId",
+            default="?",
+        )
+        waiting_value = _heartbeat_field(
+            run,
+            "waiting_on",
+            "waitingOn",
+            default="none",
+        )
+        ticket = _heartbeat_text(ticket_value, "?")
+        waiting_on = _heartbeat_text(waiting_value, "none")
+        active.append((ticket, status, waiting_on))
+    active.sort(
+        key=lambda run: (
+            _HEARTBEAT_STATE_ORDER.get(run[1], len(_HEARTBEAT_STATE_ORDER)),
+            run[0].casefold(),
+            run[2].casefold(),
+        )
+    )
+    if active:
+        return "; ".join(
+            f"{ticket} {status} waiting_on={waiting_on}"
+            for ticket, status, waiting_on in active
+        )
+    # Older event producers may expose the already-rendered alias.  It is
+    # accepted only as a scalar; no status/provider call is made as a fallback.
+    rendered = _heartbeat_text(
+        getattr(event, "fleet_status", getattr(event, "fleet", "")),
+    )
+    return rendered if rendered and rendered.casefold() != "idle" else "idle"
+
+
+def _format_heartbeat_duration(value: Any) -> str | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    whole = int(seconds)
+    if whole < 60:
+        return f"{whole}s"
+    minutes, remainder = divmod(whole, 60)
+    if minutes < 60:
+        return f"{minutes}m" if remainder == 0 else f"{minutes}m{remainder:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h" if minutes == 0 else f"{hours}h{minutes:02d}m"
+
+
+def _heartbeat_healthy(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"0", "false", "no", "off", "unavailable", "red"}:
+            return False
+        if normalized in {"1", "true", "yes", "on", "healthy", "green"}:
+            return True
+    return bool(value)
+
+
+def _heartbeat_idle(event: Any) -> str:
+    activity = _heartbeat_text(
+        getattr(event, "last_activity", getattr(event, "last_activity_at", "")),
+    )
+    duration = _format_heartbeat_duration(getattr(event, "idle_seconds", None))
+    if activity and duration is not None:
+        return f"idle={duration}"
+    if duration is not None and not activity and duration != "0s":
+        return f"idle={duration}"
+    return f"last_activity={activity or 'unknown'}"
 
 
 class Console:
@@ -73,23 +212,29 @@ class Console:
     async def _on_heartbeat(self, event: Any) -> None:
         # This is a publication only.  It never invokes FirstMate and healthy
         # ticks do not pass through the supervisor wake path.
-        if getattr(event, "healthy", False):
-            self._emit(
-                f"Harbor: heartbeat · {getattr(event, 'project', self.supervisor.project)} · healthy"
-            )
-        else:
-            self._emit(
-                f"Harbor: heartbeat · {getattr(event, 'project', self.supervisor.project)} · unavailable"
-            )
+        healthy = _heartbeat_healthy(getattr(event, "healthy", False))
+        health = "healthy" if healthy else "unavailable"
+        project = _heartbeat_text(
+            getattr(event, "project", getattr(self.supervisor, "project", "Harbor")),
+            "Harbor",
+        )
+        lifecycle = _heartbeat_text(getattr(event, "lifecycle", "UNKNOWN"), "UNKNOWN")
+        activity = _heartbeat_activity(event)
+        idle = _heartbeat_idle(event)
+        self._emit(
+            f"Harbor: heartbeat · {project} · {lifecycle} · {health} · "
+            f"fleet={activity} · {idle}"
+        )
 
     def banner(self) -> str:
         status = self.supervisor.status()
         health = "✓" if status.linear_healthy else "✗"
         hold = "on" if self.supervisor.poller.config.hold_all else "off"
+        mode = "shadow" if getattr(self.supervisor, "shadow", False) else "live"
         return (
             f"Harbor: {status.lifecycle} · deterministic first mate · {status.project} · Linear {health}\n"
             f"Scope: {', '.join(self.supervisor.poller.config.dispatch_states)} → dispatch · "
-            f"Backlog ignored · hold_all: {hold} (shadow mode)"
+            f"Backlog ignored · hold_all: {hold} ({mode} mode)"
         )
 
     def status_text(self) -> str:
@@ -107,7 +252,7 @@ class Console:
 
     def help_text(self) -> str:
         return (
-            "/status  /pause [reason]  /hold [reason]  /resume  "
+            "/status  /pause [reason]  /hold on|off <ticket>  /resume  "
             "/answer <escalation-id> <answer>  /kill [run-id]  /exit  /help"
         )
 
@@ -180,22 +325,113 @@ class Console:
             digest = render_digest(self.supervisor.status())
         return await self.first_mate.answer(question, digest=digest)
 
+    def _install_answer_signal_handler(self) -> Callable[[], None] | None:
+        """Route SIGINT to the active answer while preserving host handling.
+
+        ``asyncio.run`` installs its own SIGINT callback which cancels the
+        host task.  That is correct for an idle console, but while a question
+        is generating it would also tear down the foreground task.  Install a
+        short-lived loop callback for the answer only, then restore the exact
+        callback that was present before it.
+
+        The event-loop signal table is intentionally inspected only to restore
+        asyncio's callback (there is no public getter).  Embeddings that do
+        not own the main thread's signal handlers simply receive no temporary
+        handler; their ordinary task cancellation remains distinguishable.
+        """
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+        sig = signal.SIGINT
+        signal_handlers = getattr(loop, "_signal_handlers", None)
+        previous_handle = signal_handlers.get(sig) if signal_handlers is not None else None
+        previous_signal_handler = signal.getsignal(sig)
+        callback = self._on_answer_sigint
+        try:
+            loop.add_signal_handler(sig, callback)
+        except (NotImplementedError, OSError, RuntimeError, ValueError):
+            return None
+
+        restored = False
+
+        def restore() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            try:
+                loop.remove_signal_handler(sig)
+                if previous_handle is not None:
+                    loop.add_signal_handler(
+                        sig,
+                        previous_handle._callback,  # type: ignore[attr-defined]
+                        *previous_handle._args,  # type: ignore[attr-defined]
+                    )
+                else:
+                    signal.signal(sig, previous_signal_handler)
+            except (NotImplementedError, OSError, RuntimeError, ValueError):
+                # The host may be closing the loop as the answer is canceled;
+                # there is no useful restoration work left in that case.
+                return
+
+        return restore
+
+    def _on_answer_sigint(self) -> None:
+        """Cancel only the active answer from the temporary SIGINT callback."""
+
+        if self._answer_task is None or self._answer_task.done():
+            return
+        self.cancel_answer()
+
+    def _cancel_answer_task(self, task: asyncio.Task[str]) -> None:
+        if self.first_mate is not None:
+            cancel = getattr(self.first_mate, "cancel_active_answer", None)
+            if callable(cancel):
+                cancel()
+        if not task.done():
+            task.cancel()
+
     async def _answer(self, question: str) -> str:
         if self._answer_task is not None and not self._answer_task.done():
             return "Harbor: an answer is already in progress."
         task = asyncio.create_task(self._answer_question(question), name="harbor-first-mate-answer")
         self._answer_task = task
+        restore_signal_handler = self._install_answer_signal_handler()
         try:
-            return await task
+            # Keep cancellation of the foreground console task separate from
+            # the answer it owns.  asyncio.run's first SIGINT cancels the
+            # task running ``Console.run``; without a shield that cancellation
+            # propagates into this child before the handler can turn it into a
+            # scoped answer cancellation, and the whole process exits 130.
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
-            # A cancellation is scoped to this one task.  The supervisor's
-            # polling/heartbeat tasks are deliberately untouched.
-            if self._answer_cancel_requested:
+            intended = self._answer_cancel_requested
+            # A cancellation is scoped to this one answer.  Explicitly cancel
+            # and drain the child so a real Codex process gets killed/reaped,
+            # while the supervisor's polling/heartbeat tasks are untouched.
+            self._cancel_answer_task(task)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # Cancellation wins over a late runner failure, regardless of
+                # whether this is the operator's SIGINT or host shutdown.
+                pass
+            if intended:
                 return "Harbor: answer cancelled"
             raise
         except FirstMateError as exc:
             return f"Harbor: First Mate unavailable: {exc}"
         finally:
+            if restore_signal_handler is not None:
+                # Restore the host's SIGINT policy before making this answer
+                # idle again.  Otherwise a later Ctrl+C would still hit the
+                # answer-only callback and be ignored after the task is gone.
+                restore_signal_handler()
             self._answer_cancel_requested = False
             if self._answer_task is task:
                 self._answer_task = None
@@ -207,9 +443,7 @@ class Console:
         if task is None or task.done():
             return False
         self._answer_cancel_requested = True
-        if self.first_mate is not None:
-            self.first_mate.cancel_active_answer()
-        task.cancel()
+        self._cancel_answer_task(task)
         return True
 
     async def handle_command(self, line: str) -> str | None:
@@ -230,11 +464,23 @@ class Console:
             reason = f" · {argument.strip()}" if argument.strip() else ""
             return f"Harbor: PAUSED{reason}"
         if command == "/hold":
-            reason = argument.strip() or "operator hold"
-            # Pause is the current supervisor's hold implementation.  A
-            # dedicated hold hook, when supplied by a host, takes precedence.
-            await self._invoke_control(("hold", "pause"), reason)
-            return f"Harbor: HOLD · {reason}"
+            hold_parts = argument.strip().split()
+            if len(hold_parts) != 2 or hold_parts[0].casefold() not in {"on", "off"}:
+                return "Usage: /hold on|off <ticket>"
+            enabled = hold_parts[0].casefold() == "on"
+            identifier = hold_parts[1]
+            method = getattr(self.supervisor, "set_ticket_hold", None)
+            if not callable(method):
+                method = getattr(self.supervisor, "set_hold", None)
+            if not callable(method):
+                return "Harbor: hold unavailable · no durable ticket ledger is configured"
+            value = method(identifier, enabled)
+            if inspect.isawaitable(value):
+                value = await value
+            if not value:
+                return f"Harbor: unknown ticket · {identifier}"
+            state = "ON" if enabled else "OFF"
+            return f"Harbor: HOLD {state} · {identifier}"
         if command == "/resume":
             await self.supervisor.resume()
             return f"Harbor: {self.supervisor.status().lifecycle}"
