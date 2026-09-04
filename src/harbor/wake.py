@@ -27,6 +27,7 @@ from typing import Any
 
 from harbor.db import sql_statements
 from harbor.facts.threads import parse_severity
+from harbor.resources import runtime_asset
 from harbor.reengagement import (
     MAX_RESUME_BYTES,
     build_resume_instruction,
@@ -148,7 +149,7 @@ def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> b
 
 
 def _migration_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "migrations" / _MIGRATION_NAME
+    return runtime_asset("migrations", _MIGRATION_NAME)
 
 
 def apply_phase3_migration(db: Any, path: str | Path | None = None) -> None:
@@ -191,7 +192,7 @@ def apply_phase6_migration(db: Any, path: str | Path | None = None) -> None:
     connection = _db_connection(db)
     if connection is None:
         raise TypeError("Phase 6 migration requires a sqlite3.Connection or HarborDB")
-    migration = Path(path) if path is not None else Path(__file__).resolve().parents[2] / "migrations" / _PHASE6_MIGRATION_NAME
+    migration = Path(path) if path is not None else runtime_asset("migrations", _PHASE6_MIGRATION_NAME)
     script = migration.read_text(encoding="utf-8")
     with _db_lock(db):
         # This is a checked-in, DDL-only migration.  ``executescript`` keeps

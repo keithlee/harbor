@@ -21,6 +21,10 @@ dev = ["pytest>=8,<9"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/harbor"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "harbor/migrations"
+"schemas" = "harbor/schemas"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

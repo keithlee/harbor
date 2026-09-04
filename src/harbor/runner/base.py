@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterable
 
 from harbor.runner.stream import StreamEvent, extract_final, iter_stream
 from harbor.db import apply_phase9_migration, sql_statements
+from harbor.resources import runtime_asset
 
 
 STREAM_BUFFER_LIMIT = 8 * 1024 * 1024
@@ -473,7 +474,7 @@ def apply_phase4_migration(db: Any, path: str | Path | None = None) -> None:
         # runner be imported with a fresh Phase 1 database; the supervisor's
         # startup migration must still apply 003 before dispatching.
         return
-    migration = Path(path) if path else Path(__file__).resolve().parents[3] / "migrations" / "004_phase4_runner.sql"
+    migration = Path(path) if path else runtime_asset("migrations", "004_phase4_runner.sql")
     script = migration.read_text(encoding="utf-8")
     with _db_lock(db):
         for statement in sql_statements(script):

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from harbor.runner.base import BaseRunner, RunResult, _db_connection, _table_exists
+from harbor.resources import runtime_asset
 
 
 DEFAULT_MODEL = "gpt-5.6-luna"
@@ -61,7 +62,7 @@ class CodexRunner(BaseRunner):
         self.schema_path = (
             Path(schema_path).expanduser().resolve()
             if schema_path is not None
-            else Path(__file__).resolve().parents[3] / "schemas" / "run-result.json"
+            else runtime_asset("schemas", "run-result.json")
         )
         # A linked worktree's ``.git`` is a FILE pointing at
         # ``<repo>/.git/worktrees/<name>``.  Commits write objects, refs, reflogs

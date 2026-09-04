@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from harbor.facts.threads import is_harbor_marked
+from harbor.resources import runtime_asset
 
 
 PR_CREATED = "PR_CREATED"
@@ -461,7 +462,7 @@ def _event_from_dict(value: Mapping[str, Any]) -> PREvent:
 
 
 def _migration_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "migrations" / "007_phase8_pr_feedback.sql"
+    return runtime_asset("migrations", "007_phase8_pr_feedback.sql")
 
 
 def apply_phase8_migration(db: Any, path: str | Path | None = None) -> None:

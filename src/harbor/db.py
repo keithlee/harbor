@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from harbor.resources import runtime_asset
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -203,7 +205,7 @@ def apply_phase7_migration(db: Any, path: str | Path | None = None) -> None:
     connection = db if isinstance(db, sqlite3.Connection) else getattr(db, "connection", None)
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("Phase 7 migration requires a sqlite3.Connection or HarborDB")
-    migration = Path(path) if path is not None else Path(__file__).resolve().parents[2] / "migrations" / "006_phase7_unblock.sql"
+    migration = Path(path) if path is not None else runtime_asset("migrations", "006_phase7_unblock.sql")
     if not migration.is_file():
         # ``SCHEMA`` contains the same additive objects for brand-new DBs.  A
         # missing migration is still an error for an existing deployment so a
@@ -237,7 +239,7 @@ def apply_phase9_migration(db: Any, path: str | Path | None = None) -> None:
     connection = db if isinstance(db, sqlite3.Connection) else getattr(db, "connection", None)
     if not isinstance(connection, sqlite3.Connection):
         raise TypeError("Phase 9 migration requires a sqlite3.Connection or HarborDB")
-    migration = Path(path) if path is not None else Path(__file__).resolve().parents[2] / "migrations" / "008_phase9_correctness.sql"
+    migration = Path(path) if path is not None else runtime_asset("migrations", "008_phase9_correctness.sql")
     if not migration.is_file():
         raise FileNotFoundError(migration)
     statements = sql_statements(migration.read_text(encoding="utf-8"))

@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
+from harbor.resources import runtime_asset
 from harbor.wake import apply_phase3_migration
 
 
@@ -688,7 +689,7 @@ def build_resume_command(run_id: str, prompt: str, *, output_schema: str | None 
     if not run:
         raise ValueError("a builder run/session id is required")
     text = str(prompt)
-    schema = output_schema or str(Path(__file__).resolve().parents[2] / "schemas" / "run-result.json")
+    schema = output_schema or str(runtime_asset("schemas", "run-result.json"))
     command: list[str] = ["codex", "exec", "resume", run, text, "--json", "--output-schema", schema]
     return ResumeCommand(run, text, tuple(command))
 
