@@ -1,21 +1,23 @@
+from pathlib import Path
+
 from harbor.config.profile import PipelineProfile
 
 
 def test_profile_accepts_pipeline_table_and_scalar_forms() -> None:
     profile = PipelineProfile.from_markdown(
         """
-        | github_repository | keithlee/Bookgen |
+        | github_repository | example/SampleProject |
         required_checks: [CI, typecheck]
         bot_rework_cap: 1
         """
     )
-    assert profile.repository == "keithlee/Bookgen"
+    assert profile.repository == "example/SampleProject"
     assert profile.required_checks == ("CI", "typecheck")
     assert profile.bot_rework_cap == 1
 
 
 def test_required_check_names_may_contain_commas() -> None:
-    """Bookgen's real check is literally "Lint, typecheck and test (root)".
+    """SampleProject's real check is literally "Lint, typecheck and test (root)".
 
     A naive split turns one required check into two that can never both be
     SUCCESS, so CI would never be reported green.
@@ -32,18 +34,35 @@ def test_required_check_names_may_contain_commas() -> None:
     assert _split_list("[Todo]") == ("Todo",)
 
 
-def test_live_bookgen_pipeline_parses_when_present() -> None:
-    """Guards the checked-in registry against a config that cannot load."""
-
-    from pathlib import Path
-
+def test_registered_pipeline_parses_without_a_maintainer_checkout(
+    tmp_path: Path, monkeypatch,
+) -> None:
     from harbor.config.projects import get_project
 
-    if not (Path.home() / "Projects" / "Bookgen" / ".harbor" / "pipeline.md").is_file():
-        import pytest
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text(
+        """linear_project_slug: sample-project-abc123
+linear_team: SAMPLE
+dispatch_states: [Todo]
+poll_states: [Todo, In Progress]
+hold: false
+required_checks: ["Lint, typecheck and test (root)", "Test (apps/mobile)"]
+""",
+        encoding="utf-8",
+    )
+    registry = tmp_path / "projects.md"
+    registry.write_text(
+        f"""| name | repo_path | pipeline_path |
+| --- | --- | --- |
+| SampleProject | {repo} | {pipeline} |
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(registry))
 
-        pytest.skip("live Bookgen pipeline.md is not installed on this machine")
-    config = get_project("Bookgen")
+    config = get_project("SampleProject")
     assert config.dispatch_states == ("Todo",)
     assert "Backlog" not in config.poll_states
     # hold is an operational toggle the operator flips; only assert it parses

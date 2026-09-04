@@ -75,16 +75,16 @@ class RecordingPREventProcessor:
 def _linear_issue() -> dict[str, Any]:
     return {
         "id": "linear-id-42",
-        "identifier": "HAN-42",
+        "identifier": "SAMPLE-42",
         "title": "Exercise the shadow wake boundary",
-        "url": "https://linear.app/hanzireader/issue/HAN-42",
+        "url": "https://linear.app/sample-project/issue/SAMPLE-42",
         "updatedAt": "2026-09-03T12:00:00Z",
-        "branchName": "han-42-shadow-proof",
+        "branchName": "sample-42-shadow-proof",
         "state": {"name": "Todo", "type": "backlog"},
         "attachments": {
             "nodes": [
                 {
-                    "url": "https://github.com/keithlee/Bookgen/pull/42",
+                    "url": "https://github.com/example/SampleProject/pull/42",
                     "sourceType": "github",
                 }
             ]
@@ -97,7 +97,7 @@ def _linear_issue() -> dict[str, Any]:
 def _github_pull_request() -> dict[str, Any]:
     return {
         "number": 42,
-        "url": "https://github.com/keithlee/Bookgen/pull/42",
+        "url": "https://github.com/example/SampleProject/pull/42",
         "title": "Exercise the shadow wake boundary",
         "body": "",
         "state": "OPEN",
@@ -155,10 +155,10 @@ def test_shadow_full_poll_cycle_would_wake_but_performs_no_delivery_or_mutation(
         delivery = RecordingDelivery()
         pr_events = RecordingPREventProcessor()
         config = ProjectConfig(
-            name="Bookgen",
-            linear_project_slug="hanzireader",
+            name="SampleProject",
+            linear_project_slug="sample-project",
             repo_path=tmp_path,
-            github_repository="keithlee/Bookgen",
+            github_repository="example/SampleProject",
             required_checks=("CI",),
             poll_interval_seconds=3600,
         )
@@ -166,13 +166,13 @@ def test_shadow_full_poll_cycle_would_wake_but_performs_no_delivery_or_mutation(
         github_poller = GitHubPoller(
             github_client,
             PipelineProfile(
-                repository_owner="keithlee",
-                repository_name="Bookgen",
+                repository_owner="example",
+                repository_name="SampleProject",
                 required_checks=("CI",),
             ),
             db=db,
             event_processor=pr_events,
-            project="Bookgen",
+            project="SampleProject",
         )
         supervisor = Supervisor(
             linear_poller,
@@ -217,9 +217,9 @@ def test_shadow_full_poll_cycle_would_wake_but_performs_no_delivery_or_mutation(
 
     assert result["first"] is not None and result["first"].changed is True
     assert result["second"] is not None and result["second"].changed is False
-    assert result["first"].tickets[0]["identifier"] == "HAN-42"
+    assert result["first"].tickets[0]["identifier"] == "SAMPLE-42"
     assert result["first"].tickets[0]["state"] == "Todo"
-    assert result["first_wakes"] == [("build", "HAN-42@build")]
+    assert result["first_wakes"] == [("build", "SAMPLE-42@build")]
     assert result["second_wakes"] == []
 
     # A Todo ticket was actionable, but shadow mode did not hand it to any

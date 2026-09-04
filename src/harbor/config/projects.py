@@ -45,9 +45,8 @@ def _as_bool(value: str, default: bool) -> bool:
 def _split_list(text: str | Sequence[str] | None) -> tuple[str, ...]:
     """Split a bracketed list on commas that are not inside a quoted item.
 
-    Required check names routinely contain a comma -- Bookgen's is literally
-    "Lint, typecheck and test (root)" -- so a naive ``split(",")`` silently
-    turns one required check into two that can never both be SUCCESS.
+    Required check names may contain commas, so a naive ``split(",")`` can
+    silently turn one check into several that can never all be observed.
     """
 
     if text is None:
@@ -179,7 +178,7 @@ class ProjectConfig:
     # project is a config edit, never a code change; the query stays one
     # request regardless of how many are listed.
     linear_projects: tuple[str, ...] = ()
-    linear_team: str = "HAN"
+    linear_team: str = ""
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     pipeline_path: Path | None = None
     linear_api_url: str = "https://api.linear.app/graphql"
@@ -286,9 +285,11 @@ class ProjectConfig:
 
     @classmethod
     def from_pipeline(cls, name: str, path: Path, **overrides: object) -> "ProjectConfig":
+        explicit_slug = overrides.pop("linear_project_slug", None)
+        explicit_team = overrides.pop("linear_team", None)
         values: dict[str, object] = {
-            "linear_project_slug": overrides.pop("linear_project_slug", "hanzireader-06c91e632f50"),
-            "linear_team": overrides.pop("linear_team", "HAN"),
+            "linear_project_slug": "",
+            "linear_team": "",
             "repo_path": path.parent.parent,
             "pipeline_path": path,
         }
@@ -314,42 +315,23 @@ class ProjectConfig:
             }
         )
         values.update(overrides)
+        if explicit_slug is not None and str(explicit_slug).strip():
+            values["linear_project_slug"] = explicit_slug
+        if explicit_team is not None and str(explicit_team).strip():
+            values["linear_team"] = explicit_team
         values["poll_states"] = tuple(values.get("poll_states", POLL_STATES))
         values["dispatch_states"] = tuple(values.get("dispatch_states", DISPATCH_STATES))
         values["required_checks"] = tuple(values.get("required_checks", ()))
         values["repo_path"] = Path(values["repo_path"])
         values["pipeline_path"] = Path(values["pipeline_path"])
+        for field_name in ("linear_project_slug", "linear_team"):
+            if not str(values.get(field_name, "")).strip():
+                raise ValueError(f"Harbor project {name} is missing required {field_name}")
         return cls(name=name, **values)  # type: ignore[arg-type]
 
     @classmethod
     def from_file(cls, name: str, path: Path, **overrides: object) -> "ProjectConfig":
         return cls.from_pipeline(name, Path(path), **overrides)
-
-
-def _bookgen() -> ProjectConfig:
-    repo = Path(os.environ.get("HARBOR_BOOKGEN_PATH", Path.home() / "Projects" / "Bookgen")).expanduser()
-    pipeline = repo / ".harbor" / "pipeline.md"
-    config = ProjectConfig(
-        name="Bookgen",
-        linear_project_slug=os.environ.get("HARBOR_BOOKGEN_SLUG", "hanzireader-06c91e632f50"),
-        linear_team=os.environ.get("HARBOR_BOOKGEN_TEAM", "HAN"),
-        repo_path=repo,
-        pipeline_path=pipeline if pipeline.is_file() else None,
-        linear_api_url=os.environ.get("HARBOR_LINEAR_URL", "https://api.linear.app/graphql"),
-    )
-    if pipeline.is_file():
-        config = ProjectConfig.from_pipeline(
-            "Bookgen",
-            pipeline,
-            linear_project_slug=config.linear_project_slug,
-            linear_team=config.linear_team,
-            linear_api_url=config.linear_api_url,
-        )
-        return config
-    raise ValueError(
-        f"Harbor project Bookgen is missing its live pipeline: expected {pipeline}; "
-        "refusing to fall back to AGENTS.md"
-    )
 
 
 def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
@@ -366,15 +348,19 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
     configured = os.environ.get("HARBOR_PROJECTS_FILE")
     candidates: list[Path] = []
     if configured:
-        candidates.append(Path(configured).expanduser())
-    if config_root:
-        candidates.append(base / "projects.md")
-    candidates.extend(
-        [
-            base / "projects.md",
-            Path(__file__).resolve().parents[3] / "projects.md",
-        ]
-    )
+        selected = Path(configured).expanduser().resolve()
+        if not selected.is_file():
+            raise ValueError(f"Harbor project registry does not exist: {selected}")
+        candidates.append(selected)
+    else:
+        if config_root:
+            candidates.append(base / "projects.md")
+        candidates.extend(
+            [
+                base / "projects.md",
+                Path(__file__).resolve().parents[3] / "projects.md",
+            ]
+        )
     seen: set[Path] = set()
     registry_loaded = False
     for registry_path in candidates:
@@ -420,6 +406,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                 if key
                 in {
                     "linear_project_slug",
+                    "linear_projects",
                     "linear_team",
                     "linear_api_url",
                     "poll_interval_seconds",
@@ -440,6 +427,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     "bot_rework_cap",
                     "hold",
                     "repo_path",
+                    "install_command",
                 }
             }
             if pipeline is None or not pipeline.is_file():
@@ -453,19 +441,11 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
     if registry_loaded:
         raise ValueError(f"unknown Harbor project: {name}")
 
-    # Preserve the useful local-repository shorthand for callers that pass a
-    # checkout root (the registry is still preferred whenever present).
-    local_pipeline = base / ".harbor" / "pipeline.md"
-    if local_pipeline.is_file():
-        return ProjectConfig.from_pipeline(name, local_pipeline)
-    if normalized == "bookgen":
-        return _bookgen()
-    root = (config_root or Path.cwd()) / ".harbor"
-    candidates = (root / f"{name}.md", root / "pipeline.md")
-    for path in candidates:
-        if path.is_file():
-            return ProjectConfig.from_pipeline(name, path)
-    raise ValueError(f"unknown Harbor project: {name}")
+    if not registry_loaded:
+        expected = Path(configured).expanduser() if configured else base / "projects.md"
+        raise ValueError(
+            f"no Harbor project registry found; create {expected} or set HARBOR_PROJECTS_FILE"
+        )
 
 
 __all__ = [

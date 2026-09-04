@@ -55,7 +55,7 @@ def harness(tmp_path: Path) -> tuple[WorktreeDispatcher, list[StubSkill]]:
         built.append(stub)
         return stub
 
-    return WorktreeDispatcher(Manager(), factory, project="Bookgen"), built
+    return WorktreeDispatcher(Manager(), factory, project="SampleProject"), built
 
 
 def test_a_stub_skill_is_dispatched_and_reengaged_in_the_same_session(tmp_path: Path) -> None:
@@ -63,14 +63,14 @@ def test_a_stub_skill_is_dispatched_and_reengaged_in_the_same_session(tmp_path: 
         dispatcher, built = harness(tmp_path)
 
         first = await dispatcher.dispatch(
-            Wake(ticket={"identifier": "HAN-99"}, action="build", instruction="Build HAN-99")
+            Wake(ticket={"identifier": "SAMPLE-99"}, action="build", instruction="Build SAMPLE-99")
         )
         assert first["waiting_on"] == "review"
         run_id = first["run_id"]
         assert run_id, "the dispatcher assigns a durable logical run id"
 
         second = await dispatcher.resume(
-            Wake(ticket={"identifier": "HAN-99"}, action="reengage",
+            Wake(ticket={"identifier": "SAMPLE-99"}, action="reengage",
                  instruction="2 new review threads. Continue your workflow.")
         )
         assert second["run_id"] == run_id, "re-engagement must resume the SAME session"
@@ -85,8 +85,8 @@ def test_a_stub_skill_is_dispatched_and_reengaged_in_the_same_session(tmp_path: 
 def test_harbor_never_tells_the_stub_what_to_do_only_that_something_changed(tmp_path: Path) -> None:
     async def scenario() -> None:
         dispatcher, built = harness(tmp_path)
-        await dispatcher.dispatch(Wake(ticket={"identifier": "HAN-99"}, action="build", instruction="Build HAN-99"))
-        await dispatcher.resume(Wake(ticket={"identifier": "HAN-99"}, action="reengage",
+        await dispatcher.dispatch(Wake(ticket={"identifier": "SAMPLE-99"}, action="build", instruction="Build SAMPLE-99"))
+        await dispatcher.resume(Wake(ticket={"identifier": "SAMPLE-99"}, action="reengage",
                                      instruction="CI finished: green. Continue your workflow."))
         for _, instruction in built[0].log:
             lowered = instruction.lower()
@@ -125,8 +125,8 @@ def test_a_stub_that_never_opens_a_pr_is_still_retained(tmp_path: Path) -> None:
                 return {"status": "waiting", "waiting_on": "review", "summary": "ok"}
 
         dispatcher = WorktreeDispatcher(Manager(), lambda w, k: Minimal(w, k.run_id), project="B")
-        await dispatcher.dispatch(Wake(ticket={"identifier": "HAN-98"}, action="build", instruction="go"))
-        await dispatcher.resume(Wake(ticket={"identifier": "HAN-98"}, action="reengage", instruction="CI finished"))
-        assert dispatcher.runners["HAN-98"].resumed == 1
+        await dispatcher.dispatch(Wake(ticket={"identifier": "SAMPLE-98"}, action="build", instruction="go"))
+        await dispatcher.resume(Wake(ticket={"identifier": "SAMPLE-98"}, action="reengage", instruction="CI finished"))
+        assert dispatcher.runners["SAMPLE-98"].resumed == 1
 
     asyncio.run(scenario())

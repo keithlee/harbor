@@ -274,7 +274,7 @@ async def _start(
         )
 
     # The CLI is the production composition root.  Tests and embedders may
-    # inject any of these seams, but an ordinary ``harbor start Bookgen`` must
+    # inject any of these seams, but an ordinary ``harbor start SampleProject`` must
     # still create an isolated worktree and a persistent Codex builder.
     builder_prompt = _pipeline_text(config)
     production_dispatcher = dispatcher

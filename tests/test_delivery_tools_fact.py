@@ -65,7 +65,7 @@ def test_detection_is_read_only() -> None:
 
 def test_the_fact_reaches_the_build_instruction() -> None:
     text = build_instruction(
-        {"identifier": "HAN-32", "title": "t", "state": "Todo", "hold": False},
+        {"identifier": "SAMPLE-32", "title": "t", "state": "Todo", "hold": False},
         delivery_tools={"gh": True, "gh-axi": False},
     )
     assert "Available and authenticated in your sandbox: gh." in text
@@ -75,5 +75,5 @@ def test_the_fact_reaches_the_build_instruction() -> None:
 
 
 def test_the_instruction_is_unchanged_when_nothing_is_reported() -> None:
-    plain = build_instruction({"identifier": "HAN-1", "title": "t", "state": "Todo", "hold": True})
+    plain = build_instruction({"identifier": "SAMPLE-1", "title": "t", "state": "Todo", "hold": True})
     assert "Available and authenticated" not in plain

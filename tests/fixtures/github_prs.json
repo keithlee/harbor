@@ -3,7 +3,7 @@
     "repository": {
       "pr_217": {
         "number": 217,
-        "url": "https://github.com/keithlee/Bookgen/pull/217",
+        "url": "https://github.com/example/SampleProject/pull/217",
         "title": "manual deploy path",
         "state": "OPEN",
         "merged": false,
@@ -21,7 +21,7 @@
       },
       "pr_221": {
         "number": 221,
-        "url": "https://github.com/keithlee/Bookgen/pull/221",
+        "url": "https://github.com/example/SampleProject/pull/221",
         "title": "offline dictionary",
         "state": "OPEN",
         "merged": false,
@@ -41,7 +41,7 @@
               "id": "PRRT-1",
               "isResolved": false,
               "isOutdated": true,
-              "path": "docs/specs/proof/han-29/live-web.md",
+              "path": "docs/specs/proof/sample-29/live-web.md",
               "line": null,
               "comments": {"nodes": [{"body": "**<sub>![P1 Badge](https://img.shields.io/badge/P1-red)</sub> Title**", "author": {"login": "chatgpt-codex-connector", "isBot": true}}]}
             },

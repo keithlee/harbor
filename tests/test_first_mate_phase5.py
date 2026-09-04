@@ -22,12 +22,12 @@ def run(awaitable: Any) -> Any:
 
 def status() -> dict[str, Any]:
     return {
-        "project": "Bookgen",
+        "project": "SampleProject",
         "lifecycle": "RUNNING",
         "linear_healthy": True,
         "tickets": [
-            {"identifier": "HAN-17", "state": "In Review", "owned": False, "title": "Reader"},
-            {"identifier": "HAN-42", "state": "Todo", "owned": True, "title": "Build"},
+            {"identifier": "SAMPLE-17", "state": "In Review", "owned": False, "title": "Reader"},
+            {"identifier": "SAMPLE-42", "state": "Todo", "owned": True, "title": "Build"},
         ],
     }
 
@@ -36,8 +36,8 @@ def test_digest_is_deterministic_and_ordered_without_a_model_call() -> None:
     first = render_digest(status())
     second = render_digest({**status(), "tickets": list(reversed(status()["tickets"]))})
     assert first == second
-    assert first.index("HAN-17") < first.index("HAN-42")
-    assert "HAN-17 (observed)" in first
+    assert first.index("SAMPLE-17") < first.index("SAMPLE-42")
+    assert "SAMPLE-17 (observed)" in first
 
 
 def test_plain_question_makes_one_terra_call_and_uses_same_digest() -> None:
@@ -117,8 +117,8 @@ def test_console_ctrl_c_cancels_answer_but_keeps_supervisor_running(
     import harbor.console as console_module
 
     class Poller:
-        project_name = "Bookgen"
-        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+        project_name = "SampleProject"
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project")
 
         async def poll(self) -> PollResult:
             return PollResult((), "empty", False, ())
@@ -183,8 +183,8 @@ def test_console_ctrl_c_cancels_answer_but_keeps_supervisor_running(
 
 def test_console_host_cancellation_propagates_after_answer_cleanup() -> None:
     class Poller:
-        project_name = "Bookgen"
-        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+        project_name = "SampleProject"
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project")
 
         async def poll(self) -> PollResult:
             return PollResult((), "empty", False, ())
@@ -220,8 +220,8 @@ def test_console_host_cancellation_propagates_after_answer_cleanup() -> None:
 
 def test_answer_restores_prior_sigint_handler_when_idle() -> None:
     class Poller:
-        project_name = "Bookgen"
-        config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+        project_name = "SampleProject"
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project")
 
         async def poll(self) -> PollResult:
             return PollResult((), "empty", False, ())

@@ -26,7 +26,7 @@ def test_failed_required_check_is_red() -> None:
 
 
 def test_required_check_name_containing_a_comma_is_matched() -> None:
-    """Bookgen's real required check is "Lint, typecheck and test (root)".
+    """SampleProject's real required check is "Lint, typecheck and test (root)".
 
     Every config parser must split the list quote-aware.  A naive split makes
     one required check into two that can never both be SUCCESS, so CI reads
@@ -67,7 +67,7 @@ def test_the_github_query_selects_no_field_that_does_not_exist() -> None:
 
     from harbor.clients.github import build_pull_requests_query
 
-    query = build_pull_requests_query("keithlee", "Bookgen", [217, 221])
+    query = build_pull_requests_query("example", "SampleProject", [217, 221])
     assert "isBot" not in query
     # Bot detection uses __typename plus the `[bot]` login suffix instead.
     assert "__typename" in query

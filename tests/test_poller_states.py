@@ -17,11 +17,11 @@ def issue(identifier: str, state: str, *, title: str | None = None) -> dict:
         "id": f"id-{identifier}",
         "identifier": identifier,
         "title": title or f"Title {identifier}",
-        "url": f"https://linear.app/hanzireader/issue/{identifier}",
+        "url": f"https://linear.app/sample-project/issue/{identifier}",
         "updatedAt": "2026-09-02T20:00:00Z",
         "branchName": None,
         "state": {"name": state, "type": "started" if state != "Todo" else "backlog"},
-        "attachments": {"nodes": [{"url": "https://github.com/keithlee/Bookgen/pull/221", "sourceType": "github"}]},
+        "attachments": {"nodes": [{"url": "https://github.com/example/SampleProject/pull/221", "sourceType": "github"}]},
         "comments": {"nodes": [{"id": f"comment-{identifier}", "createdAt": "2026-09-02T20:00:00Z", "body": "hello"}]},
         "inverseRelations": {"nodes": []},
     }
@@ -43,15 +43,15 @@ def run(coro):
 
 def config(tmp_path: Path) -> ProjectConfig:
     return ProjectConfig(
-        name="Bookgen",
-        linear_project_slug="hanzireader",
+        name="SampleProject",
+        linear_project_slug="sample-project",
         repo_path=tmp_path,
         poll_interval_seconds=3600,
     )
 
 
 def test_poller_sends_only_configured_states_and_excludes_backlog(tmp_path: Path) -> None:
-    nodes = [issue("HAN-42", "Todo"), issue("HAN-17", "In Review"), issue("HAN-99", "Backlog")]
+    nodes = [issue("SAMPLE-42", "Todo"), issue("SAMPLE-17", "In Review"), issue("SAMPLE-99", "Backlog")]
     calls: list[dict] = []
     client = LinearClient(token="test-key", transport=fake_transport(nodes, calls))
     poller = LinearPoller(client, config(tmp_path))
@@ -59,17 +59,17 @@ def test_poller_sends_only_configured_states_and_excludes_backlog(tmp_path: Path
         result = run(poller.poll())
     finally:
         run(client.close())
-    assert [ticket["identifier"] for ticket in result.tickets] == ["HAN-17", "HAN-42"]
+    assert [ticket["identifier"] for ticket in result.tickets] == ["SAMPLE-17", "SAMPLE-42"]
     assert "Backlog" not in {ticket["state"] for ticket in result.tickets}
     assert calls[0]["variables"] == {
-        "slugs": ["hanzireader"],
+        "slugs": ["sample-project"],
         "states": ["Todo", "In Progress", "In Review", "Blocked", "Human Review"],
     }
     assert calls[0]["query"].strip().startswith("query HarborIssues")
 
 
 def test_unchanged_snapshot_creates_no_second_events_row(tmp_path: Path) -> None:
-    nodes = [issue("HAN-42", "Todo")]
+    nodes = [issue("SAMPLE-42", "Todo")]
     calls: list[dict] = []
     db = HarborDB(tmp_path / "harbor.db")
     client = LinearClient(transport=fake_transport(nodes, calls))
@@ -85,7 +85,7 @@ def test_unchanged_snapshot_creates_no_second_events_row(tmp_path: Path) -> None
     assert second.events == ()
     reopened = HarborDB(tmp_path / "harbor.db")
     try:
-        assert reopened.event_count("Bookgen") == 1
+        assert reopened.event_count("SampleProject") == 1
     finally:
         reopened.close()
 
@@ -102,19 +102,19 @@ def test_pipeline_scope_values_are_loaded_without_backlog(tmp_path: Path) -> Non
     assert values["hold_all"] is False
     # Config may describe the board, but the poller's fail-closed filter owns
     # the invariant that Backlog is never queried or displayed.
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path, **values)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path, **values)
     assert "Backlog" in config.poll_states
 
 
 def test_additional_projects_widen_the_same_single_request(tmp_path: Path) -> None:
     """Adding a project is a config edit, not a code change, and stays 1 call."""
 
-    nodes = [issue("HAN-42", "Todo")]
+    nodes = [issue("SAMPLE-42", "Todo")]
     calls: list[dict] = []
     client = LinearClient(token="test-key", transport=fake_transport(nodes, calls))
     scoped = ProjectConfig(
-        name="Bookgen",
-        linear_project_slug="hanzireader",
+        name="SampleProject",
+        linear_project_slug="sample-project",
         linear_projects=("second-project", "third-project"),
         repo_path=tmp_path,
         poll_interval_seconds=3600,
@@ -126,7 +126,7 @@ def test_additional_projects_widen_the_same_single_request(tmp_path: Path) -> No
         run(client.close())
     assert len(calls) == 1, "extra projects must not cost extra requests"
     assert calls[0]["variables"]["slugs"] == [
-        "hanzireader",
+        "sample-project",
         "second-project",
         "third-project",
     ]
@@ -134,15 +134,15 @@ def test_additional_projects_widen_the_same_single_request(tmp_path: Path) -> No
 
 def test_a_duplicate_or_blank_project_slug_is_ignored(tmp_path: Path) -> None:
     scoped = ProjectConfig(
-        name="Bookgen",
-        linear_project_slug="hanzireader",
-        linear_projects=("hanzireader", "  ", "other"),
+        name="SampleProject",
+        linear_project_slug="sample-project",
+        linear_projects=("sample-project", "  ", "other"),
         repo_path=tmp_path,
     )
-    assert scoped.linear_project_scope == ("hanzireader", "other")
+    assert scoped.linear_project_scope == ("sample-project", "other")
 
 
 def test_projects_may_be_configured_as_a_markdown_list_literal(tmp_path: Path) -> None:
     from harbor.config.projects import _split_list
 
-    assert _split_list("[hanzireader, second-project]") == ("hanzireader", "second-project")
+    assert _split_list("[sample-project, second-project]") == ("sample-project", "second-project")

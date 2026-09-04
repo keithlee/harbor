@@ -1,6 +1,7 @@
 # Harbor
 
-Harbor is a calm, deterministic supervisor for one configured project. It
+Harbor is a calm, deterministic supervisor for one explicitly configured
+project at a time. It
 polls Linear and GitHub without making model calls, dispatches a configured
 delivery skill in an isolated worktree, keeps the same builder session across
 re-engagement, and gives the operator a First Mate console in the same
@@ -14,18 +15,58 @@ The skill is a Markdown-controlled prompt. A team can replace
 `/work-pipeline` with its own ticket-to-PR instructions without changing
 Harbor or adding a Harbor-specific implementation role.
 
-## Install, verify, and start
+## Manual multi-project setup
+
+Harbor does not currently provide `harbor init`. Each user owns a private
+registry and one pipeline document per workflow. The checked-in `projects.md`
+and `templates/pipeline.md` files are neutral format examples; Harbor never
+uses them as real product configuration.
+
+Create pipelines wherever they make sense for the user or team. A repository-
+local `.harbor/pipeline.md` can be shared with that repository; a pipeline in a
+private directory can customize one operator's models, commands, and policy.
+
+```bash
+mkdir -p "$HOME/.harbor"
+mkdir -p "$HOME/Pipelines"
+cp templates/pipeline.md "$HOME/Pipelines/sample-project.md"
+```
+
+Create `$HOME/.harbor/projects.md` with one row per repository:
+
+```md
+| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository | base_branch |
+| --- | --- | --- | --- | --- | --- | --- |
+| SampleProject | ~/Projects/SampleProject | ~/Pipelines/sample-project.md | sample-project-abc123 | SAMPLE | example/SampleProject | main |
+| AnotherProject | ~/Projects/AnotherProject | ~/Projects/AnotherProject/.harbor/pipeline.md | another-project-def456 | OTHER | example/AnotherProject | main |
+```
+
+Set credentials and select the private registry. Credentials stay in the
+environment and must never be written into either Markdown file.
+
+```bash
+export HARBOR_PROJECTS_FILE="$HOME/.harbor/projects.md"
+export LINEAR_API_KEY="<linear-api-key>"
+export GH_TOKEN="<github-token>" # only when GitHub facts are configured
+```
+
+Each named project has separate repository, pipeline, Linear scope, GitHub
+facts, worktree root, and SQLite custody. `linear_projects` widens one named
+project's Linear scope; it is not a way to combine unrelated repositories or
+workflows. Run one Harbor process per named repository.
+
+## Verify and start
 
 From the Harbor checkout:
 
 ```bash
 cd ~/Projects/harbor
 uv sync
-uv run harbor doctor Bookgen
-uv run harbor start Bookgen
+uv run harbor doctor SampleProject
+uv run harbor start SampleProject
 ```
 
-`projects.md` resolves `Bookgen` to its repository, Linear project, GitHub
+The selected private registry resolves `SampleProject` to its repository, Linear project, GitHub
 repository, base branch, and live pipeline document. `doctor` verifies the
 Linear connection and that the configured project scope exists. `start` then
 opens the `first-mate>` prompt, starts model-free polling, and schedules any
@@ -39,10 +80,10 @@ poller uses `GITHUB_TOKEN` or `GH_TOKEN` when GitHub facts are configured.
 For a read-only one-cycle check:
 
 ```bash
-uv run harbor start Bookgen --once
-uv run harbor start Bookgen --shadow
-uv run harbor facts Bookgen --json
-uv run harbor status Bookgen --json
+uv run harbor start SampleProject --once
+uv run harbor start SampleProject --shadow
+uv run harbor facts SampleProject --json
+uv run harbor status SampleProject --json
 ```
 
 `--shadow` computes wake decisions and prints `WOULD WAKE` lines without
@@ -52,25 +93,25 @@ PR-facts query; `status` reads the local runtime ledger.
 ## Same-terminal First Mate workflow
 
 There is no `harbor ask` or project-name prefix for questions. Once
-`harbor start Bookgen` is running, type a plain question directly. Slash
+`harbor start SampleProject` is running, type a plain question directly. Slash
 commands are deterministic and do not invoke a model; plain text sends one
 question to the configured First Mate model with the same fresh digest shown
 by `/status`.
 
 ```text
 first-mate> /status
-Harbor: RUNNING · Bookgen · Linear healthy
-HAN-33  Done  ...  PR #226
-Run harbor-Bookgen-HAN-33-builder  builder  completed  waiting on none  outcome=merged  pr_url=https://github.com/keithlee/Bookgen/pull/226
+Harbor: RUNNING · SampleProject · Linear healthy
+SAMPLE-33  Done  ...  PR #226
+Run harbor-SampleProject-SAMPLE-33-builder  builder  completed  waiting on none  outcome=merged  pr_url=https://github.com/example/SampleProject/pull/226
 
 first-mate> What is the fleet waiting on?
 <one Terra answer based on the refreshed fleet digest>
 
-first-mate> /hold on HAN-42
-Harbor: HOLD ON · HAN-42
+first-mate> /hold on SAMPLE-42
+Harbor: HOLD ON · SAMPLE-42
 
-first-mate> /hold off HAN-42
-Harbor: HOLD OFF · HAN-42
+first-mate> /hold off SAMPLE-42
+Harbor: HOLD OFF · SAMPLE-42
 
 first-mate> /pause Stopping for the evening
 Harbor: PAUSED · Stopping for the evening
@@ -169,12 +210,17 @@ reconciles external state; local rows never override Linear or GitHub.
 
 ## Configuration
 
-Copy the template into the target repository:
+Copy the neutral template to the pipeline path named in the private registry:
 
 ```bash
-mkdir -p ~/Projects/Bookgen/.harbor
-cp templates/pipeline.md ~/Projects/Bookgen/.harbor/pipeline.md
+cp templates/pipeline.md "$HOME/Pipelines/sample-project.md"
 ```
+
+To swap a project to a different workflow, update only that project's
+`pipeline_path` cell in `$HARBOR_PROJECTS_FILE`, run `harbor doctor <name>`,
+then restart that named Harbor process. Existing users keep their private
+registry and project-owned pipelines when the Harbor CLI itself is upgraded;
+an update changes executable code, not those configuration files.
 
 Edit the Markdown document as data. The important fields are:
 
@@ -191,12 +237,13 @@ poll_interval_seconds: 60
 deadline_minutes: 90
 hold: true
 
-linear_project_slug: hanzireader-06c91e632f50
+linear_project_slug: sample-project-abc123
+linear_team: SAMPLE
 poll_states: [Todo, In Progress, In Review, Blocked, Human Review]
 dispatch_states: [Todo]
 base_branch: main
-worktree_root: ~/.harbor/worktrees/Bookgen
-github_repository: keithlee/Bookgen
+worktree_root: ~/.harbor/worktrees/SampleProject
+github_repository: example/SampleProject
 required_checks: [CI]
 bot_rework_cap: 1
 ```
@@ -258,30 +305,9 @@ needs and keeps the delivery instructions opaque.
 - Pause stops new dispatch/resume and suspends deadlines; it does not erase
   the ledger or pretend the builder completed.
 
-## Current implementation status
+## Test fixtures and external proof
 
-This repository is an incremental MVP implementation. Passing a unit test or a
-single real ticket does not mark every phase acceptance criterion complete.
-The verified checkpoint currently includes:
-
-- HAN-33 completed the low-risk comment-only path in Bookgen. PR #226 merged,
-  then Linear HAN-33 moved to `Done`; the exact final receipt is now reconciled
-  through a read-only PR observation, with the worktree cleanup gated on that
-  receipt.
-- The Harbor suite reports 230 passing tests, including coverage for the
-  asynchronous console/heartbeat startup, ticket-scoped hold semantics, and
-  HAN-33 merge receipt/restart reconciliation.
-
-Still required for end-to-end proof:
-
-- a live seeded GitHub PR comment and evidence that the builder replies to
-  every comment, fixes valid findings, and explicitly handles/ignores an
-  invalid one;
-- a fresh live run authorized by the operator that keeps the same terminal
-  prompt usable during a real background dispatch and shows the one-minute
-  heartbeat/activity output;
-- completion of the remaining multi-ticket unblock-ladder and risk-gated
-  human-review scenarios.
-
-These gaps are proof work, not permission to weaken the fail-closed merge or
-same-session recovery boundaries.
+The automated suite uses offline SampleProject fixtures. They never connect to
+a maintainer checkout, Linear project, or GitHub repository and never affect
+user configuration. Passing tests prove deterministic behavior; authorized
+live canaries separately prove external Linear-to-merge operation.

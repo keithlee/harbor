@@ -32,7 +32,7 @@ def transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
                     {"id": BLOCKED, "name": "Blocked", "type": "started"},
                 ]}}}}})
         return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {
-            "id": "u", "identifier": "HAN-32", "state": {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"}}}}})
+            "id": "u", "identifier": "SAMPLE-32", "state": {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"}}}}})
 
     return httpx.MockTransport(handler)
 
@@ -42,7 +42,7 @@ def test_a_state_name_is_resolved_to_its_id_before_the_mutation() -> None:
         calls: list[dict[str, Any]] = []
         client = LinearClient(token="k", transport=transport(calls))
         try:
-            await client.update_issue_state("HAN-32", "Human Review")
+            await client.update_issue_state("SAMPLE-32", "Human Review")
         finally:
             await client.close()
         assert "HarborStates" in calls[0]["query"], "the name must be resolved first"
@@ -56,7 +56,7 @@ def test_a_uuid_is_sent_straight_through_without_a_lookup() -> None:
         calls: list[dict[str, Any]] = []
         client = LinearClient(token="k", transport=transport(calls))
         try:
-            await client.update_issue_state("HAN-32", BLOCKED)
+            await client.update_issue_state("SAMPLE-32", BLOCKED)
         finally:
             await client.close()
         assert len(calls) == 1, "a configured UUID needs no resolution request"
@@ -70,8 +70,8 @@ def test_the_resolved_id_is_cached_across_calls() -> None:
         calls: list[dict[str, Any]] = []
         client = LinearClient(token="k", transport=transport(calls))
         try:
-            await client.update_issue_state("HAN-32", "Human Review")
-            await client.update_issue_state("HAN-32", "Blocked")
+            await client.update_issue_state("SAMPLE-32", "Human Review")
+            await client.update_issue_state("SAMPLE-32", "Blocked")
         finally:
             await client.close()
         assert sum("HarborStates" in c["query"] for c in calls) == 1, "one lookup populates every state"
@@ -84,7 +84,7 @@ def test_an_unknown_state_name_fails_loudly() -> None:
         client = LinearClient(token="k", transport=transport([]))
         try:
             with pytest.raises(LinearClientError, match="no Linear workflow state"):
-                await client.update_issue_state("HAN-32", "Not A State")
+                await client.update_issue_state("SAMPLE-32", "Not A State")
         finally:
             await client.close()
 
@@ -100,7 +100,7 @@ def test_harbor_never_writes_a_terminal_state(state: str) -> None:
         client = LinearClient(token="k", transport=transport(calls))
         try:
             with pytest.raises(ValueError, match="terminal"):
-                await client.update_issue_state("HAN-32", state)
+                await client.update_issue_state("SAMPLE-32", state)
         finally:
             await client.close()
         assert calls == [], "a terminal state must be refused before any network call"
@@ -120,7 +120,7 @@ def comment_transport(posts: list[dict[str, Any]]) -> httpx.MockTransport:
 def test_an_identical_comment_body_is_posted_only_once() -> None:
     """Plan section 4: dedupe on (issue_id, sha256(body)) BEFORE the POST.
 
-    HAN-7 already carries two duplicate "Applied... PR #217..." comments a
+    SAMPLE-7 already carries two duplicate "Applied... PR #217..." comments a
     minute apart, and a duplicate Linear comment is an explicit abort
     condition for the acceptance run.
     """
@@ -131,7 +131,7 @@ def test_an_identical_comment_body_is_posted_only_once() -> None:
         posts: list[dict[str, Any]] = []
         db = HarborDB(":memory:")
         client = LinearClient(token="k", transport=comment_transport(posts))
-        body = "[harbor] Blocked HAN-32 after deterministic remediation and rung-1 triage."
+        body = "[harbor] Blocked SAMPLE-32 after deterministic remediation and rung-1 triage."
         try:
             await client.create_comment_once("u-32", body, db=db)
             await client.create_comment_once("u-32", body, db=db)

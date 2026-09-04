@@ -13,8 +13,8 @@ from harbor.wake import WakeDecider, apply_phase3_migration, record_push
 
 def _ticket(**extra: object) -> dict[str, object]:
     value: dict[str, object] = {
-        "identifier": "HAN-6",
-        "id": "linear-han-6",
+        "identifier": "SAMPLE-6",
+        "id": "linear-sample-6",
         "title": "Phase 6",
         "state": "In Progress",
         "blocked_by": [],
@@ -40,10 +40,10 @@ def _thread(identifier: str = "review-1", *, outdated: bool = False, severity: s
 
 def _db(tmp_path: Path) -> HarborDB:
     db = HarborDB(tmp_path / "harbor.db")
-    db.replace_tickets("Bookgen", [_ticket()])
+    db.replace_tickets("SampleProject", [_ticket()])
     apply_phase3_migration(db)
     db.connection.execute(
-        "INSERT INTO runs(id, ticket, role, status, waiting_on) VALUES ('run-6', 'HAN-6', 'builder', 'waiting', 'review')"
+        "INSERT INTO runs(id, ticket, role, status, waiting_on) VALUES ('run-6', 'SAMPLE-6', 'builder', 'waiting', 'review')"
     )
     db.connection.commit()
     return db
@@ -95,8 +95,8 @@ def test_ci_completion_resumes_same_run_once(tmp_path: Path) -> None:
 
 
 class _Linear:
-    project_name = "Bookgen"
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader")
+    project_name = "SampleProject"
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project")
     db = None
 
     def __init__(self, ticket: dict[str, object]) -> None:
@@ -130,7 +130,7 @@ def test_supervisor_uses_github_facts_and_resumes_runner(tmp_path: Path) -> None
     ticket = _ticket()
     github = _GitHub(
         {
-            "ticket": "HAN-6",
+            "ticket": "SAMPLE-6",
             "number": 6,
             "head_sha": "head-a",
             "threads": [_thread()],
@@ -157,10 +157,10 @@ def test_builder_push_advances_seen_head_and_round(tmp_path: Path) -> None:
         from harbor.wake import observe_pr_facts
 
         observe_pr_facts(db, _ticket(), {"number": 6, "head_sha": "head-a", "threads": [_thread()]})
-        assert record_push(db, "HAN-6", "head-b", pr_number=6) == 1
+        assert record_push(db, "SAMPLE-6", "head-b", pr_number=6) == 1
         assert db.connection.execute("SELECT head_sha FROM prs WHERE number = 6").fetchone()[0] == "head-b"
         assert db.connection.execute("SELECT seen_at_sha FROM review_threads WHERE id = 'review-1'").fetchone()[0] == "head-b"
-        assert db.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier = 'HAN-6'").fetchone()[0] == 1
+        assert db.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier = 'SAMPLE-6'").fetchone()[0] == 1
     finally:
         db.close()
 
@@ -194,7 +194,7 @@ def test_every_thread_reaches_the_builder_at_realistic_body_sizes() -> None:
 
     threads = [_connector_thread(i, outdated=i % 2 == 0) for i in range(4)]
     text = build_resume_instruction(
-        {"identifier": "HAN-29"},
+        {"identifier": "SAMPLE-29"},
         {"id": "run-1"},
         {"head_sha": "83c065d5", "ci": {"state": "green"}},
         threads,
@@ -215,7 +215,7 @@ def test_outdated_threads_carry_path_without_a_line() -> None:
     from harbor.reengagement import build_resume_instruction
 
     text = build_resume_instruction(
-        {"identifier": "HAN-29"},
+        {"identifier": "SAMPLE-29"},
         {"id": "run-1"},
         {"head_sha": "abc"},
         [_connector_thread(0, outdated=True), _connector_thread(1, outdated=False)],
@@ -229,7 +229,7 @@ def test_many_threads_still_each_get_a_fenced_slot() -> None:
     from harbor.reengagement import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, build_resume_instruction
 
     threads = [_connector_thread(i) for i in range(8)]
-    text = build_resume_instruction({"identifier": "HAN-1"}, {"id": "r"}, {}, threads)
+    text = build_resume_instruction({"identifier": "SAMPLE-1"}, {"id": "r"}, {}, threads)
     assert len(text.encode("utf-8")) < 2048
     assert text.count(UNTRUSTED_OPEN) == text.count(UNTRUSTED_CLOSE) == 8
     for thread in threads:
@@ -246,7 +246,7 @@ def test_a_parked_pr_still_reengages_on_new_review_threads():
 
     from harbor.wake import WakeDecider
 
-    ticket = {"identifier": "HAN-32", "state": "Human Review", "owned": True}
+    ticket = {"identifier": "SAMPLE-32", "state": "Human Review", "owned": True}
     facts = {
         "prs": [{"number": 225, "head_sha": "d64f0a33", "merged": False}],
         "head_sha": "d64f0a33",
@@ -256,18 +256,18 @@ def test_a_parked_pr_still_reengages_on_new_review_threads():
             "resolved": False, "outdated": False, "path": "README.md",
             "body": "**P2 Badge** Require a text-provider key in setup",
         }],
-        "run": {"id": "harbor-Bookgen-HAN-32-builder", "waiting_on": "human"},
+        "run": {"id": "harbor-SampleProject-SAMPLE-32-builder", "waiting_on": "human"},
     }
     wake = WakeDecider(None, shadow=True).decide(ticket, facts)
     assert wake is not None, "a parked PR with a new P2 thread must re-engage"
     assert wake.action == "reengage"
-    assert wake.resume == "harbor-Bookgen-HAN-32-builder", "the SAME session"
+    assert wake.resume == "harbor-SampleProject-SAMPLE-32-builder", "the SAME session"
 
 
 def test_a_ticket_waiting_on_nothing_relevant_does_not_reengage():
     from harbor.wake import WakeDecider
 
-    ticket = {"identifier": "HAN-32", "state": "In Progress", "owned": True}
+    ticket = {"identifier": "SAMPLE-32", "state": "In Progress", "owned": True}
     facts = {
         "prs": [{"number": 225, "head_sha": "abc", "merged": False}],
         "head_sha": "abc",
@@ -299,26 +299,26 @@ def test_a_builder_push_is_counted_from_harbors_own_observation():
             self.connection.execute("CREATE TABLE prs (number INTEGER PRIMARY KEY, ticket TEXT, head_sha TEXT, observed_at TEXT)")
             self.connection.execute("CREATE TABLE tickets (identifier TEXT PRIMARY KEY, owned INTEGER, bot_rework_rounds INTEGER)")
             self.connection.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, ticket TEXT, status TEXT, session_id TEXT, waiting_on TEXT, worktree TEXT, started_at TEXT, finished_at TEXT)")
-            self.connection.execute("INSERT INTO prs VALUES (225, 'HAN-32', 'oldhead', '')")
-            self.connection.execute("INSERT INTO tickets VALUES ('HAN-32', 1, 0)")
-            self.connection.execute("INSERT INTO runs VALUES ('r1', 'HAN-32', 'waiting', 's', 'human', '', '', '')")
+            self.connection.execute("INSERT INTO prs VALUES (225, 'SAMPLE-32', 'oldhead', '')")
+            self.connection.execute("INSERT INTO tickets VALUES ('SAMPLE-32', 1, 0)")
+            self.connection.execute("INSERT INTO runs VALUES ('r1', 'SAMPLE-32', 'waiting', 's', 'human', '', '', '')")
             self.connection.commit()
 
         def set_runtime(self, *a, **k) -> None:
             return None
 
         def rounds(self) -> int:
-            return self.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier='HAN-32'").fetchone()[0]
+            return self.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier='SAMPLE-32'").fetchone()[0]
 
     class P:
-        project_name = "Bookgen"
-        config = ProjectConfig(name="Bookgen", linear_project_slug="s")
+        project_name = "SampleProject"
+        config = ProjectConfig(name="SampleProject", linear_project_slug="s")
         async def poll(self):
             return PollResult((), "s", False, ())
 
     ledger = Ledger()
     supervisor = Supervisor(P(), db=ledger)
-    ticket = {"identifier": "HAN-32", "owned": True}
+    ticket = {"identifier": "SAMPLE-32", "owned": True}
 
     # An unchanged head is not a rework round.
     supervisor._record_observed_rework(ticket, {"prs": [{"number": 225, "head_sha": "oldhead"}]})
@@ -343,21 +343,21 @@ def test_an_unowned_tickets_push_is_never_counted():
             self.connection = sqlite3.connect(":memory:")
             self.connection.execute("CREATE TABLE prs (number INTEGER PRIMARY KEY, ticket TEXT, head_sha TEXT, observed_at TEXT)")
             self.connection.execute("CREATE TABLE tickets (identifier TEXT PRIMARY KEY, owned INTEGER, bot_rework_rounds INTEGER)")
-            self.connection.execute("INSERT INTO prs VALUES (217, 'HAN-7', 'oldhead', '')")
-            self.connection.execute("INSERT INTO tickets VALUES ('HAN-7', 0, 0)")
+            self.connection.execute("INSERT INTO prs VALUES (217, 'SAMPLE-7', 'oldhead', '')")
+            self.connection.execute("INSERT INTO tickets VALUES ('SAMPLE-7', 0, 0)")
             self.connection.commit()
 
         def set_runtime(self, *a, **k) -> None:
             return None
 
     class P:
-        project_name = "Bookgen"
-        config = ProjectConfig(name="Bookgen", linear_project_slug="s")
+        project_name = "SampleProject"
+        config = ProjectConfig(name="SampleProject", linear_project_slug="s")
         async def poll(self):
             return PollResult((), "s", False, ())
 
     ledger = Ledger()
     supervisor = Supervisor(P(), db=ledger)
-    supervisor._record_observed_rework({"identifier": "HAN-7"}, {"prs": [{"number": 217, "head_sha": "newhead"}]})
-    rounds = ledger.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier='HAN-7'").fetchone()[0]
+    supervisor._record_observed_rework({"identifier": "SAMPLE-7"}, {"prs": [{"number": 217, "head_sha": "newhead"}]})
+    rounds = ledger.connection.execute("SELECT bot_rework_rounds FROM tickets WHERE identifier='SAMPLE-7'").fetchone()[0]
     assert rounds == 0

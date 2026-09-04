@@ -8,7 +8,7 @@ from harbor.heartbeat import Heartbeat
 
 
 class _Supervisor:
-    project = "Bookgen"
+    project = "SampleProject"
     on_update = None
     on_heartbeat = None
 
@@ -20,18 +20,18 @@ def run(coro):
 def test_heartbeat_captures_active_fleet_and_console_renders_idle_duration() -> None:
     async def scenario() -> tuple[object, list[str]]:
         heartbeat = Heartbeat(
-            "Bookgen",
+            "SampleProject",
             status_provider=lambda: {
-                "project": "Bookgen",
+                "project": "SampleProject",
                 "lifecycle": "RUNNING",
                 "linear_healthy": True,
                 "last_activity": 90.0,
                 "runs": [
-                    {"ticket": "HAN-9", "status": "blocked", "waiting_on": "human"},
-                    {"ticket": "HAN-2", "status": "waiting", "waiting_on": "review"},
-                    {"ticket": "HAN-1", "status": "running", "waiting_on": "none"},
-                    {"ticket": "HAN-3", "status": "completed", "outcome": "parked", "waiting_on": "human"},
-                    {"ticket": "HAN-4", "status": "failed", "waiting_on": "none"},
+                    {"ticket": "SAMPLE-9", "status": "blocked", "waiting_on": "human"},
+                    {"ticket": "SAMPLE-2", "status": "waiting", "waiting_on": "review"},
+                    {"ticket": "SAMPLE-1", "status": "running", "waiting_on": "none"},
+                    {"ticket": "SAMPLE-3", "status": "completed", "outcome": "parked", "waiting_on": "human"},
+                    {"ticket": "SAMPLE-4", "status": "failed", "waiting_on": "none"},
                 ],
             },
             clock=lambda: 135.0,
@@ -42,11 +42,11 @@ def test_heartbeat_captures_active_fleet_and_console_renders_idle_duration() -> 
         return event, output
 
     event, output = run(scenario())
-    assert [run.ticket for run in event.active_runs] == ["HAN-1", "HAN-2", "HAN-9", "HAN-3"]
+    assert [run.ticket for run in event.active_runs] == ["SAMPLE-1", "SAMPLE-2", "SAMPLE-9", "SAMPLE-3"]
     assert output == [
-        "Harbor: heartbeat · Bookgen · RUNNING · healthy · "
-        "fleet=HAN-1 running waiting_on=none; HAN-2 waiting waiting_on=review; "
-        "HAN-9 blocked waiting_on=human; HAN-3 parked waiting_on=human · idle=45s"
+        "Harbor: heartbeat · SampleProject · RUNNING · healthy · "
+        "fleet=SAMPLE-1 running waiting_on=none; SAMPLE-2 waiting waiting_on=review; "
+        "SAMPLE-9 blocked waiting_on=human; SAMPLE-3 parked waiting_on=human · idle=45s"
     ]
 
 
@@ -55,12 +55,12 @@ def test_heartbeat_console_reports_idle_and_sanitizes_untrusted_facts() -> None:
         output: list[str] = []
         console = Console(_Supervisor(), output=output.append)
         event = SimpleNamespace(
-            project="Bookgen\nforged",
+            project="SampleProject\nforged",
             lifecycle="PAUSED\tmode",
             healthy=False,
             active_runs=[
-                {"ticket": "HAN-42\n", "status": "waiting", "waiting_on": "human\x1b[31m"},
-                {"ticket": "HAN-99", "status": "completed"},
+                {"ticket": "SAMPLE-42\n", "status": "waiting", "waiting_on": "human\x1b[31m"},
+                {"ticket": "SAMPLE-99", "status": "completed"},
             ],
             idle_seconds=0,
             last_activity=None,
@@ -69,6 +69,6 @@ def test_heartbeat_console_reports_idle_and_sanitizes_untrusted_facts() -> None:
         return output
 
     assert run(scenario()) == [
-        "Harbor: heartbeat · Bookgen forged · PAUSED mode · unavailable · "
-        "fleet=HAN-42 waiting waiting_on=human [31m · last_activity=unknown"
+        "Harbor: heartbeat · SampleProject forged · PAUSED mode · unavailable · "
+        "fleet=SAMPLE-42 waiting waiting_on=human [31m · last_activity=unknown"
     ]

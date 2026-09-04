@@ -1,6 +1,7 @@
 # Harbor pipeline profile
 
-Edit this file in the project repository. Values are data only. Harbor keeps
+Copy this file for SampleProject and replace every placeholder before running
+`harbor doctor`. Values are data only. Harbor keeps
 `skill` opaque: the configured runner owns how that skill is loaded and
 executed. Unknown keys remain available to the delivery skill.
 
@@ -16,8 +17,8 @@ deadline_minutes: 90
 
 ## Scope
 
-linear_project_slug: hanzireader-06c91e632f50
-linear_team: HAN
+linear_project_slug: sample-project-<slug>
+linear_team: SAMPLE
 poll_states: [Todo, In Progress, In Review, Blocked, Human Review]
 dispatch_states: [Todo]
 hold: true # shadow hold: retain the hold gate without external mutations
@@ -28,7 +29,7 @@ heartbeat_seconds: 60
 ## Git and GitHub facts (read-only)
 
 base_branch: main
-worktree_root: ~/.harbor/worktrees/Bookgen
-github_repository: keithlee/Bookgen
+worktree_root: ~/.harbor/worktrees/SampleProject
+github_repository: example/SampleProject # optional; remove for Linear-only supervision
 required_checks: [CI]
 bot_rework_cap: 1

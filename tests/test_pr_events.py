@@ -406,16 +406,16 @@ def test_pending_recovery_delivers_only_current_project_ticket_and_pr(tmp_path) 
     target_source = {**foreign_source, "id": "issue-34"}
     foreign_facts = {**pr(), "comments": [foreign_source]}
     target_facts = {**pr(), "number": 34, "comments": [target_source]}
-    foreign.observe({"identifier": "HAN-7"}, foreign_facts)
-    processor.observe({"identifier": "HAN-34"}, target_facts)
+    foreign.observe({"identifier": "SAMPLE-7"}, foreign_facts)
+    processor.observe({"identifier": "SAMPLE-34"}, target_facts)
 
     delivered_tickets: list[str] = []
 
     class ScopedDispatcher:
         async def handle_pr_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
-            # An unscoped recovery query would offer the older HAN-7 row here,
+            # An unscoped recovery query would offer the older SAMPLE-7 row here,
             # just as TicketScope would reject it in the supervisor.
-            if event["ticket"] != "HAN-34":
+            if event["ticket"] != "SAMPLE-34":
                 raise RuntimeError("outside invocation scope")
             delivered_tickets.append(event["ticket"])
             if event["event_type"] == PR_CREATED:
@@ -424,23 +424,23 @@ def test_pending_recovery_delivers_only_current_project_ticket_and_pr(tmp_path) 
 
     delivered = run(
         processor.process(
-            {"identifier": "HAN-34"},
+            {"identifier": "SAMPLE-34"},
             target_facts,
             builder=ScopedDispatcher(),
         )
     )
 
     assert delivered
-    assert delivered_tickets == ["HAN-34"] * len(delivered)
-    assert {item["ticket"] for item in delivered} == {"HAN-34"}
+    assert delivered_tickets == ["SAMPLE-34"] * len(delivered)
+    assert {item["ticket"] for item in delivered} == {"SAMPLE-34"}
     rows = db.connection.execute(
         "SELECT project, ticket, pr_number, offered FROM github_pr_events ORDER BY id"
     ).fetchall()
     assert [(row[0], row[1], row[2], row[3]) for row in rows] == [
-        ("other", "HAN-7", 7, 0),
-        ("other", "HAN-7", 7, 0),
-        ("demo", "HAN-34", 34, 1),
-        ("demo", "HAN-34", 34, 1),
+        ("other", "SAMPLE-7", 7, 0),
+        ("other", "SAMPLE-7", 7, 0),
+        ("demo", "SAMPLE-34", 34, 1),
+        ("demo", "SAMPLE-34", 34, 1),
     ]
     db.close()
 

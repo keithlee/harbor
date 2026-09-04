@@ -19,8 +19,8 @@ def run(value: Any) -> Any:
 
 
 class FakePoller:
-    project_name = "Bookgen"
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", heartbeat_seconds=1)
+    project_name = "SampleProject"
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", heartbeat_seconds=1)
 
     def __init__(self) -> None:
         self.calls = 0
@@ -28,7 +28,7 @@ class FakePoller:
     async def poll(self) -> PollResult:
         self.calls += 1
         ticket = {
-            "identifier": "HAN-42",
+            "identifier": "SAMPLE-42",
             "title": "A ticket",
             "state": "In Progress",
             "owned": True,
@@ -52,7 +52,7 @@ class FakeRunner:
 def test_pipeline_and_registry_are_human_editable(tmp_path: Path, monkeypatch: Any) -> None:
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text(
-        """# Pipeline\n\n| role | model | reasoning_effort |\n| --- | --- | --- |\n| builder | custom-builder | high |\n| firstmate | custom-terra | medium |\nheartbeat_seconds: 7\n""",
+        """# Pipeline\n\n| role | model | reasoning_effort |\n| --- | --- | --- |\n| builder | custom-builder | high |\n| firstmate | custom-terra | medium |\nheartbeat_seconds: 7\nlinear_project_slug: demo-abc123\nlinear_team: DEMO\n""",
         encoding="utf-8",
     )
     registry = tmp_path / "projects.md"
@@ -95,7 +95,7 @@ def test_plain_question_refreshes_once_and_calls_first_mate_once() -> None:
     assert len(calls) == 1
     assert poll_count == 1
     assert responses == 1
-    assert "HAN-42" in calls[0]
+    assert "SAMPLE-42" in calls[0]
 
 
 def test_heartbeat_publishes_without_waking_first_mate() -> None:
@@ -103,9 +103,9 @@ def test_heartbeat_publishes_without_waking_first_mate() -> None:
         published: list[object] = []
         model_calls: list[object] = []
         heartbeat = Heartbeat(
-            "Bookgen",
+            "SampleProject",
             interval_seconds=1,
-            status_provider=lambda: {"project": "Bookgen", "lifecycle": "RUNNING", "linear_healthy": True},
+            status_provider=lambda: {"project": "SampleProject", "lifecycle": "RUNNING", "linear_healthy": True},
             publisher=published.append,
         )
         await heartbeat.tick()
@@ -178,13 +178,13 @@ def test_blocked_builder_final_routes_to_ladder_and_status_shows_escalation() ->
     seen, digest = run(scenario())
     assert len(seen) == 1
     assert seen[0][1]["id"] == "run-42"
-    assert "HAN-42" in digest
+    assert "SAMPLE-42" in digest
 
 
 def test_answer_command_records_citation_and_resumes_same_session(tmp_path: Path) -> None:
     async def scenario() -> str:
         db = HarborDB(tmp_path / "answer.db")
-        db.record_escalation("HAN-42", "run-42", "ambiguous_ac", "Which cache?", 2)
+        db.record_escalation("SAMPLE-42", "run-42", "ambiguous_ac", "Which cache?", 2)
         resumed: list[tuple[str, str]] = []
 
         class Runner:

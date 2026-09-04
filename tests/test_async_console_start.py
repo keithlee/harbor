@@ -14,12 +14,12 @@ from harbor.worktree import DiskFloor
 
 
 class BlockingTodoPoller:
-    project_name = "Bookgen"
+    project_name = "SampleProject"
 
     def __init__(self) -> None:
         self.config = ProjectConfig(
-            name="Bookgen",
-            linear_project_slug="hanzireader",
+            name="SampleProject",
+            linear_project_slug="sample-project",
             poll_interval_seconds=60,
             heartbeat_seconds=0.001,
         )
@@ -28,7 +28,7 @@ class BlockingTodoPoller:
     async def poll(self) -> PollResult:
         self.calls += 1
         ticket = {
-            "identifier": "HAN-async",
+            "identifier": "SAMPLE-async",
             "title": "A long-running test ticket",
             "state": "Todo",
             "pr_urls": [],
@@ -74,7 +74,7 @@ def test_console_is_available_while_initial_dispatch_and_heartbeat_run() -> None
             # The runner is deliberately blocked.  A same-terminal status
             # query must still complete while it is in flight.
             response = await console.handle_command("/status")
-            assert "HAN-async" in response
+            assert "SAMPLE-async" in response
 
             # A second poll sees the same Todo ticket but must not start a
             # second builder while the first dispatch is active.
@@ -146,12 +146,12 @@ def test_immediate_exit_marks_queued_dispatch_restartable(tmp_path) -> None:
     async def scenario() -> tuple[str, Wake | None]:
         db = HarborDB(tmp_path / "harbor.sqlite")
         db.replace_tickets(
-            "Bookgen",
-            [{"identifier": "HAN-async", "title": "Queued", "state": "Todo", "owned": False, "hold": False}],
+            "SampleProject",
+            [{"identifier": "SAMPLE-async", "title": "Queued", "state": "Todo", "owned": False, "hold": False}],
             emit_events=False,
         )
         decider = WakeDecider(db)
-        ticket = db.tickets("Bookgen")[0]
+        ticket = db.tickets("SampleProject")[0]
         first = decider.decide(ticket)
         assert first is not None
 
@@ -162,8 +162,8 @@ def test_immediate_exit_marks_queued_dispatch_restartable(tmp_path) -> None:
         supervisor._schedule_wake(first)  # type: ignore[attr-defined]
         await supervisor.exit()
 
-        row = db.queue_item(idem_key="HAN-async@build")
-        restarted = WakeDecider(db).decide(db.tickets("Bookgen")[0])
+        row = db.queue_item(idem_key="SAMPLE-async@build")
+        restarted = WakeDecider(db).decide(db.tickets("SampleProject")[0])
         state = str(row["status"] if row else "missing")
         db.close()
         return state, restarted
@@ -171,16 +171,16 @@ def test_immediate_exit_marks_queued_dispatch_restartable(tmp_path) -> None:
     state, restarted = asyncio.run(scenario())
     assert state == "stopped"
     assert restarted is not None
-    assert restarted.idem_key == "HAN-async@build"
+    assert restarted.idem_key == "SAMPLE-async@build"
 
 
 class RetryTodoPoller:
-    project_name = "Bookgen"
+    project_name = "SampleProject"
 
     def __init__(self) -> None:
         self.config = ProjectConfig(
             name=self.project_name,
-            linear_project_slug="hanzireader",
+            linear_project_slug="sample-project",
             poll_interval_seconds=60,
             heartbeat_seconds=60,
         )
@@ -189,7 +189,7 @@ class RetryTodoPoller:
     async def poll(self) -> PollResult:
         self.calls += 1
         ticket = {
-            "identifier": "HAN-34",
+            "identifier": "SAMPLE-34",
             "title": "Retry a pre-run dispatch",
             "state": "Todo",
             "pr_urls": [],
@@ -232,8 +232,8 @@ def test_pre_run_dispatch_failure_is_a_restartable_failed_queue_receipt(tmp_path
     async def scenario() -> tuple[dict[str, Any], dict[str, Any], int, int, int]:
         db = HarborDB(tmp_path / "harbor.sqlite")
         db.replace_tickets(
-            "Bookgen",
-            [{"identifier": "HAN-34", "title": "Retry", "state": "Todo", "hold": False}],
+            "SampleProject",
+            [{"identifier": "SAMPLE-34", "title": "Retry", "state": "Todo", "hold": False}],
             emit_events=False,
         )
 
@@ -242,7 +242,7 @@ def test_pre_run_dispatch_failure_is_a_restartable_failed_queue_receipt(tmp_path
             first_manager,
             lambda path, wake: RecordingRunner(),
             db=db,
-            project="Bookgen",
+            project="SampleProject",
         )
         first = Supervisor(
             RetryTodoPoller(),
@@ -252,7 +252,7 @@ def test_pre_run_dispatch_failure_is_a_restartable_failed_queue_receipt(tmp_path
         )
         await first.start()
         await settle(first)
-        first_row = db.queue_item(idem_key="HAN-34@build")
+        first_row = db.queue_item(idem_key="SAMPLE-34@build")
         assert first_row is not None
 
         # Restart with a healthy worktree manager.  The old failed row remains
@@ -263,7 +263,7 @@ def test_pre_run_dispatch_failure_is_a_restartable_failed_queue_receipt(tmp_path
             second_manager,
             lambda path, wake: RecordingRunner(),
             db=db,
-            project="Bookgen",
+            project="SampleProject",
         )
         second = Supervisor(
             RetryTodoPoller(),
@@ -276,12 +276,12 @@ def test_pre_run_dispatch_failure_is_a_restartable_failed_queue_receipt(tmp_path
         await second.poll_once()
 
         rows = db.connection.execute(
-            "SELECT status, error FROM work_queue WHERE ticket = 'HAN-34' ORDER BY id"
+            "SELECT status, error FROM work_queue WHERE ticket = 'SAMPLE-34' ORDER BY id"
         ).fetchall()
         owner = db.connection.execute(
-            "SELECT owned FROM tickets WHERE identifier = 'HAN-34'"
+            "SELECT owned FROM tickets WHERE identifier = 'SAMPLE-34'"
         ).fetchone()
-        runner = second_dispatcher.runners["HAN-34"]
+        runner = second_dispatcher.runners["SAMPLE-34"]
         await first.exit()
         await second.exit()
         db.close()

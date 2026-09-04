@@ -27,7 +27,7 @@ MUTATION_WORDS = re.compile(
 
 
 def test_the_query_builder_emits_only_a_query() -> None:
-    query = build_pull_requests_query("keithlee", "Bookgen", [217, 221])
+    query = build_pull_requests_query("example", "SampleProject", [217, 221])
     assert query.lstrip().startswith("query ")
     assert "mutation" not in query.lower()
 
@@ -59,7 +59,7 @@ def test_a_full_poll_sends_only_queries_over_the_wire() -> None:
     async def scenario() -> None:
         client = GitHubClient(token="k", transport=httpx.MockTransport(handler))
         try:
-            await client.pull_requests("keithlee", "Bookgen", [217, 218, 221])
+            await client.pull_requests("example", "SampleProject", [217, 218, 221])
         finally:
             await client.close()
 

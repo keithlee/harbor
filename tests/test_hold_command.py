@@ -19,10 +19,10 @@ def run(coro):
 
 def _issue(title: str = "A ticket", updated_at: str = "2026-09-03T20:00:00Z") -> dict:
     return {
-        "id": "linear-han-42",
-        "identifier": "HAN-42",
+        "id": "linear-sample-42",
+        "identifier": "SAMPLE-42",
         "title": title,
-        "url": "https://linear.app/hanzireader/issue/HAN-42",
+        "url": "https://linear.app/sample-project/issue/SAMPLE-42",
         "updatedAt": updated_at,
         "state": {"name": "Todo", "type": "backlog"},
         "attachments": {"nodes": []},
@@ -36,8 +36,8 @@ def _console(tmp_path: Path, nodes: list[dict]) -> tuple[Console, Supervisor, Ha
         return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
 
     config = ProjectConfig(
-        name="Bookgen",
-        linear_project_slug="hanzireader",
+        name="SampleProject",
+        linear_project_slug="sample-project",
         repo_path=tmp_path,
         poll_interval_seconds=3600,
     )
@@ -51,11 +51,11 @@ def test_hold_on_and_off_are_ticket_scoped_and_do_not_pause(tmp_path: Path) -> N
     console, supervisor, db, client = _console(tmp_path, [_issue()])
     try:
         run(supervisor.poll_once())
-        assert run(console.handle_command("/hold off HAN-42")) == "Harbor: HOLD OFF · HAN-42"
-        assert db.tickets("Bookgen")[0]["hold"] is False
+        assert run(console.handle_command("/hold off SAMPLE-42")) == "Harbor: HOLD OFF · SAMPLE-42"
+        assert db.tickets("SampleProject")[0]["hold"] is False
         assert supervisor.lifecycle == Lifecycle.STOPPED
-        assert run(console.handle_command("/hold on HAN-42")) == "Harbor: HOLD ON · HAN-42"
-        assert db.tickets("Bookgen")[0]["hold"] is True
+        assert run(console.handle_command("/hold on SAMPLE-42")) == "Harbor: HOLD ON · SAMPLE-42"
+        assert db.tickets("SampleProject")[0]["hold"] is True
         assert supervisor.lifecycle == Lifecycle.STOPPED
     finally:
         run(supervisor.exit())
@@ -67,9 +67,9 @@ def test_hold_rejects_invalid_syntax_without_mutating_the_ticket(tmp_path: Path)
     console, supervisor, db, client = _console(tmp_path, [_issue()])
     try:
         run(supervisor.poll_once())
-        for command in ("/hold", "/hold maybe HAN-42", "/hold off", "/hold off HAN-42 extra"):
+        for command in ("/hold", "/hold maybe SAMPLE-42", "/hold off", "/hold off SAMPLE-42 extra"):
             assert run(console.handle_command(command)) == "Usage: /hold on|off <ticket>"
-        assert db.tickets("Bookgen")[0]["hold"] is True
+        assert db.tickets("SampleProject")[0]["hold"] is True
     finally:
         run(supervisor.exit())
         run(client.close())
@@ -80,8 +80,8 @@ def test_hold_rejects_an_unknown_ticket(tmp_path: Path) -> None:
     console, supervisor, db, client = _console(tmp_path, [_issue()])
     try:
         run(supervisor.poll_once())
-        assert run(console.handle_command("/hold off HAN-999")) == "Harbor: unknown ticket · HAN-999"
-        assert db.tickets("Bookgen")[0]["hold"] is True
+        assert run(console.handle_command("/hold off SAMPLE-999")) == "Harbor: unknown ticket · SAMPLE-999"
+        assert db.tickets("SampleProject")[0]["hold"] is True
     finally:
         run(supervisor.exit())
         run(client.close())
@@ -93,7 +93,7 @@ def test_hold_persists_across_a_changed_linear_poll(tmp_path: Path) -> None:
     console, supervisor, db, client = _console(tmp_path, nodes)
     try:
         run(supervisor.poll_once())
-        assert run(console.handle_command("/hold off HAN-42")) == "Harbor: HOLD OFF · HAN-42"
+        assert run(console.handle_command("/hold off SAMPLE-42")) == "Harbor: HOLD OFF · SAMPLE-42"
 
         # A changed remote observation exercises the normal upsert path.  The
         # poller must preserve Harbor's local hold instead of Linear's default.
@@ -103,7 +103,7 @@ def test_hold_persists_across_a_changed_linear_poll(tmp_path: Path) -> None:
         assert result.changed is True
         assert result.tickets[0]["hold"] is False
         assert supervisor.status().tickets[0]["hold"] is False
-        assert db.tickets("Bookgen")[0]["hold"] is False
+        assert db.tickets("SampleProject")[0]["hold"] is False
     finally:
         run(supervisor.exit())
         run(client.close())

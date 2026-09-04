@@ -23,11 +23,11 @@ from harbor.supervisor import Supervisor
 class TodoPoller:
     """One Todo ticket, which a live supervisor would dispatch."""
 
-    project_name = "Bookgen"
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", heartbeat_seconds=1)
+    project_name = "SampleProject"
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", heartbeat_seconds=1)
 
     async def poll(self) -> PollResult:
-        ticket = {"identifier": "HAN-42", "title": "A ticket", "state": "Todo", "pr_urls": []}
+        ticket = {"identifier": "SAMPLE-42", "title": "A ticket", "state": "Todo", "pr_urls": []}
         return PollResult((ticket,), "snapshot-1", True, (ticket,))
 
 
@@ -57,9 +57,9 @@ class ShadowLinearClient:
 
 def test_parser_exposes_facts_shadow_and_answer() -> None:
     parser = build_parser()
-    assert parser.parse_args(["facts", "Bookgen", "--json"]).json is True
-    assert parser.parse_args(["start", "Bookgen", "--shadow"]).shadow is True
-    answer = parser.parse_args(["answer", "7", "Keith", "owns", "it", "--project", "Bookgen"])
+    assert parser.parse_args(["facts", "SampleProject", "--json"]).json is True
+    assert parser.parse_args(["start", "SampleProject", "--shadow"]).shadow is True
+    answer = parser.parse_args(["answer", "7", "Keith", "owns", "it", "--project", "SampleProject"])
     assert answer.escalation == "7"
     assert " ".join(answer.text) == "Keith owns it"
 
@@ -67,14 +67,14 @@ def test_parser_exposes_facts_shadow_and_answer() -> None:
 def test_shadow_start_prints_observed_ticket_digest_without_dispatch(monkeypatch, tmp_path: Path, capsys) -> None:
     node = {
         "id": "linear-id-42",
-        "identifier": "HAN-42",
+        "identifier": "SAMPLE-42",
         "title": "A ticket",
         "state": {"name": "Todo", "type": "backlog"},
         "attachments": {"nodes": []},
         "comments": {"nodes": []},
         "inverseRelations": {"nodes": []},
     }
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = ShadowLinearClient([node])
     dispatcher = RecordingDispatcher()
     monkeypatch.setattr(cli, "get_project", lambda _: config)
@@ -82,7 +82,7 @@ def test_shadow_start_prints_observed_ticket_digest_without_dispatch(monkeypatch
 
     result = asyncio.run(
         cli._start(
-            "Bookgen",
+            "SampleProject",
             shadow=True,
             linear_client=client,
             dispatcher=dispatcher,
@@ -95,8 +95,8 @@ def test_shadow_start_prints_observed_ticket_digest_without_dispatch(monkeypatch
     output = capsys.readouterr().out
     assert result == 0
     assert "(shadow mode)" in output
-    assert "Harbor: RUNNING · Bookgen · Linear healthy\nHAN-42 (observed)  Todo  A ticket" in output
-    assert "WOULD WAKE build HAN-42 · idem_key=HAN-42@build" in output
+    assert "Harbor: RUNNING · SampleProject · Linear healthy\nSAMPLE-42 (observed)  Todo  A ticket" in output
+    assert "WOULD WAKE build SAMPLE-42 · idem_key=SAMPLE-42@build" in output
     assert dispatcher.calls == []
     assert len(client.fetches) == 1
 
@@ -108,7 +108,7 @@ def test_shadow_decides_a_build_but_never_dispatches() -> None:
         await supervisor.poll_once()
         assert dispatcher.calls == []
         assert [w.action for w in supervisor.shadow_wakes] == ["build"]
-        assert supervisor.shadow_wakes[0].idem_key == "HAN-42@build"
+        assert supervisor.shadow_wakes[0].idem_key == "SAMPLE-42@build"
 
     asyncio.run(scenario())
 
@@ -138,7 +138,7 @@ def test_two_shadow_cycles_produce_identical_decisions() -> None:
         second = [(w.action, w.idem_key) for w in supervisor.shadow_wakes]
         # The decider's shadow ledger makes the second cycle a no-op.
         assert second == []
-        assert first == [("build", "HAN-42@build")]
+        assert first == [("build", "SAMPLE-42@build")]
 
     asyncio.run(scenario())
 
@@ -154,7 +154,7 @@ def test_shadow_does_not_deliver_pr_events() -> None:
     async def scenario() -> None:
         processor = Processor()
         supervisor = Supervisor(TodoPoller(), shadow=True, pr_event_processor=processor)
-        await supervisor._process_pr_events({"identifier": "HAN-42"}, {"prs": [{"number": 1}]})
+        await supervisor._process_pr_events({"identifier": "SAMPLE-42"}, {"prs": [{"number": 1}]})
         assert processor.calls == 0
 
     asyncio.run(scenario())
@@ -168,7 +168,7 @@ def test_answer_requires_a_citation() -> None:
             return None
 
         def escalations(self) -> list[dict[str, Any]]:
-            return [{"id": "7", "kind": "product_decision", "question": "Who owns it?", "ticket": "HAN-42"}]
+            return [{"id": "7", "kind": "product_decision", "question": "Who owns it?", "ticket": "SAMPLE-42"}]
 
         def record_resolution(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise AssertionError("must not record an uncited answer")
@@ -192,7 +192,7 @@ def test_answer_records_a_cited_resolution() -> None:
             return None
 
         def escalations(self) -> list[dict[str, Any]]:
-            return [{"id": "7", "kind": "product_decision", "question": "Who owns it?", "ticket": "HAN-42"}]
+            return [{"id": "7", "kind": "product_decision", "question": "Who owns it?", "ticket": "SAMPLE-42"}]
 
         def record_resolution(self, kind: str, question: str, answer: str, citation: str, **kwargs: Any) -> int:
             self.recorded.append((kind, question, answer, citation))

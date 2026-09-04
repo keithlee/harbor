@@ -101,7 +101,7 @@ def test_codex_start_resume_schema_and_persistent_session(tmp_path: Path) -> Non
         worktree.mkdir()
         runner = CodexRunner(
             worktree,
-            ticket="HAN-42",
+            ticket="SAMPLE-42",
             executable=str(fake_codex(tmp_path)),
             db=runs_db(),
             deadline_seconds=5,
@@ -137,7 +137,7 @@ def test_event_stream_touches_activity_without_agent_calls(tmp_path: Path) -> No
         store = Store(connection)
         worktree = tmp_path / "wt"
         worktree.mkdir()
-        runner = CodexRunner(worktree, ticket="HAN-42", executable=str(slow_codex(tmp_path)), db=store, deadline_seconds=5)
+        runner = CodexRunner(worktree, ticket="SAMPLE-42", executable=str(slow_codex(tmp_path)), db=store, deadline_seconds=5)
         result = await runner.start("build")
         assert result.status == "completed"
         assert store.touches >= 2
@@ -203,7 +203,7 @@ def test_deadline_suspends_while_paused() -> None:
 
 def test_restart_reaps_tracked_run() -> None:
     connection = runs_db()
-    connection.execute("INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES ('run-1', 'HAN-42', 'builder', 'running', 999999, 999999)")
+    connection.execute("INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES ('run-1', 'SAMPLE-42', 'builder', 'running', 999999, 999999)")
     connection.commit()
     orphaned = asyncio.run(reap_orphan_runs(connection))
     assert orphaned == ["run-1"]
@@ -273,7 +273,7 @@ def test_restart_terminates_a_still_live_process_group() -> None:
         connection = runs_db()
         connection.execute(
             "INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES (?, ?, ?, ?, ?, ?)",
-            ("run-live", "HAN-42", "builder", "running", child.pid, pgid),
+            ("run-live", "SAMPLE-42", "builder", "running", child.pid, pgid),
         )
         connection.commit()
 
@@ -305,10 +305,10 @@ def test_an_orphaned_run_does_not_cause_a_second_dispatch() -> None:
         "CREATE TABLE tickets (identifier TEXT PRIMARY KEY, owned INTEGER DEFAULT 0, "
         "hold INTEGER DEFAULT 1, bot_rework_rounds INTEGER DEFAULT 0)"
     )
-    connection.execute("INSERT INTO tickets(identifier, owned) VALUES ('HAN-42', 1)")
+    connection.execute("INSERT INTO tickets(identifier, owned) VALUES ('SAMPLE-42', 1)")
     connection.execute(
         "INSERT INTO runs(id, ticket, role, status, pid, pgid) VALUES "
-        "('run-1', 'HAN-42', 'builder', 'running', 999999, 999999)"
+        "('run-1', 'SAMPLE-42', 'builder', 'running', 999999, 999999)"
     )
     connection.commit()
     apply_phase3_migration(connection)
@@ -320,7 +320,7 @@ def test_an_orphaned_run_does_not_cause_a_second_dispatch() -> None:
     # owned ticket must not be rebuilt from scratch behind the operator's back.
     decider = WakeDecider(connection, shadow=True)
     wake = decider.decide(
-        {"identifier": "HAN-42", "state": "In Progress", "owned": True},
+        {"identifier": "SAMPLE-42", "state": "In Progress", "owned": True},
         {"prs": [{"number": 1, "head_sha": "abc", "merged": False}], "head_sha": "abc", "threads": []},
     )
     assert wake is None, f"an orphaned run must not produce a second dispatch, got {wake}"

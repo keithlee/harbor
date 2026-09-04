@@ -21,7 +21,7 @@ def run(awaitable):
 
 
 def ticket(**extra):
-    value = {"identifier": "HAN-42", "id": "linear-42", "title": "Blocked", "state": "In Progress"}
+    value = {"identifier": "SAMPLE-42", "id": "linear-42", "title": "Blocked", "state": "In Progress"}
     value.update(extra)
     return value
 
@@ -175,8 +175,8 @@ def test_empty_resolution_citation_is_rejected(tmp_path: Path):
 def test_third_same_kind_block_parks_after_two_rung_one_answers(tmp_path: Path):
     db = HarborDB(tmp_path / "harbor.db")
     linear = LinearFake()
-    db.record_escalation("HAN-42", "one", "env_blocker", "q1", 1, citation="AGENTS.md:1", answer="a")
-    db.record_escalation("HAN-42", "two", "env_blocker", "q2", 1, citation="AGENTS.md:2", answer="a")
+    db.record_escalation("SAMPLE-42", "one", "env_blocker", "q1", 1, citation="AGENTS.md:1", answer="a")
+    db.record_escalation("SAMPLE-42", "two", "env_blocker", "q2", 1, citation="AGENTS.md:2", answer="a")
     try:
         result = run(
             UnblockLadder(db, linear=linear, remediation_executor=lambda command: False).handle(
@@ -196,7 +196,7 @@ def test_resolution_is_reused_at_rung_one_without_terra(tmp_path: Path):
         "Which cache?",
         "Use local cache.",
         "resolutions#7",
-        source_ticket="HAN-41",
+        source_ticket="SAMPLE-41",
     )
     calls = []
 
@@ -222,9 +222,9 @@ def test_resolution_is_reused_at_rung_one_without_terra(tmp_path: Path):
 
 
 def test_merge_model_is_a_builder_command_not_a_harbor_write():
-    held = model_merge_outcome("low", True, ticket="HAN-42")
-    free = model_merge_outcome("low", False, ticket="HAN-42")
-    high = model_merge_outcome("high", False, ticket="HAN-42")
+    held = model_merge_outcome("low", True, ticket="SAMPLE-42")
+    free = model_merge_outcome("low", False, ticket="SAMPLE-42")
+    high = model_merge_outcome("high", False, ticket="SAMPLE-42")
     assert held.outcome == "parked" and held.waiting_on == "human" and held.command.action == "park"
     assert free.outcome == "merged" and free.command.action == "merge"
     assert high.outcome == "parked" and high.command.action == "park"
@@ -324,11 +324,11 @@ def test_ticket_c_cites_ticket_bs_resolution_and_pages_nobody():
         db = HarborDB(":memory:")
         try:
             if seed:
-                db.record_resolution("product_decision", question, "Keith owns it.", "AGENTS.md:12", source_ticket="HAN-B")
+                db.record_resolution("product_decision", question, "Keith owns it.", "AGENTS.md:12", source_ticket="SAMPLE-B")
             terra, pager = Terra(), Pager()
             ladder = UnblockLadder(db, linear=None, first_mate=terra, notifier=pager, repo_path=".")
             result = await ladder.handle(
-                {"identifier": "HAN-C", "id": "uuid-c"},
+                {"identifier": "SAMPLE-C", "id": "uuid-c"},
                 {"id": "builder-c"},
                 {"status": "blocked", "summary": "s",
                  "blocker": {"kind": "product_decision", "question": question}},
@@ -368,10 +368,10 @@ def test_a_protected_path_is_never_auto_resolved_even_with_a_stored_answer():
     async def exercise():
         db = HarborDB(":memory:")
         try:
-            db.record_resolution("product_decision", question, "Yes, go ahead.", "AGENTS.md:1", source_ticket="HAN-B")
+            db.record_resolution("product_decision", question, "Yes, go ahead.", "AGENTS.md:1", source_ticket="SAMPLE-B")
             ladder = UnblockLadder(db, linear=None, notifier=None, repo_path=".", protected_paths=("deploy/",))
             return await ladder.handle(
-                {"identifier": "HAN-P"}, {"id": "b"},
+                {"identifier": "SAMPLE-P"}, {"id": "b"},
                 {"status": "blocked", "summary": "s",
                  "blocker": {"kind": "product_decision", "question": question,
                              "paths": ["deploy/prod.yml"]}},

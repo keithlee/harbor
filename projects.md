@@ -1,10 +1,10 @@
-# Harbor projects
+# Harbor projects example
 
-This registry is intentionally human-editable. Add one row per project; paths
-may use `~` or environment variables. Every runnable project must point at its
-live `.harbor/pipeline.md`; Harbor fails closed with the expected path instead
-of silently reading `AGENTS.md`.
+This checked-in file is an empty format example, never a source of real user
+configuration. Create a private registry and select it with
+`HARBOR_PROJECTS_FILE`. Paths may use `~` or environment variables. Every
+runnable project must point at its live pipeline; Harbor fails closed instead
+of silently reading `AGENTS.md` or inheriting another product's identity.
 
-| name | repo_path | pipeline_path | linear_project_slug | github_repository | base_branch |
-| --- | --- | --- | --- | --- | --- |
-| Bookgen | ~/Projects/Bookgen | ~/Projects/Bookgen/.harbor/pipeline.md | hanzireader-06c91e632f50 | keithlee/Bookgen | main |
+| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository | base_branch |
+| --- | --- | --- | --- | --- | --- | --- |

@@ -13,13 +13,13 @@ from harbor.supervisor import Supervisor, WorktreeDispatcher
 from harbor.wake import apply_phase3_migration
 
 
-def _db(tmp_path: Path, ticket: str = "HAN-35") -> HarborDB:
+def _db(tmp_path: Path, ticket: str = "SAMPLE-35") -> HarborDB:
     db = HarborDB(tmp_path / "harbor.db")
     apply_phase3_migration(db)
     apply_phase4_migration(db)
     apply_phase9_migration(db)
     db.replace_tickets(
-        "Bookgen",
+        "SampleProject",
         [{"identifier": ticket, "title": ticket, "state": "Todo"}],
         emit_events=False,
     )
@@ -27,7 +27,7 @@ def _db(tmp_path: Path, ticket: str = "HAN-35") -> HarborDB:
 
 
 class _Poller:
-    project_name = "Bookgen"
+    project_name = "SampleProject"
     config = SimpleNamespace(poll_interval_seconds=3600.0, hold_all=False)
 
     async def poll(self) -> Any:
@@ -42,7 +42,7 @@ def test_shadow_startup_does_not_reap_a_live_run(tmp_path: Path, monkeypatch: An
     db = _db(tmp_path)
     db.connection.execute(
         "INSERT INTO runs(id, ticket, role, status, pid, pgid) "
-        "VALUES ('run-35', 'HAN-35', 'builder', 'running', 123, 123)"
+        "VALUES ('run-35', 'SAMPLE-35', 'builder', 'running', 123, 123)"
     )
     db.connection.commit()
     calls: list[tuple[Any, ...]] = []
@@ -79,7 +79,7 @@ def test_reaper_compare_and_set_preserves_a_newer_result(tmp_path: Path, monkeyp
     db = _db(tmp_path)
     db.connection.execute(
         "INSERT INTO runs(id, ticket, role, status, pid, pgid) "
-        "VALUES ('run-race', 'HAN-35', 'builder', 'running', 123, 123)"
+        "VALUES ('run-race', 'SAMPLE-35', 'builder', 'running', 123, 123)"
     )
     db.connection.commit()
     signals: list[int] = []
@@ -123,7 +123,7 @@ def test_resume_session_uses_dispatcher_running_guard(tmp_path: Path) -> None:
     db = _db(tmp_path)
     db.connection.execute(
         "INSERT INTO runs(id, ticket, role, status, worktree) "
-        "VALUES ('run-answer', 'HAN-35', 'builder', 'running', ?)",
+        "VALUES ('run-answer', 'SAMPLE-35', 'builder', 'running', ?)",
         (str(tmp_path),),
     )
     db.connection.commit()
@@ -136,8 +136,8 @@ def test_resume_session_uses_dispatcher_running_guard(tmp_path: Path) -> None:
             resumed.append((run_id, instruction))
             return {"status": "waiting", "summary": "resumed"}
 
-    dispatcher = WorktreeDispatcher(object(), lambda *_: Runner(), db=db, project="Bookgen")
-    dispatcher.runners["HAN-35"] = Runner()
+    dispatcher = WorktreeDispatcher(object(), lambda *_: Runner(), db=db, project="SampleProject")
+    dispatcher.runners["SAMPLE-35"] = Runner()
     supervisor = Supervisor(_Poller(), db=db, dispatcher=dispatcher, shadow=True)
 
     try:
@@ -158,7 +158,7 @@ def test_resume_upsert_preserves_durable_run_fields(tmp_path: Path) -> None:
         "commit_sha, artifact_json) VALUES (?, ?, 'builder', 'waiting', ?, ?, ?, ?, ?)",
         (
             "run-upsert",
-            "HAN-35",
+            "SAMPLE-35",
             '{"status":"waiting","summary":"previous result"}',
             "2026-09-04T07:00:00+00:00",
             "2026-09-04T07:10:00+00:00",
@@ -171,7 +171,7 @@ def test_resume_upsert_preserves_durable_run_fields(tmp_path: Path) -> None:
         db,
         {
             "id": "run-upsert",
-            "ticket": "HAN-35",
+            "ticket": "SAMPLE-35",
             "role": "builder",
             "status": "running",
             "waiting_on": None,

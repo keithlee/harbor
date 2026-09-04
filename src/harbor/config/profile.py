@@ -20,7 +20,7 @@ def _split_list(value: str | Sequence[str] | None) -> tuple[str, ...]:
     """Split a data-only list value. Never eval, never YAML.
 
     Quote-aware, because a required check name legitimately contains a comma
-    -- Bookgen's is literally ``Lint, typecheck and test (root)``.  Splitting
+    -- SampleProject's is literally ``Lint, typecheck and test (root)``.  Splitting
     it naively yields two check names that can never both be SUCCESS, so CI is
     reported ``pending`` forever and no wake ever fires on green.
     """
@@ -165,23 +165,30 @@ class PipelineProfile:
     ) -> "PipelineProfile":
         defaults = defaults or {}
         values = _keys(text)
+        repository_default_keys = (
+            "github_repository",
+            "github_repo",
+            "repo",
+            "repository",
+        )
+        has_repository_default = any(key in defaults for key in repository_default_keys)
+        default_repository = next(
+            (str(defaults[key]) for key in repository_default_keys if defaults.get(key)),
+            "",
+        )
         repository = _first(
             values,
             "github_repository",
             "github_repo",
             "repository",
             "repo",
-        ) or str(
-            defaults.get("github_repository")
-            or defaults.get("github_repo")
-            or defaults.get("repo")
-            or defaults.get("repository")
-            or os.environ.get("GITHUB_REPOSITORY", "")
-        )
+        ) or default_repository
+        if not repository and not has_repository_default:
+            repository = os.environ.get("GITHUB_REPOSITORY", "")
         owner, repo = _repository_parts(repository)
-        owner = _first(values, "github_owner", "owner") or str(
-            defaults.get("github_owner") or os.environ.get("GITHUB_OWNER", "") or owner
-        )
+        owner = _first(values, "github_owner", "owner") or str(defaults.get("github_owner") or owner)
+        if not owner and not has_repository_default:
+            owner = os.environ.get("GITHUB_OWNER", "")
         repo = _first(values, "github_name", "repository_name", "repo_name") or str(
             defaults.get("github_name") or defaults.get("repository_name") or repo
         )

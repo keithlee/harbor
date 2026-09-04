@@ -17,8 +17,8 @@ from harbor.supervisor import Supervisor, Wake, WorktreeDispatcher
 
 
 class IdlePoller:
-    project_name = "Bookgen"
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", heartbeat_seconds=1)
+    project_name = "SampleProject"
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", heartbeat_seconds=1)
 
     async def poll(self) -> PollResult:
         return PollResult((), "snapshot-1", False, ())
@@ -44,9 +44,9 @@ class Manager:
 def supervisor_with(tmp_path: Path) -> tuple[Supervisor, Manager, WorktreeDispatcher]:
     manager = Manager(tmp_path / "wt")
     (tmp_path / "wt").mkdir(parents=True, exist_ok=True)
-    dispatcher = WorktreeDispatcher(manager, lambda wt, wake: object(), project="Bookgen")
-    dispatcher.worktrees["HAN-42"] = manager.create("HAN-42")
-    dispatcher.runners["HAN-42"] = object()
+    dispatcher = WorktreeDispatcher(manager, lambda wt, wake: object(), project="SampleProject")
+    dispatcher.worktrees["SAMPLE-42"] = manager.create("SAMPLE-42")
+    dispatcher.runners["SAMPLE-42"] = object()
     supervisor = Supervisor(IdlePoller(), dispatcher=dispatcher, worktree_manager=manager)
     return supervisor, manager, dispatcher
 
@@ -57,7 +57,7 @@ def wake(*, observed_merge: bool = True) -> Wake:
         if observed_merge
         else {}
     )
-    return Wake(ticket={"identifier": "HAN-42"}, action="reengage", facts=facts)
+    return Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage", facts=facts)
 
 
 MERGED = {
@@ -72,10 +72,10 @@ def test_a_verified_merge_removes_the_worktree(tmp_path: Path) -> None:
     async def scenario() -> None:
         supervisor, manager, dispatcher = supervisor_with(tmp_path)
         await supervisor._handle_runner_result(wake(), {**MERGED, "merge_verified": True})
-        assert manager.removed == [dispatcher.worktree_manager.path_for("HAN-42")]
+        assert manager.removed == [dispatcher.worktree_manager.path_for("SAMPLE-42")]
         # The retained session is released along with its worktree.
-        assert "HAN-42" not in dispatcher.runners
-        assert "HAN-42" not in dispatcher.worktrees
+        assert "SAMPLE-42" not in dispatcher.runners
+        assert "SAMPLE-42" not in dispatcher.worktrees
 
     asyncio.run(scenario())
 
@@ -87,7 +87,7 @@ def test_an_unverified_merge_claim_keeps_the_worktree(tmp_path: Path) -> None:
         supervisor, manager, dispatcher = supervisor_with(tmp_path)
         await supervisor._handle_runner_result(wake(observed_merge=False), {**MERGED, "merge_verified": False})
         assert manager.removed == []
-        assert "HAN-42" in dispatcher.runners
+        assert "SAMPLE-42" in dispatcher.runners
 
     asyncio.run(scenario())
 
@@ -104,11 +104,11 @@ def test_builder_true_merge_receipt_without_observed_fact_keeps_the_worktree(tmp
             "merge_commit_sha": "30f420dfe67be12ee76e3efc7acb80699eece557",
         }
         await supervisor._cleanup_merged_worktree(
-            Wake(ticket={"identifier": "HAN-42"}, action="reengage"),
+            Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage"),
             untrusted,
         )
         assert manager.removed == []
-        assert "HAN-42" in dispatcher.worktrees
+        assert "SAMPLE-42" in dispatcher.worktrees
 
     asyncio.run(scenario())
 
@@ -168,10 +168,10 @@ def test_pr_events_are_never_offered_for_an_unowned_ticket(tmp_path: Path) -> No
         supervisor = Supervisor(IdlePoller(), pr_event_processor=processor)
         facts = {"prs": [{"number": 217, "head_sha": "abc"}]}
 
-        await supervisor._process_pr_events({"identifier": "HAN-7"}, facts)
+        await supervisor._process_pr_events({"identifier": "SAMPLE-7"}, facts)
         assert processor.calls == [], "an observed-only ticket must not reach the builder"
 
-        await supervisor._process_pr_events({"identifier": "HAN-32", "owned": True}, facts)
-        assert processor.calls == ["HAN-32"], "an owned ticket must still be processed"
+        await supervisor._process_pr_events({"identifier": "SAMPLE-32", "owned": True}, facts)
+        assert processor.calls == ["SAMPLE-32"], "an owned ticket must still be processed"
 
     asyncio.run(scenario())

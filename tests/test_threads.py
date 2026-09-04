@@ -20,6 +20,6 @@ def test_threads_preserve_outdated_path_but_clear_line_and_identify_bot() -> Non
     assert [item["severity"] for item in result] == ["P1", "P2", "P2", "P2"]
     assert sum(item["outdated"] for item in result) == 3
     assert all(item["is_bot"] for item in result)
-    assert result[0]["path"] == "docs/specs/proof/han-29/live-web.md"
+    assert result[0]["path"] == "docs/specs/proof/sample-29/live-web.md"
     assert result[0]["line"] is None
     assert result[1]["line"] == 648

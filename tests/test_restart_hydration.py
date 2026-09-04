@@ -67,11 +67,11 @@ class Runner:
 def build(tmp_path: Path, status: str, *, worktree_exists: bool = True) -> tuple[WorktreeDispatcher, Ledger, Manager]:
     root = tmp_path / "wt"
     root.mkdir(parents=True, exist_ok=True)
-    worktree = root / "HAN-42"
+    worktree = root / "SAMPLE-42"
     if worktree_exists:
         worktree.mkdir(parents=True, exist_ok=True)
     ledger = Ledger()
-    ledger.add("run-1", "HAN-42", status, worktree)
+    ledger.add("run-1", "SAMPLE-42", status, worktree)
     manager = Manager(root)
     built: list[Runner] = []
 
@@ -80,13 +80,13 @@ def build(tmp_path: Path, status: str, *, worktree_exists: bool = True) -> tuple
         built.append(runner)
         return runner
 
-    dispatcher = WorktreeDispatcher(manager, factory, db=ledger, project="Bookgen")
+    dispatcher = WorktreeDispatcher(manager, factory, db=ledger, project="SampleProject")
     dispatcher._built = built  # type: ignore[attr-defined]
     return dispatcher, ledger, manager
 
 
 def reengage_wake() -> Wake:
-    return Wake(ticket={"identifier": "HAN-42"}, action="reengage", instruction="CI finished. Continue.")
+    return Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage", instruction="CI finished. Continue.")
 
 
 def test_resume_after_restart_rebuilds_the_same_session(tmp_path: Path) -> None:
@@ -97,7 +97,7 @@ def test_resume_after_restart_rebuilds_the_same_session(tmp_path: Path) -> None:
         result = await dispatcher.resume(reengage_wake())
 
         assert result is not None
-        runner = dispatcher.runners["HAN-42"]
+        runner = dispatcher.runners["SAMPLE-42"]
         assert runner.resumed == [("run-1", "CI finished. Continue.")]
         # The persisted run id is reused, so no second logical session exists.
         assert runner.default_run_id == "run-1"
@@ -129,13 +129,13 @@ def test_a_running_row_is_left_to_the_orphan_reap(tmp_path: Path) -> None:
 def test_an_in_memory_runner_is_not_resumed_while_its_run_row_is_running(tmp_path: Path) -> None:
     async def scenario() -> None:
         dispatcher, _, _ = build(tmp_path, "running")
-        runner = Runner(tmp_path / "wt" / "HAN-42", "run-1")
-        dispatcher.runners["HAN-42"] = runner
+        runner = Runner(tmp_path / "wt" / "SAMPLE-42", "run-1")
+        dispatcher.runners["SAMPLE-42"] = runner
         assert await dispatcher.resume(reengage_wake()) is None
         assert runner.resumed == []
         with pytest.raises(PREventError, match="still running"):
             await dispatcher.handle_pr_event(
-                {"ticket": "HAN-42", "instruction": "new review", "run_id": "run-1"}
+                {"ticket": "SAMPLE-42", "instruction": "new review", "run_id": "run-1"}
             )
         assert runner.resumed == []
 
@@ -170,17 +170,17 @@ def test_pr_event_cannot_enter_the_pre_ledger_row_dispatch_window(tmp_path: Path
         dispatcher = WorktreeDispatcher(manager, lambda worktree, wake: runner)
         build = asyncio.create_task(
             dispatcher.dispatch(
-                Wake(ticket={"identifier": "HAN-window"}, action="build", instruction="build")
+                Wake(ticket={"identifier": "SAMPLE-window"}, action="build", instruction="build")
             )
         )
         await asyncio.wait_for(started.wait(), timeout=1)
-        assert dispatcher.runners["HAN-window"] is runner
+        assert dispatcher.runners["SAMPLE-window"] is runner
         with pytest.raises(PREventError, match="already active"):
             await dispatcher.handle_pr_event(
-                {"ticket": "HAN-window", "run_id": "run-window", "instruction": "review"}
+                {"ticket": "SAMPLE-window", "run_id": "run-window", "instruction": "review"}
             )
         assert await dispatcher.resume(
-            Wake(ticket={"identifier": "HAN-window"}, action="reengage", resume="run-window")
+            Wake(ticket={"identifier": "SAMPLE-window"}, action="reengage", resume="run-window")
         ) is None
         assert calls == []
         release.set()
@@ -203,7 +203,7 @@ def test_a_removed_worktree_fails_closed(tmp_path: Path) -> None:
 def test_an_unknown_ticket_fails_closed(tmp_path: Path) -> None:
     async def scenario() -> None:
         dispatcher, _, _ = build(tmp_path, "waiting")
-        wake = Wake(ticket={"identifier": "HAN-99"}, action="reengage", instruction="x")
+        wake = Wake(ticket={"identifier": "SAMPLE-99"}, action="reengage", instruction="x")
         assert await dispatcher.resume(wake) is None
 
     asyncio.run(scenario())
@@ -212,8 +212,8 @@ def test_an_unknown_ticket_fails_closed(tmp_path: Path) -> None:
 def test_hydration_is_idempotent(tmp_path: Path) -> None:
     async def scenario() -> None:
         dispatcher, _, _ = build(tmp_path, "waiting")
-        first = await dispatcher.hydrate("HAN-42")
-        second = await dispatcher.hydrate("HAN-42")
+        first = await dispatcher.hydrate("SAMPLE-42")
+        second = await dispatcher.hydrate("SAMPLE-42")
         assert first is second
         assert len(dispatcher._built) == 1  # type: ignore[attr-defined]
 
@@ -224,9 +224,9 @@ def test_a_pr_event_after_restart_reaches_the_same_session(tmp_path: Path) -> No
     async def scenario() -> None:
         dispatcher, _, _ = build(tmp_path, "waiting")
         await dispatcher.handle_pr_event(
-            {"ticket": "HAN-42", "instruction": "2 new review threads.", "run_id": "run-1"}
+            {"ticket": "SAMPLE-42", "instruction": "2 new review threads.", "run_id": "run-1"}
         )
-        assert dispatcher.runners["HAN-42"].resumed == [("run-1", "2 new review threads.")]
+        assert dispatcher.runners["SAMPLE-42"].resumed == [("run-1", "2 new review threads.")]
 
     asyncio.run(scenario())
 
@@ -245,7 +245,7 @@ def test_an_operator_answer_in_a_new_process_resumes_the_same_session(tmp_path: 
         resumed = await dispatcher.resume_session("run-1", "Operator answer: proceed.")
 
         assert resumed is True
-        runner = dispatcher.runners["HAN-42"]
+        runner = dispatcher.runners["SAMPLE-42"]
         assert runner.resumed == [("run-1", "Operator answer: proceed.")]
         assert manager.created == [], "no new worktree for an answer resume"
 

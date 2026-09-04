@@ -28,7 +28,7 @@ from harbor.poll.linear_poller import PollResult
 from harbor.supervisor import Supervisor, Wake, WorktreeDispatcher
 from harbor.worktree import WorktreeManager
 
-TICKET = "HAN-32"
+TICKET = "SAMPLE-32"
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -77,7 +77,7 @@ class StubSkill:
         return git(self.worktree, "rev-parse", "HEAD")
 
     async def start(self, instruction: str, *, run_id: str | None = None) -> dict[str, Any]:
-        head = self._work_and_push("implement HAN-32")
+        head = self._work_and_push("implement SAMPLE-32")
         held = "hold: on" in instruction.lower()
         if held:
             return {"status": "waiting", "outcome": "parked", "waiting_on": "human",
@@ -101,8 +101,8 @@ class StubSkill:
 
 class Poller:
     def __init__(self, ticket: dict[str, Any]) -> None:
-        self.config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader-06c91e632f50")
-        self.project_name = "Bookgen"
+        self.config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project-06c91e632f50")
+        self.project_name = "SampleProject"
         self._ticket = ticket
 
     async def poll(self) -> PollResult:
@@ -112,7 +112,7 @@ class Poller:
 def build(tmp_path: Path, *, hold: bool) -> tuple[Supervisor, WorktreeManager, list[StubSkill], HarborDB, Path]:
     checkout, _ = real_repo(tmp_path)
     manager = WorktreeManager(
-        checkout, root=tmp_path / "wt", repo_name="Bookgen",
+        checkout, root=tmp_path / "wt", repo_name="SampleProject",
         disk_usage=lambda _: 100.0, install_command="none",
     )
     db = HarborDB(tmp_path / "harbor.db")
@@ -124,7 +124,7 @@ def build(tmp_path: Path, *, hold: bool) -> tuple[Supervisor, WorktreeManager, l
         return stub
 
     ticket = {"identifier": TICKET, "title": "Update docs", "state": "Todo", "hold": hold, "pr_urls": []}
-    dispatcher = WorktreeDispatcher(manager, factory, db=db, project="Bookgen")
+    dispatcher = WorktreeDispatcher(manager, factory, db=db, project="SampleProject")
     supervisor = Supervisor(
         Poller(ticket), db=db, dispatcher=dispatcher, worktree_manager=manager,
     )
@@ -143,7 +143,7 @@ def test_ac8_hold_off_the_skill_merges_and_harbor_removes_the_worktree(tmp_path:
             await supervisor.start(initial_poll=False)
             wake = Wake(
                 ticket={"identifier": TICKET, "hold": False}, action="build",
-                instruction="Build HAN-32\nhold: OFF. Your own risk gate decides the merge.",
+                instruction="Build SAMPLE-32\nhold: OFF. Your own risk gate decides the merge.",
                 idem_key=f"{TICKET}@build",
                 facts={"number": 225, "url": "https://example.test/pr/225", "merged": True},
             )
@@ -180,7 +180,7 @@ def test_ac10_a_manual_merge_resumes_the_same_session_and_then_cleans_up(tmp_pat
             await supervisor.start(initial_poll=False)
             build_wake = Wake(
                 ticket={"identifier": TICKET, "hold": True}, action="build",
-                instruction="Build HAN-32\nhold: ON. This gates the MERGE ONLY.",
+                instruction="Build SAMPLE-32\nhold: ON. This gates the MERGE ONLY.",
                 idem_key=f"{TICKET}@build",
             )
             parked = await supervisor.dispatcher.dispatch(build_wake)

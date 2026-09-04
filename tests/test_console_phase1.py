@@ -21,7 +21,7 @@ def test_console_lifecycle_commands_work_without_agents(tmp_path: Path) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
 
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     db = HarborDB(tmp_path / "harbor.db")
     client = LinearClient(transport=httpx.MockTransport(handler))
     supervisor = Supervisor(LinearPoller(client, config, db=db), db=db)
@@ -46,7 +46,7 @@ def test_console_banner_reports_live_and_shadow_mode(tmp_path: Path) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
 
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
     live = Supervisor(LinearPoller(client, config))
     shadow = Supervisor(LinearPoller(client, config), shadow=True)
@@ -69,7 +69,7 @@ def test_free_form_input_is_not_dispatched_in_phase_one(tmp_path: Path) -> None:
         calls.append(request)
         return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
 
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
     supervisor = Supervisor(LinearPoller(client, config))
     console = Console(supervisor)
@@ -96,17 +96,17 @@ def test_status_renders_observed_tickets_and_never_backlog(tmp_path: Path) -> No
         }
 
     nodes = [
-        node("HAN-29", "In Progress"),
-        node("HAN-16", "In Progress"),
-        node("HAN-17", "In Review"),
-        node("HAN-7", "Blocked"),
-        node("HAN-99", "Backlog"),
+        node("SAMPLE-29", "In Progress"),
+        node("SAMPLE-16", "In Progress"),
+        node("SAMPLE-17", "In Review"),
+        node("SAMPLE-7", "Blocked"),
+        node("SAMPLE-99", "Backlog"),
     ]
 
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
 
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
     supervisor = Supervisor(LinearPoller(client, config))
     console = Console(supervisor)
@@ -116,9 +116,9 @@ def test_status_renders_observed_tickets_and_never_backlog(tmp_path: Path) -> No
     finally:
         run(supervisor.exit())
         run(client.close())
-    for identifier, state in (("HAN-29", "In Progress"), ("HAN-16", "In Progress"), ("HAN-17", "In Review"), ("HAN-7", "Blocked")):
+    for identifier, state in (("SAMPLE-29", "In Progress"), ("SAMPLE-16", "In Progress"), ("SAMPLE-17", "In Review"), ("SAMPLE-7", "Blocked")):
         assert f"{identifier} (observed)  {state}" in rendered
-    assert "HAN-99" not in rendered
+    assert "SAMPLE-99" not in rendered
     assert "Backlog" not in rendered
 
 
@@ -152,7 +152,7 @@ def test_background_output_is_emitted_under_patch_stdout(tmp_path: Path, monkeyp
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
 
-    config = ProjectConfig(name="Bookgen", linear_project_slug="hanzireader", repo_path=tmp_path)
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     db = HarborDB(tmp_path / "harbor.db")
     client = LinearClient(transport=httpx.MockTransport(handler))
     supervisor = Supervisor(LinearPoller(client, config, db=db), db=db)
