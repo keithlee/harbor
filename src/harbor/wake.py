@@ -644,24 +644,43 @@ HOLD_OFF_CONTRACT = (
 def detect_delivery_tools(env: Mapping[str, str] | None = None) -> dict[str, bool]:
     """Probe which delivery tools a builder could actually use.
 
-    Read-only and cheap: a PATH lookup plus a token presence check.  It never
-    contacts GitHub, so it cannot itself be a mutation, and it reports only
-    what the environment offers.
+    Read-only and cheap: a PATH lookup, a token presence check, and (only when
+    neither token variable exists) a bounded ``gh auth status`` probe.  The
+    latter recognizes credentials stored by ``gh`` in its config/keyring
+    without exposing command output or credential material.
     """
 
     import os
     import shutil
+    import subprocess
 
     environ = dict(env if env is not None else os.environ)
     has_token = bool(environ.get("GH_TOKEN") or environ.get("GITHUB_TOKEN"))
+    gh_path = shutil.which("gh")
+    gh_authenticated = bool(gh_path and has_token)
+    if gh_path and not has_token:
+        try:
+            status = subprocess.run(
+                [gh_path, "auth", "status"],
+                check=False,
+                env=environ,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Missing configuration, a timeout, or an execution failure must
+            # never turn into optimistic delivery authority.
+            pass
+        else:
+            gh_authenticated = status.returncode == 0
     tools: dict[str, bool] = {
         "git": shutil.which("git") is not None,
-        # ``gh`` needs both the binary and a token; without one it prompts,
-        # which a non-interactive run can never answer.
-        "gh": shutil.which("gh") is not None and has_token,
+        "gh": gh_authenticated,
     }
-    if shutil.which("gh") is not None and not has_token:
-        tools["gh (no GH_TOKEN/GITHUB_TOKEN in this run)"] = False
+    if gh_path and not gh_authenticated and not has_token:
+        tools["gh (no token variable and gh auth status failed)"] = False
     return tools
 
 
@@ -673,11 +692,11 @@ def delivery_tools_fact(tools: Mapping[str, Any] | None = None) -> str:
     -- it says what IS, never what to do.
 
     This exists because of a real failure: a builder abandoned an approved
-    merge reporting "gh-axi returned api.github.com UNKNOWN" and "MCP tool
-    call requires approval, but approval policy is never", while plain ``gh``
-    was authenticated and working in that very sandbox the whole time.  A
-    non-interactive ``codex exec`` refuses any MCP call that wants approval,
-    so an agent that reaches only for MCP or a wrapper strands itself.
+    merge after an unavailable GitHub transport and an MCP call reported
+    "approval policy is never", while plain ``gh`` was authenticated and
+    working in that very sandbox the whole time. A non-interactive ``codex
+    exec`` refuses any MCP call that wants approval, so an agent that reaches
+    only for MCP strands itself.
     """
 
     values = dict(tools or {})
@@ -690,10 +709,18 @@ def delivery_tools_fact(tools: Mapping[str, Any] | None = None) -> str:
         parts.append(f"Available and authenticated in your sandbox: {', '.join(available)}.")
     if unavailable:
         parts.append(f"Not usable in this run: {', '.join(unavailable)}.")
-    parts.append(
-        "This run is non-interactive, so any MCP tool that requests approval "
-        "is refused; prefer a shell tool listed as available."
-    )
+    if values.get("gh"):
+        parts.append(
+            "This run is non-interactive, so any MCP tool that requests approval "
+            "is refused; use the available `gh` CLI for GitHub mutations and do "
+            "not use gh-axi."
+        )
+    else:
+        parts.append(
+            "This run is non-interactive, so any MCP tool that requests approval "
+            "is refused; no GitHub mutation transport is available. Do not use MCP "
+            "or gh-axi; report a delivery-transport blocker."
+        )
     return " ".join(parts)
 
 

@@ -111,6 +111,7 @@ class LinearClient:
         self.endpoint = endpoint
         self.token = resolve_token(token)
         self._state_ids: dict[str, str] = {}
+        self._state_types: dict[str, str] = {}
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=timeout, transport=transport)
 
@@ -248,15 +249,9 @@ class LinearClient:
         nodes = ((data.get("projects") or {}).get("nodes")) or []
         return [dict(node) for node in nodes if isinstance(node, Mapping)]
 
-    async def resolve_state_id(self, issue_id: str, name: str) -> str | None:
-        """Resolve a workflow state name to its id for the issue's team."""
+    async def _cache_team_states(self, issue_id: str) -> None:
+        """Load names and terminal types for the issue's owning Linear team."""
 
-        wanted = str(name).strip().casefold()
-        if not wanted:
-            return None
-        cached = self._state_ids.get(wanted)
-        if cached is not None:
-            return cached
         data = await self._post(LINEAR_STATES_QUERY, {"issueId": str(issue_id)})
         issue = data.get("issue") or {}
         team = issue.get("team") or {}
@@ -267,15 +262,38 @@ class LinearClient:
             label = str(node.get("name", "")).strip()
             identifier = node.get("id")
             if label and identifier:
-                self._state_ids[label.casefold()] = str(identifier)
+                state_id = str(identifier)
+                self._state_ids[label.casefold()] = state_id
+                self._state_types[state_id] = str(node.get("type", "")).strip().casefold()
+
+    async def resolve_state_id(self, issue_id: str, name: str) -> str | None:
+        """Resolve a workflow state name to its id for the issue's team."""
+
+        wanted = str(name).strip().casefold()
+        if not wanted:
+            return None
+        cached = self._state_ids.get(wanted)
+        if cached is not None:
+            return cached
+        await self._cache_team_states(issue_id)
         return self._state_ids.get(wanted)
+
+    async def _resolve_state_type(self, issue_id: str, state_id: str) -> str | None:
+        """Return the authoritative workflow type for a state id, if visible."""
+
+        cached = self._state_types.get(state_id)
+        if cached is not None:
+            return cached
+        await self._cache_team_states(issue_id)
+        return self._state_types.get(state_id)
 
     async def update_issue_state(self, issue_id: str, state_id: str) -> dict[str, Any]:
         """Set a non-terminal Linear state by id/name.
 
         State names are accepted for deterministic tests and simple fakes; a
-        production caller should pass the Linear workflow state's id.  Done
-        and other completed states are rejected before any network request.
+        production callers may pass a workflow state's id. Every target is
+        checked against the owning team's authoritative workflow type, so a
+        completed state with a custom label cannot bypass Harbor custody.
         """
 
         issue = str(issue_id).strip()
@@ -299,6 +317,13 @@ class LinearClient:
                     f"no Linear workflow state named {state!r} is available for issue {issue}"
                 )
             state = resolved
+        state_type = await self._resolve_state_type(issue, state)
+        if state_type is None:
+            raise LinearClientError(
+                f"no Linear workflow state id {state!r} is available for issue {issue}"
+            )
+        if state_type in {"completed", "canceled", "cancelled"}:
+            raise ValueError("Harbor never sets a terminal Linear state")
         data = await self._post(LINEAR_STATE_MUTATION, {"issueId": issue, "stateId": state})
         result = data.get("issueUpdate")
         if not isinstance(result, dict):

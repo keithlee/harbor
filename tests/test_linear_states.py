@@ -19,6 +19,7 @@ from harbor.clients.linear import LinearClient, LinearClientError
 
 HUMAN_REVIEW = "c845aec8-ce2d-4d6b-971c-566efe72167a"
 BLOCKED = "6876f9e0-76aa-4dac-ac4f-fabeceb1d54f"
+RELEASED = "125951a0-e488-4ffb-b525-16d42657d0b7"
 
 
 def transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
@@ -30,6 +31,7 @@ def transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
                 "id": "t", "name": "HAN", "states": {"nodes": [
                     {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"},
                     {"id": BLOCKED, "name": "Blocked", "type": "started"},
+                    {"id": RELEASED, "name": "Released", "type": "completed"},
                 ]}}}}})
         return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {
             "id": "u", "identifier": "SAMPLE-32", "state": {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"}}}}})
@@ -51,7 +53,7 @@ def test_a_state_name_is_resolved_to_its_id_before_the_mutation() -> None:
     asyncio.run(scenario())
 
 
-def test_a_uuid_is_sent_straight_through_without_a_lookup() -> None:
+def test_a_uuid_is_validated_before_the_mutation() -> None:
     async def scenario() -> None:
         calls: list[dict[str, Any]] = []
         client = LinearClient(token="k", transport=transport(calls))
@@ -59,8 +61,8 @@ def test_a_uuid_is_sent_straight_through_without_a_lookup() -> None:
             await client.update_issue_state("SAMPLE-32", BLOCKED)
         finally:
             await client.close()
-        assert len(calls) == 1, "a configured UUID needs no resolution request"
-        assert calls[0]["variables"]["stateId"] == BLOCKED
+        assert "HarborStates" in calls[0]["query"], "a UUID must be type-checked first"
+        assert calls[1]["variables"]["stateId"] == BLOCKED
 
     asyncio.run(scenario())
 
@@ -104,6 +106,24 @@ def test_harbor_never_writes_a_terminal_state(state: str) -> None:
         finally:
             await client.close()
         assert calls == [], "a terminal state must be refused before any network call"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", [RELEASED, "Released"])
+def test_harbor_rejects_terminal_state_ids_and_custom_labels(state: str) -> None:
+    """A UUID or a benign-looking label must not bypass terminal-state custody."""
+
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=transport(calls))
+        try:
+            with pytest.raises(ValueError, match="terminal"):
+                await client.update_issue_state("HAN-32", state)
+        finally:
+            await client.close()
+        assert len(calls) == 1
+        assert "HarborStates" in calls[0]["query"]
 
     asyncio.run(scenario())
 

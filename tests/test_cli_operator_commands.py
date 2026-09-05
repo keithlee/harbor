@@ -62,6 +62,87 @@ def test_parser_exposes_facts_shadow_and_answer() -> None:
     answer = parser.parse_args(["answer", "7", "Keith", "owns", "it", "--project", "SampleProject"])
     assert answer.escalation == "7"
     assert " ".join(answer.text) == "Keith owns it"
+    comment = parser.parse_args(["linear", "comment", "HAN-46", "--body", "progress"])
+    assert comment.linear_command == "comment"
+    assert comment.issue == "HAN-46"
+    state = parser.parse_args(["linear", "state", "HAN-46", "--state", "In Review"])
+    assert state.linear_command == "state"
+    assert state.state == "In Review"
+
+
+def test_linear_commands_use_direct_client_without_mcp(monkeypatch, capsys) -> None:
+    class DirectLinearClient:
+        instances: list["DirectLinearClient"] = []
+
+        def __init__(self, *, endpoint: str) -> None:
+            self.endpoint = endpoint
+            self.token = "configured-key"
+            self.comments: list[tuple[str, str]] = []
+            self.states: list[tuple[str, str]] = []
+            self.closed = False
+            self.instances.append(self)
+
+        async def create_comment(self, issue: str, body: str) -> dict[str, object]:
+            self.comments.append((issue, body))
+            return {"success": True}
+
+        async def update_issue_state(self, issue: str, state: str) -> dict[str, object]:
+            self.states.append((issue, state))
+            return {"issue": {"state": {"name": state}}}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(cli, "LinearClient", DirectLinearClient)
+
+    assert asyncio.run(cli._linear_write("comment", "HAN-46", body="progress")) == 0
+    assert DirectLinearClient.instances[0].comments == [("HAN-46", "progress")]
+    assert DirectLinearClient.instances[0].closed is True
+    assert asyncio.run(cli._linear_write("state", "HAN-46", state="In Review")) == 0
+    assert DirectLinearClient.instances[1].states == [("HAN-46", "In Review")]
+    assert "commented on HAN-46" in capsys.readouterr().out
+
+
+def test_linear_commands_fail_clearly_without_an_api_key(monkeypatch, capsys) -> None:
+    class UnauthenticatedLinearClient:
+        token = None
+
+        def __init__(self, *, endpoint: str) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(cli, "LinearClient", UnauthenticatedLinearClient)
+
+    assert asyncio.run(cli._linear_write("comment", "HAN-46", body="progress")) == 2
+    assert "HARBOR_LINEAR_API_KEY" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("terminal", ["Done", "completed", "CANCELED", "cancelled"])
+def test_linear_state_command_rejects_terminal_states_before_calling_the_transport(
+    monkeypatch, capsys, terminal: str
+) -> None:
+    class RecordingLinearClient:
+        instances: list["RecordingLinearClient"] = []
+
+        def __init__(self, *, endpoint: str) -> None:
+            self.token = "configured-key"
+            self.states: list[tuple[str, str]] = []
+            self.instances.append(self)
+
+        async def update_issue_state(self, issue: str, state: str) -> dict[str, object]:
+            self.states.append((issue, state))
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "LinearClient", RecordingLinearClient)
+
+    assert asyncio.run(cli._linear_write("state", "HAN-46", state=terminal)) == 1
+    assert RecordingLinearClient.instances[0].states == []
+    assert "verified merge" in capsys.readouterr().err
 
 
 def test_shadow_start_prints_observed_ticket_digest_without_dispatch(monkeypatch, tmp_path: Path, capsys) -> None:

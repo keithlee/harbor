@@ -50,6 +50,19 @@ def build_parser() -> argparse.ArgumentParser:
     answer.add_argument("escalation")
     answer.add_argument("text", nargs="+", help="the answer; include Citation: path:line when you have one")
     answer.add_argument("--project", default=None, help="project whose ledger holds the escalation")
+    linear = commands.add_parser(
+        "linear",
+        help="make a narrow, non-interactive-safe Linear progress update",
+    )
+    linear_commands = linear.add_subparsers(dest="linear_command", required=True)
+    comment = linear_commands.add_parser("comment", help="post a comment on one Linear issue")
+    comment.add_argument("issue", metavar="IDENTIFIER", help="Linear issue id or identifier, e.g. HAN-46")
+    comment.add_argument("--body", required=True, help="comment body")
+    comment.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
+    state = linear_commands.add_parser("state", help="move one Linear issue to a non-terminal state")
+    state.add_argument("issue", metavar="IDENTIFIER", help="Linear issue id or identifier, e.g. HAN-46")
+    state.add_argument("--state", required=True, help="non-terminal Linear workflow state name or id")
+    state.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
     return parser
 
 
@@ -97,6 +110,21 @@ def _worktree_root(config: Any) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".harbor" / "wt" / str(getattr(config, "name", "project"))).resolve()
+
+
+def _is_terminal_linear_state(value: str | None) -> bool:
+    """Keep the direct CLI fail-closed even when a client is substituted.
+
+    ``LinearClient`` rejects terminal state names too, but this command is the
+    builder-facing authority boundary.  Checking here means an injected client
+    or future transport cannot accidentally turn a verified-merge transition
+    into ordinary builder custody.
+    """
+
+    state = str(value or "").strip().casefold()
+    return state in {"done", "completed", "canceled", "cancelled"} or any(
+        marker in state for marker in ("done", "completed", "canceled", "cancelled")
+    )
 
 
 def build_production_dispatcher(
@@ -512,6 +540,61 @@ async def _answer(escalation_id: str, text: str, *, project_name: str | None = N
         db.close()
 
 
+async def _linear_write(
+    command: str,
+    issue: str,
+    *,
+    body: str | None = None,
+    state: str | None = None,
+    project_name: str | None = None,
+) -> int:
+    """Apply one scoped Linear progress mutation without using Linear MCP.
+
+    Builders may invoke this command in a non-interactive sandbox, where MCP
+    mutation approval is unavailable.  The transport deliberately exposes only
+    comments and non-terminal state updates; ``Done`` remains merge-reconciled
+    Harbor custody.
+    """
+
+    endpoint: str | None = None
+    if project_name:
+        try:
+            endpoint = get_project(project_name).linear_api_url
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+    client = LinearClient(endpoint=endpoint or "https://api.linear.app/graphql")
+    try:
+        if not client.token:
+            print(
+                "Harbor: Linear writes require LINEAR_API_KEY or HARBOR_LINEAR_API_KEY",
+                file=sys.stderr,
+            )
+            return 2
+        if command == "comment":
+            await client.create_comment(issue, body or "")
+            print(f"Harbor: commented on {issue}")
+            return 0
+        if command == "state":
+            if _is_terminal_linear_state(state):
+                print(
+                    "Harbor: terminal Linear states are reconciled only after a verified merge",
+                    file=sys.stderr,
+                )
+                return 1
+            result = await client.update_issue_state(issue, state or "")
+            updated = ((result.get("issue") or {}).get("state") or {}).get("name") or state
+            print(f"Harbor: set {issue} to {updated}")
+            return 0
+        print(f"Harbor: unknown Linear command {command}", file=sys.stderr)
+        return 2
+    except (LinearClientError, ValueError) as exc:
+        print(f"Harbor: Linear {command} failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await client.close()
+
+
 async def _status(project_name: str, *, as_json: bool = False) -> int:
     try:
         config = get_project(project_name)
@@ -547,6 +630,14 @@ async def _async_main(args: argparse.Namespace) -> int:
         return await _facts(args.project, as_json=getattr(args, "json", True))
     if args.command == "answer":
         return await _answer(args.escalation, " ".join(args.text), project_name=args.project)
+    if args.command == "linear":
+        return await _linear_write(
+            args.linear_command,
+            args.issue,
+            body=getattr(args, "body", None),
+            state=getattr(args, "state", None),
+            project_name=getattr(args, "project", None),
+        )
     return await _status(args.project, as_json=getattr(args, "json", False))
 
 
