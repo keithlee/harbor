@@ -15,6 +15,25 @@ The skill is a Markdown-controlled prompt. A team can replace
 `/work-pipeline` with its own ticket-to-PR instructions without changing
 Harbor or adding a Harbor-specific implementation role.
 
+## Why Harbor exists
+
+Harbor is inspired by Symphony's issue-to-workspace orchestration and
+Firstmate's operator-oriented supervision. It addresses two practical
+constraints in long-running delivery workflows:
+
+- **Monitoring should be cheap.** Linear and GitHub polling, snapshot
+  comparison, wake decisions, heartbeats, and status rendering are ordinary
+  deterministic code. A cycle with no actionable Linear or GitHub facts does
+  not invoke a model.
+- **Delivery policy belongs to the project.** Planning, implementation,
+  review, proof, and merge rules vary by repository. Harbor passes the selected
+  pipeline document and skill to the builder instead of embedding those rules
+  in the supervisor.
+
+Builder and First Mate models, reasoning effort, polling cadence, deadline,
+and merge hold are configured in Markdown. The built-in runner uses Codex;
+supporting another agent harness requires a runner adapter.
+
 ## Manual multi-project setup
 
 Harbor does not currently provide `harbor init`. Each user owns a private
@@ -142,40 +161,126 @@ lifecycle control. `hold_all`/`hold` in `pipeline.md` supplies the default
 shadow policy for newly observed work; the command changes one ticket's local
 operational flag.
 
-## Technical flow
+## Architecture
 
-```text
-projects.md
-   │ resolve project + live .harbor/pipeline.md
-   ▼
-CLI composition root
-   │ build clients, pollers, ledger, worktree manager, Terra First Mate
-   ▼
-Supervisor (model-free asyncio loop)
-   ├─ Linear GraphQL: configured project + poll states
-   ├─ GitHub GraphQL: only PRs attached to those Linear tickets
-   ├─ snapshot diff: unchanged cycle emits no event
-   ├─ wake decision: Todo → one idempotent build dispatch
-   ├─ heartbeat: configurable liveness/activity publication
-   └─ digest: the exact status context used by /status and plain questions
-          │
-          ├─ build/re-engage → isolated worktree → Codex builder (Luna)
-          │                    raw pipeline.md + ticket facts
-          │                    same run/session on resume
-          │
-          ├─ PR created/commented/CI changed → read-only facts → re-engage
-          │                    comment handling belongs to the skill
-          │
-          └─ blocked → deterministic remediation → Terra cite/escalate
-                                    → operator answer → same builder resume
+The blue nodes are Harbor's deterministic control plane. The amber nodes are
+the model-consuming work. Linear and GitHub remain external authorities;
+SQLite stores operational custody and receipts, not a second copy of project
+truth.
+
+```mermaid
+flowchart LR
+    subgraph external["External authority"]
+        LIN["Linear<br/>tickets and states"]
+        GH["GitHub<br/>PRs, CI, and reviews"]
+    end
+
+    subgraph harbor["Harbor control plane - model-free"]
+        POLL["Scoped API poll"]
+        SNAP{"Actionable wake?"}
+        WAKE["Idempotent wake decision"]
+        HEART["Heartbeat and /status"]
+        DB[("SQLite<br/>operational custody")]
+        REM["Deterministic remediation"]
+        WT["Isolated Git worktree"]
+        VERIFY["Verify merge receipt<br/>and clean worktree"]
+    end
+
+    subgraph agents["Model-consuming work"]
+        BUILD["Persistent Codex builder<br/>pipeline and skill"]
+        MATE["First Mate<br/>questions and blocker triage"]
+    end
+
+    OP["Operator"]
+
+    LIN -->|"read scoped tickets"| POLL
+    GH -->|"read attached PR facts"| POLL
+    POLL --> SNAP
+    SNAP -->|"no"| HEART
+    SNAP -->|"yes"| WAKE
+    WAKE --> DB
+    WAKE ==>|"Todo: dispatch once"| WT
+    WT ==> BUILD
+    BUILD ==>|"skill writes PR and merges"| GH
+    BUILD ==>|"skill owns Done transition"| LIN
+    GH -.->|"CI or review changed"| POLL
+    WAKE ==>|"resume same session"| BUILD
+    BUILD -.->|"blocked"| REM
+    REM -.->|"judgment required"| MATE
+    OP <--> MATE
+    OP -->|"hold, pause, answer"| WAKE
+    GH -->|"exact PR observed merged"| VERIFY
+    VERIFY --> DB
+
+    classDef externalNode fill:#f3f4f6,stroke:#4b5563,color:#111827;
+    classDef controlNode fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
+    classDef modelNode fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef operatorNode fill:#f3e8ff,stroke:#9333ea,color:#581c87;
+    class LIN,GH externalNode;
+    class POLL,SNAP,WAKE,HEART,DB,REM,WT,VERIFY controlNode;
+    class BUILD,MATE modelNode;
+    class OP operatorNode;
 ```
 
-The supervisor is the deterministic half of First Mate: it polls, dispatches,
-supervises, and re-engages at zero model cost. The conversational half is the
-configured First Mate model (Terra by default), invoked only for a plain
-question or rung-1 blocker triage. The builder is Luna by default and receives
-the configured pipeline document as prompt data. Harbor does not import,
-rewrite, or interpret the skill's internal workflow.
+Harbor's GitHub client is query-only. GitHub mutations in the diagram belong
+to the builder acting under the configured skill. Harbor itself may make only
+narrow, cited Linear progress or escalation writes; the skill owns the normal
+delivery workflow and terminal `Done` transition.
+
+## Example workflow: Linear to Done
+
+1. Harbor polls the named project's configured Linear scope and active states.
+   `Backlog` is excluded.
+2. It reads GitHub facts only for PRs attached to those active Linear tickets.
+3. Harbor hashes the normalized Linear snapshot, then evaluates current GitHub
+   facts even when that Linear snapshot is unchanged. If neither source yields
+   an actionable wake, the cycle ends without a model call.
+4. An eligible, unblocked `Todo` ticket produces one idempotent build wake.
+5. Harbor creates an isolated worktree from the configured base branch and
+   starts the configured builder with the ticket facts and raw pipeline
+   document.
+6. The delivery skill owns planning, implementation, tests, commits, the PR,
+   review responses, proof, risk policy, and the merge decision.
+7. When CI or review facts change, Harbor resumes the retained builder session
+   instead of creating a replacement agent.
+8. After GitHub reports the exact PR as merged, Harbor records the merge receipt
+   and only then removes the ticket worktree.
+
+If a builder is blocked, Harbor first tries deterministic remediation. A
+remaining blocker goes to the configured First Mate for cited triage, then to
+the operator when judgment or authority is required. An operator answer resumes
+the retained builder session when it is still available.
+
+## Token efficiency
+
+| Path | Model usage | Current behavior |
+| --- | --- | --- |
+| Linear/GitHub polling | None | Ordinary API calls scoped to configured tickets and attached PRs. |
+| Snapshot, wake, heartbeat, and `/status` | None | Deterministic code; cycles with no actionable wake do not invoke an LLM. |
+| SQLite receipts and restart recovery | None | Retains ownership, idempotency, run, session, escalation, and merge evidence. |
+| Builder | Yes | Runs the configured delivery pipeline only after an actionable wake. |
+| First Mate | Yes, on demand | Invoked for a plain-language question or blocker triage, not routine polling. |
+
+Same-session re-engagement preserves the builder's context instead of silently
+starting a replacement. Harbor can record runner-reported cost, but it does not
+enforce a per-task token limit. `deadline_minutes` is a time boundary, not a
+token budget.
+
+## What each developer can swap
+
+| Developer choice | Change now | Harbor keeps owning | Current limit |
+| --- | --- | --- | --- |
+| Project identity | Private registry via `HARBOR_PROJECTS_FILE`; repository, pipeline, Linear scope, GitHub repository, and base branch | Polling, worktree isolation, and custody | No `harbor init` command yet |
+| Builder and First Mate models | Model and reasoning settings in `pipeline.md` | Wake lifecycle and same-session resume | Available models depend on the runner |
+| Delivery flow | Replace `skill: /work-pipeline` and its surrounding Markdown instructions | Scheduling, liveness, escalation, receipts, and worktree lifecycle | The runner environment must already provide the replacement skill |
+| Supervision policy | Poll and dispatch states, cadence, deadline, hold, checks, worktree root, and rework cap | Idempotency and safety boundaries | A deadline is not a token budget |
+| Execution harness | Implement and inject another runner | Worktree dispatch and run lifecycle | Codex is the only built-in production runner |
+| Tracker | Extend the client and poller boundary | Snapshot, wake, and receipt model | Linear is the only built-in tracker |
+
+Harbor treats `skill` and the rest of `pipeline.md` as workflow data. Replacing
+the skill does not change Harbor's supervision contract: the workflow receives
+the same ticket facts, worktree, wake and re-engagement lifecycle, and status
+context.
 
 ### Heartbeat
 
