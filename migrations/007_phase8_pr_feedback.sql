@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS github_pr_states (
     project TEXT NOT NULL DEFAULT '',
     ticket TEXT NOT NULL DEFAULT '',
     pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL,
     head_sha TEXT,
     created_at TEXT,
     risk_status TEXT NOT NULL DEFAULT 'unknown',
@@ -16,7 +17,7 @@ CREATE TABLE IF NOT EXISTS github_pr_states (
     observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS github_pr_states_ticket_idx
-    ON github_pr_states(project, ticket, pr_number);
+    ON github_pr_states(project, ticket, pr_url);
 
 CREATE TABLE IF NOT EXISTS github_pr_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS github_pr_events (
     project TEXT NOT NULL DEFAULT '',
     ticket TEXT NOT NULL DEFAULT '',
     pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL,
     event_type TEXT NOT NULL,
     head_sha TEXT,
     payload_json TEXT NOT NULL,
@@ -32,4 +34,4 @@ CREATE TABLE IF NOT EXISTS github_pr_events (
     observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS github_pr_events_ticket_type_idx
-    ON github_pr_events(project, ticket, event_type, id);
+    ON github_pr_events(project, ticket, pr_url, event_type, id);

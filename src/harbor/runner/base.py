@@ -147,22 +147,11 @@ def merge_is_verified(payload: Mapping[str, Any], observed: Mapping[str, Any] | 
 
     if not isinstance(observed, Mapping):
         return False
-    # GitHubPoller emits a boolean merged flag.  A non-empty merge timestamp
-    # or commit SHA is also authoritative only when it came from that
-    # read-only PR observation.  Never inspect the builder payload here:
-    # ``merged_at``, ``merge_commit_sha`` and ``merge_verified`` in final JSON
-    # are all self-reported and cannot authorize cleanup.
-    merged = observed.get("merged")
-    if isinstance(merged, bool) and merged:
-        return True
-    return bool(
-        isinstance(observed.get("merge_commit_sha"), str)
-        and observed.get("merge_commit_sha", "").strip()
-        or isinstance(observed.get("merged_at"), str)
-        and observed.get("merged_at", "").strip()
-        or isinstance(observed.get("mergedAt"), str)
-        and observed.get("mergedAt", "").strip()
-    )
+    # GitHubPoller emits a boolean ``merged`` flag; only that literal ``True``
+    # counts.  Never inspect the builder payload here: ``merged_at``,
+    # ``merge_commit_sha`` and ``merge_verified`` in final JSON are all
+    # self-reported and cannot authorize cleanup.
+    return observed.get("merged") is True
 
 
 def _missing_artifact_blocker(*, reason: str) -> dict[str, str]:

@@ -217,11 +217,8 @@ def ci_finished(facts: Mapping[str, Any]) -> bool:
 def merged(facts: Mapping[str, Any]) -> bool:
     """Return whether an observed PR (or every observed PR) is merged."""
 
-    value = _value(facts, "merged", "isMerged", default=None)
-    if value is not None:
-        if isinstance(value, str):
-            return value.strip().casefold() in {"1", "true", "yes", "on", "merged"}
-        return bool(value)
+    if "merged" in facts:
+        return facts.get("merged") is True
     prs = _value(facts, "prs", default=())
     if isinstance(prs, Mapping):
         prs = prs.values()
@@ -274,15 +271,23 @@ def build_resume_instruction(
             first = next((item for item in prs if isinstance(item, Mapping)), None)
             if first is not None:
                 head = _text(_value(first, "head_sha", "headSha", "headRefOid", "sha", default="unknown"), "unknown")
-    lines = [
-        f"Continue ticket {identifier} in the existing builder session {run_id}.",
-        f"Observed PR head: {head}.",
-    ]
+    lines = [f"Continue ticket {identifier} in the existing builder session {run_id}."]
     state = ci_state(facts)
-    if state:
-        lines.append(f"Observed CI state: {state}.")
-    if merged(facts):
-        lines.append("Observed PR state: merged.")
+    pr_metadata = "\n".join(
+        (
+            "head_sha=" + _utf8_prefix(_safe_body(head), 256),
+            "ci_state=" + _utf8_prefix(_safe_body(state or ""), 128),
+            f"merged={'true' if merged(facts) else 'false'}",
+        )
+    )
+    lines.extend(
+        [
+            "Observed untrusted PR facts:",
+            "<untrusted-pr-facts>",
+            pr_metadata,
+            "</untrusted-pr-facts>",
+        ]
+    )
 
     # Build metadata first.  Body budgets are reduced if needed so every
     # supplied thread remains represented without crossing the hard bound.
@@ -290,9 +295,12 @@ def build_resume_instruction(
     for source in threads or ():
         if not isinstance(source, Mapping):
             continue
-        thread_id = _thread_id(source)
+        thread_id = _utf8_prefix(_safe_body(_thread_id(source)), 48)
         outdated = _is_outdated(source)
-        path = _text(_value(source, "path", default="(no path)"), "(no path)")
+        path = _utf8_prefix(
+            _safe_body(_text(_value(source, "path", default="(no path)"), "(no path)")),
+            96,
+        )
         line = _line(source, outdated)
         if outdated:
             metadata = f"Review thread {thread_id}; path={path}; outdated: true."
@@ -319,7 +327,7 @@ def build_resume_instruction(
         # the first one or two bodies and silently drop the rest -- and with
         # bot_rework_cap at 1, a dropped P2 finding is never offered again.
         overhead = sum(
-            len(f"\n{metadata}\n{UNTRUSTED_OPEN}\n\n{UNTRUSTED_CLOSE}".encode("utf-8"))
+            len(f"\n{UNTRUSTED_OPEN}\n{metadata}\n\n{UNTRUSTED_CLOSE}".encode("utf-8"))
             for metadata, _ in blocks
         )
         spare = available - len(prefix.encode("utf-8")) - footer_cost - overhead
@@ -337,26 +345,13 @@ def build_resume_instruction(
                     budget += extra
                     remainder -= extra
                 fitted = _utf8_prefix(body, max(0, budget))
-                result = f"{result}\n{metadata}\n{UNTRUSTED_OPEN}\n{fitted}\n{UNTRUSTED_CLOSE}"
+                result = f"{result}\n{UNTRUSTED_OPEN}\n{metadata}\n{fitted}\n{UNTRUSTED_CLOSE}"
             result += "\n" + footer
         else:
-            # Pathologically small budget (or a huge number of threads): fall
-            # back to fitting as many complete blocks as possible.
-            for metadata, body in blocks:
-                block = f"{metadata}\n{UNTRUSTED_OPEN}\n{body[:900]}\n{UNTRUSTED_CLOSE}"
-                candidate = f"{result}\n{block}"
-                if len(candidate.encode("utf-8")) <= available:
-                    result = candidate
-                    continue
-                room = available - len(
-                    f"{result}\n{metadata}\n{UNTRUSTED_OPEN}\n\n{UNTRUSTED_CLOSE}".encode("utf-8")
-                )
-                fitted = _utf8_prefix(body, max(0, room))
-                candidate = f"{result}\n{metadata}\n{UNTRUSTED_OPEN}\n{fitted}\n{UNTRUSTED_CLOSE}"
-                if len(candidate.encode("utf-8")) <= available:
-                    result = candidate
-            if len(result.encode("utf-8")) + footer_cost <= available:
-                result += "\n" + footer
+            # Never acknowledge a selected thread that did not fit into the
+            # handoff. The caller will leave every thread unseen and retry or
+            # escalate instead of silently losing actionable feedback.
+            raise ValueError("resume instruction cannot represent every review thread")
     elif len(result.encode("utf-8")) + len(("\n" + footer).encode("utf-8")) <= available:
         result += "\n" + footer
 

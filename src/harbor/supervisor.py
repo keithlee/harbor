@@ -35,6 +35,7 @@ from harbor.wake import (
     TicketScope,
     apply_phase3_migration,
     apply_phase6_migration,
+    mark_threads_seen,
     observe_pr_facts,
     record_push,
     ticket_scope as normalize_ticket_scope,
@@ -395,7 +396,7 @@ class WorktreeDispatcher:
             "ticket": str(row[4]) if row[4] else identifier,
         }
 
-    async def hydrate(self, identifier: str) -> Any:
+    async def hydrate(self, identifier: str, *, recover_terminal: bool = False) -> Any:
         """Rebuild the retained runner for a ticket after a Harbor restart.
 
         ``self.runners`` is process-local, but the run row, the session id, and
@@ -417,7 +418,10 @@ class WorktreeDispatcher:
         if existing_key is not None:
             return self.runners.get(existing_key)
         row = self._persisted_run(identifier)
-        if row is None or row.get("status") not in {"waiting", "parked", "blocked"}:
+        recoverable = {"waiting", "parked", "blocked"}
+        if recover_terminal:
+            recoverable.update({"terminated", "orphaned", "failed"})
+        if row is None or row.get("status") not in recoverable:
             return None
         identifier = str(row.get("ticket") or identifier)
         worktree_path = row.get("worktree")
@@ -451,6 +455,105 @@ class WorktreeDispatcher:
         self.worktrees[identifier] = worktree
         self.runners[identifier] = runner
         return runner
+
+    async def retry(self, identifier: str, instruction: str | None = None) -> Any:
+        """Explicitly resume a terminated/orphaned run in its retained session.
+
+        Stopped runs are never recovered implicitly: ``/kill`` must remain a
+        real stop. This operator-only path accepts terminated, orphaned, or
+        failed runs, verifies the durable session and
+        worktree, replaces any stale build queue receipt with a re-engagement
+        receipt, and resumes the same logical run id.
+        """
+
+        identifier = str(identifier or "").strip()
+        if not identifier or not self._in_scope(identifier):
+            raise ValueError(f"ticket is outside this supervisor's scope: {identifier or '(empty)'}")
+        row = self._persisted_run(identifier)
+        if row is None:
+            raise RuntimeError(f"no retained builder exists for {identifier}")
+        status = str(row.get("status") or "").casefold()
+        if status not in {"terminated", "orphaned", "failed"}:
+            raise RuntimeError(
+                f"retained builder for {identifier} is {status or 'unknown'}, not recoverable"
+            )
+        run_id = str(row.get("id") or "").strip()
+        session_id = str(row.get("session_id") or "").strip()
+        if not run_id or not session_id:
+            raise RuntimeError(f"retained builder for {identifier} has no resumable session id")
+
+        # A terminal in-memory runner may retain `terminated=True` on its old
+        # context. Rebuild its lightweight handle from the durable session so
+        # the retry cannot inherit the prior process's terminal flags.
+        self.runners.pop(identifier, None)
+        runner = await self.hydrate(identifier, recover_terminal=True)
+        if runner is None:
+            raise RuntimeError(
+                f"retained builder for {identifier} cannot attach its existing worktree"
+            )
+
+        retry_key = f"{identifier}@retry@{run_id}"
+        retry_instruction = instruction or (
+            f"Operator requested recovery of {identifier} after its builder process stopped. "
+            "Continue in this same retained session and worktree. Re-read current Linear and "
+            "GitHub facts, reconcile any interrupted work, and complete the configured gate."
+        )
+        has_idem = getattr(self.db, "queue_has_idem", None) if self.db is not None else None
+        if callable(has_idem) and has_idem(retry_key, live_only=True):
+            raise RuntimeError(f"a retry is already active for {identifier}")
+
+        transition = getattr(self.db, "transition_ticket_queue", None) if self.db is not None else None
+        if callable(transition):
+            transition(
+                identifier,
+                "stopped",
+                error="superseded by explicit same-session retry",
+            )
+        enqueue = getattr(self.db, "enqueue", None) if self.db is not None else None
+        if callable(enqueue):
+            queued = enqueue(
+                identifier,
+                "reengage",
+                retry_key,
+                {
+                    "instruction": retry_instruction,
+                    "ticket": {"identifier": identifier},
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "reason": "operator-retry",
+                },
+            )
+            if not queued:
+                raise RuntimeError(f"a retry is already active for {identifier}")
+
+        wake = Wake(
+            ticket={"identifier": identifier, "builder_run_id": run_id, "run_id": run_id},
+            action="reengage",
+            resume=run_id,
+            instruction=retry_instruction,
+            idem_key=retry_key,
+            reason="operator-retry",
+        )
+        transition_queue = getattr(self.db, "transition_queue", None) if self.db is not None else None
+        try:
+            result = await self.resume(wake)
+        except Exception:
+            if callable(transition_queue):
+                transition_queue(
+                    "failed",
+                    idem_key=retry_key,
+                    error="same-session retry raised before starting",
+                )
+            raise
+        if result is None or result is False:
+            if callable(transition_queue):
+                transition_queue(
+                    "failed",
+                    idem_key=retry_key,
+                    error="same-session retry could not start",
+                )
+            raise RuntimeError(f"same-session retry could not start for {identifier}")
+        return result
 
     async def resume(self, wake: Wake) -> Any:
         identifier = self._identifier(wake)
@@ -772,6 +875,56 @@ class Supervisor:
     def _ticket_key(ticket: Mapping[str, Any]) -> str:
         return str(ticket.get("identifier") or ticket.get("id") or "")
 
+    @staticmethod
+    def _normalized_pr_url(value: Any) -> str | None:
+        if isinstance(value, Mapping):
+            value = value.get("url") or value.get("href")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip().rstrip("/").casefold()
+
+    @classmethod
+    def _ticket_pr_urls(cls, ticket: Mapping[str, Any]) -> set[str]:
+        values = ticket.get("pr_urls", ticket.get("attachments", ()))
+        if isinstance(values, Mapping):
+            values = values.get("nodes", ())
+        if isinstance(values, (str, bytes, Mapping)):
+            values = (values,)
+        return {
+            normalized
+            for value in values or ()
+            if (normalized := cls._normalized_pr_url(value)) is not None
+        }
+
+    def _authoritative_ticket(self, ticket: Mapping[str, Any]) -> dict[str, Any]:
+        """Prefer the latest Linear-observed attachments retained in Harbor."""
+
+        candidate = dict(ticket)
+        identifier = self._ticket_key(candidate)
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if not identifier or connection is None:
+            return candidate
+        try:
+            row = connection.execute(
+                "SELECT pr_urls_json FROM tickets WHERE identifier = ?", (identifier,)
+            ).fetchone()
+        except Exception:
+            return candidate
+        if row is None:
+            return candidate
+        try:
+            urls = json.loads(row[0] or "[]")
+        except (TypeError, ValueError):
+            urls = []
+        candidate["pr_urls"] = urls if isinstance(urls, list) else []
+        return candidate
+
+    def _ticket_has_pr_url(self, ticket: Mapping[str, Any], pr_url: Any) -> bool:
+        target = self._normalized_pr_url(pr_url)
+        if not target:
+            return False
+        return target in self._ticket_pr_urls(self._authoritative_ticket(ticket))
+
     def _in_scope(self, value: Any) -> bool:
         """Return whether one ticket may mutate or reach a builder."""
 
@@ -821,11 +974,16 @@ class Supervisor:
                 candidate = row.get("url") or row.get("html_url") or row.get("href")
                 if candidate and str(candidate).rstrip("/") == target_url:
                     return row
-        if target_number:
+        if target_number and not pr_url:
             for row in rows:
                 number = row.get("number", row.get("pr_number"))
                 if cls._pr_number(number) == target_number:
                     return row
+        if pr_url:
+            # A named artifact is an identity boundary.  Do not bind it to a
+            # sole row for another PR (or another repository with the same
+            # number) merely because no second observation exists.
+            return None
         return rows[0] if len(rows) == 1 else None
 
     @staticmethod
@@ -836,18 +994,7 @@ class Supervisor:
             return False
         # GitHubPoller emits a bool.  Do not let a string such as ``"false"``
         # become truthy evidence merely because it came from a JSON adapter.
-        merged = facts.get("merged")
-        if isinstance(merged, bool) and merged:
-            return True
-        state = facts.get("state")
-        if isinstance(state, str) and state.casefold() == "merged":
-            return True
-        return bool(
-            isinstance(facts.get("merge_commit_sha"), str)
-            and facts.get("merge_commit_sha", "").strip()
-            or isinstance(facts.get("merged_at"), str)
-            and facts.get("merged_at", "").strip()
-        )
+        return facts.get("merged") is True
 
     def observed_pr_facts(self, ticket: str | Mapping[str, Any]) -> Mapping[str, Any] | None:
         """Return the latest local read-only PR observation for one ticket.
@@ -903,27 +1050,17 @@ class Supervisor:
         ticket_rows = list(tickets)
         grouped: dict[str, list[Mapping[str, Any]]] = {}
         # Normal GitHubPoller results carry ``ticket``.  Minimal test fakes
-        # may omit it, in which case match the PR number against attachments.
+        # may omit it, in which case require their exact URL to match an
+        # independently observed Linear attachment.  PR numbers alone are
+        # repository-local and cannot establish identity.
         for item in facts:
             if not isinstance(item, Mapping):
                 continue
             identifier = str(item.get("ticket") or item.get("ticket_id") or "")
             if not identifier:
-                number = item.get("number", item.get("pr_number"))
+                item_url = self._normalized_pr_url(item)
                 for ticket in ticket_rows:
-                    attachments = ticket.get("pr_urls", ticket.get("attachments", ()))
-                    if isinstance(attachments, Mapping):
-                        attachments = attachments.get("nodes", ())
-                    if isinstance(attachments, (str, bytes)):
-                        attachments = (attachments,)
-                    def attachment_number(attachment: Any) -> str:
-                        if isinstance(attachment, Mapping):
-                            attachment = attachment.get(
-                                "number", attachment.get("url", attachment.get("href", ""))
-                            )
-                        return str(attachment).rstrip("/").split("/")[-1]
-
-                    if any(str(number) == attachment_number(attachment) for attachment in attachments or ()):
+                    if item_url and item_url in self._ticket_pr_urls(ticket):
                         identifier = self._ticket_key(ticket)
                         break
             if identifier:
@@ -1251,7 +1388,8 @@ class Supervisor:
         outside the configured poll states and would otherwise strand the
         completed run and its worktree forever.  Reconciliation is scoped to
         persisted ``completed/outcome=merged`` rows and queries only the PR
-        URL already present in the final artifact.
+        URL already present in the final artifact and independently retained
+        from the Linear ticket attachment.
         """
 
         connection = getattr(self.db, "connection", None) if self.db is not None else None
@@ -1270,11 +1408,23 @@ class Supervisor:
             identifier = str(row[1])
             if not self._in_scope(identifier):
                 continue
+            try:
+                payload = json.loads(row[3]) if row[3] else {}
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            pr_url = payload.get("pr_url") or payload.get("pull_request_url")
+            if not isinstance(pr_url, str) or not pr_url.strip():
+                continue
+            ticket = self._authoritative_ticket({"identifier": identifier})
+            if not self._ticket_has_pr_url(ticket, pr_url):
+                continue
             # A merge receipt can be durable even when cleanup failed (for
             # example, a transient filesystem error).  Retry cleanup from
-            # that Harbor receipt alone; do not parse or trust builder JSON.
+            # that Harbor receipt alone, but keep it bound to the exact PR URL
+            # stored when the positive observation was recorded.
             if row[4] == 1 and row[5] is None:
-                ticket = {"identifier": identifier}
                 wake = Wake(
                     ticket=ticket,
                     action="reengage",
@@ -1288,21 +1438,12 @@ class Supervisor:
                     "waiting_on": "none",
                     "merge_verified": True,
                     "run_id": run_id,
+                    "pr_url": pr_url,
                 }
                 await self._cleanup_merged_worktree(wake, result)
                 continue
-            try:
-                payload = json.loads(row[3]) if row[3] else {}
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(payload, Mapping):
-                continue
             if str(payload.get("outcome", "")).casefold() != "merged":
                 continue
-            pr_url = payload.get("pr_url") or payload.get("pull_request_url")
-            if not isinstance(pr_url, str) or not pr_url.strip():
-                continue
-            ticket = {"identifier": identifier, "pr_urls": [pr_url]}
             wake = Wake(
                 ticket=ticket,
                 action="reengage",
@@ -1347,6 +1488,15 @@ class Supervisor:
             await self._handle_runner_result(wake, result)
         elif wake.action == "reengage":
             result = await self._invoke(target, ("resume", "reengage", "continue_run", "continue"), wake)
+            if result is None or result is False:
+                raise RuntimeError("retained builder refused re-engagement delivery")
+            threads = wake.facts.get("threads") if isinstance(wake.facts, Mapping) else None
+            head_sha = wake.facts.get("head_sha") if isinstance(wake.facts, Mapping) else None
+            if (
+                isinstance(threads, Iterable)
+                and not isinstance(threads, (str, bytes, Mapping))
+            ):
+                mark_threads_seen(self.db, threads, str(head_sha) if head_sha else None)
             await self._handle_runner_result(wake, result)
         elif wake.action == "stop" and wake.notify:
             await self._invoke(self.notifier, ("notify", "send", "publish"), wake)
@@ -1501,9 +1651,10 @@ class Supervisor:
 
         A builder can finish immediately after merging, before the next normal
         poll.  Its final JSON is still only a claim at that point.  If the
-        claim names a PR, query that exact attachment once and use the returned
-        PR facts as the merge receipt.  Cached facts remain useful when a
-        restart occurs while GitHub is temporarily unavailable.
+        claim names a PR that Linear independently attached to the ticket,
+        query that exact attachment once and use the returned PR facts as the
+        merge receipt. Cached facts remain useful when a restart occurs while
+        GitHub is temporarily unavailable.
         """
 
         if not self._in_scope(wake.ticket):
@@ -1511,17 +1662,9 @@ class Supervisor:
         if str(result.get("status", "")).casefold() != "completed":
             return None
         pr_url = result.get("pr_url") or result.get("pull_request_url")
-        candidate = dict(wake.ticket)
-        if pr_url:
-            urls = candidate.get("pr_urls")
-            if isinstance(urls, Mapping):
-                urls = urls.get("nodes", ())
-            if isinstance(urls, (str, bytes)) or urls is None:
-                urls = [urls] if urls else []
-            urls = list(urls)
-            if str(pr_url) not in {str(item) for item in urls}:
-                urls.append(str(pr_url))
-            candidate["pr_urls"] = urls
+        candidate = self._authoritative_ticket(wake.ticket)
+        if not self._ticket_has_pr_url(candidate, pr_url):
+            return None
 
         # A Wake can carry facts from the deterministic GitHub poll that
         # caused the resume.  Treat only a positive PR fact as authority; the
@@ -1563,16 +1706,39 @@ class Supervisor:
     def _run_id_for_result(self, wake: Wake, result: Mapping[str, Any]) -> str:
         """Resolve an exact run identity without guessing across runs."""
 
-        run_id = result.get("run_id") or wake.run_id
-        if run_id:
-            return str(run_id)
+        trusted_run_id = str(wake.run_id or "").strip()
+        claimed_run_id = str(result.get("run_id") or "").strip()
+        if trusted_run_id:
+            if claimed_run_id and claimed_run_id != trusted_run_id:
+                return ""
+            return trusted_run_id
         identifier = self._ticket_key(wake.ticket)
+        dispatcher = self.dispatcher
+        if claimed_run_id and isinstance(dispatcher, WorktreeDispatcher):
+            expected = dispatcher._stable_run_id(wake)
+            if claimed_run_id == expected and identifier in dispatcher.runners:
+                return claimed_run_id
         connection = getattr(self.db, "connection", None) if self.db is not None else None
         if connection is None or not identifier:
             return ""
+        if claimed_run_id:
+            try:
+                claimed = connection.execute(
+                    "SELECT ticket, role FROM runs WHERE id = ? LIMIT 1", (claimed_run_id,)
+                ).fetchone()
+            except Exception:
+                return ""
+            if (
+                claimed
+                and str(claimed[0]) == identifier
+                and str(claimed[1]).casefold() == "builder"
+            ):
+                return claimed_run_id
+            return ""
         try:
             rows = connection.execute(
-                "SELECT id FROM runs WHERE ticket = ? ORDER BY COALESCE(started_at, id), id",
+                "SELECT id FROM runs WHERE ticket = ? AND role = 'builder' "
+                "ORDER BY COALESCE(started_at, id), id",
                 (identifier,),
             ).fetchall()
         except Exception:
@@ -1585,18 +1751,31 @@ class Supervisor:
     def _merge_receipt_key(self, wake: Wake, result: Mapping[str, Any]) -> str:
         run_id = self._run_id_for_result(wake, result)
         identifier = self._ticket_key(wake.ticket)
-        return f"{identifier}\x00{run_id}" if identifier and run_id else ""
+        pr_url = result.get("pr_url") or result.get("pull_request_url")
+        target = str(pr_url).rstrip("/") if pr_url else ""
+        return (
+            f"{identifier}\x00{run_id}\x00{target}"
+            if identifier and run_id and target
+            else ""
+        )
 
     def _run_merge_receipt_is_authorized(self, wake: Wake, result: Mapping[str, Any]) -> bool:
         """Require an observed receipt, including for direct cleanup calls."""
 
+        if wake.run_id and result.get("run_id") and not self._run_id_for_result(wake, result):
+            return False
         # A deterministic wake may carry the exact PR observation that caused
         # this delivery.  This is the only in-memory authority available to
         # DB-less embedders/tests; builder result fields are intentionally not
         # consulted.
-        if self._fact_confirms_merge(
-            wake.facts if isinstance(wake.facts, Mapping) else None
-        ):
+        pr_url = result.get("pr_url") or result.get("pull_request_url")
+        if not self._ticket_has_pr_url(wake.ticket, pr_url):
+            return False
+        observed = self._matching_pr_fact(
+            wake.facts if isinstance(wake.facts, Mapping) else None,
+            str(pr_url) if pr_url else None,
+        )
+        if pr_url and self._fact_confirms_merge(observed):
             return True
         key = self._merge_receipt_key(wake, result)
         if key and key in self._verified_merge_runs:
@@ -1611,11 +1790,22 @@ class Supervisor:
             return False
         try:
             row = connection.execute(
-                "SELECT ticket, merge_verified FROM runs WHERE id = ?", (run_id,)
+                "SELECT ticket, merge_verified, final_json FROM runs WHERE id = ?", (run_id,)
             ).fetchone()
         except Exception:
             return False
-        return bool(row and str(row[0]) == identifier and row[1] == 1)
+        if not row or str(row[0]) != identifier or row[1] != 1 or not pr_url:
+            return False
+        try:
+            stored = json.loads(row[2] or "{}")
+        except (TypeError, ValueError):
+            return False
+        stored_url = (
+            stored.get("pr_url") or stored.get("pull_request_url")
+            if isinstance(stored, Mapping)
+            else None
+        )
+        return bool(stored_url and str(stored_url).rstrip("/") == str(pr_url).rstrip("/"))
 
     def _update_run_receipt(
         self,
@@ -1631,7 +1821,8 @@ class Supervisor:
             return
         connection = getattr(self.db, "connection", None) if self.db is not None else None
         run_id = self._run_id_for_result(wake, result)
-        if connection is None or not run_id:
+        identifier = self._ticket_key(wake.ticket)
+        if connection is None or not run_id or not identifier:
             return
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
@@ -1656,8 +1847,9 @@ class Supervisor:
         try:
             with lock:
                 connection.execute(
-                    f"UPDATE runs SET {', '.join(f'{key} = ?' for key in updates)} WHERE id = ?",
-                    tuple(updates.values()) + (run_id,),
+                    f"UPDATE runs SET {', '.join(f'{key} = ?' for key in updates)} "
+                    "WHERE id = ? AND ticket = ?",
+                    tuple(updates.values()) + (run_id, identifier),
                 )
                 connection.commit()
         except Exception:
@@ -1720,10 +1912,26 @@ class Supervisor:
         status = str(result.get("status", "")).casefold()
         if status != "blocked" and not isinstance(result.get("blocker"), Mapping):
             return
-        run_id = str(result.get("run_id") or wake.run_id or "")
+        run_id = self._run_id_for_result(wake, result)
+        if wake.run_id and result.get("run_id") and not run_id:
+            self.last_error = "runner result run_id does not match retained wake run_id"
+            return
         run = {"id": run_id}
         if isinstance(result.get("worktree"), str):
             run["worktree"] = result["worktree"]
+        elif run_id and self.db is not None:
+            # Runner finals intentionally contain only result metadata.  The
+            # retained worktree is durable run state, so recover it by the
+            # exact run id before resolving repository-local authority.
+            connection = getattr(self.db, "connection", None)
+            try:
+                row = connection.execute(
+                    "SELECT worktree FROM runs WHERE id = ?", (run_id,)
+                ).fetchone() if connection is not None else None
+            except Exception:
+                row = None
+            if row is not None and row[0]:
+                run["worktree"] = str(row[0])
         try:
             value = self.unblock_ladder.handle(
                 wake.ticket,
@@ -1881,10 +2089,18 @@ class Supervisor:
         if not head:
             return
         number = result.get("pr_number") or result.get("number")
+        pr_url = result.get("pr_url") or result.get("pull_request_url")
         if number is None and isinstance(wake.facts, Mapping):
             number = wake.facts.get("pr_number") or wake.facts.get("number")
+        if pr_url is None and isinstance(wake.facts, Mapping):
+            pr_url = wake.facts.get("url") or wake.facts.get("pr_url")
         try:
-            self.record_builder_push(wake.ticket, str(head), pr_number=int(number) if number else None)
+            self.record_builder_push(
+                wake.ticket,
+                str(head),
+                pr_number=int(number) if number else None,
+                pr_url=str(pr_url) if pr_url else None,
+            )
         except (TypeError, ValueError, RuntimeError):
             # A push receipt is advisory; do not turn a completed builder run
             # into a supervisor failure when the local ledger lacks its PR.
@@ -1910,12 +2126,14 @@ class Supervisor:
             return
         for row in self._pr_rows(facts):
             number = row.get("number") or row.get("pr_number")
+            pr_url = row.get("url") or row.get("pr_url")
             head = str(row.get("head_sha") or row.get("headSha") or row.get("headRefOid") or "").strip()
-            if number is None or not head:
+            if number is None or not pr_url or not head:
                 continue
             try:
                 stored = connection.execute(
-                    "SELECT head_sha FROM prs WHERE number = ?", (int(number),)
+                    "SELECT head_sha FROM prs WHERE ticket = ? AND url = ?",
+                    (identifier, str(pr_url)),
                 ).fetchone()
             except Exception:
                 continue
@@ -1924,7 +2142,12 @@ class Supervisor:
                 # Either the first observation of this PR, or nothing moved.
                 continue
             try:
-                self.record_builder_push(identifier, head, pr_number=int(number))
+                self.record_builder_push(
+                    identifier,
+                    head,
+                    pr_number=int(number),
+                    pr_url=str(pr_url),
+                )
             except (RuntimeError, TypeError, ValueError) as exc:
                 self.last_error = f"could not record rework for {identifier}: {exc}"
 
@@ -1934,6 +2157,7 @@ class Supervisor:
         head_sha: str,
         *,
         pr_number: int | None = None,
+        pr_url: str | None = None,
     ) -> int:
         """Record a builder-owned push without performing the push.
 
@@ -1946,7 +2170,13 @@ class Supervisor:
             raise RuntimeError("record_builder_push requires a HarborDB")
         if not self._in_scope(ticket):
             return 0
-        return record_push(self.db, ticket, head_sha, pr_number=pr_number)
+        return record_push(
+            self.db,
+            ticket,
+            head_sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+        )
 
     def _enrich_ticket(self, ticket: Mapping[str, Any]) -> dict[str, Any]:
         """Preserve local ownership/rework state across Linear snapshots.
@@ -2072,7 +2302,12 @@ class Supervisor:
             return
         identifier = self._ticket_key(ticket)
         run = self._latest_run(identifier)
+        authoritative_ticket = self._authoritative_ticket(ticket)
+        attached_urls = self._ticket_pr_urls(authoritative_ticket)
         for row in self._pr_rows(facts):
+            row_url = self._normalized_pr_url(row)
+            if not row_url or row_url not in attached_urls:
+                continue
             # ``GitHubPoller`` already performs a read-only observe while
             # constructing facts.  ``process`` is intentionally called again
             # so pending receipts survive a transient builder/contract error.
@@ -2081,7 +2316,7 @@ class Supervisor:
             except (TypeError, ValueError):
                 signature = None
             if signature is None:
-                value = process(ticket, row, run=run, builder=self.dispatcher or self.runner)
+                value = process(authoritative_ticket, row, run=run, builder=self.dispatcher or self.runner)
             else:
                 parameters = signature.parameters
                 kwargs: dict[str, Any] = {}
@@ -2091,13 +2326,19 @@ class Supervisor:
                     kwargs["builder"] = self.dispatcher or self.runner
                 if "comment_handler" in parameters and (self.dispatcher or self.runner) is not None:
                     kwargs["comment_handler"] = self.dispatcher or self.runner
-                value = process(ticket, row, **kwargs)
+                value = process(authoritative_ticket, row, **kwargs)
             if inspect.isawaitable(value):
                 await value
 
     async def poll_once(self) -> PollResult | None:
         if self.lifecycle in {Lifecycle.PAUSING, Lifecycle.PAUSED}:
             return self.last_result
+        # A builder may merge and move Linear to Done before GitHub's read
+        # model reports the merge to Harbor.  Done tickets are intentionally
+        # absent from the normal Linear poll, so retry exact-PR reconciliation
+        # on every live cycle instead of requiring a supervisor restart.
+        if not self.shadow:
+            await self._reconcile_completed_merges()
         try:
             result = await self.poller.poll()
         except Exception as exc:  # keep the console alive through a transient API error
@@ -2188,6 +2429,7 @@ class Supervisor:
             self.db.set_runtime(self.project, self.lifecycle.value)
         await self._apply_startup_migrations()
         await self._hydrate_retained_builders()
+        await self._retry_deterministic_blockers()
         if initial_poll:
             await self.poll_once()
         await self._reconcile_completed_merges()
@@ -2237,6 +2479,50 @@ class Supervisor:
             if runner is not None:
                 restored.append(identifier)
         return restored
+
+    async def _retry_deterministic_blockers(self) -> list[str]:
+        """Resume only capability blockers that have a known safe adapter.
+
+        This intentionally excludes product decisions and protected-path
+        review gates.  It lets a deployed Harbor fix recover an already parked
+        builder without requiring a user to repeat the instruction.
+        """
+
+        ladder = self.unblock_ladder
+        checker = getattr(ladder, "can_retry_deterministically", None) if ladder is not None else None
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if not callable(checker) or connection is None or self.shadow:
+            return []
+        tickets = {
+            str(item.get("identifier")): item
+            for item in self.db.tickets(self.project)
+            if item.get("identifier") and self._in_scope(item)
+        }
+        try:
+            rows = connection.execute(
+                "SELECT * FROM runs WHERE status = 'blocked' AND final_json IS NOT NULL "
+                "ORDER BY COALESCE(finished_at, started_at, id) DESC, id DESC"
+            ).fetchall()
+        except Exception:
+            return []
+        retried: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            run = dict(row)
+            identifier = str(run.get("ticket") or "")
+            if not identifier or identifier in seen or identifier not in tickets:
+                continue
+            seen.add(identifier)
+            try:
+                final = json.loads(str(run.get("final_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(final, Mapping) or not checker(tickets[identifier], run, final):
+                continue
+            value = ladder.handle(tickets[identifier], run, final)
+            self.last_unblock = await value if inspect.isawaitable(value) else value
+            retried.append(identifier)
+        return retried
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -2492,11 +2778,28 @@ class Supervisor:
     async def resume_session(self, run_id: str, prompt: str) -> bool:
         """Resume one persistent builder session, without creating a replacement."""
 
-        if self.ticket_scope:
-            identifier = self._ticket_for_run(run_id)
-            if not identifier or not self._in_scope(identifier):
-                return False
+        identifier = self._ticket_for_run(run_id)
+        if self.ticket_scope and (not identifier or not self._in_scope(identifier)):
+            return False
         target = self.dispatcher or self.runner
+        if isinstance(target, WorktreeDispatcher):
+            if not identifier:
+                return False
+            wake = Wake(
+                ticket={"identifier": identifier, "builder_run_id": str(run_id), "run_id": str(run_id)},
+                action="reengage",
+                resume=str(run_id),
+                instruction=prompt,
+            )
+            value = await target.resume(wake)
+            if value is None or value is False:
+                return False
+            # WorktreeDispatcher returns the builder's terminal payload.  Feed
+            # it back through the same result router used for poll-driven
+            # wakes so a second blocker is bounded, recorded, and either
+            # adapted again or escalated instead of disappearing.
+            await self._handle_runner_result(wake, value)
+            return True
         method = getattr(target, "resume_session", None) if target is not None else None
         if callable(method):
             value = method(run_id, prompt)
@@ -2513,6 +2816,28 @@ class Supervisor:
             return False
         value = await value if inspect.isawaitable(value) else value
         return value is not False
+
+    async def retry_builder(self, identifier: str) -> Any:
+        """Run an explicit terminal recovery through the normal result router."""
+
+        target = self.dispatcher
+        retry = getattr(target, "retry", None) if target is not None else None
+        if not callable(retry):
+            raise RuntimeError("retained builder retry is unavailable")
+        result = retry(str(identifier), None)
+        result = await result if inspect.isawaitable(result) else result
+        if isinstance(result, Mapping):
+            run_id = str(result.get("run_id") or "")
+        else:
+            run_id = str(getattr(result, "run_id", "") or "")
+        wake = Wake(
+            ticket={"identifier": str(identifier), "builder_run_id": run_id, "run_id": run_id},
+            action="reengage",
+            resume=run_id or None,
+            reason="operator-retry",
+        )
+        await self._handle_runner_result(wake, result)
+        return result
 
     async def answer_escalation(self, escalation_id: str, response: str) -> dict[str, Any]:
         """Record a cited operator answer and resume its retained builder.

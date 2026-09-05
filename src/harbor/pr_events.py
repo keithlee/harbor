@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from harbor.db import sql_statements
 from harbor.facts.threads import is_harbor_marked
 from harbor.resources import runtime_asset
 
@@ -36,9 +37,10 @@ RISK_INVALIDATED = "RISK_INVALIDATED"
 COMMENT_VERSION = NEW_COMMENT_VERSION  # descriptive compatibility alias
 
 _HARBOR_REPLY_MARKER = re.compile(
-    r"(?:<!--\s*harbor(?:\b|[-_:])|\[harbor\]|(?:^|\s)harbor\s*:)",
+    r"(?:<!--\s*harbor(?:\b|[-_:])|\[harbor\])",
     re.IGNORECASE,
 )
+_LINEAR_LINKBACK_MARKER = re.compile(r"<!--\s*linear-linkback\b", re.IGNORECASE)
 _REPLY_MARKER_PREFIX = "<!-- harbor:reply:"
 _REPLY_MARKER_SUFFIX = " -->"
 _RISK_MARKER_PREFIX = "<!-- harbor:risk-sha:"
@@ -110,6 +112,30 @@ def _pr_number(facts: Mapping[str, Any]) -> int:
     return number
 
 
+def _pr_url(facts: Mapping[str, Any]) -> str:
+    value = _value(facts, "url", "html_url", "href")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("PR facts require an exact URL")
+    return value.strip().rstrip("/")
+
+
+def _ticket_pr_urls(ticket: Any) -> set[str]:
+    if not isinstance(ticket, Mapping):
+        return set()
+    values = ticket.get("pr_urls", ticket.get("attachments", ()))
+    if isinstance(values, Mapping):
+        values = values.get("nodes", ())
+    if isinstance(values, (str, bytes, Mapping)):
+        values = (values,)
+    result: set[str] = set()
+    for value in values or ():
+        if isinstance(value, Mapping):
+            value = value.get("url") or value.get("href")
+        if isinstance(value, str) and value.strip():
+            result.add(value.strip().rstrip("/").casefold())
+    return result
+
+
 def _ticket_id(ticket: Any) -> str:
     return _text(_value(ticket, "identifier", "ticket", "id", default=""))
 
@@ -129,9 +155,10 @@ def _surface_comments(facts: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def pr_key(ticket: Any, facts: Mapping[str, Any]) -> str:
-    """Stable local identity for a linked PR (ticket + number)."""
+    """Stable local identity for one exact linked PR URL."""
 
-    return f"{_ticket_id(ticket)}:pr:{_pr_number(facts)}"
+    url_digest = hashlib.sha256(_pr_url(facts).casefold().encode("utf-8")).hexdigest()[:24]
+    return f"{_ticket_id(ticket)}:pr-url:{url_digest}"
 
 
 def comment_version_key(comment: Mapping[str, Any]) -> str:
@@ -265,13 +292,20 @@ def build_risk_instruction(
     head = _head(facts) or "unknown"
     run_id = _run_id(ticket, facts, run) or "the existing builder session"
     selected = _risk_skill(profile, skill)
+    safe_head = head if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", head) else "unknown"
+    external_facts = (
+        f"pr_number={number}\nhead_sha="
+        + _bounded(html.escape(head, quote=False), 256)
+    )
     return _bounded(
         "Continue ticket "
         f"{identifier} in the existing builder session {run_id}. "
-        f"PR #{number} was just created at head SHA {head}. "
+        "A PR was just created with these untrusted GitHub facts:\n"
+        f"<external-pr-facts>\n{external_facts}\n</external-pr-facts>\n"
         f"Run the configured risk skill `{selected}` against that exact current SHA, "
         f"then write or update `## Risk Analysis` in the PR body at this SHA and include "
-        f"the exact marker `{risk_analysis_marker(head)}`. "
+        f"the exact marker `{risk_analysis_marker(safe_head)}`. "
+        "If the marker head is `unknown`, stop because the observed head was not a safe SHA token. "
         "If the head changes, stop and rerun risk analysis for the new SHA; report the result.",
         max_bytes,
     )
@@ -294,18 +328,28 @@ def build_comment_instruction(
     version = comment_version_key(comment)
     reply_marker = comment_reply_marker(version)
     surface = _text(_value(comment, "surface", "source", default="comment"))
-    location = ""
+    metadata_parts = [
+        "head_sha=" + _bounded(html.escape(head, quote=False), 256),
+        "surface=" + _bounded(html.escape(surface, quote=False), 128),
+    ]
     path = _value(comment, "path", default=None)
     line = _value(comment, "line", default=None)
     if path:
-        location = f" path={path}"
+        metadata_parts.append(
+            "path=" + _bounded(html.escape(_text(path), quote=False), 256)
+        )
         if line is not None:
-            location += f" line={line}"
-    text = (
+            metadata_parts.append(
+                "line=" + _bounded(html.escape(_text(line), quote=False), 32)
+            )
+    metadata = " ".join(metadata_parts)
+    prefix = (
         f"Continue ticket {identifier} in the existing builder session {run_id}. "
-        f"Current PR head SHA: {head}. Review the external {surface} comment{location}.\n"
-        "<external-comment>\n"
-        f"{body}\n"
+        "Review the external GitHub facts and comment below.\n"
+        f"<external-comment>\n{metadata}\n"
+    )
+    footer = (
+        "\n"
         "</external-comment>\n"
         "Return a structured disposition: valid requires the fix and tests plus a reply; "
         "invalid or out-of-scope requires evidence plus a reply; ambiguous requires a "
@@ -313,7 +357,11 @@ def build_comment_instruction(
         f"Post the reply on GitHub yourself and include this exact receipt marker "
         f"verbatim in its body: {reply_marker}"
     )
-    return _bounded(text, max_bytes)
+    fixed_bytes = len((prefix + footer).encode("utf-8"))
+    if fixed_bytes > max_bytes:
+        raise PREventError("comment instruction budget is too small for its required fence and footer")
+    body_budget = max_bytes - fixed_bytes
+    return prefix + _bounded(body, body_budget) + footer
 
 
 def normalize_comment_response(response: Any) -> dict[str, Any]:
@@ -416,6 +464,7 @@ class PREvent:
     key: str
     ticket: str
     pr_number: int
+    pr_url: str
     head_sha: str | None
     payload: Mapping[str, Any]
     instruction: str
@@ -438,6 +487,7 @@ class PREvent:
             "event_key": self.event_key,
             "ticket": self.ticket,
             "pr_number": self.pr_number,
+            "pr_url": self.pr_url,
             "head_sha": self.head_sha,
             "payload": dict(self.payload),
             "instruction": self.instruction,
@@ -454,6 +504,7 @@ def _event_from_dict(value: Mapping[str, Any]) -> PREvent:
         key=_text(value.get("key") or value.get("event_key")),
         ticket=_text(value.get("ticket")),
         pr_number=int(value.get("pr_number") or payload.get("pr_number") or payload.get("number")),
+        pr_url=_text(value.get("pr_url") or payload.get("pr_url") or payload.get("url")),
         head_sha=value.get("head_sha") or payload.get("head_sha"),
         payload=payload,
         instruction=_text(value.get("instruction") or payload.get("instruction")),
@@ -474,7 +525,115 @@ def apply_phase8_migration(db: Any, path: str | Path | None = None) -> None:
     migration = Path(path) if path is not None else _migration_path()
     script = migration.read_text(encoding="utf-8")
     with _lock(db):
-        connection.executescript(script)
+        for statement in sql_statements(script):
+            if statement.upper().startswith("CREATE INDEX"):
+                continue
+            connection.execute(statement)
+        for table in ("github_pr_states", "github_pr_events"):
+            columns = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "pr_url" not in columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''"
+                )
+
+        # Older phase-8 rows stored the exact URL only inside the serialized
+        # PR-created payload. Recover that durable authority, propagate it to
+        # sibling comment receipts, and rewrite the old ticket+number keys
+        # before an observation can create duplicate events. Ambiguous or
+        # URL-less groups remain empty and therefore fail closed.
+        legacy_events = connection.execute(
+            "SELECT id, event_key, project, ticket, pr_number, event_type, "
+            "payload_json, offered, replied FROM github_pr_events WHERE pr_url=''"
+        ).fetchall()
+        decoded: list[tuple[Any, dict[str, Any], str]] = []
+        urls_by_group: dict[tuple[str, str, int], set[str]] = {}
+        for row in legacy_events:
+            try:
+                document = json.loads(row[6])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                document = {}
+            if not isinstance(document, dict):
+                document = {}
+            payload = document.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            candidate = _text(
+                document.get("pr_url")
+                or document.get("url")
+                or payload.get("pr_url")
+                or payload.get("url")
+            ).strip().rstrip("/")
+            group = (_text(row[2]), _text(row[3]), int(row[4]))
+            # Only the original PR-created observation is an authority source
+            # for upgrading a number-keyed group. Comment payloads may contain
+            # copied or foreign URLs and cannot select a repository.
+            if candidate and _text(row[5]) == PR_CREATED:
+                urls_by_group.setdefault(group, set()).add(candidate)
+            decoded.append((row, document, candidate))
+
+        resolved_urls = {
+            group: next(iter(urls))
+            for group, urls in urls_by_group.items()
+            if len(urls) == 1
+        }
+        for row, document, candidate in decoded:
+            group = (_text(row[2]), _text(row[3]), int(row[4]))
+            pr_url = resolved_urls.get(group, "")
+            if not pr_url:
+                continue
+            new_state_key = pr_key({"identifier": row[3]}, {"url": pr_url})
+            payload = document.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+                document["payload"] = payload
+            event_type = _text(row[5])
+            if event_type == PR_CREATED:
+                new_key = new_state_key
+            elif event_type == NEW_COMMENT_VERSION:
+                version = _text(payload.get("comment_version"))
+                comment = payload.get("comment")
+                if not version and isinstance(comment, Mapping):
+                    version = comment_version_key(comment)
+                if not version:
+                    continue
+                new_key = f"{new_state_key}:{version}"
+            else:
+                continue
+            new_event_key = _event_key(event_type, new_key)
+            document.update(
+                {"key": new_key, "event_key": new_event_key, "pr_url": pr_url}
+            )
+            payload["pr_url"] = pr_url
+            connection.execute(
+                "UPDATE github_pr_events SET event_key=?, pr_url=?, payload_json=? WHERE id=?",
+                (new_event_key, pr_url, _json(document), row[0]),
+            )
+
+        legacy_states = connection.execute(
+            "SELECT pr_key, project, ticket, pr_number FROM github_pr_states WHERE pr_url=''"
+        ).fetchall()
+        for row in legacy_states:
+            group = (_text(row[1]), _text(row[2]), int(row[3]))
+            pr_url = resolved_urls.get(group, "")
+            if not pr_url:
+                continue
+            new_key = pr_key({"identifier": row[2]}, {"url": pr_url})
+            connection.execute(
+                "UPDATE github_pr_states SET pr_key=?, pr_url=? WHERE pr_key=?",
+                (new_key, pr_url, row[0]),
+            )
+        connection.execute("DROP INDEX IF EXISTS github_pr_states_ticket_idx")
+        connection.execute(
+            "CREATE INDEX github_pr_states_ticket_idx ON "
+            "github_pr_states(project, ticket, pr_url)"
+        )
+        connection.execute("DROP INDEX IF EXISTS github_pr_events_ticket_type_idx")
+        connection.execute(
+            "CREATE INDEX github_pr_events_ticket_type_idx ON "
+            "github_pr_events(project, ticket, pr_url, event_type, id)"
+        )
         connection.commit()
 
 
@@ -549,13 +708,14 @@ class PREventProcessor:
         with _lock(self.db):
             try:
                 connection.execute(
-                    "INSERT INTO github_pr_events(event_key, project, ticket, pr_number, event_type, "
-                    "head_sha, payload_json, offered, replied, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+                    "INSERT INTO github_pr_events(event_key, project, ticket, pr_number, pr_url, event_type, "
+                    "head_sha, payload_json, offered, replied, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
                     (
                         key,
                         self.project,
                         event.ticket,
                         event.pr_number,
+                        event.pr_url,
                         event.event_type,
                         event.head_sha,
                         _json(event_dict),
@@ -579,6 +739,7 @@ class PREventProcessor:
         key: str,
         ticket: str,
         number: int,
+        pr_url: str,
         head_sha: str | None,
         created_at: Any,
         *,
@@ -590,6 +751,7 @@ class PREventProcessor:
             "project": self.project,
             "ticket": ticket,
             "pr_number": number,
+            "pr_url": pr_url,
             "head_sha": head_sha,
             "created_at": created_at,
             "risk_status": risk_status,
@@ -602,10 +764,10 @@ class PREventProcessor:
             return
         with _lock(self.db):
             connection.execute(
-                "INSERT INTO github_pr_states(pr_key, project, ticket, pr_number, head_sha, created_at, "
-                "risk_status, risk_head_sha, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO github_pr_states(pr_key, project, ticket, pr_number, pr_url, head_sha, created_at, "
+                "risk_status, risk_head_sha, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(pr_key) DO UPDATE SET project=excluded.project, ticket=excluded.ticket, "
-                "pr_number=excluded.pr_number, head_sha=excluded.head_sha, created_at=excluded.created_at, "
+                "pr_number=excluded.pr_number, pr_url=excluded.pr_url, head_sha=excluded.head_sha, created_at=excluded.created_at, "
                 "risk_status=excluded.risk_status, risk_head_sha=excluded.risk_head_sha, observed_at=excluded.observed_at",
                 tuple(state.values()),
             )
@@ -630,7 +792,10 @@ class PREventProcessor:
         """Observe one PR and return only newly-created local event receipts."""
 
         number = _pr_number(facts)
+        pr_url = _pr_url(facts)
         identifier = _ticket_id(ticket)
+        if pr_url.casefold() not in _ticket_pr_urls(ticket):
+            return []
         state_key = pr_key(ticket, facts)
         previous = self._state_row(state_key)
         head_sha = _head(facts)
@@ -648,6 +813,7 @@ class PREventProcessor:
             state_key,
             identifier,
             number,
+            pr_url,
             head_sha,
             _value(facts, "created_at", "createdAt", default=None),
             risk_status=risk_status,
@@ -668,6 +834,7 @@ class PREventProcessor:
                     state_key,
                     identifier,
                     number,
+                    pr_url,
                     head_sha,
                     _value(facts, "created_at", "createdAt", default=None),
                     risk_status="valid",
@@ -697,6 +864,7 @@ class PREventProcessor:
                 state_key,
                 identifier,
                 number,
+                pr_url,
                 head_sha,
                 payload,
                 build_risk_instruction(ticket, facts, skill=self.risk_skill, run=run),
@@ -708,7 +876,18 @@ class PREventProcessor:
         for source in _surface_comments(facts):
             body = _text(_value(source, "body", "text", default=""))
             marked = bool(_value(source, "harbor_marked", "is_harbor_marked", default=False)) or is_harbor_marked(body) or bool(_HARBOR_REPLY_MARKER.search(body))
-            if marked:
+            surface = _text(_value(source, "surface", "source", default="comment"))
+            is_bot = bool(_value(source, "is_bot", "isBot", default=False))
+            # Suppress Harbor receipts and explicitly marked Linear metadata.
+            # Bot authorship alone is not a safe suppression boundary: review
+            # tools post actionable top-level issue comments and review bodies.
+            # Bot review-thread comments are the one exception because
+            # WakeDecider handles those with severity and rework-cap context.
+            if (
+                marked
+                or bool(_LINEAR_LINKBACK_MARKER.search(body))
+                or (is_bot and surface == "thread")
+            ):
                 continue
             version = comment_version_key(source)
             key = f"{state_key}:{version}"
@@ -717,15 +896,17 @@ class PREventProcessor:
                 key,
                 identifier,
                 number,
+                pr_url,
                 head_sha,
                 {
                     "ticket": identifier,
                     "pr_number": number,
+                    "pr_url": pr_url,
                     "head_sha": head_sha,
                     "comment": dict(source),
                     "comment_version": version,
                     "reply_marker": comment_reply_marker(version),
-                    "surface": _value(source, "surface", "source", default="comment"),
+                    "surface": surface,
                 },
                 build_comment_instruction(ticket, facts, source, run=run),
                 _run_id(ticket, facts, run),
@@ -738,7 +919,7 @@ class PREventProcessor:
         # observes the exact marker in a *different* GitHub comment.  This is
         # intentionally done after inserting this poll's events so a reply
         # that races the first observation can still acknowledge its source.
-        self._acknowledge_reply_markers(facts)
+        self._acknowledge_reply_markers(facts, pr_url=pr_url)
 
         events.sort(key=lambda item: (0 if item.event_type == PR_CREATED else 1, item.event_key))
         return [event.as_dict() for event in events]
@@ -750,6 +931,7 @@ class PREventProcessor:
         project: str | None = None,
         ticket: str | None = None,
         pr_number: int | None = None,
+        pr_url: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return observed PR events, optionally scoped to one PR.
 
@@ -768,6 +950,15 @@ class PREventProcessor:
                 rows = [row for row in rows if _text(row.get("ticket")) == str(ticket)]
             if pr_number is not None:
                 rows = [row for row in rows if row.get("pr_number") == pr_number]
+            if pr_url is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if _text(row.get("pr_url") or _value(row.get("payload", {}), "url"))
+                    .rstrip("/")
+                    .casefold()
+                    == pr_url.rstrip("/").casefold()
+                ]
             if pending_only:
                 rows = [
                     row
@@ -780,7 +971,11 @@ class PREventProcessor:
                         _text(row.get("event_type") or row.get("type")) == PR_CREATED
                         and self.risk_status(
                             {"identifier": row.get("ticket")},
-                            {"number": row.get("pr_number")},
+                            {
+                                "number": row.get("pr_number"),
+                                "url": row.get("pr_url")
+                                or _value(row.get("payload", {}), "url"),
+                            },
                         )
                         != "valid"
                     )
@@ -803,6 +998,9 @@ class PREventProcessor:
         if pr_number is not None:
             clauses.append("pr_number = ?")
             parameters.append(int(pr_number))
+        if pr_url is not None:
+            clauses.append("pr_url = ?")
+            parameters.append(pr_url.rstrip("/"))
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY id"
@@ -819,7 +1017,11 @@ class PREventProcessor:
             state = self._state_row(
                 pr_key(
                     {"identifier": value.get("ticket")},
-                    {"number": value.get("pr_number")},
+                    {
+                        "number": value.get("pr_number"),
+                        "url": value.get("pr_url")
+                        or _value(value.get("payload", {}), "url"),
+                    },
                 )
             )
             if not state or _text(state.get("risk_status"), "unknown") != "valid":
@@ -963,7 +1165,12 @@ class PREventProcessor:
             return dict(converted) if isinstance(converted, Mapping) else converted
         return value
 
-    def _acknowledge_reply_markers(self, facts: Mapping[str, Any]) -> None:
+    def _acknowledge_reply_markers(
+        self,
+        facts: Mapping[str, Any],
+        *,
+        pr_url: str,
+    ) -> None:
         """Acknowledge comment events from observed GitHub reply markers.
 
         The source comment itself is excluded by id.  That prevents an edited
@@ -987,7 +1194,10 @@ class PREventProcessor:
                 observed.append((comment_id, body))
         if not observed:
             return
-        for raw in self.events():
+        # Markers are source-version-bound but are not globally unique to a
+        # repository.  Only events belonging to the exact PR currently being
+        # observed may be acknowledged by comments on that PR.
+        for raw in self.events(pr_url=pr_url):
             if _text(raw.get("event_type") or raw.get("type")) != NEW_COMMENT_VERSION:
                 continue
             event_key = _text(raw.get("event_key") or raw.get("key"))
@@ -1023,6 +1233,7 @@ class PREventProcessor:
             key,
             _ticket_id(ticket),
             _pr_number(facts),
+            _pr_url(facts),
             _head(facts),
             row.get("created_at"),
             risk_status="valid",
@@ -1120,11 +1331,19 @@ class PREventProcessor:
                         # The event receipt may have been observed on an older
                         # poll.  Validate against the latest observed state, not
                         # the stale event payload, before accepting risk.
-                        current = self._state_row(pr_key({"identifier": event.ticket}, {"number": event.pr_number}))
+                        event_ticket = {
+                            "identifier": event.ticket,
+                            "pr_urls": [event.pr_url],
+                        }
+                        event_facts = {
+                            "number": event.pr_number,
+                            "url": event.pr_url,
+                        }
+                        current = self._state_row(pr_key(event_ticket, event_facts))
                         current_head = _text(current.get("head_sha"), event.head_sha) if current else event.head_sha
                         self.mark_risk_valid(
-                            {"identifier": event.ticket},
-                            {"number": event.pr_number, "head_sha": current_head},
+                            event_ticket,
+                            {**event_facts, "head_sha": current_head},
                             risk,
                         )
                     self._mark_offered(event.event_key, replied=False)
@@ -1148,12 +1367,18 @@ class PREventProcessor:
                         )
                     else:
                         normalized = normalize_comment_response(result)
-                        # Keep the explicit classification mapping used by
-                        # small/fake handlers for backwards compatibility.
-                        # Real retained runners use the branch above, so their
-                        # local receipt still requires the GitHub marker.
-                        self._mark_offered(event.event_key, replied=True)
-                        delivered.append({**event.as_dict(), "response": normalized})
+                        # A structured disposition proves only local builder
+                        # delivery. Every adapter, including compatibility
+                        # handlers, requires a later read-only observation of
+                        # the source-version-bound GitHub reply marker.
+                        self._mark_offered(event.event_key, replied=False)
+                        delivered.append(
+                            {
+                                **event.as_dict(),
+                                "response": normalized,
+                                "reply_observed": False,
+                            }
+                        )
                 else:
                     # Unknown local events are not silently marked as delivered;
                     # this keeps future event types fail-closed.
@@ -1186,6 +1411,7 @@ class PREventProcessor:
             project=self.project,
             ticket=_ticket_id(ticket),
             pr_number=_pr_number(facts),
+            pr_url=_pr_url(facts),
         )
         by_key = {_text(item.get("event_key") or item.get("key")): item for item in new}
         for item in pending:

@@ -906,7 +906,7 @@ class HarborDB:
         comment_id: str | None = None,
         body: str | None = None,
     ) -> bool:
-        """Check the Linear comment idempotency ledger by issue and body hash."""
+        """Check a receipt by exact id, or by body only when no id exists."""
 
         with self._lock:
             if comment_id is not None:
@@ -914,8 +914,7 @@ class HarborDB:
                     "SELECT 1 FROM comment_receipts WHERE issue_id = ? AND comment_id = ? LIMIT 1",
                     (str(issue_id), str(comment_id)),
                 ).fetchone()
-                if row:
-                    return True
+                return row is not None
             if body is None:
                 return False
             digest = hashlib.sha256(str(body).encode("utf-8")).hexdigest()

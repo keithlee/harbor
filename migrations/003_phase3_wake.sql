@@ -22,9 +22,9 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_ticket_status_idx ON runs(ticket, status);
 
 CREATE TABLE IF NOT EXISTS prs (
-    number INTEGER PRIMARY KEY,
+    url TEXT PRIMARY KEY,
+    number INTEGER NOT NULL,
     ticket TEXT NOT NULL REFERENCES tickets(identifier) ON DELETE CASCADE,
-    url TEXT,
     head_sha TEXT,
     ci_state TEXT,
     merged INTEGER NOT NULL DEFAULT 0,
@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS prs_ticket_idx ON prs(ticket);
 
 CREATE TABLE IF NOT EXISTS review_threads (
     id TEXT PRIMARY KEY,
-    pr INTEGER NOT NULL REFERENCES prs(number) ON DELETE CASCADE,
+    pr_url TEXT NOT NULL REFERENCES prs(url) ON DELETE CASCADE,
     severity TEXT,
     is_bot INTEGER NOT NULL DEFAULT 0,
     outdated INTEGER NOT NULL DEFAULT 0,
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS review_threads (
     seen_at_sha TEXT,
     observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS review_threads_pr_idx ON review_threads(pr);
+CREATE INDEX IF NOT EXISTS review_threads_pr_idx ON review_threads(pr_url);
 
 CREATE TABLE IF NOT EXISTS work_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,4 +80,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS comment_receipts_issue_comment_idx
 -- SQLite has no portable ADD COLUMN IF NOT EXISTS.  The migration runner in
 -- harbor.wake checks for this column before applying this statement.
 ALTER TABLE tickets ADD COLUMN bot_rework_rounds INTEGER NOT NULL DEFAULT 0;
-

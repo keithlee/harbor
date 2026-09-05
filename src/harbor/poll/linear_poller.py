@@ -51,6 +51,17 @@ def normalize_issue(node: Mapping[str, Any], *, hold_all: bool = True) -> dict[s
     ]
     comments = _nodes(node.get("comments"))
     comment_ids = [str(item["id"]) for item in comments if item.get("id")]
+    linear_comments = [
+        {
+            "id": str(item["id"]),
+            "body": str(item.get("body", "")),
+            "created_at": item.get("createdAt"),
+            "updated_at": item.get("updatedAt"),
+            "author": dict(item["user"]) if isinstance(item.get("user"), Mapping) else None,
+        }
+        for item in comments
+        if item.get("id")
+    ]
     return {
         "identifier": str(node.get("identifier", "")),
         "id": node.get("id"),
@@ -62,6 +73,7 @@ def normalize_issue(node: Mapping[str, Any], *, hold_all: bool = True) -> dict[s
         "updated_at": node.get("updatedAt"),
         "pr_urls": pr_urls,
         "comment_ids": comment_ids,
+        "linear_comments": linear_comments,
         "blocked_by": _blocked_by(node),
         "owned": False,
         "hold": hold_all,

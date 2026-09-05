@@ -16,7 +16,7 @@ query HarborIssues($slugs: [String!]!, $states: [String!]!) {
       id identifier title url updatedAt branchName
       state { name type }
       attachments(first: 10) { nodes { url sourceType } }
-      comments(first: 20) { nodes { id createdAt body } }
+      comments(first: 20) { nodes { id createdAt updatedAt body user { id name } } }
       inverseRelations(first: 20) { nodes { type issue { identifier state { type } } } }
     }
   }

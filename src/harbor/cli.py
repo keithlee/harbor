@@ -17,6 +17,7 @@ from harbor.config.projects import get_project
 from harbor.console import Console
 from harbor.db import HarborDB
 from harbor.first_mate import FirstMate
+from harbor.lease import ProjectLease, ProjectLeaseError
 from harbor.notify import Notifier
 from harbor.poll.github_poller import GitHubPoller
 from harbor.poll.linear_poller import LinearPoller
@@ -625,7 +626,19 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.command == "doctor":
         return await _doctor(args.project)
     if args.command == "start":
-        return await _start(args.project, once=args.once, shadow=args.shadow, ticket=args.ticket)
+        if args.shadow:
+            return await _start(args.project, once=args.once, shadow=True, ticket=args.ticket)
+        try:
+            config = get_project(args.project)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+        try:
+            with ProjectLease(_db_path(), config.name):
+                return await _start(args.project, once=args.once, shadow=False, ticket=args.ticket)
+        except ProjectLeaseError as exc:
+            print(f"Harbor: start refused: {exc}", file=sys.stderr)
+            return 2
     if args.command == "facts":
         return await _facts(args.project, as_json=getattr(args, "json", True))
     if args.command == "answer":

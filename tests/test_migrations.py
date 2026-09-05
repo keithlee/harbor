@@ -18,7 +18,17 @@ from harbor.db import sql_statements
 
 MIGRATIONS = sorted((Path(__file__).resolve().parents[1] / "migrations").glob("*.sql"))
 
-SQL_KEYWORDS = ("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE", "DROP", "PRAGMA")
+SQL_KEYWORDS = (
+    "CREATE",
+    "ALTER",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "DROP",
+    "PRAGMA",
+    "BEGIN",
+    "COMMIT",
+)
 
 
 def test_migrations_directory_is_not_empty() -> None:

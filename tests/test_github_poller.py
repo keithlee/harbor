@@ -2,7 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from harbor.poll.github_poller import GitHubPoller
+from harbor.poll.github_poller import GitHubPoller, parse_pull_request
 
 
 class FakeGitHubClient:
@@ -38,3 +38,17 @@ def test_no_attached_prs_means_no_github_call() -> None:
     client = FakeGitHubClient({})
     assert run(GitHubPoller(client, owner="o", repo="r").poll([{"identifier": "SAMPLE-1", "pr_urls": []}])) == []
     assert client.calls == []
+
+
+def test_parser_never_promotes_state_to_merge_authority() -> None:
+    facts = parse_pull_request(
+        {
+            "number": 8,
+            "merged": False,
+            "state": "MERGED",
+            "merge_commit_sha": "looks-real",
+            "headRefOid": "head-a",
+        }
+    )
+
+    assert facts["merged"] is False

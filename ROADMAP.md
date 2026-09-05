@@ -62,9 +62,13 @@ shadow poll and has every prerequisite for a real builder dispatch.
 - Add a disposable-repository integration test covering bootstrap, shadow
   polling, isolated worktree creation, dependency installation, and a mocked
   Codex delivery run.
-- Run an authorized live canary against a non-production Linear/GitHub project
-  to prove background dispatch, PR creation, re-engagement, review handling,
-  and merge/cleanup reconciliation.
+- Build a reusable opt-in low-risk canary command that creates a uniquely
+  scoped docs-only Linear ticket, monitors Harbor through PR creation,
+  re-engagement, review, CI, merge, and cleanup, and preserves transition-only
+  evidence for diagnosis. Keep this out of the runtime until its external
+  mutation contract and failure recovery have an independently reviewed spec.
+- Run that canary against a non-production Linear/GitHub project before broad
+  supervisor or lifecycle changes are merged.
 - Keep the existing fail-closed behavior: no cleanup from a self-reported
   merge, no duplicate builder session, and no terminal Linear `Done` write by
   Harbor itself.

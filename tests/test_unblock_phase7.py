@@ -120,6 +120,76 @@ def test_rung_one_cites_discoveries_without_paging(tmp_path: Path):
         db.close()
 
 
+def test_unblock_uses_retained_worktree_authority_not_stale_base_checkout(tmp_path: Path):
+    base = tmp_path / "base"
+    worktree = tmp_path / "worktree"
+    base.mkdir()
+    worktree.mkdir()
+    (base / "AGENTS.md").write_text("Ask a human about every merge.\n", encoding="utf-8")
+    (worktree / "AGENTS.md").write_text(
+        "Low-risk PRs are pre-authorized to merge after the clean-context audit passes.\n",
+        encoding="utf-8",
+    )
+    resumed = []
+
+    async def terra(prompt, blocker):
+        assert "pre-authorized" in prompt
+        assert "Ask a human" not in prompt
+        return {"disposition": "resolve", "answer": "Proceed after the audit.", "citation": "AGENTS.md:1"}
+
+    async def resume(run_id, prompt):
+        resumed.append((run_id, prompt))
+        return True
+
+    result = run(
+        UnblockLadder(first_mate=terra, resumer=resume, repo_path=base, remediation_executor=lambda command: False).handle(
+            ticket(), {"id": "builder-session", "worktree": str(worktree)},
+            {"blocker": {"kind": "ambiguous_ac", "question": "May this low-risk PR merge?"}},
+        )
+    )
+    assert result.rung == 1 and result.resumed
+    assert resumed[0][0] == "builder-session"
+
+
+def test_repository_agent_role_is_adapted_without_human_escalation(tmp_path: Path):
+    role = tmp_path / ".claude" / "agents" / "pr-proof-auditor.md"
+    role.parent.mkdir(parents=True)
+    role.write_text("Audit the PR from clean context. Input: PR URL only.\n", encoding="utf-8")
+    resumed = []
+
+    async def resume(run_id, prompt):
+        resumed.append((run_id, prompt))
+        return True
+
+    result = run(
+        UnblockLadder(resumer=resume, repo_path=tmp_path).handle(
+            ticket(), {"id": "builder-session", "worktree": str(tmp_path)},
+            {"blocker": {"kind": "missing_proof_capability", "question": "Can the mandatory clean-context pr-proof-auditor be invoked?", "evidence": "unknown agent_type 'pr-proof-auditor'"}},
+        )
+    )
+    assert result.rung == 0 and result.resumed and not result.notified
+    assert "supported `default` subagent" in resumed[0][1]
+    assert ".claude/agents/pr-proof-auditor.md:1" in resumed[0][1]
+
+
+def test_approval_gated_linear_connector_is_adapted_without_human(tmp_path: Path):
+    resumed = []
+
+    async def resume(run_id, prompt):
+        resumed.append((run_id, prompt))
+        return True
+
+    result = run(
+        UnblockLadder(resumer=resume, repo_path=tmp_path).handle(
+            ticket(), {"id": "builder-session", "worktree": str(tmp_path)},
+            {"blocker": {"kind": "env_blocker", "question": "How should Linear be updated?", "evidence": "mcp__linear__save_issue returned: MCP tool call requires approval, but approval policy is never."}},
+        )
+    )
+    assert result.rung == 0 and result.resumed and not result.notified
+    assert "mcp__codex_apps__linear_*" in resumed[0][1]
+    assert "mcp__linear__*" in resumed[0][1]
+
+
 def test_novel_product_question_escalates_and_lists_sources(tmp_path: Path):
     db = HarborDB(tmp_path / "harbor.db")
     linear = LinearFake()
@@ -237,6 +307,18 @@ def test_manual_merge_reengages_retained_builder_only():
     )
     assert command is not None
     assert command.action == "reengage" and command.run_id == "builder-session"
+
+
+@pytest.mark.parametrize("value", ["true", "MERGED", 1, "1"])
+def test_manual_merge_requires_a_literal_boolean(value: object) -> None:
+    assert (
+        observe_manual_merge(
+            ticket(),
+            {"id": "builder-session", "waiting_on": "human"},
+            {"merged": value},
+        )
+        is None
+    )
 
 
 def test_linear_progress_primitives_write_comment_and_nonterminal_state_only():

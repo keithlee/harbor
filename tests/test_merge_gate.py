@@ -9,6 +9,7 @@ treated as verified either.
 from __future__ import annotations
 
 from harbor.runner.base import merge_is_verified, normalize_final_result
+from harbor.supervisor import Supervisor
 
 
 MERGED = {"status": "completed", "outcome": "merged", "waiting_on": "none", "summary": "Merged", "pr_url": "https://example.test/pr/1"}
@@ -111,3 +112,11 @@ def test_builder_merge_receipt_fields_never_become_external_authority() -> None:
 def test_only_a_positive_observed_pr_fact_verifies_a_merge() -> None:
     assert merge_is_verified(MERGED, observed={"merged": "true"}) is False
     assert merge_is_verified(MERGED, observed={"merged": True}) is True
+    assert merge_is_verified(MERGED, observed={"merged": False, "merge_commit_sha": "abc123"}) is False
+    assert Supervisor._fact_confirms_merge({"merged": False, "merge_commit_sha": "abc123"}) is False
+    assert (
+        Supervisor._fact_confirms_merge(
+            {"merged": False, "state": "MERGED", "merge_commit_sha": "abc123"}
+        )
+        is False
+    )

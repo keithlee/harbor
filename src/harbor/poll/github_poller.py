@@ -148,9 +148,9 @@ def parse_pull_request(
     head_sha = _head_sha(pull_request)
     threads = parse_threads(pull_request.get("reviewThreads"), seen_at_sha=None)
     comments = parse_comment_surfaces(pull_request, pr_number=number)
-    merged = bool(pull_request.get("merged", False))
-    if not merged and str(pull_request.get("state", "")).upper() == "MERGED":
-        merged = True
+    # Only GitHub's canonical boolean is merge authority.  A state label or
+    # merge-looking SHA must never synthesize an irreversible merge receipt.
+    merged = pull_request.get("merged") is True
     facts: dict[str, Any] = {
         "number": number,
         "body": pull_request.get("body"),
@@ -278,15 +278,23 @@ class GitHubPoller:
         for number, ticket in attached:
             if number not in by_number:
                 continue
+            node = dict(by_number[number])
+            # GitHub test doubles and some reduced query adapters omit `url`.
+            # The poll target is already constrained by the configured
+            # owner/repository and Linear attachment, so reconstruct only that
+            # exact canonical URL rather than falling back to PR-number identity.
+            node.setdefault("url", f"https://github.com/{owner}/{repo}/pull/{number}")
             facts = parse_pull_request(
-                by_number[number], required_checks=self.required_checks, ticket=ticket
+                node, required_checks=self.required_checks, ticket=ticket
             )
             processor = self.event_processor
             if processor is not None:
                 observe = getattr(processor, "observe", None)
                 if callable(observe):
                     events = observe(
-                        {"identifier": ticket} if ticket is not None else {},
+                        {"identifier": ticket, "pr_urls": [facts["url"]]}
+                        if ticket is not None
+                        else {},
                         facts,
                     )
                     if inspect.isawaitable(events):

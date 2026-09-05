@@ -23,7 +23,7 @@ def _ticket(identifier: str, *, state: str = "Todo") -> dict[str, Any]:
         "title": f"Title {identifier}",
         "state": state,
         "blocked_by": [],
-        "pr_urls": [],
+        "pr_urls": [f"https://github.com/example/repo/pull/{identifier.rsplit('-', 1)[-1]}"],
         "owned": False,
     }
 
@@ -162,7 +162,7 @@ def test_hydration_and_merge_reconcile_are_scoped(tmp_path: Path) -> None:
                     "SAMPLE-34",
                     "completed",
                     str(target_path),
-                    '{"status":"completed","outcome":"merged"}',
+                    '{"status":"completed","outcome":"merged","pr_url":"https://github.com/example/repo/pull/34"}',
                     1,
                 ),
                 (
@@ -170,7 +170,7 @@ def test_hydration_and_merge_reconcile_are_scoped(tmp_path: Path) -> None:
                     "SAMPLE-35",
                     "completed",
                     str(foreign_path),
-                    '{"status":"completed","outcome":"merged"}',
+                    '{"status":"completed","outcome":"merged","pr_url":"https://github.com/example/repo/pull/35"}',
                     1,
                 ),
             ],

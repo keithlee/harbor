@@ -253,7 +253,8 @@ class Console:
     def help_text(self) -> str:
         return (
             "/status  /pause [reason]  /hold on|off <ticket>  /resume  "
-            "/answer <escalation-id> <answer>  /kill [run-id]  /exit  /help"
+            "/answer <escalation-id> <answer>  /retry <ticket>  "
+            "/kill [run-id]  /exit  /help"
         )
 
     async def _invoke_control(self, names: tuple[str, ...], argument: str) -> bool:
@@ -313,7 +314,10 @@ class Console:
 
     async def _answer_question(self, question: str) -> str:
         if self.first_mate is None:
-            return "Phase 1 handles /status, /pause, /resume, /exit, and /help; no model call was made."
+            return (
+                "Deterministic slash commands include /status, /pause, /resume, /retry, "
+                "/exit, and /help; no model call was made."
+            )
         # A question gets exactly one fresh observation and exactly one model
         # invocation.  Rendering the digest is synchronous and model-free.
         refresh = getattr(self.supervisor, "fresh_digest", None)
@@ -495,6 +499,20 @@ class Console:
                 return f"Harbor: answer not recorded: {exc}"
             resumed = " · same builder resumed" if result.get("resumed") else " · builder session not available"
             return f"Harbor: answer recorded for escalation {escalation_id}{resumed}"
+        if command == "/retry":
+            identifier = argument.strip()
+            if not identifier:
+                return "Usage: /retry <ticket>"
+            retry = getattr(self.supervisor, "retry_builder", None)
+            if not callable(retry):
+                return "Harbor: retry unavailable · no retained builder recovery hook is configured"
+            try:
+                result = retry(identifier)
+                result = await result if inspect.isawaitable(result) else result
+            except (RuntimeError, ValueError) as exc:
+                return f"Harbor: retry refused · {exc}"
+            status = result.get("status") if isinstance(result, Mapping) else getattr(result, "status", None)
+            return f"Harbor: same builder retried · {identifier} · {status or 'result recorded'}"
         if command == "/kill":
             target = argument.strip()
             handled = await self._invoke_control(("kill", "terminate_builder", "terminate"), target)

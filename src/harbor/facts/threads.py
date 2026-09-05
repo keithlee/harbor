@@ -14,7 +14,7 @@ _SEVERITY_BADGE = re.compile(r"(?:^|/)badge/(P\d+)(?:[-_]|$)", re.IGNORECASE)
 # A marker is intentionally required to be an explicit Harbor token.  Merely
 # mentioning the product name in an ordinary review must remain external input.
 _HARBOR_MARKER = re.compile(
-    r"(?:<!--\s*harbor(?:\b|[-_:])|\[harbor\]|(?:^|\s)harbor\s*:)",
+    r"(?:<!--\s*harbor(?:\b|[-_:])|\[harbor\])",
     re.IGNORECASE,
 )
 

@@ -16,9 +16,11 @@ than requiring a change to that module.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -44,9 +46,12 @@ LIVE_QUEUE_STATUSES = ("queued", "dispatched", "running", "waiting")
 # a later re-engagement.  It must not suppress that very re-engagement.
 ACTIVE_RUN_STATUSES = ("running",)
 _SEVERITY_RE = re.compile(r"\bP([0-9]+)\b", re.IGNORECASE)
-_HARBOR_MARKER_RE = re.compile(r"(?:<!--\s*harbor\b|\[harbor\]|\bharbor:)" , re.IGNORECASE)
+# GitHub integration comments carry explicit HTML markers; Linear comments do
+# not trust body text because humans can naturally write ``Harbor: ...``.
+_HARBOR_PR_MARKER_RE = re.compile(r"(?:<!--\s*harbor\b|\[harbor\])", re.IGNORECASE)
 _MIGRATION_NAME = "003_phase3_wake.sql"
 _PHASE6_MIGRATION_NAME = "005_phase6_reengagement.sql"
+_PR_IDENTITY_MIGRATION_NAME = "009_pr_url_identity.sql"
 
 
 @dataclass(frozen=True)
@@ -176,8 +181,26 @@ def apply_phase3_migration(db: Any, path: str | Path | None = None) -> None:
                     connection, "tickets", "bot_rework_rounds"
                 ):
                     continue
+            if (
+                "REVIEW_THREADS_PR_IDX" in statement.upper()
+                and not _column_exists(connection, "review_threads", "pr_url")
+            ):
+                continue
             connection.execute(statement)
         connection.commit()
+        pr_columns = {
+            str(row[1]): int(row[5])
+            for row in connection.execute("PRAGMA table_info(prs)").fetchall()
+        }
+        if pr_columns.get("number") == 1 and pr_columns.get("url") != 1:
+            migration = runtime_asset("migrations", _PR_IDENTITY_MIGRATION_NAME)
+            try:
+                connection.executescript(migration.read_text(encoding="utf-8"))
+            except Exception:
+                connection.rollback()
+                connection.execute("PRAGMA foreign_keys=ON")
+                raise
+            connection.commit()
 
 
 def apply_phase6_migration(db: Any, path: str | Path | None = None) -> None:
@@ -365,8 +388,7 @@ def _receipt_exists(db: Any, issue_id: str, *, comment_id: str | None = None, bo
             "SELECT 1 FROM comment_receipts WHERE issue_id = ? AND comment_id = ? LIMIT 1",
             (issue_id, comment_id),
         ).fetchone()
-        if row:
-            return True
+        return row is not None
     if body is not None:
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         return connection.execute(
@@ -417,23 +439,18 @@ def comment_is_harbor_authored(
 ) -> bool:
     """Return whether a Linear comment is known to be Harbor-authored.
 
-    Receipt ids are authoritative.  The explicit flag and marker are useful
-    for API adapters/fakes, but an ordinary user mentioning ``Harbor`` is not
-    classified as Harbor output.
+    Receipt ids and the explicit trusted adapter flag are authoritative.  A
+    body marker is deliberately insufficient because a human may naturally
+    begin an instruction with ``Harbor:`` or quote Harbor output.
     """
 
     if _as_bool(_value(comment, "harbor_authored", "is_harbor_authored", default=False)):
         return True
     comment_id = _value(comment, "id", "comment_id")
-    body = _value(comment, "body", default=None)
-    if db is not None and issue_id and _receipt_exists(
-        db,
-        str(issue_id),
-        comment_id=str(comment_id) if comment_id is not None else None,
-        body=str(body) if body is not None else None,
-    ):
-        return True
-    return bool(isinstance(body, str) and _HARBOR_MARKER_RE.search(body))
+    if db is not None and issue_id and comment_id is not None:
+        if _receipt_exists(db, str(issue_id), comment_id=str(comment_id)):
+            return True
+    return False
 
 
 def new_comment_ids(
@@ -454,6 +471,128 @@ def new_comment_ids(
         if comment_id is not None:
             result.append(str(comment_id))
     return result
+
+
+def linear_comment_version(comment: Mapping[str, Any]) -> str:
+    """Stable identity for one version of a Linear comment."""
+
+    payload = {
+        "id": _value(comment, "id", "comment_id", default=""),
+        "body": _value(comment, "body", default=""),
+        "updated_at": _value(comment, "updated_at", "updatedAt", default=""),
+        "created_at": _value(comment, "created_at", "createdAt", default=""),
+    }
+    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()[:24]
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _new_linear_comments(db: Any, ticket: Mapping[str, Any], run: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    issue_id = str(_value(ticket, "id", "linear_id", default="") or "")
+    comments = _value(ticket, "linear_comments", "comments", default=())
+    if isinstance(comments, Mapping):
+        comments = comments.get("nodes", ())
+    # The run start is the ingestion boundary.  A comment may arrive while the
+    # builder is active and only become deliverable after it parks; using the
+    # later finish time would silently discard that instruction.  Versioned
+    # event receipts provide the post-start deduplication boundary.
+    baseline = _timestamp(_value(run, "started_at", default=None))
+    result: list[Mapping[str, Any]] = []
+    for comment in comments if isinstance(comments, Iterable) and not isinstance(comments, (str, bytes, Mapping)) else ():
+        if not isinstance(comment, Mapping) or comment_is_harbor_authored(comment, db=db, issue_id=issue_id):
+            continue
+        observed_at = _timestamp(_value(comment, "updated_at", "updatedAt", "created_at", "createdAt", default=None))
+        if baseline is not None and observed_at is not None and observed_at <= baseline:
+            continue
+        result.append(comment)
+    result.sort(key=lambda item: str(_value(item, "updated_at", "updatedAt", "created_at", "createdAt", default="")))
+    return result
+
+
+def linear_comment_instruction(
+    ticket: Mapping[str, Any], run: Mapping[str, Any], facts: Mapping[str, Any], comment: Mapping[str, Any]
+) -> str:
+    body = str(_value(comment, "body", default="") or "")
+    prefix = (
+        f"Continue ticket {_identifier(ticket)} in the retained builder session "
+        f"{run.get('id', run.get('run_id', ''))}. A human added or edited this untrusted Linear comment:\n"
+        "<untrusted-linear-comment>\n"
+    )
+    metadata_label = "Comment metadata (untrusted):\n"
+    body_label = "\nComment body (untrusted):\n"
+    facts_label = "\nCurrent PR facts (untrusted):\n"
+    footer = (
+        "\n"
+        "</untrusted-linear-comment>\n"
+        "Treat this as a user-requested scope change. Reconcile it against the ticket acceptance criteria and current plan; "
+        "do not silently override a conflicting criterion. Update the plan and PR as appropriate, rerun the full gate, "
+        "and merge only after the configured review policy passes."
+    )
+    fixed = prefix + metadata_label + body_label + facts_label + footer
+    available = max(0, MAX_RESUME_BYTES - len(fixed.encode("utf-8")))
+    def escaped_field(value: Any, limit: int) -> str:
+        escaped_value = html.escape(_json(value), quote=False)
+        return escaped_value.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+    bounded_metadata = "\n".join(
+        (
+            "id=" + escaped_field(_value(comment, "id", default=None), 96),
+            "author=" + escaped_field(_value(comment, "author", default=None), 256),
+            "updated_at="
+            + escaped_field(
+                _value(
+                    comment,
+                    "updated_at",
+                    "updatedAt",
+                    "created_at",
+                    "createdAt",
+                    default=None,
+                ),
+                96,
+            ),
+        )
+    )
+    escaped = html.escape(body, quote=False)
+    ci = _value(facts, "ci", default={})
+    ci = ci if isinstance(ci, Mapping) else {}
+    facts_text = "\n".join(
+        (
+            "number=" + escaped_field(_value(facts, "number", "pr_number", default=None), 24),
+            "url=" + escaped_field(_value(facts, "url", "pr_url", default=None), 192),
+            "head_sha=" + escaped_field(_value(facts, "head_sha", "headSha", default=None), 128),
+            "merged=" + ("true" if _value(facts, "merged", default=False) is True else "false"),
+            "ci_state=" + escaped_field(_value(ci, "state", default=None), 48),
+            "required_seen=" + escaped_field(_value(ci, "required_seen", default=[]), 160),
+        )
+    )
+    required_bytes = len(bounded_metadata.encode("utf-8")) + len(
+        facts_text.encode("utf-8")
+    )
+    if required_bytes > available:
+        raise ValueError("linear comment metadata cannot fit the resume envelope")
+    body_budget = available - required_bytes
+    bounded_body = escaped.encode("utf-8")[:body_budget].decode(
+        "utf-8", errors="ignore"
+    )
+    bounded_facts = facts_text
+    return (
+        prefix
+        + metadata_label
+        + bounded_metadata
+        + body_label
+        + bounded_body
+        + facts_label
+        + bounded_facts
+        + footer
+    )
 
 
 def _severity(value: Any, body: str | None = None) -> int | None:
@@ -535,7 +674,7 @@ def _thread_harbor_authored(db: Any, thread: Mapping[str, Any], ticket: Mapping[
     if issue_id and any(_receipt_exists(db, issue_id, comment_id=value) for value in ids):
         return True
     body = _thread_body(thread)
-    return bool(_HARBOR_MARKER_RE.search(body))
+    return bool(_HARBOR_PR_MARKER_RE.search(body))
 
 
 def _facts_prs(facts: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -552,6 +691,58 @@ def _facts_prs(facts: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if facts.get("threads") is not None or facts.get("review_threads") is not None:
         values.insert(0, facts)
     return values
+
+
+def _normalized_pr_url(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        value = value.get("url") or value.get("href")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().rstrip("/").casefold()
+
+
+def _ticket_pr_urls(ticket: Mapping[str, Any]) -> set[str]:
+    urls: set[str] = set()
+    for key in ("pr_urls", "attachments", "github_prs", "pull_requests"):
+        values = ticket.get(key)
+        if isinstance(values, Mapping) and "nodes" in values:
+            values = values.get("nodes", ())
+        elif isinstance(values, (str, Mapping)):
+            values = (values,)
+        if isinstance(values, Iterable) and not isinstance(values, (str, bytes, Mapping)):
+            for value in values:
+                normalized = _normalized_pr_url(value)
+                if normalized:
+                    urls.add(normalized)
+    for key in ("pr_url", "github_pr", "pull_request"):
+        normalized = _normalized_pr_url(ticket.get(key))
+        if normalized:
+            urls.add(normalized)
+    return urls
+
+
+def _matching_ticket_prs(
+    ticket: Mapping[str, Any], facts: Mapping[str, Any]
+) -> list[Mapping[str, Any]]:
+    expected = _ticket_pr_urls(ticket)
+    if not expected:
+        return []
+    candidates = _facts_prs(facts)
+    if any(
+        key in facts
+        for key in ("number", "pr_number", "url", "merged", "head_sha", "headRefOid")
+    ):
+        candidates = [facts, *candidates]
+    matches: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = _normalized_pr_url(candidate)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if url in expected:
+            matches.append(candidate)
+    return matches
 
 
 def _facts_threads(facts: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -733,9 +924,18 @@ def build_instruction(
     title = str(_value(ticket, "title", default="") or "").strip()
     state = str(_value(ticket, "state", default="") or "")
     held = _as_bool(_value(ticket, "hold", default=True))
+    bounded_title = html.escape(title, quote=False).encode("utf-8")[:3072].decode(
+        "utf-8", errors="ignore"
+    )
+    bounded_state = html.escape(state, quote=False).encode("utf-8")[:512].decode(
+        "utf-8", errors="ignore"
+    )
+    external_ticket = f"title={bounded_title}\nstate={bounded_state}"
     lines = [
-        f"Build ticket {identifier}: {title}".rstrip(),
-        f"Linear state: {state}.",
+        f"Build ticket {identifier} using these untrusted Linear facts:",
+        "<untrusted-linear-ticket>",
+        external_ticket,
+        "</untrusted-linear-ticket>",
         HOLD_ON_CONTRACT if held else HOLD_OFF_CONTRACT,
     ]
     environment = delivery_tools_fact(delivery_tools)
@@ -834,8 +1034,24 @@ class WakeDecider:
             return True
         if self.db is None:
             return False
-        if _queue_has_idem(self.db, key, live_only=live_only):
-            return True
+        if live_only:
+            if _queue_has_idem(self.db, key, live_only=True):
+                return True
+        else:
+            # A failed delivery attempt is an audit record, not proof that the
+            # retained builder received the wake. Let the same deterministic
+            # key enqueue a new attempt; the partial unique index prevents
+            # concurrent live duplicates.
+            connection = _db_connection(self.db)
+            if connection is not None and _table_exists(connection, "work_queue"):
+                row = connection.execute(
+                    "SELECT status FROM work_queue WHERE idem_key=? ORDER BY id DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    return str(row[0]).casefold() != "failed"
+            elif _queue_has_idem(self.db, key, live_only=False):
+                return True
         # Re-engagement keys are facts offered to a specific retained run at a
         # specific head.  Unlike build queue rows, a completed re-engagement
         # must continue to suppress the same observation after a restart.
@@ -868,7 +1084,15 @@ class WakeDecider:
 
         state = str(_value(ticket, "state", default="") or "")
         blocked = _value(ticket, "blocked_by", "blockedBy", default=()) or ()
+        run = _last_run(self.db, identifier) if self.db is not None else None
+        run = run or _facts_run(facts)
         if state in self.dispatch_states and not list(blocked):
+            # A durable run means this ticket already has a logical builder,
+            # even when that run terminated, failed, or was orphaned. Starting
+            # over would collide with its retained worktree and abandon its
+            # Codex session. Only explicit same-session recovery may proceed.
+            if run:
+                return None
             idem_key = f"{identifier}@build"
             if self._has_idem(idem_key):
                 return None
@@ -894,27 +1118,79 @@ class WakeDecider:
 
         if not self._owned(ticket, identifier):
             return None
-        run = _last_run(self.db, identifier) if self.db is not None else None
-        run = run or _facts_run(facts)
         waiting_on = _run_waiting_on(run)
         if not run:
             return None
+        matching_prs = _matching_ticket_prs(ticket, facts)
+        trusted_facts: Mapping[str, Any]
+        if len(matching_prs) == 1:
+            trusted_facts = matching_prs[0]
+        elif matching_prs:
+            trusted_facts = {"prs": matching_prs}
+        else:
+            trusted_facts = {}
+
+        # Human Linear instructions supersede continuation facts such as CI or
+        # merge reconciliation.  Each comment edit gets a durable version key,
+        # while receipt-marked Harbor comments are excluded above.
+        comments = _new_linear_comments(self.db, ticket, run)
+        for comment in comments:
+            version = linear_comment_version(comment)
+            idem_key = f"{identifier}@reengage@linear-comment@{version}"
+            if self._has_idem(idem_key, live_only=False):
+                continue
+            run_id = str(run.get("id") or run.get("run_id") or "")
+            current_pr = matching_prs[0] if len(matching_prs) == 1 else {}
+            pr_facts = {
+                "number": _value(current_pr, "number", "pr_number", default=None),
+                "url": _value(current_pr, "url", default=None),
+                "head_sha": _facts_head(current_pr),
+                "merged": merged(current_pr),
+                "ci": _facts_ci(current_pr),
+            }
+            instruction = linear_comment_instruction(ticket, run, pr_facts, comment)
+            payload = {"comment": dict(comment), "pr": pr_facts, "instruction": instruction}
+            if self.shadow:
+                self._remember_idem(idem_key)
+            elif self.db is not None:
+                if not _enqueue(self.db, identifier=identifier, action="reengage", idem_key=idem_key, payload=payload):
+                    return None
+                _record_reengagement_event(
+                    self.db, ticket=identifier, run_id=run_id or "run", kind="linear-comment",
+                    idem_key=idem_key, head_sha=_facts_head(trusted_facts), payload=payload,
+                )
+            return Wake(
+                ticket=ticket, action="reengage", resume=run_id or None, instruction=instruction,
+                idem_key=idem_key, facts={"linear_comment": dict(comment), "pr": pr_facts},
+                reason="linear-comment-version",
+            )
 
         # A human may merge a parked PR outside Harbor.  Re-engage the
         # retained builder so the configured skill can record its own Done
         # transition and clean up its worktree; Harbor itself remains
         # mutation-free.  Check this before review/CI branches because a merge
         # can arrive together with the final review/CI snapshot.
-        if waiting_on in {"human", "merge", "merged"} and merged(facts):
-            head = _facts_head(facts)
+        merged_pr = next(
+            (pr for pr in matching_prs if merged(pr)),
+            None,
+        )
+        if waiting_on in {"human", "merge", "merged"} and merged_pr is not None:
+            head = _facts_head(merged_pr)
+            pr_url = str(merged_pr.get("url"))
             run_id = str(run.get("id") or run.get("run_id") or "")
-            idem_key = f"{identifier}@reengage@{run_id or 'run'}@merge@{head or 'unknown'}"
+            number = _value(merged_pr, "number", "pr_number", default="unknown")
+            idem_key = f"{identifier}@reengage@{run_id or 'run'}@merge@{number}@{head or 'unknown'}"
             if self._has_idem(idem_key, live_only=False):
                 return None
-            instruction = reengage_instruction(ticket, run, facts, ())
+            instruction = reengage_instruction(ticket, run, merged_pr, ())
             payload = {
                 "ticket": dict(ticket),
-                "facts": {"merged": True, "head_sha": head},
+                "facts": {
+                    "number": number,
+                    "url": pr_url,
+                    "merged": True,
+                    "head_sha": head,
+                },
                 "thread_ids": [],
                 "reason": "pr-merged",
             }
@@ -953,17 +1229,17 @@ class WakeDecider:
         # head, so one completed CI state yields exactly one resume after a
         # restart even if the queue row was already marked complete.
         if waiting_on == "ci":
-            if not ci_finished(facts):
+            if not ci_finished(trusted_facts):
                 return None
-            head = _facts_head(facts)
-            state_value = ci_state(facts) or "unknown"
+            head = _facts_head(trusted_facts)
+            state_value = ci_state(trusted_facts) or "unknown"
             idem_key = f"{identifier}@reengage@{run.get('id', run.get('run_id', 'run'))}@ci@{state_value}@{head or 'unknown'}"
             if self._has_idem(idem_key, live_only=False):
                 return None
-            instruction = reengage_instruction(ticket, run, facts, ())
+            instruction = reengage_instruction(ticket, run, trusted_facts, ())
             payload = {
                 "ticket": dict(ticket),
-                "facts": {"ci": _facts_ci(facts), "head_sha": head},
+                "facts": {"ci": _facts_ci(trusted_facts), "head_sha": head},
                 "thread_ids": [],
                 "reason": "ci-finished",
             }
@@ -993,7 +1269,7 @@ class WakeDecider:
                 resume=str(run.get("id") or run.get("run_id") or "") or None,
                 instruction=instruction,
                 idem_key=idem_key,
-                facts={"ci": _facts_ci(facts), "head_sha": head},
+                facts={"ci": _facts_ci(trusted_facts), "head_sha": head},
             )
 
         # The plan's re-engagement box is fed by BOTH the waiting and the
@@ -1002,8 +1278,8 @@ class WakeDecider:
         # finding lost for good.  "ci" has its own branch above.
         if waiting_on not in {"review", "human", "parked"}:
             return None
-        head = _facts_head(facts)
-        threads = _new_threads(self.db, ticket, facts, head_sha=head)
+        head = _facts_head(trusted_facts)
+        threads = _new_threads(self.db, ticket, trusted_facts, head_sha=head)
         if not threads:
             return None
         run_id = str(run.get("id") or run.get("run_id") or "")
@@ -1030,7 +1306,7 @@ class WakeDecider:
         idem_key = f"{identifier}@reengage@{run_id or 'run'}@{head or 'unknown'}"
         if self._has_idem(idem_key, live_only=False):
             return None
-        instruction = reengage_instruction(ticket, run, facts, threads)
+        instruction = reengage_instruction(ticket, run, trusted_facts, threads)
         if self.shadow:
             self._remember_idem(idem_key)
         elif self.db is not None:
@@ -1041,13 +1317,12 @@ class WakeDecider:
                     idem_key=idem_key,
                     payload={
                         "ticket": dict(ticket),
-                        "facts": dict(facts),
+                        "facts": dict(trusted_facts),
                         "thread_ids": [_thread_id(t) for t in threads],
                         "instruction": instruction,
                     },
                 ):
                     return None
-            _mark_threads_seen(self.db, threads, head)
             _record_reengagement_event(
                 self.db,
                 ticket=identifier,
@@ -1083,7 +1358,8 @@ def _enqueue_stop(db: Any, identifier: str, idem_key: str, threads: Iterable[Map
             connection.commit()
 
 
-def _mark_threads_seen(db: Any, threads: Iterable[Mapping[str, Any]], head_sha: str | None) -> None:
+def mark_threads_seen(db: Any, threads: Iterable[Mapping[str, Any]], head_sha: str | None) -> None:
+    """Receipt review threads only after the retained builder handoff succeeds."""
     if not head_sha:
         return
     connection = _db_connection(db)
@@ -1124,6 +1400,7 @@ def record_push(
     head_sha: str,
     *,
     pr_number: int | None = None,
+    pr_url: str | None = None,
 ) -> int:
     """Record a builder push for the rework cap and advance seen heads.
 
@@ -1147,15 +1424,36 @@ def record_push(
         else:
             rounds = 0
         if _table_exists(connection, "prs"):
-            if pr_number is None:
+            if pr_url:
+                connection.execute(
+                    "UPDATE prs SET head_sha = ?, observed_at = CURRENT_TIMESTAMP WHERE ticket = ? AND url = ?",
+                    (head_sha, identifier, pr_url),
+                )
+                connection.execute(
+                    "UPDATE review_threads SET seen_at_sha = ? WHERE pr_url = ?",
+                    (head_sha, pr_url),
+                )
+            elif pr_number is None:
                 connection.execute("UPDATE prs SET head_sha = ?, observed_at = CURRENT_TIMESTAMP WHERE ticket = ?", (head_sha, identifier))
                 connection.execute(
-                    "UPDATE review_threads SET seen_at_sha = ? WHERE pr IN (SELECT number FROM prs WHERE ticket = ?)",
+                    "UPDATE review_threads SET seen_at_sha = ? WHERE pr_url IN (SELECT url FROM prs WHERE ticket = ?)",
                     (head_sha, identifier),
                 )
             else:
-                connection.execute("UPDATE prs SET head_sha = ?, observed_at = CURRENT_TIMESTAMP WHERE number = ?", (head_sha, pr_number))
-                connection.execute("UPDATE review_threads SET seen_at_sha = ? WHERE pr = ?", (head_sha, pr_number))
+                rows = connection.execute(
+                    "SELECT url FROM prs WHERE ticket = ? AND number = ?",
+                    (identifier, pr_number),
+                ).fetchall()
+                if len(rows) == 1:
+                    exact_url = str(rows[0][0])
+                    connection.execute(
+                        "UPDATE prs SET head_sha = ?, observed_at = CURRENT_TIMESTAMP WHERE url = ?",
+                        (head_sha, exact_url),
+                    )
+                    connection.execute(
+                        "UPDATE review_threads SET seen_at_sha = ? WHERE pr_url = ?",
+                        (head_sha, exact_url),
+                    )
         connection.commit()
     return rounds
 
@@ -1172,29 +1470,32 @@ def observe_pr_facts(db: Any, ticket: str | Mapping[str, Any], facts: Mapping[st
     connection = _db_connection(db)
     if connection is None:
         raise TypeError("observe_pr_facts requires HarborDB or sqlite3.Connection")
-    prs = _facts_prs(facts)
-    if not prs and (facts.get("number") or facts.get("pr_number")):
-        prs = [facts]
+    # Merge/CI/review facts acquire authority only by matching an exact PR URL
+    # already attached to this Linear ticket.  PR numbers are repository-local,
+    # so number-only or same-number foreign observations are never persisted.
+    prs = _matching_ticket_prs(ticket, facts) if isinstance(ticket, Mapping) else []
     with _db_lock(db):
         for pr in prs:
             number = _as_int(pr.get("number", pr.get("pr_number")), 0)
-            if number <= 0:
+            pr_url = pr.get("url")
+            if number <= 0 or not isinstance(pr_url, str) or not pr_url.strip():
                 continue
             if _table_exists(connection, "tickets"):
                 connection.execute(
-                    "INSERT OR IGNORE INTO prs(number, ticket, url) VALUES (?, ?, ?)",
-                    (number, identifier, pr.get("url")),
+                    "INSERT OR IGNORE INTO prs(url, number, ticket) VALUES (?, ?, ?)",
+                    (pr_url, number, identifier),
                 )
             connection.execute(
                 "UPDATE prs SET url = COALESCE(?, url), head_sha = COALESCE(?, head_sha), "
                 "ci_state = COALESCE(?, ci_state), merged = COALESCE(?, merged), observed_at = CURRENT_TIMESTAMP "
-                "WHERE number = ?",
+                "WHERE url = ? AND ticket = ?",
                 (
-                    pr.get("url"),
+                    pr_url,
                     pr.get("head_sha", pr.get("headRefOid")),
-                    pr.get("ci_state"),
-                    int(_as_bool(pr.get("merged"))) if "merged" in pr else None,
-                    number,
+                    ci_state(pr),
+                    int(pr.get("merged") is True) if "merged" in pr else None,
+                    pr_url,
+                    identifier,
                 ),
             )
             threads = pr.get("threads", pr.get("review_threads", ()))
@@ -1205,13 +1506,13 @@ def observe_pr_facts(db: Any, ticket: str | Mapping[str, Any], facts: Mapping[st
                     continue
                 body = _thread_body(thread)
                 connection.execute(
-                    "INSERT INTO review_threads(id, pr, severity, is_bot, outdated, resolved, path, line, body, seen_at_sha) "
+                    "INSERT INTO review_threads(id, pr_url, severity, is_bot, outdated, resolved, path, line, body, seen_at_sha) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                     "severity=excluded.severity, is_bot=excluded.is_bot, outdated=excluded.outdated, "
                     "resolved=excluded.resolved, path=excluded.path, line=excluded.line, body=excluded.body, "
                     "seen_at_sha=COALESCE(excluded.seen_at_sha, review_threads.seen_at_sha)",
                     (
-                        _thread_id(thread), number, str(thread.get("severity")) if thread.get("severity") is not None else None,
+                        _thread_id(thread), pr_url, str(thread.get("severity")) if thread.get("severity") is not None else None,
                         int(_thread_is_bot(thread)), int(_as_bool(thread.get("outdated", thread.get("isOutdated", False)))),
                         int(_as_bool(thread.get("resolved", thread.get("isResolved", False)))), thread.get("path"), thread.get("line"), body,
                         thread.get("seen_at_sha", thread.get("seenAtSha")),
@@ -1238,6 +1539,9 @@ __all__ = [
     "comment_is_harbor_authored",
     "decide",
     "new_comment_ids",
+    "linear_comment_instruction",
+    "linear_comment_version",
+    "mark_threads_seen",
     "note_builder_push",
     "observe_pr_facts",
     "reconcile_review_threads",

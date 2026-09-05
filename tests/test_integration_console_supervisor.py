@@ -11,7 +11,9 @@ from harbor.db import HarborDB
 from harbor.first_mate import FirstMate
 from harbor.heartbeat import Heartbeat
 from harbor.poll.linear_poller import PollResult
-from harbor.supervisor import Lifecycle, Supervisor
+from harbor.runner.base import apply_phase4_migration
+from harbor.supervisor import Lifecycle, Supervisor, WorktreeDispatcher
+from harbor.wake import apply_phase3_migration
 
 
 def run(value: Any) -> Any:
@@ -202,3 +204,107 @@ def test_answer_command_records_citation_and_resumes_same_session(tmp_path: Path
 
     response = run(scenario())
     assert "answer recorded" in response
+
+
+def test_worktree_resume_routes_a_second_blocker_with_persisted_worktree_to_unblock_ladder(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> list[Any]:
+        seen: list[Any] = []
+        worktree = tmp_path / "retained-worktree"
+        worktree.mkdir()
+        db = HarborDB(tmp_path / "resume.db")
+        db.replace_tickets(
+            "SampleProject",
+            [{"identifier": "SAMPLE-42", "title": "A ticket", "state": "Blocked"}],
+        )
+        apply_phase3_migration(db)
+        apply_phase4_migration(db)
+        db.connection.execute(
+            "INSERT INTO runs(id, ticket, role, status, worktree) "
+            "VALUES ('run-42', 'SAMPLE-42', 'builder', 'waiting', ?)",
+            (str(worktree),),
+        )
+        db.connection.commit()
+
+        class RetainedRunner:
+            contexts = {"run-42": object()}
+
+        class Ladder:
+            async def handle(self, ticket: Any, run: Any, final: Any, *, blocker: Any = None) -> str:
+                seen.append((ticket, run, final, blocker))
+                return "parked"
+
+        dispatcher = WorktreeDispatcher(object(), lambda *_args, **_kwargs: None)
+        dispatcher.runners["SAMPLE-42"] = RetainedRunner()
+
+        async def resume(_wake: Any) -> dict[str, Any]:
+            return {
+                "status": "blocked",
+                "run_id": "run-42",
+                "blocker": {"kind": "env_blocker", "question": "Still unavailable?"},
+            }
+
+        dispatcher.resume = resume  # type: ignore[method-assign]
+        supervisor = Supervisor(
+            FakePoller(), db=db, dispatcher=dispatcher, unblock_ladder=Ladder()
+        )
+        assert await supervisor.resume_session("run-42", "Use the deterministic adapter") is True
+        db.close()
+        return seen
+
+    seen = run(scenario())
+    assert len(seen) == 1
+    assert seen[0][0]["identifier"] == "SAMPLE-42"
+    assert seen[0][1]["id"] == "run-42"
+    assert seen[0][1]["worktree"].endswith("retained-worktree")
+    assert seen[0][3]["question"] == "Still unavailable?"
+
+
+def test_startup_retries_only_latest_known_deterministic_blocker(tmp_path: Path) -> None:
+    async def scenario() -> tuple[list[str], list[Any]]:
+        db = HarborDB(tmp_path / "restart.db")
+        handled: list[Any] = []
+
+        class Ladder:
+            def can_retry_deterministically(self, ticket: Any, run_row: Any, final: Any) -> bool:
+                return final.get("blocker", {}).get("kind") == "env_blocker"
+
+            async def handle(self, ticket: Any, run_row: Any, final: Any) -> str:
+                handled.append((ticket, run_row, final))
+                return "resumed"
+
+        supervisor = Supervisor(FakePoller(), db=db, unblock_ladder=Ladder())
+        await supervisor._apply_startup_migrations()
+        db.record_observation(
+            "SampleProject",
+            "restart-snapshot",
+            {},
+            ({"identifier": "SAMPLE-42", "title": "A ticket", "state": "Blocked", "owned": True, "hold": False},),
+        )
+        for run_id, question, finished_at in (
+            ("older", "Old connector failure", "2026-09-05T01:00:00+00:00"),
+            ("latest", "Latest connector failure", "2026-09-05T02:00:00+00:00"),
+        ):
+            db.connection.execute(
+                "INSERT INTO runs(id, ticket, role, status, final_json, finished_at) "
+                "VALUES (?, 'SAMPLE-42', 'builder', 'blocked', ?, ?)",
+                (
+                    run_id,
+                    '{"status":"blocked","blocker":{"kind":"env_blocker","question":"'
+                    + question
+                    + '"}}',
+                    finished_at,
+                ),
+            )
+        db.connection.commit()
+        try:
+            retried = await supervisor._retry_deterministic_blockers()
+        finally:
+            db.close()
+        return retried, handled
+
+    retried, handled = run(scenario())
+    assert retried == ["SAMPLE-42"]
+    assert len(handled) == 1
+    assert handled[0][1]["id"] == "latest"

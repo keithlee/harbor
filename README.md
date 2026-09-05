@@ -138,6 +138,9 @@ Harbor: PAUSED · Stopping for the evening
 first-mate> /resume
 Harbor: RUNNING
 
+first-mate> /retry SAMPLE-42
+Harbor: same builder retried · SAMPLE-42 · waiting
+
 first-mate> /exit
 Harbor: STOPPED
 ```
@@ -151,6 +154,7 @@ The commands are:
 | `/pause [reason]` | Pause the whole supervisor: no new dispatches or resumes; a running builder is allowed to finish and its deadline is suspended. |
 | `/resume` | Re-enable dispatch/resume, restart deadline accounting, and perform a fresh poll. |
 | `/answer <escalation-id> <answer>` | Record an operator decision and attempt to resume the retained builder session. |
+| `/retry <ticket>` | Explicitly recover a terminated, orphaned, or failed builder in its retained Codex session and worktree. Running/waiting builders and missing session/worktree state are refused. |
 | `/kill [run-id]` | Request termination through an installed process-owner hook; reports when no hook is available. |
 | `/exit` | Stop polling, heartbeat, and active dispatches, then close the foreground console. It does not create a replacement agent. |
 | `/help` | Print the command list. |
@@ -181,7 +185,7 @@ flowchart LR
         WAKE["Idempotent wake decision"]
         HEART["Heartbeat and /status"]
         DB[("SQLite<br/>operational custody")]
-        REM["Deterministic remediation"]
+        REM["Deterministic remediation<br/>and capability adapters"]
         WT["Isolated Git worktree"]
         VERIFY["Verify merge receipt<br/>and clean worktree"]
     end
@@ -193,7 +197,7 @@ flowchart LR
 
     OP["Operator"]
 
-    LIN -->|"read scoped tickets"| POLL
+    LIN -->|"read scoped tickets and comments"| POLL
     GH -->|"read attached PR facts"| POLL
     POLL --> SNAP
     SNAP -->|"no"| HEART
@@ -386,7 +390,7 @@ needs and keeps the delivery instructions opaque.
 | `src/harbor/wake.py` | Model-free build/re-engagement decisions, ownership, caps, and idempotency. |
 | `src/harbor/reengagement.py` | Turn changed PR/CI facts into a bounded same-session resume instruction. |
 | `src/harbor/pr_events.py` | PR-created and external-comment event receipts, risk/comment handoff, and mandatory reply contract. |
-| `src/harbor/unblock.py` | Rung 0 remediation, Terra cite-or-escalate, operator parking, and same-session resume. |
+| `src/harbor/unblock.py` | Rung 0 remediation, deterministic capability adapters, bounded restart retry, Terra cite-or-escalate, operator parking, and same-session resume. |
 | `src/harbor/worktree.py` | Fresh `origin/main` worktrees, disk/lock safety, install, and verified-merge cleanup. |
 | `src/harbor/runner/base.py` | Runner lifecycle, deadlines, result normalization, liveness, and orphan handling. |
 | `src/harbor/runner/codex.py` | Persistent Luna `codex exec`/`resume` in the isolated worktree. |
@@ -400,8 +404,14 @@ needs and keeps the delivery instructions opaque.
   query.
 - Every builder runs in `~/.harbor/wt/<project>/<ticket>` (or configured
   `worktree_root`), never in the operator's checkout.
+- One live supervisor owns each project. A second `harbor start <project>` is
+  refused before it can poll, reap, or dispatch, and reports the current
+  owner's PID and working directory.
 - A logical run ID and Codex session ID are retained for re-engagement; Harbor
   never silently creates a replacement session for a blocker.
+- Terminal runs remain stopped by default. `/retry <ticket>` is the explicit
+  operator boundary that converts a stale build receipt into same-session
+  re-engagement; it never creates another worktree or builder conversation.
 - Harbor observes GitHub and does not mutate it. Risk analysis, PR replies,
   review resolution, and merge are performed by the configured skill.
 - A claimed merge is not enough to delete a worktree. Harbor first observes

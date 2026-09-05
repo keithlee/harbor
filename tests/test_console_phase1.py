@@ -62,6 +62,32 @@ def test_console_banner_reports_live_and_shadow_mode(tmp_path: Path) -> None:
     assert "(shadow mode)" in shadow_banner
 
 
+def test_retry_command_uses_the_supervisors_explicit_recovery_path(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
+    client = LinearClient(transport=httpx.MockTransport(handler))
+    supervisor = Supervisor(LinearPoller(client, config))
+    calls: list[str] = []
+
+    async def retry_builder(identifier: str) -> dict[str, str]:
+        calls.append(identifier)
+        return {"status": "waiting", "run_id": "run-1"}
+
+    supervisor.retry_builder = retry_builder  # type: ignore[method-assign]
+    console = Console(supervisor)
+    try:
+        assert run(console.handle_command("/retry")) == "Usage: /retry <ticket>"
+        response = run(console.handle_command("/retry SAMPLE-42"))
+    finally:
+        run(supervisor.exit())
+        run(client.close())
+
+    assert response == "Harbor: same builder retried · SAMPLE-42 · waiting"
+    assert calls == ["SAMPLE-42"]
+
+
 def test_free_form_input_is_not_dispatched_in_phase_one(tmp_path: Path) -> None:
     calls: list[httpx.Request] = []
 

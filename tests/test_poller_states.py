@@ -66,6 +66,14 @@ def test_poller_sends_only_configured_states_and_excludes_backlog(tmp_path: Path
         "states": ["Todo", "In Progress", "In Review", "Blocked", "Human Review"],
     }
     assert calls[0]["query"].strip().startswith("query HarborIssues")
+    assert result.tickets[0]["linear_comments"][0] == {
+        "id": "comment-SAMPLE-17",
+        "body": "hello",
+        "created_at": "2026-09-02T20:00:00Z",
+        "updated_at": None,
+        "author": None,
+    }
+    assert "updatedAt body user { id name }" in calls[0]["query"]
 
 
 def test_unchanged_snapshot_creates_no_second_events_row(tmp_path: Path) -> None:

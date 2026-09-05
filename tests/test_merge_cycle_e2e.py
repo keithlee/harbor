@@ -123,7 +123,7 @@ def build(tmp_path: Path, *, hold: bool) -> tuple[Supervisor, WorktreeManager, l
         built.append(stub)
         return stub
 
-    ticket = {"identifier": TICKET, "title": "Update docs", "state": "Todo", "hold": hold, "pr_urls": []}
+    ticket = {"identifier": TICKET, "title": "Update docs", "state": "Todo", "hold": hold, "pr_urls": ["https://example.test/pr/225"]}
     dispatcher = WorktreeDispatcher(manager, factory, db=db, project="SampleProject")
     supervisor = Supervisor(
         Poller(ticket), db=db, dispatcher=dispatcher, worktree_manager=manager,
@@ -142,7 +142,7 @@ def test_ac8_hold_off_the_skill_merges_and_harbor_removes_the_worktree(tmp_path:
         try:
             await supervisor.start(initial_poll=False)
             wake = Wake(
-                ticket={"identifier": TICKET, "hold": False}, action="build",
+                ticket={"identifier": TICKET, "hold": False, "pr_urls": ["https://example.test/pr/225"]}, action="build",
                 instruction="Build SAMPLE-32\nhold: OFF. Your own risk gate decides the merge.",
                 idem_key=f"{TICKET}@build",
                 facts={"number": 225, "url": "https://example.test/pr/225", "merged": True},
@@ -179,7 +179,7 @@ def test_ac10_a_manual_merge_resumes_the_same_session_and_then_cleans_up(tmp_pat
         try:
             await supervisor.start(initial_poll=False)
             build_wake = Wake(
-                ticket={"identifier": TICKET, "hold": True}, action="build",
+                ticket={"identifier": TICKET, "hold": True, "pr_urls": ["https://example.test/pr/225"]}, action="build",
                 instruction="Build SAMPLE-32\nhold: ON. This gates the MERGE ONLY.",
                 idem_key=f"{TICKET}@build",
             )
@@ -199,7 +199,7 @@ def test_ac10_a_manual_merge_resumes_the_same_session_and_then_cleans_up(tmp_pat
 
             # Harbor's next poll sees `merged` on an owned waiting_on=human run.
             reengage = Wake(
-                ticket={"identifier": TICKET}, action="reengage", resume=run_id,
+                ticket={"identifier": TICKET, "pr_urls": ["https://example.test/pr/225"]}, action="reengage", resume=run_id,
                 instruction="PR merged. Continue your workflow.",
                 facts={"number": 225, "url": "https://example.test/pr/225", "merged": True, "head_sha": merged_head},
             )

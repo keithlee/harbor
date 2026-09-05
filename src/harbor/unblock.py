@@ -116,6 +116,42 @@ def _question(blocker: Mapping[str, Any]) -> str:
     return _text(value).strip()
 
 
+def deterministic_capability_adapter(
+    blocker: Mapping[str, Any], repo_path: str | Path | None = None
+) -> tuple[str, str, str] | None:
+    """Return a safe tool adapter for a known non-product capability mismatch."""
+
+    kind = _kind(blocker)
+    question = _question(blocker)
+    evidence = _text(_value(blocker, "evidence", default=""))
+    combined = f"{question} {evidence}"
+    lowered = combined.casefold()
+    root = Path(repo_path) if repo_path is not None else None
+
+    role_match = re.search(r"\b([a-z0-9][a-z0-9_-]*auditor)\b", combined, re.IGNORECASE)
+    if kind == "missing_proof_capability" and "unknown agent_type" in lowered and root is not None and role_match:
+        role_path = root / ".claude" / "agents" / f"{role_match.group(1)}.md"
+        if role_path.is_file():
+            relative = role_path.relative_to(root)
+            return (
+                f"Invoke a fresh supported `default` subagent in clean context. Have it read `{relative}` "
+                "as its role contract, then give it only the PR URL required by that contract. "
+                "Do not retry the repository role name as agent_type.",
+                f"{relative}:1",
+                "repository agent role adapted to a supported clean-context subagent",
+            )
+
+    if kind == "env_blocker" and "linear" in lowered and "requires approval" in lowered:
+        return (
+            "Retry the Linear operation with the available `codex_apps` Linear connector "
+            "(`mcp__codex_apps__linear_*`) instead of the approval-gated `mcp__linear__*` connector. "
+            "Keep the same ticket, worktree, and builder session.",
+            "deterministic:linear-connector-adapter",
+            "approval-gated Linear connector adapted to the non-interactive connector",
+        )
+    return None
+
+
 def _answer(blocker: Mapping[str, Any], final: Any) -> str:
     value = _value(blocker, "answer", "recommendation", default=None)
     if value is None:
@@ -857,6 +893,31 @@ class UnblockLadder:
                 return int(counter(ticket_id, kind=kind))
         return 0
 
+    def _prior_rung_zero(self, ticket_id: str, kind: str) -> int:
+        if self.db is None:
+            return 0
+        counter = getattr(self.db, "count_escalations", None)
+        if callable(counter):
+            try:
+                return int(counter(ticket_id, kind=kind, rung_resolved=0))
+            except TypeError:
+                return 0
+        return 0
+
+    def can_retry_deterministically(
+        self, ticket: Mapping[str, Any], run: Mapping[str, Any], final: Mapping[str, Any]
+    ) -> bool:
+        """Whether a restart may safely replay a known capability adapter."""
+
+        blocker_value = dict(_blocker(final))
+        run_repo_value = _value(run, "worktree", "cwd", default=None)
+        run_repo = Path(str(run_repo_value)) if run_repo_value else None
+        authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
+        return (
+            self._prior_rung_zero(_identifier(ticket), _kind(blocker_value)) < 2
+            and deterministic_capability_adapter(blocker_value, authority_repo) is not None
+        )
+
     def _record(
         self,
         ticket_id: str,
@@ -934,10 +995,30 @@ class UnblockLadder:
         kind = _kind(blocker_value)
         question = _question(blocker_value) or _text(_value(final, "summary", "next_action", default="")).strip()
         question = question or f"How should Harbor unblock {ticket_id or 'this ticket'}?"
+        run_repo_value = _value(run, "worktree", "cwd", default=None)
+        run_repo = Path(str(run_repo_value)) if run_repo_value else None
+        authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
+
+        adapter = (
+            deterministic_capability_adapter(blocker_value, authority_repo)
+            if self._prior_rung_zero(ticket_id, kind) < 2
+            else None
+        )
+        if adapter is not None:
+            answer, citation, reason = adapter
+            escalation = self._record(ticket_id, run_id, kind, question, 0, citation=citation, answer=answer)
+            resumed, command = await self._resume(
+                ticket_id, run_id, answer=answer, citation=citation, reason=reason,
+            )
+            return UnblockResult(
+                ticket_id, run_id, kind, question, 0, "resume" if resumed or command else "escalate", resumed,
+                answer=answer, citation=citation, resume_command=command,
+                reason=reason, escalation=escalation,
+            )
         remediation = await execute_remediation(
             blocker_value,
             executor=self.remediation_executor,
-            cwd=_value(run, "worktree", "cwd", default=None),
+            cwd=run_repo_value,
         )
         if remediation.fixed:
             citation = f"deterministic:{remediation.plan.kind if remediation.plan else kind}"
@@ -966,7 +1047,7 @@ class UnblockLadder:
                 blocker_value,
                 db=self.db,
                 first_mate=self.first_mate,
-                repo_path=self.repo_path,
+                repo_path=authority_repo,
                 protected_paths=self.protected_paths,
             )
         # Keep the citation boundary defensive even if an injected Terra
@@ -1178,7 +1259,7 @@ def observe_manual_merge(
 ) -> BuilderCommand | None:
     """Return a re-engagement command after the operator merges by hand."""
 
-    merged = _bool(_value(facts, "merged", "is_merged", default=False))
+    merged = facts.get("merged") is True
     waiting = _text(_value(run, "waiting_on", "waitingOn", default="")).casefold()
     if not merged or waiting != "human":
         return None

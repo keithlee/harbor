@@ -8,12 +8,16 @@ Harbor observed itself -- never on the builder's own claim.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
 from harbor.config.projects import ProjectConfig
+from harbor.db import HarborDB, apply_phase9_migration
 from harbor.poll.linear_poller import PollResult
+from harbor.runner.base import apply_phase4_migration
 from harbor.supervisor import Supervisor, Wake, WorktreeDispatcher
+from harbor.wake import apply_phase3_migration
 
 
 class IdlePoller:
@@ -41,6 +45,20 @@ class Manager:
         self.removed.append(Path(target))
 
 
+class WrongPRFacts:
+    async def poll(self, tickets: Any) -> list[dict[str, Any]]:
+        identifier = str(tuple(tickets)[0].get("identifier"))
+        return [
+            {
+                "ticket": identifier,
+                "number": 101,
+                "url": "https://github.com/example/repo/pull/101",
+                "head_sha": "head-101",
+                "merged": True,
+            }
+        ]
+
+
 def supervisor_with(tmp_path: Path) -> tuple[Supervisor, Manager, WorktreeDispatcher]:
     manager = Manager(tmp_path / "wt")
     (tmp_path / "wt").mkdir(parents=True, exist_ok=True)
@@ -57,7 +75,14 @@ def wake(*, observed_merge: bool = True) -> Wake:
         if observed_merge
         else {}
     )
-    return Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage", facts=facts)
+    return Wake(
+        ticket={
+            "identifier": "SAMPLE-42",
+            "pr_urls": ["https://github.com/example/repo/pull/1"],
+        },
+        action="reengage",
+        facts=facts,
+    )
 
 
 MERGED = {
@@ -109,6 +134,172 @@ def test_builder_true_merge_receipt_without_observed_fact_keeps_the_worktree(tmp
         )
         assert manager.removed == []
         assert "SAMPLE-42" in dispatcher.worktrees
+
+    asyncio.run(scenario())
+
+
+def test_merged_fact_for_a_different_pr_never_cleans_up(tmp_path: Path) -> None:
+    assert (
+        Supervisor._matching_pr_fact(
+            {
+                "number": 202,
+                "url": "https://github.com/example/repo-a/pull/202",
+                "merged": True,
+            },
+            "https://github.com/example/repo-b/pull/202",
+        )
+        is None
+    )
+
+    async def scenario() -> None:
+        supervisor, manager, dispatcher = supervisor_with(tmp_path)
+        mismatched = Wake(
+            ticket={"identifier": "SAMPLE-42"},
+            action="reengage",
+            facts={
+                "number": 101,
+                "url": "https://github.com/example/repo/pull/101",
+                "merged": True,
+            },
+        )
+        result = {
+            **MERGED,
+            "pr_url": "https://github.com/example/repo/pull/202",
+            "merge_verified": True,
+        }
+        await supervisor._handle_runner_result(mismatched, result)
+        assert manager.removed == []
+        assert "SAMPLE-42" in dispatcher.worktrees
+
+    asyncio.run(scenario())
+
+
+def test_direct_cleanup_requires_the_wake_fact_to_match_the_result_pr(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        supervisor, manager, dispatcher = supervisor_with(tmp_path)
+        wake_for_101 = Wake(
+            ticket={"identifier": "SAMPLE-42"},
+            action="reengage",
+            facts={
+                "number": 101,
+                "url": "https://github.com/example/repo/pull/101",
+                "merged": True,
+            },
+        )
+        forged = {
+            **MERGED,
+            "pr_url": "https://github.com/example/repo/pull/202",
+            "merge_verified": True,
+        }
+        await supervisor._cleanup_merged_worktree(wake_for_101, forged)
+        assert manager.removed == []
+        assert "SAMPLE-42" in dispatcher.worktrees
+
+    asyncio.run(scenario())
+
+
+def test_restart_reconciliation_rejects_a_different_merged_pr(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        db = HarborDB(":memory:")
+        apply_phase3_migration(db)
+        apply_phase4_migration(db)
+        apply_phase9_migration(db)
+        db.replace_tickets(
+            "SampleProject",
+            [{"identifier": "SAMPLE-A", "title": "A", "state": "Done"}],
+            emit_events=False,
+        )
+        manager = Manager(tmp_path / "wt-pr-mismatch")
+        worktree = manager.create("SAMPLE-A")
+        dispatcher = WorktreeDispatcher(
+            manager, lambda wt, wake: object(), db=db, project="SampleProject"
+        )
+        dispatcher.worktrees["SAMPLE-A"] = worktree
+        final = {
+            **MERGED,
+            "pr_url": "https://github.com/example/repo/pull/202",
+            "run_id": "run-a",
+        }
+        db.connection.execute(
+            "INSERT INTO runs(id, ticket, role, worktree, status, final_json, merge_verified) "
+            "VALUES ('run-a', 'SAMPLE-A', 'builder', ?, 'completed', ?, 0)",
+            (str(worktree), json.dumps(final)),
+        )
+        db.connection.commit()
+        supervisor = Supervisor(
+            IdlePoller(),
+            db=db,
+            dispatcher=dispatcher,
+            worktree_manager=manager,
+            github_poller=WrongPRFacts(),
+        )
+        try:
+            await supervisor._reconcile_completed_merges()
+            row = db.connection.execute(
+                "SELECT merge_verified, cleanup_at FROM runs WHERE id = 'run-a'"
+            ).fetchone()
+            assert row is not None and (row[0], row[1]) == (0, None)
+            assert manager.removed == []
+            assert worktree.exists()
+        finally:
+            db.close()
+
+    asyncio.run(scenario())
+
+
+def test_result_run_id_cannot_move_merge_receipt_across_tickets(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        db = HarborDB(":memory:")
+        apply_phase3_migration(db)
+        apply_phase4_migration(db)
+        apply_phase9_migration(db)
+        db.replace_tickets(
+            "SampleProject",
+            [
+                {"identifier": "SAMPLE-A", "title": "A", "state": "In Review"},
+                {"identifier": "SAMPLE-B", "title": "B", "state": "In Review"},
+            ],
+            emit_events=False,
+        )
+        manager = Manager(tmp_path / "wt-cross-ticket")
+        dispatcher = WorktreeDispatcher(
+            manager, lambda wt, wake: object(), project="SampleProject"
+        )
+        for identifier, run_id in (("SAMPLE-A", "run-a"), ("SAMPLE-B", "run-b")):
+            worktree = manager.create(identifier)
+            dispatcher.worktrees[identifier] = worktree
+            dispatcher.runners[identifier] = object()
+            db.connection.execute(
+                "INSERT INTO runs(id, ticket, role, worktree, status, final_json, merge_verified) "
+                "VALUES (?, ?, 'builder', ?, 'completed', ?, 0)",
+                (run_id, identifier, str(worktree), json.dumps(MERGED)),
+            )
+        db.connection.commit()
+        supervisor = Supervisor(
+            IdlePoller(), db=db, dispatcher=dispatcher, worktree_manager=manager
+        )
+        forged = {**MERGED, "run_id": "run-b", "merge_verified": True}
+        trusted_wake = Wake(
+            ticket={"identifier": "SAMPLE-A"},
+            action="reengage",
+            resume="run-a",
+            facts={"number": 1, "merged": True},
+        )
+        try:
+            await supervisor._handle_runner_result(trusted_wake, forged)
+            await supervisor._reconcile_completed_merges()
+            rows = db.connection.execute(
+                "SELECT ticket, merge_verified, cleanup_at FROM runs ORDER BY ticket"
+            ).fetchall()
+            assert [(row[0], row[1], row[2]) for row in rows] == [
+                ("SAMPLE-A", 0, None),
+                ("SAMPLE-B", 0, None),
+            ]
+            assert manager.removed == []
+            assert (tmp_path / "wt-cross-ticket" / "SAMPLE-A").exists()
+            assert (tmp_path / "wt-cross-ticket" / "SAMPLE-B").exists()
+        finally:
+            db.close()
 
     asyncio.run(scenario())
 
@@ -166,12 +357,47 @@ def test_pr_events_are_never_offered_for_an_unowned_ticket(tmp_path: Path) -> No
     async def scenario() -> None:
         processor = Processor()
         supervisor = Supervisor(IdlePoller(), pr_event_processor=processor)
-        facts = {"prs": [{"number": 217, "head_sha": "abc"}]}
+        pr_url = "https://github.com/example/repo/pull/217"
+        facts = {"prs": [{"number": 217, "url": pr_url, "head_sha": "abc"}]}
 
         await supervisor._process_pr_events({"identifier": "SAMPLE-7"}, facts)
         assert processor.calls == [], "an observed-only ticket must not reach the builder"
 
-        await supervisor._process_pr_events({"identifier": "SAMPLE-32", "owned": True}, facts)
+        await supervisor._process_pr_events(
+            {"identifier": "SAMPLE-32", "owned": True, "pr_urls": [pr_url]},
+            facts,
+        )
         assert processor.calls == ["SAMPLE-32"], "an owned ticket must still be processed"
+
+    asyncio.run(scenario())
+
+
+def test_pr_events_ignore_a_foreign_url_even_when_facts_claim_the_ticket() -> None:
+    class Processor:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def process(self, ticket: Any, row: Any, **kwargs: Any) -> None:
+            self.calls.append(str(row.get("url")))
+
+    async def scenario() -> None:
+        processor = Processor()
+        supervisor = Supervisor(IdlePoller(), pr_event_processor=processor)
+        attached = "https://github.com/good/repo/pull/7"
+        foreign = {
+            "ticket": "SAMPLE-32",
+            "number": 7,
+            "url": "https://github.com/evil/other/pull/7",
+            "head_sha": "evil-sha",
+        }
+        await supervisor._process_pr_events(
+            {
+                "identifier": "SAMPLE-32",
+                "owned": True,
+                "pr_urls": [attached],
+            },
+            {"prs": [foreign]},
+        )
+        assert processor.calls == []
 
     asyncio.run(scenario())

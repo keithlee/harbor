@@ -83,14 +83,19 @@ class Manager:
         self.removed.append(Path(target))
 
 
-def build_supervisor(tmp_path: Path, *, with_github: bool = True) -> tuple[Supervisor, Manager, HarborDB, MergeFacts | None]:
+def build_supervisor(
+    tmp_path: Path,
+    *,
+    with_github: bool = True,
+    attached: bool = True,
+) -> tuple[Supervisor, Manager, HarborDB, MergeFacts | None]:
     db = HarborDB(":memory:")
     apply_phase3_migration(db)
     apply_phase4_migration(db)
     apply_phase9_migration(db)
     db.replace_tickets(
         "SampleProject",
-        [{"identifier": "SAMPLE-33", "title": "Receipt", "state": "Todo", "pr_urls": [], "owned": True, "hold": False}],
+        [{"identifier": "SAMPLE-33", "title": "Receipt", "state": "Todo", "pr_urls": [HAN33_PR] if attached else [], "owned": True, "hold": False}],
         emit_events=False,
     )
     db.mark_owned("SAMPLE-33")
@@ -119,10 +124,30 @@ def build_supervisor(tmp_path: Path, *, with_github: bool = True) -> tuple[Super
 
 def wake() -> Wake:
     return Wake(
-        ticket={"identifier": "SAMPLE-33"},
+        ticket={"identifier": "SAMPLE-33", "pr_urls": [HAN33_PR]},
         action="reengage",
         resume="harbor-SampleProject-SAMPLE-33-builder",
     )
+
+
+def test_builder_pr_url_without_a_linear_attachment_is_never_observed_or_cleaned(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[list[Path], dict[str, Any], int]:
+        supervisor, manager, db, github = build_supervisor(tmp_path, attached=False)
+        await supervisor._handle_runner_result(wake(), dict(HAN33_FINAL_JSON))
+        row = db.connection.execute(
+            "SELECT merge_verified, cleanup_at FROM runs WHERE ticket = 'SAMPLE-33'"
+        ).fetchone()
+        calls = len(github.calls if github else ())
+        await supervisor.exit()
+        db.close()
+        return manager.removed, dict(row), calls
+
+    removed, row, calls = asyncio.run(scenario())
+    assert removed == []
+    assert row == {"merge_verified": 0, "cleanup_at": None}
+    assert calls == 0
 
 
 def test_observed_pr226_upgrades_receipt_cleans_worktree_and_digest(tmp_path: Path) -> None:
@@ -186,6 +211,32 @@ def test_restart_reconciles_stale_han33_merge_after_linear_done(tmp_path: Path) 
     assert removed == [Path(tmp_path / "worktrees" / "SAMPLE-33")]
     assert row["merge_verified"] == 1
     assert row["cleanup_at"]
+
+
+def test_normal_poll_reconciles_merge_after_ticket_leaves_linear_scope(tmp_path: Path) -> None:
+    """A Done ticket must not need a supervisor restart to receive its merge receipt."""
+
+    async def scenario() -> tuple[list[Path], dict[str, Any], list[Any]]:
+        supervisor, manager, db, github = build_supervisor(tmp_path)
+        # IdlePoller returns no tickets, matching a merged issue that already
+        # left the configured Linear poll states.
+        await supervisor.poll_once()
+        row = db.connection.execute(
+            "SELECT merge_verified, cleanup_at, final_json FROM runs WHERE ticket = 'SAMPLE-33'"
+        ).fetchone()
+        await supervisor.exit()
+        db.close()
+        return manager.removed, dict(row), list(github.calls if github else ())
+
+    removed, row, calls = asyncio.run(scenario())
+    assert removed == [Path(tmp_path / "worktrees" / "SAMPLE-33")]
+    assert row["merge_verified"] == 1
+    assert row["cleanup_at"]
+    assert json.loads(row["final_json"])["merge_verified"] is True
+    assert len(calls) == 2
+    assert calls[0][0]["identifier"] == "SAMPLE-33"
+    assert calls[0][0]["pr_urls"] == [HAN33_PR]
+    assert calls[1] == (), "the ordinary poll still receives no Linear tickets"
 
 
 def test_cleanup_binds_an_older_receipt_to_its_exact_run_worktree(tmp_path: Path) -> None:
