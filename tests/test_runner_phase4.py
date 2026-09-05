@@ -99,12 +99,16 @@ def test_codex_start_resume_schema_and_persistent_session(tmp_path: Path) -> Non
     async def scenario() -> None:
         worktree = tmp_path / "wt"
         worktree.mkdir()
+        shared_git = tmp_path / "shared-git"
+        shared_git.mkdir()
         runner = CodexRunner(
             worktree,
             ticket="SAMPLE-42",
             executable=str(fake_codex(tmp_path)),
             db=runs_db(),
             deadline_seconds=5,
+            writable_roots=(shared_git,),
+            network_access=True,
         )
         first = await runner.start("build", run_id="run-1")
         assert first.status == "waiting"
@@ -114,9 +118,13 @@ def test_codex_start_resume_schema_and_persistent_session(tmp_path: Path) -> Non
         second = await runner.resume("run-1", "continue")
         assert second.status == "completed"
         assert second.outcome == "merged"
-        args = (worktree / ".fake-args").read_text(encoding="utf-8")
+        args = json.loads((worktree / ".fake-args").read_text(encoding="utf-8"))
         assert "model_reasoning_effort=xhigh" in args
         assert "session-123" in args
+        assert f"sandbox_workspace_write.writable_roots={json.dumps([str(shared_git)])}" in args
+        assert "sandbox_workspace_write.network_access=true" in args
+        assert "-C" not in args
+        assert "-s" not in args
         assert (worktree / ".fake-cwd").read_text(encoding="utf-8") == str(worktree)
 
     asyncio.run(scenario())

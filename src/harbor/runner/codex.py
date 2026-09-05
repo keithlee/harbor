@@ -113,8 +113,9 @@ class CodexRunner(BaseRunner):
         schema = str(self.schema_path)
         if resume:
             # ``resume`` retains the original worktree/sandbox/session context;
-            # Codex's resume subcommand accepts model/schema/json overrides but
-            # intentionally does not accept -C or -s.
+            # Codex's resume subcommand accepts config overrides but
+            # intentionally does not accept -C or -s. Reapply the sandbox
+            # config because a new resume process does not inherit it.
             return [
                 self.executable,
                 "exec",
@@ -124,6 +125,7 @@ class CodexRunner(BaseRunner):
                 self.model,
                 "-c",
                 f"model_reasoning_effort={self.reasoning_effort}",
+                *self._sandbox_config(),
                 "--output-schema",
                 schema,
                 "--json",

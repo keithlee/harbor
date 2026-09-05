@@ -27,8 +27,8 @@ def linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
     return repo, worktree
 
 
-def config_values(runner: CodexRunner) -> dict[str, str]:
-    command = runner.command("x", run_id="r")
+def config_values(runner: CodexRunner, *, resume: bool = False) -> dict[str, str]:
+    command = runner.command("x", run_id="r", resume=resume)
     out: dict[str, str] = {}
     for index, item in enumerate(command):
         if item == "-c" and index + 1 < len(command):
@@ -97,12 +97,16 @@ def test_extra_writable_roots_are_honoured(tmp_path: Path) -> None:
     assert str((repo / ".git").resolve()) in roots
 
 
-def test_the_resume_command_does_not_repeat_sandbox_flags(tmp_path: Path) -> None:
-    """`codex exec resume` retains the original worktree/sandbox context."""
+def test_the_resume_command_reapplies_config_without_unsupported_flags(tmp_path: Path) -> None:
+    """A new resume process needs config overrides but rejects `-C` and `-s`."""
 
-    _, worktree = linked_worktree(tmp_path)
+    repo, worktree = linked_worktree(tmp_path)
     runner = CodexRunner(worktree, ticket="SAMPLE-42")
     resumed = runner.command("x", run_id="r", resume=True)
     assert "resume" in resumed
-    assert not any("sandbox_workspace_write" in item for item in resumed)
+    config = config_values(runner, resume=True)
+    assert config["sandbox_workspace_write.network_access"] == "true"
+    assert str((repo / ".git").resolve()) in json.loads(
+        config["sandbox_workspace_write.writable_roots"]
+    )
     assert "-C" not in resumed and "-s" not in resumed
