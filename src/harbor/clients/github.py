@@ -24,6 +24,20 @@ class GitHubGraphQLError(GitHubError):
     """GitHub returned a valid HTTP response containing GraphQL errors."""
 
 
+GITHUB_TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
+
+
+def _github_token_from_environment(preferred: str) -> str | None:
+    """Read the configured token name, then GitHub's two standard aliases."""
+
+    names = tuple(dict.fromkeys(name for name in (preferred, *GITHUB_TOKEN_ENV_VARS) if name))
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
 def _aliases(numbers: Iterable[int]) -> tuple[tuple[str, int], ...]:
     seen: set[int] = set()
     result: list[tuple[str, int]] = []
@@ -155,7 +169,7 @@ class GitHubClient:
         token_env: str = "GITHUB_TOKEN",
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.token = token or os.environ.get(token_env) or os.environ.get("GH_TOKEN")
+        self.token = token or _github_token_from_environment(token_env)
         self.endpoint = endpoint
         self.transport = transport
         self.timeout = timeout

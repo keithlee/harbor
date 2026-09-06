@@ -746,6 +746,7 @@ class Supervisor:
         runner: Any | None = None,
         notifier: Any | None = None,
         shadow: bool = False,
+        read_only: bool = False,
         on_wake: Callable[[Wake], Awaitable[None] | None] | None = None,
         heartbeat: Any | None = None,
         heartbeat_interval: float | None = None,
@@ -787,7 +788,7 @@ class Supervisor:
                 # WakeDecider already implements shadow as "decide without a
                 # ledger write", which is what makes two shadow cycles diff
                 # empty.  Pass it through rather than reimplementing it.
-                shadow=bool(shadow),
+                shadow=bool(shadow or read_only),
                 ticket_scope=self.ticket_scope,
             )
         self.worktree_manager = worktree_manager
@@ -821,7 +822,13 @@ class Supervisor:
         # Shadow mode decides and reports but never dispatches, resumes, or
         # enqueues.  It is the plan's Phase 3 proof that a first start against
         # a live board wakes nothing.
-        self.shadow = bool(shadow)
+        # Read-only is a complete delivery boundary, including for embedders
+        # that construct Supervisor directly instead of going through the CLI.
+        self.shadow = bool(shadow or read_only)
+        # A duplicate project start is an observer of the owner, not another
+        # runtime.  It may refresh local observations, but it must not replace
+        # the owner's durable lifecycle row while it starts or exits.
+        self.read_only = bool(read_only)
         self.shadow_wakes: list[Wake] = []
         self.last_pr_facts: tuple[Mapping[str, Any], ...] = ()
         self.unblock_ladder = unblock_ladder
@@ -864,8 +871,13 @@ class Supervisor:
             last_activity=lambda: self._last_activity_at,
             publisher=self._publish_heartbeat,
         )
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value)
+        self._set_runtime()
+
+    def _set_runtime(self, reason: str | None = None) -> None:
+        """Persist lifecycle only when this process owns the project lease."""
+
+        if self.db is not None and not self.read_only:
+            self.db.set_runtime(self.project, self.lifecycle.value, reason)
 
     @property
     def paused(self) -> bool:
@@ -2425,8 +2437,7 @@ class Supervisor:
         self._stop.clear()
         self._dispatch_suspended = False
         self._background_dispatch = True
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value)
+        self._set_runtime()
         await self._apply_startup_migrations()
         await self._hydrate_retained_builders()
         await self._retry_deterministic_blockers()
@@ -2434,8 +2445,7 @@ class Supervisor:
             await self.poll_once()
         await self._reconcile_completed_merges()
         self.lifecycle = Lifecycle.RUNNING
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value)
+        self._set_runtime()
         start_heartbeat = getattr(self.heartbeat, "start", None)
         if callable(start_heartbeat):
             value = start_heartbeat()
@@ -2537,8 +2547,7 @@ class Supervisor:
             return
         self.lifecycle = Lifecycle.PAUSING
         self._dispatch_suspended = True
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value, reason)
+        self._set_runtime(reason)
         # BaseRunner.pause() pauses only its deadline; the process remains
         # alive and may finish.  A dispatcher can additionally checkpoint its
         # own persistent session, but no new dispatch/resume is allowed.
@@ -2549,8 +2558,7 @@ class Supervisor:
         except Exception as exc:
             self.last_error = str(exc)
         self.lifecycle = Lifecycle.PAUSED
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value, reason)
+        self._set_runtime(reason)
 
     async def resume(self) -> None:
         if self.lifecycle != Lifecycle.PAUSED:
@@ -2570,8 +2578,7 @@ class Supervisor:
             self.last_error = str(exc)
         self._dispatch_suspended = False
         self.lifecycle = Lifecycle.RUNNING
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value)
+        self._set_runtime()
         await self.poll_once()
 
     async def stop(self) -> None:
@@ -2600,8 +2607,7 @@ class Supervisor:
             except asyncio.CancelledError:
                 pass
         self.lifecycle = Lifecycle.STOPPED
-        if self.db:
-            self.db.set_runtime(self.project, self.lifecycle.value)
+        self._set_runtime()
 
     async def exit(self) -> None:
         await self.stop()

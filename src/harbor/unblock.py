@@ -1038,6 +1038,31 @@ class UnblockLadder:
                 escalation=escalation,
             )
 
+        # GitHub delivery transport is an observed runtime capability, never
+        # a repository-policy question.  A failed read-only `gh auth status`
+        # check has one deterministic operator remedy, and must not consume a
+        # First Mate turn or rewrite the ticket as a product blocker.
+        if remediation.plan is not None and remediation.plan.kind == "github_transport":
+            reason = (
+                "GitHub CLI authentication is unavailable. Run `gh auth login --hostname github.com` "
+                "in the environment that starts Harbor before retrying this builder session."
+            )
+            escalation = self._record(ticket_id, run_id, kind, question, 0, answer=reason)
+            notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication: {reason}")
+            return UnblockResult(
+                ticket_id,
+                run_id,
+                kind,
+                question,
+                0,
+                "escalate",
+                False,
+                notified=notified,
+                remediation=remediation,
+                reason=reason,
+                escalation=escalation,
+            )
+
         triage_result: TriageResult
         if self._prior_rung_one(ticket_id, kind) >= self.rung_one_cap:
             triage_result = TriageResult("escalate", reason="same-kind rung-1 cap reached")

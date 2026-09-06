@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -14,10 +15,20 @@ from typing import TextIO
 class ProjectLeaseError(RuntimeError):
     """Another live process already owns a project's supervisor lease."""
 
+    def __init__(self, project: str, owner: str) -> None:
+        self.project = str(project)
+        self.owner = str(owner)
+        super().__init__(
+            f"{self.project} already has a live Harbor supervisor ({self.owner})"
+        )
+
 
 def _lease_path(db_path: str | Path, project: str) -> Path:
-    safe_project = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(project)).strip("-") or "project"
-    return Path(db_path).expanduser().resolve().parent / "locks" / f"{safe_project}.lock"
+    project_name = str(project)
+    safe_project = re.sub(r"[^A-Za-z0-9_.-]+", "-", project_name).strip("-") or "project"
+    identity = hashlib.sha256(project_name.encode("utf-8")).hexdigest()[:12]
+    filename = f"{safe_project}-{identity}.lock"
+    return Path(db_path).expanduser().resolve().parent / "locks" / filename
 
 
 class ProjectLease:
@@ -45,9 +56,7 @@ class ProjectLease:
             handle.seek(0)
             owner = handle.read().strip() or "owner metadata unavailable"
             handle.close()
-            raise ProjectLeaseError(
-                f"{self.project} already has a live Harbor supervisor ({owner})"
-            ) from exc
+            raise ProjectLeaseError(self.project, owner) from exc
         try:
             metadata = {
                 "project": self.project,

@@ -40,7 +40,14 @@ ARTIFACT_KEYS = frozenset(
     }
 )
 BLOCKER_KINDS = frozenset(
-    {"product_decision", "env_blocker", "ambiguous_ac", "missing_proof_capability", "conflicting_instruction"}
+    {
+        "product_decision",
+        "env_blocker",
+        "github_transport",
+        "ambiguous_ac",
+        "missing_proof_capability",
+        "conflicting_instruction",
+    }
 )
 
 

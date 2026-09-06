@@ -77,6 +77,73 @@ def test_rung_zero_repairs_missing_module_and_resumes_same_session(tmp_path: Pat
         db.close()
 
 
+def test_rung_zero_verifies_github_transport_and_resumes_same_session(tmp_path: Path):
+    db = HarborDB(tmp_path / "harbor.db")
+    commands = []
+    resumed = []
+
+    async def execute(command):
+        commands.append(command)
+        return {"returncode": 0}
+
+    async def resume(run_id, prompt):
+        resumed.append((run_id, prompt))
+        return True
+
+    try:
+        result = run(
+            UnblockLadder(db, resumer=resume, remediation_executor=execute).handle(
+                ticket(),
+                {"id": "builder-session"},
+                {"blocker": {"kind": "github_transport", "question": "Which approved GitHub mutation transport should be used?"}},
+            )
+        )
+        assert result.rung == 0 and result.action == "resume" and result.resumed
+        assert result.remediation is not None and result.remediation.plan is not None
+        assert result.remediation.plan.kind == "github_transport"
+        assert commands == [["gh", "auth", "status", "--hostname", "github.com"]]
+        assert resumed[0][0] == "builder-session"
+        assert "use gh for GitHub mutations" in resumed[0][1]
+    finally:
+        db.close()
+
+
+def test_github_transport_auth_failure_skips_first_mate_and_linear_parking(tmp_path: Path):
+    db = HarborDB(tmp_path / "harbor.db")
+    linear = LinearFake()
+    first_mate_calls = []
+    notifications = []
+
+    async def first_mate(*args):
+        first_mate_calls.append(args)
+        return {"disposition": "resolve", "answer": "wrong", "citation": "AGENTS.md:1"}
+
+    async def notify(message):
+        notifications.append(message)
+
+    try:
+        result = run(
+            UnblockLadder(
+                db,
+                linear=linear,
+                first_mate=first_mate,
+                notifier=notify,
+                remediation_executor=lambda command: {"returncode": 1},
+            ).handle(
+                ticket(),
+                {"id": "builder-session"},
+                {"blocker": {"kind": "github_transport", "question": "Which approved GitHub mutation transport should be used?"}},
+            )
+        )
+        assert result.rung == 0 and result.action == "escalate" and not result.resumed
+        assert "gh auth login --hostname github.com" in result.reason
+        assert first_mate_calls == []
+        assert linear.comments == [] and linear.states == []
+        assert notifications and "GitHub CLI authentication" in notifications[0]
+    finally:
+        db.close()
+
+
 def test_rung_one_cites_discoveries_without_paging(tmp_path: Path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "DISCOVERIES.md").write_text(

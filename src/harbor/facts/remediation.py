@@ -25,6 +25,10 @@ ADB_NOT_RUNNING_MARKERS = (
     "unable to connect to adb",
     "no devices/emulators found",
 )
+GITHUB_TRANSPORT_MARKERS = (
+    "github mutation transport",
+    "github mutation approval",
+)
 
 
 def _value(value: Any, *names: str, default: Any = None) -> Any:
@@ -110,6 +114,13 @@ def remediation_plan(blocker: Any) -> RemediationPlan | None:
     """
 
     text = blocker_text(blocker).casefold()
+    kind = str(_value(blocker, "kind", "type", "category", default="")).casefold().replace("-", "_")
+    if kind == "github_transport" or any(marker in text for marker in GITHUB_TRANSPORT_MARKERS):
+        return RemediationPlan(
+            kind="github_transport",
+            commands=(("gh", "auth", "status", "--hostname", "github.com"),),
+            reason="GitHub CLI authentication is verified with gh auth status; use gh for GitHub mutations.",
+        )
     if any(marker in text for marker in MODULE_NOT_FOUND_MARKERS):
         return RemediationPlan(
             kind="missing_module",
@@ -225,6 +236,7 @@ run_remediation = execute_remediation
 
 __all__ = [
     "ADB_NOT_RUNNING_MARKERS",
+    "GITHUB_TRANSPORT_MARKERS",
     "MODULE_NOT_FOUND_MARKERS",
     "RemediationPlan",
     "RemediationResult",

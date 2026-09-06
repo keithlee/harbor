@@ -19,7 +19,9 @@ import hashlib
 import html
 import json
 import re
+import shutil
 import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
@@ -832,46 +834,45 @@ HOLD_OFF_CONTRACT = (
 )
 
 
+def _gh_auth_status(gh_path: str, env: Mapping[str, str]) -> bool:
+    """Return whether the GitHub CLI accepts its configured credentials."""
+
+    child_env = dict(env)
+    try:
+        result = subprocess.run(
+            [gh_path, "auth", "status", "--hostname", "github.com"],
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def detect_delivery_tools(env: Mapping[str, str] | None = None) -> dict[str, bool]:
     """Probe which delivery tools a builder could actually use.
 
-    Read-only and cheap: a PATH lookup, a token presence check, and (only when
-    neither token variable exists) a bounded ``gh auth status`` probe.  The
-    latter recognizes credentials stored by ``gh`` in its config/keyring
-    without exposing command output or credential material.
+    Read-only: a PATH lookup plus ``gh auth status``.  The CLI can use a
+    credential stored in its config/keychain, so an environment token is not
+    required for builder GitHub mutations.  ``GITHUB_TOKEN``/``GH_TOKEN`` are
+    still passed through unchanged for Harbor's separate GitHub API client.
     """
 
     import os
-    import shutil
-    import subprocess
 
     environ = dict(env if env is not None else os.environ)
-    has_token = bool(environ.get("GH_TOKEN") or environ.get("GITHUB_TOKEN"))
     gh_path = shutil.which("gh")
-    gh_authenticated = bool(gh_path and has_token)
-    if gh_path and not has_token:
-        try:
-            status = subprocess.run(
-                [gh_path, "auth", "status"],
-                check=False,
-                env=environ,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            # Missing configuration, a timeout, or an execution failure must
-            # never turn into optimistic delivery authority.
-            pass
-        else:
-            gh_authenticated = status.returncode == 0
+    gh_authenticated = gh_path is not None and _gh_auth_status(gh_path, environ)
     tools: dict[str, bool] = {
         "git": shutil.which("git") is not None,
         "gh": gh_authenticated,
     }
-    if gh_path and not gh_authenticated and not has_token:
-        tools["gh (no token variable and gh auth status failed)"] = False
+    if gh_path is not None and not gh_authenticated:
+        tools["gh (auth status failed)"] = False
     return tools
 
 

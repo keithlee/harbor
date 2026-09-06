@@ -12,6 +12,15 @@ def run(awaitable):
     return asyncio.run(awaitable)
 
 
+def test_client_picks_up_gh_token_alias(monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "secret")
+
+    client = GitHubClient()
+
+    assert client.token == "secret"
+
+
 def test_graphql_transport_is_one_read_request_and_not_a_mutation() -> None:
     calls: list[httpx.Request] = []
 

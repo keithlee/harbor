@@ -256,6 +256,7 @@ async def _start(
     *,
     once: bool = False,
     shadow: bool = False,
+    read_only: bool = False,
     ticket: str | None = None,
     # Dependency seams keep CLI assembly testable and let a delivery skill
     # provide its own runner/worktree dispatcher without Harbor importing it.
@@ -307,7 +308,7 @@ async def _start(
     # still create an isolated worktree and a persistent Codex builder.
     builder_prompt = _pipeline_text(config)
     production_dispatcher = dispatcher
-    if production_dispatcher is None and runner is None:
+    if production_dispatcher is None and runner is None and not read_only:
         manager = worktree_manager
         if manager is None:
             manager = WorktreeManager(
@@ -335,7 +336,8 @@ async def _start(
         poller,
         db=db,
         notifier=notifier,
-        shadow=shadow,
+        shadow=shadow or read_only,
+        read_only=read_only,
         github_poller=github_poller,
         dispatcher=production_dispatcher,
         runner=runner,
@@ -626,19 +628,58 @@ async def _async_main(args: argparse.Namespace) -> int:
     if args.command == "doctor":
         return await _doctor(args.project)
     if args.command == "start":
+        # Explicit shadow starts are already read-only and do not need to own
+        # the project's live supervisor lease.  A normal duplicate start is
+        # still useful as a status/question console, so keep it alive as a
+        # read-only observer instead of allowing a second dispatcher.
         if args.shadow:
-            return await _start(args.project, once=args.once, shadow=True, ticket=args.ticket)
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=True,
+                read_only=True,
+                ticket=args.ticket,
+            )
         try:
             config = get_project(args.project)
         except ValueError as exc:
             print(f"Harbor: {exc}", file=sys.stderr)
             return 2
+        lease = ProjectLease(_db_path(), config.name)
         try:
-            with ProjectLease(_db_path(), config.name):
-                return await _start(args.project, once=args.once, shadow=False, ticket=args.ticket)
+            lease.acquire()
         except ProjectLeaseError as exc:
-            print(f"Harbor: start refused: {exc}", file=sys.stderr)
-            return 2
+            reason = (
+                f"Another Harbor instance is already running for {config.name}; "
+                "this instance is read-only. "
+                f"Owner: {exc.owner}"
+            )
+            print(f"Harbor: {reason}", file=sys.stderr)
+            try:
+                notification = Notifier().notify(reason)
+                if asyncio.iscoroutine(notification):
+                    await notification
+            except Exception as notify_exc:
+                # Notification Center is an operator convenience; losing it
+                # must not turn a safe read-only observer into a failed start.
+                print(f"Harbor: notification unavailable: {notify_exc}", file=sys.stderr)
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=False,
+                read_only=True,
+                ticket=args.ticket,
+            )
+        try:
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=False,
+                read_only=False,
+                ticket=args.ticket,
+            )
+        finally:
+            lease.release()
     if args.command == "facts":
         return await _facts(args.project, as_json=getattr(args, "json", True))
     if args.command == "answer":

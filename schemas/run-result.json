@@ -45,6 +45,7 @@
           "enum": [
             "product_decision",
             "env_blocker",
+            "github_transport",
             "ambiguous_ac",
             "missing_proof_capability",
             "conflicting_instruction"

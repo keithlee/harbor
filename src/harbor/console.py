@@ -230,7 +230,10 @@ class Console:
         status = self.supervisor.status()
         health = "✓" if status.linear_healthy else "✗"
         hold = "on" if self.supervisor.poller.config.hold_all else "off"
-        mode = "shadow" if getattr(self.supervisor, "shadow", False) else "live"
+        if getattr(self.supervisor, "read_only", False):
+            mode = "read-only"
+        else:
+            mode = "shadow" if getattr(self.supervisor, "shadow", False) else "live"
         return (
             f"Harbor: {status.lifecycle} · deterministic first mate · {status.project} · Linear {health}\n"
             f"Scope: {', '.join(self.supervisor.poller.config.dispatch_states)} → dispatch · "
@@ -461,6 +464,14 @@ class Console:
         argument = parts[1] if len(parts) == 2 else ""
         if command in {"/help", "/h"}:
             return self.help_text()
+        if getattr(self.supervisor, "read_only", False) and command in {
+            "/pause",
+            "/hold",
+            "/resume",
+            "/answer",
+            "/kill",
+        }:
+            return f"Harbor: read-only mode · {command} ignored while another supervisor owns the project"
         if command == "/status":
             return self.status_text()
         if command == "/pause":
