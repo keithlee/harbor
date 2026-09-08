@@ -1,5 +1,7 @@
 # Harbor
 
+https://harbor-press-release.keithtlee.chatgpt.site/#release
+
 Harbor is a calm, deterministic supervisor for one explicitly configured
 project at a time. It
 polls Linear and GitHub without making model calls, dispatches a configured
