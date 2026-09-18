@@ -118,12 +118,47 @@ def _ticket_line(ticket: Any) -> str:
             detail += f" ({','.join(severities)})"
         suffix.append(detail)
 
+    for gap in _items(_get(ticket, "handoff", default=())):
+        summary = " ".join(_text(_get(gap, "summary", default="")).split())
+        if summary:
+            suffix.append(f"handoff gate: {summary}")
+
     line = f"{identifier}{observed}  {state}"
     if title:
         line += f"  {title}"
     if suffix:
         line += "  " + "  ".join(suffix)
     return line
+
+
+def _folded(value: Any, limit: int) -> str:
+    text = " ".join(_text(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _escalation_line(row: Any) -> str:
+    """One open escalation: what to answer, why, and what was already tried."""
+
+    escalation_id = _text(_get(row, "id", default="?"), "?")
+    ticket = _text(_get(row, "ticket", default=None), "(no ticket)")
+    kind = _text(_get(row, "kind", default="unknown"), "unknown")
+    line = f"Escalation #{escalation_id}  {ticket}  {kind}  {_folded(_get(row, 'question', default=''), 200)}"
+    details: list[str] = []
+    if kind != "handoff_gate":
+        try:
+            rung = int(_get(row, "rung_resolved", default=2))
+        except (TypeError, ValueError):
+            rung = 2
+        details.append("tried rung 0 and rung 1" if rung >= 2 else f"stopped at rung {rung}")
+    reason = _folded(_get(row, "reason", default=""), 160)
+    if reason:
+        details.append(reason)
+    searched = [_text(item) for item in _items(_get(row, "searched", default=()))]
+    if searched:
+        details.append(f"searched {', '.join(searched)}")
+    if details:
+        line += f"  ({'; '.join(details)})"
+    return f"{line}  → /answer {escalation_id} <answer>"
 
 
 def _status_value(source: Any) -> Any:
@@ -199,7 +234,9 @@ def render_digest(source: Any) -> str:
     escalations = _get(source, "escalations", default=None)
     if escalations is not None:
         values = _items(escalations)
-        lines.append(f"Escalations: {len(values)}")
+        values.sort(key=lambda item: (len(_text(_get(item, "id", default=""))), _text(_get(item, "id", default=""))))
+        lines.append(f"Escalations: {len(values)} open")
+        lines.extend(_escalation_line(item) for item in values)
     spend = _get(source, "spend_today", "cost_today", "cost_usd", default=None)
     if spend is not None:
         try:

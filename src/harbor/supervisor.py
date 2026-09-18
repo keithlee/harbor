@@ -13,7 +13,7 @@ import inspect
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -40,7 +40,29 @@ from harbor.wake import (
     record_push,
     ticket_scope as normalize_ticket_scope,
 )
-from harbor.pr_events import PREventError
+from harbor.pr_events import PREventError, handoff_gate_text, has_handoff_gaps
+
+# Terminal runner states that stop a builder until an operator ``/retry``.
+_STOPPED_RUN_STATUSES = frozenset({"failed", "terminated", "orphaned"})
+_MAX_NOTICE_CHARS = 300
+# A handoff whose PR Linear has not attached yet is re-checked on later polls
+# and escalated as unverified after this many polls.
+_HANDOFF_OBSERVATION_POLLS = 3
+
+
+# A Linear reply is stored as an escalation answer only when it starts with
+# ``Answer:``; the colon is required so "Answer pending, ..." stays chatter.
+_LINEAR_ANSWER_RE = re.compile(r"^\s*answer\s*:\s*(?P<answer>\S.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 try:  # PR feedback was added after the initial supervisor phases.
     from harbor.pr_events import apply_phase8_migration
@@ -125,6 +147,8 @@ class WorktreeDispatcher:
         # Set by Supervisor so a BaseRunner can normalize a final result
         # against Harbor's last read-only PR observation before persisting it.
         self.observed_pr_facts: Callable[[str], Any] | None = None
+        # Set by Supervisor: the open handoff gate appended to every resume.
+        self.handoff_gate: Callable[[str], str] | None = None
         self.runners: dict[str, Any] = {}
         self.worktrees: dict[str, Any] = {}
         # Serializes the whole lifecycle of one ticket's retained builder.
@@ -182,6 +206,20 @@ class WorktreeDispatcher:
             notify=wake.notify,
             reason=wake.reason,
         )
+
+    def _with_handoff_gate(self, identifier: str, instruction: str) -> str:
+        """Append unreplied PR comments and stale risk to a resume prompt."""
+
+        gate = self.handoff_gate
+        if gate is None:
+            return instruction
+        try:
+            text = str(gate(identifier) or "").strip()
+        except Exception:
+            # The gate is a reminder built from local receipts; a failure to
+            # render it must not block delivering the builder's actual wake.
+            return instruction
+        return f"{instruction}\n\n{text}" if text and instruction else text or instruction
 
     def _remember_run_id(self, identifier: str, run_id: str) -> None:
         """Attach the logical id to the queued build receipt when available."""
@@ -585,6 +623,7 @@ class WorktreeDispatcher:
                 recovered = str(getattr(runner, "default_run_id", "") or "")
                 if recovered:
                     wake = self._with_run_id(wake, recovered)
+            wake = replace(wake, instruction=self._with_handoff_gate(identifier, wake.instruction))
             result = await self._runner_call(runner, wake, resume=True)
             await self._record_push_result(wake, result)
             return result
@@ -635,7 +674,7 @@ class WorktreeDispatcher:
                 ticket={"identifier": ticket, "builder_run_id": run_id, "run_id": run_id},
                 action="reengage",
                 resume=run_id,
-                instruction=instruction,
+                instruction=self._with_handoff_gate(ticket, instruction),
                 facts=facts if isinstance(facts, Mapping) else {},
             )
             result = await self._runner_call(runner, wake, resume=True)
@@ -718,6 +757,24 @@ class WorktreeDispatcher:
                 value = method()
                 if inspect.isawaitable(value):
                     await value
+
+
+class _ResultRoutingTarget:
+    """Deliver a PR event to the retained builder, then route its run result.
+
+    ``PREventProcessor`` records only delivery receipts.  Without this bridge
+    a builder that blocked while handling a PR event never reached the ladder.
+    """
+
+    def __init__(self, supervisor: "Supervisor", processor: Any, target: Any) -> None:
+        self.supervisor = supervisor
+        self.processor = processor
+        self.target = target
+
+    async def handle_pr_event(self, event: Mapping[str, Any]) -> Any:
+        result = await self.processor.deliver(self.target, event)
+        await self.supervisor.route_pr_event_result(event, result)
+        return result
 
 
 class Supervisor:
@@ -811,6 +868,7 @@ class Supervisor:
         if isinstance(self.dispatcher, WorktreeDispatcher):
             self.dispatcher.ticket_scope = self.ticket_scope
             self.dispatcher.observed_pr_facts = self.observed_pr_facts
+            self.dispatcher.handoff_gate = self.handoff_gate_text
         for target in (self.runner,):
             if target is not None:
                 try:
@@ -852,6 +910,14 @@ class Supervisor:
         # A process-local marker for a merge receipt obtained from an
         # observed PR fact.  Builder JSON alone never enters this set.
         self._verified_merge_runs: set[str] = set()
+        # Process-local keys of operator notifications already sent, so a
+        # per-poll retry of the same failure pages the operator once.
+        self._operator_notices: set[str] = set()
+        # Handoffs reported before Linear attached their PR, keyed by ticket.
+        self._pending_handoffs: dict[str, dict[str, Any]] = {}
+        # Ledger handoffs (run id + finish time) already checked by this
+        # process; a restart re-derives parked handoffs from the runs table.
+        self._handoffs_seen: set[str] = set()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.heartbeat = heartbeat or Heartbeat(
@@ -1385,12 +1451,82 @@ class Supervisor:
         # running rows.
         if not self.shadow:
             if self.ticket_scope:
-                await reap_orphan_runs(self.db, ticket_scope=self.ticket_scope)
+                orphaned = await reap_orphan_runs(self.db, ticket_scope=self.ticket_scope)
             else:
                 # Preserve the original unscoped call shape for embedders that
                 # provide a narrow reap adapter of their own.
-                await reap_orphan_runs(self.db)
+                orphaned = await reap_orphan_runs(self.db)
+            await self._notify_orphaned_runs(orphaned)
         self._migrations_applied = True
+
+    def _project_ticket_ids(self) -> set[str] | None:
+        """Identifiers this project has observed, or ``None`` when unknown."""
+
+        method = getattr(self.db, "tickets", None) if self.db is not None else None
+        if not callable(method):
+            return None
+        try:
+            return {str(item.get("identifier")) for item in method(self.project) if item.get("identifier")}
+        except Exception:
+            return None
+
+    def _ticket_project(self, identifier: str) -> str | None:
+        """The project that last observed a ticket, or ``None`` when unknown."""
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not identifier:
+            return None
+        try:
+            row = connection.execute("SELECT project FROM tickets WHERE identifier = ?", (identifier,)).fetchone()
+        except Exception:
+            return None
+        return str(row[0]) if row and row[0] else None
+
+    async def _notify_operator(self, key: str, message: str) -> bool:
+        """Send one operator notification per distinct key in this process."""
+
+        if self.notifier is None or self.shadow or self.read_only or key in self._operator_notices:
+            return False
+        target = getattr(self.notifier, "notify", None) or getattr(self.notifier, "send", None) or self.notifier
+        if not callable(target):
+            return False
+        text = " ".join(str(message).split())
+        if len(text) > _MAX_NOTICE_CHARS:
+            text = text[: _MAX_NOTICE_CHARS - 1] + "…"
+        try:
+            value = target(text)
+            if inspect.isawaitable(value):
+                await value
+        except Exception as exc:
+            # Only a delivered notice is deduplicated; a flaky notifier is
+            # retried the next time the same event is reported.
+            self.last_error = f"operator notification failed: {exc}"
+            return False
+        self._operator_notices.add(key)
+        return True
+
+    async def _notify_orphaned_runs(self, run_ids: Iterable[str] | None) -> None:
+        """Tell the operator which of this project's builders a restart stopped."""
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not run_ids:
+            return
+        project_tickets = self._project_ticket_ids()
+        for run_id in run_ids:
+            try:
+                row = connection.execute("SELECT ticket FROM runs WHERE id = ?", (str(run_id),)).fetchone()
+            except Exception:
+                continue
+            identifier = str(row[0]) if row and row[0] else ""
+            if not identifier or not self._in_scope(identifier):
+                continue
+            if project_tickets is not None and identifier not in project_tickets:
+                continue
+            await self._notify_operator(
+                f"orphaned:{run_id}",
+                f"{identifier} builder orphaned: Harbor restarted while it was running. "
+                f"Run /retry {identifier} to resume the same session.",
+            )
 
     async def _reconcile_completed_merges(self) -> None:
         """Recover merge receipts that arrived just after a builder exited.
@@ -1499,6 +1635,8 @@ class Supervisor:
             result = await self._invoke(target, ("dispatch", "start", "build", "run"), wake)
             await self._handle_runner_result(wake, result)
         elif wake.action == "reengage":
+            if wake.reason == "linear-comment-version":
+                self._record_linear_reply(wake)
             result = await self._invoke(target, ("resume", "reengage", "continue_run", "continue"), wake)
             if result is None or result is False:
                 raise RuntimeError("retained builder refused re-engagement delivery")
@@ -1511,7 +1649,96 @@ class Supervisor:
                 mark_threads_seen(self.db, threads, str(head_sha) if head_sha else None)
             await self._handle_runner_result(wake, result)
         elif wake.action == "stop" and wake.notify:
-            await self._invoke(self.notifier, ("notify", "send", "publish"), wake)
+            try:
+                await self._invoke(self.notifier, ("notify", "send", "publish"), wake)
+            except Exception as exc:
+                self.last_error = f"operator notification failed: {exc}"
+
+    def _record_linear_reply(self, wake: Wake) -> None:
+        """Save an explicit Linear ``Answer:`` reply to the ticket's open escalations.
+
+        Every human comment resumes the builder as an instruction.  Only a
+        comment that starts with ``Answer:`` and was created after the
+        escalation opened marks it answered and, for ladder questions, stores
+        its reusable resolution, cited to that comment.  It may replace an
+        earlier Linear answer but never an operator's console answer.
+        Teammate chatter such as "looking into it" never becomes authority.
+        """
+
+        comment = wake.facts.get("linear_comment") if isinstance(wake.facts, Mapping) else None
+        body = str(comment.get("body") or "").strip()[:4000] if isinstance(comment, Mapping) else ""
+        match = _LINEAR_ANSWER_RE.match(body)
+        identifier = self._wake_ticket_identifier(wake)
+        finder = getattr(self.db, "open_escalations", None) if self.db is not None else None
+        if match is None or not identifier or not callable(finder):
+            return
+        # Creation time, not edit time: an old comment edited later still
+        # predates the question it would otherwise claim to answer.
+        created = _parse_time(comment.get("created_at"))
+        if created is None:
+            return
+        answer = match.group("answer").strip()
+        record = getattr(self.db, "record_resolution", None)
+        update = getattr(self.db, "update_escalation", None)
+        comment_id = str(comment.get("id") or "").strip()
+        citation = f"linear:{identifier}" + (f"#comment-{comment_id}" if comment_id else "")
+        answerable = [
+            row
+            for row in finder([identifier])
+            if (opened := _parse_time(row.get("created_at"))) is not None and created > opened
+        ]
+        # Legacy rows can leave several inferred-open questions on one ticket;
+        # a reply answers only the newest one it could have been written for.
+        for row in sorted(answerable, key=lambda item: int(item.get("id") or 0))[-1:]:
+            resolution: Mapping[str, Any] | None = None
+            # A handoff gate is PR state, not a reusable policy question.
+            if row.get("kind") != "handoff_gate" and callable(record):
+                finder_resolution = getattr(self.db, "find_resolution", None)
+                existing = finder_resolution(str(row.get("kind")), str(row.get("question"))) if callable(finder_resolution) else None
+                replace = not (
+                    isinstance(existing, Mapping)
+                    and not str(existing.get("citation") or "").startswith("linear:")
+                )
+                try:
+                    resolution = record(
+                        str(row.get("kind")), str(row.get("question")), answer, citation,
+                        source_ticket=identifier, replace=replace,
+                    )
+                except (TypeError, ValueError):
+                    resolution = None
+            if callable(update):
+                resolution_id = resolution.get("id") if isinstance(resolution, Mapping) else None
+                update(row["id"], status="answered", resolution_id=resolution_id)
+
+    async def _deliver_scheduled_wake(self, wake: Wake) -> None:
+        """Background delivery that tells the operator when a builder cannot run."""
+
+        try:
+            await self._deliver_wake(wake)
+        except Exception as exc:
+            await self._notify_dispatch_failure(wake, str(exc))
+            raise
+
+    async def _notify_dispatch_failure(self, wake: Wake, error: str) -> None:
+        identifier = self._wake_ticket_identifier(wake)
+        if not identifier or self._stop.is_set():
+            return
+        if wake.action != "reengage":
+            await self._notify_operator(
+                f"dispatch:{identifier}:{wake.action}",
+                f"Harbor could not start the builder for {identifier}: {error}",
+            )
+            return
+        # A refused resume is usually a benign race with a live handoff and is
+        # retried on the next poll.  Only a stopped builder needs the operator.
+        run = self._latest_run(identifier) or {}
+        status = str(run.get("status") or "").casefold()
+        if status in _STOPPED_RUN_STATUSES:
+            await self._notify_operator(
+                f"stopped-reengage:{identifier}:{run.get('id')}",
+                f"{identifier} has new work but its builder is {status}. "
+                f"Run /retry {identifier} to resume the same session.",
+            )
 
     def _dispatch_finished(self, key: str, task: asyncio.Task[Any]) -> None:
         """Consume a background delivery result so it cannot be lost/warned."""
@@ -1621,7 +1848,7 @@ class Supervisor:
             if identifier in self._started_build_tickets:
                 return
             self._started_build_tickets.add(identifier)
-        task = asyncio.create_task(self._deliver_wake(wake), name=f"harbor-dispatch-{key}")
+        task = asyncio.create_task(self._deliver_scheduled_wake(wake), name=f"harbor-dispatch-{key}")
         self._dispatch_tasks[key] = task
         self._dispatch_wakes[key] = wake
         task.add_done_callback(lambda finished, key=key: self._dispatch_finished(key, finished))
@@ -1898,6 +2125,274 @@ class Supervisor:
             self._update_run_receipt(wake, normalized)
         return normalized
 
+    async def _report_result(self, wake: Wake, result: Mapping[str, Any]) -> None:
+        """Enforce the handoff gate, close finished escalations, and page stops.
+
+        Blocked finals belong to the unblock ladder, which pages on its own.  An
+        ordinary waiting or completed turn never closes an open escalation;
+        only an answer, a newer ladder result, a clean handoff, or a verified
+        merge does.
+        """
+
+        if self.shadow or self.read_only:
+            return
+        identifier = self._ticket_key(wake.ticket)
+        if not identifier:
+            return
+        try:
+            if wake.run_id and result.get("run_id") and not self._run_id_for_result(wake, result):
+                # A result claiming another run must not change this ticket.
+                return
+            # A newer result supersedes any handoff still waiting to be checked.
+            self._pending_handoffs.pop(identifier, None)
+            status = str(result.get("status") or "").casefold()
+            outcome = str(result.get("outcome") or "").casefold()
+            waiting_on = str(result.get("waiting_on") or "").casefold()
+            pr_url = str(result.get("pr_url") or "").strip()
+            if status == "blocked" or isinstance(result.get("blocker"), Mapping):
+                return
+            handoff = outcome == "merged" or (outcome == "parked" and waiting_on == "human")
+            if handoff and pr_url and self._handoff_gate_enabled():
+                ledger_key = self._ledger_handoff(identifier)
+                if ledger_key is not None:
+                    self._handoffs_seen.add(ledger_key[0])
+                gaps = await self._handoff_gaps(wake.ticket, pr_url, refresh=True)
+                if gaps is None:
+                    # Linear has not attached this PR yet, so nothing about it
+                    # is verified.  Re-check on later polls instead of paging.
+                    self._pending_handoffs[identifier] = {"wake": wake, "result": dict(result), "polls": 0}
+                    return
+                await self._complete_handoff(wake, result, gaps)
+            elif outcome == "parked" and waiting_on == "human":
+                await self._notify_park(identifier, result)
+            elif status in _STOPPED_RUN_STATUSES and not self._stop.is_set():
+                run_id = self._run_id_for_result(wake, result) or str(result.get("run_id") or "")
+                summary = str(result.get("error") or result.get("summary") or status)
+                await self._notify_operator(
+                    f"{status}:{identifier}:{run_id}:{summary}",
+                    f"{identifier} builder {status}: {summary}. Run /retry {identifier} to resume the same session.",
+                )
+        except Exception as exc:
+            # Reporting is operator convenience; it must never take down the
+            # result router that owns cleanup and the unblock ladder.
+            self.last_error = f"result report for {identifier} failed: {exc}"
+
+    def _handoff_gate_enabled(self) -> bool:
+        return callable(getattr(self.pr_event_processor, "handoff_gaps", None))
+
+    async def _complete_handoff(self, wake: Wake, result: Mapping[str, Any], gaps: Mapping[str, Any]) -> None:
+        """Escalate a handoff with gaps, or close its gate and page a clean park."""
+
+        identifier = self._ticket_key(wake.ticket)
+        outcome = str(result.get("outcome") or "").casefold()
+        if has_handoff_gaps(gaps):
+            await self._escalate_handoff(wake, result, outcome, gaps)
+            return
+        close = getattr(self.db, "close_open_escalations", None) if self.db is not None else None
+        if callable(close):
+            if outcome == "merged" and result.get("merge_verified") is True:
+                close(identifier)
+            else:
+                close(identifier, kinds=("handoff_gate",))
+        if outcome == "parked" and str(result.get("waiting_on") or "").casefold() == "human":
+            await self._notify_park(identifier, result)
+
+    async def _notify_park(self, identifier: str, result: Mapping[str, Any]) -> None:
+        pr_url = str(result.get("pr_url") or "").strip()
+        summary = str(result.get("summary") or "")
+        detail = (
+            f"is merge-ready and waiting on you: {pr_url}"
+            if pr_url
+            else f"is parked and waiting on you: {summary or 'no PR reported'}"
+        )
+        await self._notify_operator(f"parked:{identifier}:{pr_url}:{summary}", f"{identifier} {detail}")
+
+    def _ledger_handoff(self, identifier: str) -> tuple[str, dict[str, Any], str] | None:
+        """The ticket's latest run if it is a handoff: ``(key, final, run id)``."""
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not identifier:
+            return None
+        try:
+            row = connection.execute(
+                "SELECT id, status, final_json, finished_at FROM runs WHERE ticket = ? "
+                "ORDER BY COALESCE(finished_at, started_at, id) DESC, id DESC LIMIT 1",
+                (identifier,),
+            ).fetchone()
+            final = json.loads(row[2]) if row is not None and row[2] else None
+        except Exception:
+            return None
+        if row is None or not isinstance(final, dict):
+            return None
+        status = str(row[1] or "").casefold()
+        outcome = str(final.get("outcome") or "").casefold()
+        parked = outcome == "parked" and str(final.get("waiting_on") or "").casefold() == "human"
+        handoff = (status == "waiting" and parked) or (status == "completed" and outcome == "merged")
+        if not handoff or not str(final.get("pr_url") or "").strip():
+            return None
+        return f"{row[0]}@{row[3] or ''}", final, str(row[0])
+
+    async def _retry_pending_handoffs(self) -> None:
+        """Check handoffs whose PR was not attached when reported, or parked before a restart."""
+
+        for ticket in self._fleet_tickets:
+            identifier = self._ticket_key(ticket)
+            if identifier in self._pending_handoffs or not self._in_scope(identifier) or not self._owns(ticket):
+                continue
+            ledger = self._ledger_handoff(identifier)
+            if ledger is None or ledger[0] in self._handoffs_seen or ledger[1].get("outcome") != "parked":
+                continue
+            # A park recorded before this process started (or one whose report
+            # was lost) still needs its handoff gate and merge-ready page.
+            self._handoffs_seen.add(ledger[0])
+            self._pending_handoffs[identifier] = {
+                "wake": Wake(ticket={"identifier": identifier}, action="reengage", resume=ledger[2]),
+                "result": ledger[1],
+                "polls": 0,
+            }
+        for identifier, pending in list(self._pending_handoffs.items()):
+            if not self._in_scope(identifier):
+                continue
+            wake, result = pending["wake"], pending["result"]
+            pr_url = str(result.get("pr_url") or "")
+            ledger = self._ledger_handoff(identifier)
+            if self._latest_run(identifier) is not None and (
+                ledger is None or str(ledger[1].get("pr_url") or "") != pr_url
+            ):
+                # The builder has moved on (blocked, resumed, or a new PR);
+                # a stale handoff must not supersede its newer escalation.
+                self._pending_handoffs.pop(identifier, None)
+                continue
+            try:
+                gaps = await self._handoff_gaps(wake.ticket, pr_url)
+                if gaps is None:
+                    pending["polls"] += 1
+                    if pending["polls"] < _HANDOFF_OBSERVATION_POLLS:
+                        continue
+                    gaps = {
+                        "pr_url": pr_url,
+                        "risk": "unverified",
+                        "unreplied": [],
+                        "summary": (
+                            f"no Harbor observation of the PR after {pending['polls']} polls "
+                            "(is it attached to the Linear ticket?)"
+                        ),
+                    }
+                self._pending_handoffs.pop(identifier, None)
+                await self._complete_handoff(wake, result, gaps)
+            except Exception as exc:
+                self.last_error = f"handoff check for {identifier} failed: {exc}"
+
+    def _linear_ticket(self, identifier: str) -> dict[str, Any]:
+        """The ticket fields Linear writes need, from Harbor's last observation."""
+
+        ticket: dict[str, Any] = {"identifier": identifier}
+        method = getattr(self.db, "tickets", None) if self.db is not None else None
+        if callable(method):
+            try:
+                row = next((item for item in method(self.project) if item.get("identifier") == identifier), None)
+            except Exception:
+                row = None
+            if row and row.get("linear_id"):
+                ticket["linear_id"] = row["linear_id"]
+        return self._authoritative_ticket(ticket)
+
+    async def _handoff_gaps(
+        self, ticket: Mapping[str, Any], pr_url: str, *, refresh: bool = False
+    ) -> Mapping[str, Any] | None:
+        """Observe one handed-off PR and report its unreplied comments and risk."""
+
+        processor = self.pr_event_processor
+        finder = getattr(processor, "handoff_gaps", None)
+        identifier = self._ticket_key(ticket)
+        ticket = self._authoritative_ticket(ticket)
+        if not callable(finder) or not self._ticket_has_pr_url(ticket, pr_url):
+            return None
+        head: str | None = None
+        comment_ids: set[str] | None = None
+        if refresh and self.github_poller is not None:
+            # A builder can reply and merge inside one run.  Read the PR once
+            # more so a reply marker posted seconds ago is not reported open.
+            try:
+                rows = await self._call_github((ticket,))
+            except Exception:
+                rows = []
+            grouped = self._github_facts_by_ticket((ticket,), rows).get(identifier, {})
+            match = self._matching_pr_fact(grouped, pr_url)
+            if match is not None:
+                observe = getattr(processor, "observe", None)
+                if callable(observe):
+                    observe(ticket, match)
+                head = str(match.get("head_sha") or "") or None
+                comment_ids = self._comment_ids(match)
+        return finder(identifier, pr_url, head_sha=head, comment_ids=comment_ids)
+
+    async def _escalate_handoff(
+        self, wake: Wake, result: Mapping[str, Any], outcome: str, gaps: Mapping[str, Any]
+    ) -> None:
+        identifier = self._ticket_key(wake.ticket)
+        verb = "merged" if outcome == "merged" else "parked for human review"
+        question = f"{identifier} {verb} {gaps.get('pr_url')} with {gaps.get('summary')}."
+        reason = "every external PR comment needs an observed reply and a risk analysis at the current head before handoff"
+        method = getattr(self.unblock_ladder, "escalate_handoff", None) if self.unblock_ladder is not None else None
+        if not callable(method):
+            await self._notify_operator(f"handoff:{identifier}:{question}", question)
+            return
+        run = {"id": self._run_id_for_result(wake, result)}
+        value = method(self._linear_ticket(identifier), run, question=question, reason=reason)
+        self.last_unblock = (await value if inspect.isawaitable(value) else value) or self.last_unblock
+
+    def handoff_gate_text(self, identifier: str) -> str:
+        """Render open handoff gaps for every unmerged PR attached to a ticket."""
+
+        finder = getattr(self.pr_event_processor, "handoff_gaps", None)
+        if not callable(finder) or not identifier:
+            return ""
+        ticket = self._authoritative_ticket({"identifier": identifier})
+        cached = self.observed_pr_facts(identifier)
+        gaps: list[Mapping[str, Any]] = []
+        urls = {
+            str(value).strip().rstrip("/")
+            for value in ticket.get("pr_urls") or ()
+            if isinstance(value, str) and value.strip()
+        }
+        for url in sorted(urls):
+            row = self._matching_pr_fact(cached, url)
+            if row is not None and self._fact_confirms_merge(row):
+                continue
+            gap = finder(identifier, url, head_sha=(row or {}).get("head_sha"), comment_ids=self._comment_ids(row))
+            if has_handoff_gaps(gap):
+                gaps.append(gap)
+        return handoff_gate_text(gaps)
+
+    def _ticket_handoff(self, ticket: Mapping[str, Any], facts: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """Open handoff gaps for this poll's unmerged PRs, for /status."""
+
+        finder = getattr(self.pr_event_processor, "handoff_gaps", None)
+        if not callable(finder):
+            return []
+        identifier = self._ticket_key(ticket)
+        attached = self._ticket_pr_urls(self._authoritative_ticket(ticket))
+        gaps: list[Mapping[str, Any]] = []
+        try:
+            for row in self._pr_rows(facts):
+                url = row.get("url")
+                if not url or self._normalized_pr_url(row) not in attached or self._fact_confirms_merge(row):
+                    continue
+                gap = finder(identifier, str(url), head_sha=row.get("head_sha"), comment_ids=self._comment_ids(row))
+                if has_handoff_gaps(gap):
+                    gaps.append(gap)
+        except Exception as exc:
+            self.last_error = f"handoff status for {identifier} failed: {exc}"
+        return gaps
+
+    @staticmethod
+    def _comment_ids(row: Mapping[str, Any] | None) -> set[str] | None:
+        comments = row.get("comments") if isinstance(row, Mapping) else None
+        if not isinstance(comments, list):
+            return None
+        return {str(item.get("id")) for item in comments if isinstance(item, Mapping)}
+
     async def _handle_runner_result(self, wake: Wake, result: Any) -> None:
         """Route a blocked builder final to the injected Phase 7 ladder."""
 
@@ -1915,12 +2410,14 @@ class Supervisor:
                 self._record_observed_push(wake, result)
             if isinstance(result, Mapping):
                 await self._cleanup_merged_worktree(wake, result)
+                await self._report_result(wake, result)
             return
         if not isinstance(result, Mapping):
             return
         if not isinstance(self.dispatcher, WorktreeDispatcher):
             self._record_observed_push(wake, result)
         await self._cleanup_merged_worktree(wake, result)
+        await self._report_result(wake, result)
         status = str(result.get("status", "")).casefold()
         if status != "blocked" and not isinstance(result.get("blocker"), Mapping):
             return
@@ -2316,6 +2813,12 @@ class Supervisor:
         run = self._latest_run(identifier)
         authoritative_ticket = self._authoritative_ticket(ticket)
         attached_urls = self._ticket_pr_urls(authoritative_ticket)
+        target = self.dispatcher or self.runner
+        if target is not None and callable(getattr(processor, "deliver", None)):
+            # The builder's reply to a PR event is a full run result.  Route it
+            # like any other wake so a blocker raised while answering a PR
+            # comment or running the risk turn reaches the unblock ladder.
+            target = _ResultRoutingTarget(self, processor, target)
         for row in self._pr_rows(facts):
             row_url = self._normalized_pr_url(row)
             if not row_url or row_url not in attached_urls:
@@ -2328,19 +2831,34 @@ class Supervisor:
             except (TypeError, ValueError):
                 signature = None
             if signature is None:
-                value = process(authoritative_ticket, row, run=run, builder=self.dispatcher or self.runner)
+                value = process(authoritative_ticket, row, run=run, builder=target)
             else:
                 parameters = signature.parameters
                 kwargs: dict[str, Any] = {}
                 if "run" in parameters:
                     kwargs["run"] = run
                 if "builder" in parameters:
-                    kwargs["builder"] = self.dispatcher or self.runner
-                if "comment_handler" in parameters and (self.dispatcher or self.runner) is not None:
-                    kwargs["comment_handler"] = self.dispatcher or self.runner
+                    kwargs["builder"] = target
+                if "comment_handler" in parameters and target is not None:
+                    kwargs["comment_handler"] = target
                 value = process(authoritative_ticket, row, **kwargs)
             if inspect.isawaitable(value):
                 await value
+
+    async def route_pr_event_result(self, event: Mapping[str, Any], result: Any) -> None:
+        """Send one PR-event builder result through the normal result router."""
+
+        if result is None or result is False:
+            return
+        identifier = str(event.get("ticket") or "")
+        run_id = str(event.get("run_id") or "")
+        wake = Wake(
+            ticket={"identifier": identifier, "builder_run_id": run_id, "run_id": run_id},
+            action="reengage",
+            resume=run_id or None,
+            reason=f"pr-event:{event.get('event_type') or event.get('type') or ''}",
+        )
+        await self._handle_runner_result(wake, result)
 
     async def poll_once(self) -> PollResult | None:
         if self.lifecycle in {Lifecycle.PAUSING, Lifecycle.PAUSED}:
@@ -2417,10 +2935,16 @@ class Supervisor:
                     # pending for a later poll, while a transient review
                     # problem cannot take down Linear/GitHub supervision.
                     self.last_error = str(exc)
+                if self._owns(ticket):
+                    handoff = self._ticket_handoff(ticket, facts)
+                    if handoff:
+                        ticket["handoff"] = handoff
             wake = self.decider.decide(ticket, facts) if self.decider is not None else None
             if wake is not None:
                 await self._emit_wake(wake)
         self._fleet_tickets = tuple(fleet_tickets)
+        if not self.shadow:
+            await self._retry_pending_handoffs()
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -2617,11 +3141,38 @@ class Supervisor:
         escalation_rows: tuple[dict[str, Any], ...] = ()
         run_rows: tuple[dict[str, Any], ...] = ()
         if self.db is not None:
-            method = getattr(self.db, "escalations", None) or getattr(self.db, "list_escalations", None)
+            method = (
+                getattr(self.db, "open_escalations", None)
+                or getattr(self.db, "escalations", None)
+                or getattr(self.db, "list_escalations", None)
+            )
             if callable(method):
                 try:
                     values = method()
-                    escalation_rows = tuple(dict(item) for item in values if isinstance(item, Mapping))
+                    # Show only escalations for tickets in this project's
+                    # current poll: a Done ticket's stale escalation is noise,
+                    # and another project's id is not answerable here.
+                    polled = {self._ticket_key(ticket) for ticket in tickets}
+                    project_tickets = self._project_ticket_ids()
+
+                    def visible(item: Mapping[str, Any]) -> bool:
+                        ticket_id = str(item.get("ticket") or "")
+                        if not ticket_id:
+                            return True
+                        if not self._in_scope(ticket_id):
+                            return False
+                        if ticket_id in polled:
+                            return True
+                        # A pre-migration row has no recorded state and is
+                        # usually stale once its ticket leaves the poll; an
+                        # explicitly open row stays visible for its project.
+                        if item.get("status_inferred"):
+                            return False
+                        return project_tickets is None or ticket_id in project_tickets
+
+                    escalation_rows = tuple(
+                        dict(item) for item in values if isinstance(item, Mapping) and visible(item)
+                    )
                 except Exception:
                     escalation_rows = ()
             connection = getattr(self.db, "connection", None)
@@ -2846,7 +3397,11 @@ class Supervisor:
         return result
 
     async def answer_escalation(self, escalation_id: str, response: str) -> dict[str, Any]:
-        """Record a cited operator answer and resume its retained builder.
+        """Record an operator answer, mark the escalation answered, and resume.
+
+        ``Citation: path:line`` is optional.  Without one the operator is the
+        cited authority (``operator:escalation-<id>``), so a product decision
+        can be answered directly and still reused at rung 1.
 
         Phase 7 owns escalation storage and Linear mutations.  This console
         convenience only calls its DB primitives and the injected same-session
@@ -2870,6 +3425,18 @@ class Supervisor:
                     f"escalation {wanted} is outside invocation scope "
                     f"{self.ticket_scope.selector}"
                 )
+        row_status = str(row.get("status") or "open").casefold()
+        if row_status not in {"open", "answered"}:
+            raise ValueError(f"escalation {wanted} is {row_status}; answer the ticket's current escalation instead")
+        row_ticket = str(row.get("ticket") or "")
+        if getattr(self.db, "connection", None) is not None:
+            # A durable ledger can place every ticket it observed; an answer
+            # for a ticket it cannot place is refused rather than trusted.
+            owner = self._ticket_project(row_ticket) if row_ticket else None
+            if owner != self.project:
+                raise ValueError(
+                    f"escalation {wanted} is for {row_ticket or 'no ticket'}, not a ticket observed in project {self.project}"
+                )
         text = str(response).strip()
         if not text:
             raise ValueError("an answer is required")
@@ -2877,24 +3444,34 @@ class Supervisor:
         if citation_match is None:
             citation_match = re.search(r"\[(?:citation|source)\s*[:=]\s*([^\]]+)\]", text, re.IGNORECASE)
         if citation_match is None:
-            raise ValueError("a citation is required (use 'Citation: path:line')")
-        citation = citation_match.group(1).strip()
-        answer = (text[: citation_match.start()] + text[citation_match.end() :]).strip(" \t\r\n-|")
+            # A product call has no document to cite: the operator is the
+            # authority, and the resolution records that attribution.
+            citation = f"operator:escalation-{wanted}"
+            answer = text
+        else:
+            citation = citation_match.group(1).strip()
+            answer = (text[: citation_match.start()] + text[citation_match.end() :]).strip(" \t\r\n-|")
         if not answer:
             raise ValueError("an answer is required")
         record = getattr(self.db, "record_resolution", None) or getattr(self.db, "add_resolution", None)
         if not callable(record):
             raise RuntimeError("the Harbor ledger cannot record resolutions")
         try:
+            # An explicit operator answer corrects any earlier stored answer.
             resolution = record(
                 str(row.get("kind", "env_blocker")),
                 str(row.get("question", "")),
                 answer,
                 citation,
                 source_ticket=row.get("ticket"),
+                replace=True,
             )
         except TypeError:
             resolution = record(str(row.get("kind", "env_blocker")), str(row.get("question", "")), answer, citation)
+        update = getattr(self.db, "update_escalation", None)
+        if callable(update):
+            resolution_id = resolution.get("id") if isinstance(resolution, Mapping) else None
+            update(wanted, status="answered", resolution_id=resolution_id)
         run_id = str(row.get("run_id") or "")
         resumed = False
         if run_id:

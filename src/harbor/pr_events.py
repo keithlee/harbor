@@ -1223,6 +1223,79 @@ class PREventProcessor:
                     self._mark_replied(event_key)
                     break
 
+    def handoff_gaps(
+        self,
+        ticket: Any,
+        pr_url: str,
+        *,
+        head_sha: str | None = None,
+        comment_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Report what still blocks handing one observed PR to a human or merge.
+
+        ``unreplied`` lists the newest version of each external comment with
+        no observed reply marker.  ``risk`` is ``valid`` only when the risk
+        receipt names ``head_sha`` (or the last observed head).  When
+        ``comment_ids`` is supplied, comments no longer present on the PR are
+        ignored.  ``None`` means Harbor never observed this PR.
+        """
+
+        identifier = ticket if isinstance(ticket, str) else _ticket_id(ticket)
+        url = str(pr_url or "").strip().rstrip("/")
+        if not identifier or not url:
+            return None
+        state = self._state_row(pr_key({"identifier": identifier}, {"url": url}))
+        if state is None:
+            return None
+        head = head_sha or state.get("head_sha")
+        risk_status = _text(state.get("risk_status"), "unknown")
+        if risk_status == "valid" and (not head or state.get("risk_head_sha") == head):
+            risk = "valid"
+        elif risk_status in {"valid", "invalidated"}:
+            risk = "stale"
+        else:
+            risk = "missing"
+        present = {str(item) for item in comment_ids} if comment_ids is not None else None
+        latest: dict[str, tuple[str, Mapping[str, Any]]] = {}
+        for row in self.events(project=self.project, ticket=identifier):
+            if _text(row.get("event_type") or row.get("type")) != NEW_COMMENT_VERSION:
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else row
+            if _text(payload.get("pr_url") or row.get("pr_url")).rstrip("/").casefold() != url.casefold():
+                continue
+            comment = payload.get("comment") if isinstance(payload.get("comment"), Mapping) else {}
+            comment_id = _text(comment.get("id")) or _text(payload.get("comment_version"))
+            surface = _text(payload.get("surface") or comment.get("surface"), "comment")
+            # Rows are ordered oldest first, so an edited comment keeps only
+            # its newest version: that is the one the builder must answer.
+            # The surface is part of the identity because GitHub can expose
+            # one comment id as both an inline comment and a thread reply,
+            # each with its own reply marker.
+            latest[f"{surface}\x00{comment_id}"] = (_text(row.get("event_key") or row.get("key")), payload)
+        unreplied: list[dict[str, Any]] = []
+        for identity, (event_key, payload) in latest.items():
+            comment_id = identity.split("\x00", 1)[1]
+            if present is not None and comment_id not in present:
+                continue
+            if self._event_flags(event_key)[1]:
+                continue
+            unreplied.append(
+                {
+                    "comment_id": comment_id,
+                    "surface": _text(payload.get("surface"), "comment"),
+                    "reply_marker": _text(payload.get("reply_marker")),
+                }
+            )
+        gaps = {"ticket": identifier, "pr_url": url, "head_sha": head, "risk": risk, "unreplied": unreplied}
+        gaps["summary"] = summarize_handoff(gaps)
+        return gaps
+
+    async def deliver(self, target: Any, event: PREvent | Mapping[str, Any]) -> Any:
+        """Offer one event to ``target`` using the processor's call contract."""
+
+        value = event if isinstance(event, PREvent) else _event_from_dict(event)
+        return await self._invoke(target, value)
+
     def mark_risk_valid(self, ticket: Any, facts: Mapping[str, Any], result: Any) -> dict[str, Any]:
         normalized = validate_risk_result(result, current_head=_head(facts))
         key = pr_key(ticket, facts)
@@ -1424,6 +1497,55 @@ class PREventProcessor:
     offer = dispatch
 
 
+def has_handoff_gaps(gaps: Mapping[str, Any] | None) -> bool:
+    """Whether an observed PR still has unreplied comments or stale risk."""
+
+    return bool(gaps) and (bool(gaps.get("unreplied")) or gaps.get("risk") != "valid")
+
+
+def summarize_handoff(gaps: Mapping[str, Any]) -> str:
+    """One deterministic phrase for /status, prompts, and escalations."""
+
+    parts: list[str] = []
+    count = len(gaps.get("unreplied") or ())
+    if count:
+        parts.append(f"{count} unreplied external comment{'s' if count != 1 else ''}")
+    if gaps.get("risk") != "valid":
+        parts.append(f"risk analysis {gaps.get('risk')}")
+    return "; ".join(parts) or "clear"
+
+
+def handoff_gate_text(
+    gaps: Iterable[Mapping[str, Any]],
+    *,
+    max_comments: int = 5,
+    max_bytes: int = 1500,
+) -> str:
+    """Render the same-builder reminder of what must close before handoff."""
+
+    open_gaps = [gap for gap in gaps if has_handoff_gaps(gap)]
+    if not open_gaps:
+        return ""
+    lines = ["Harbor handoff gate (read-only GitHub observation):"]
+    for gap in open_gaps:
+        unreplied = list(gap.get("unreplied") or ())
+        url = html.escape(_text(gap.get("pr_url")), quote=False)
+        head = html.escape(_text(gap.get("head_sha"), "unknown"), quote=False)
+        lines.append(f"- {url} at head {head}: {summarize_handoff(gap)}")
+        for item in unreplied[:max_comments]:
+            lines.append(
+                f"  - {html.escape(_text(item.get('surface')), quote=False)} comment "
+                f"{html.escape(_text(item.get('comment_id')), quote=False)}: reply with marker {item.get('reply_marker')}"
+            )
+        if len(unreplied) > max_comments:
+            lines.append(f"  - and {len(unreplied) - max_comments} more")
+    lines.append(
+        "Do not merge and do not park for human review until every listed comment has a reply "
+        "carrying its marker and `## Risk Analysis` carries the current head's risk marker."
+    )
+    return _bounded("\n".join(lines), max_bytes)
+
+
 PRFeedbackProcessor = PREventProcessor
 GitHubPREventProcessor = PREventProcessor
 PrEventProcessor = PREventProcessor
@@ -1466,10 +1588,13 @@ __all__ = [
     "comment_reply_marker",
     "comment_version_key",
     "detect_pr_events",
+    "handoff_gate_text",
+    "has_handoff_gaps",
     "is_harbor_marked",
     "normalize_comment_response",
     "pr_key",
     "risk_analysis_marker",
+    "summarize_handoff",
     "validate_comment_response",
     "validate_risk_result",
 ]

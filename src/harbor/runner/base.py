@@ -230,6 +230,20 @@ def normalize_final_result(
         if merge_is_verified(value, observed):
             value.update({"outcome": "merged", "waiting_on": "none", "merge_verified": True})
             return value
+        if outcome == "parked" and str(value.get("waiting_on") or "").casefold() == "human":
+            # A merge-ready park is waiting on the operator's merge, not on
+            # review.  A park waiting on CI or review keeps its own wake path.  Keeping ``waiting_on=human`` is what lets an operator
+            # merge re-engage this same builder and later clean its worktree.
+            value.update(
+                {
+                    "status": "waiting",
+                    "outcome": "parked",
+                    "waiting_on": "human",
+                    "merge_verified": False,
+                    "next_action": value.get("next_action") or "Wait for the operator to merge the PR.",
+                }
+            )
+            return value
         value.update(
             {
                 "status": "waiting",

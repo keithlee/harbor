@@ -186,6 +186,7 @@ def test_blocked_builder_final_routes_to_ladder_and_status_shows_escalation() ->
 def test_answer_command_records_citation_and_resumes_same_session(tmp_path: Path) -> None:
     async def scenario() -> str:
         db = HarborDB(tmp_path / "answer.db")
+        db.replace_tickets("SampleProject", [{"identifier": "SAMPLE-42", "title": "A ticket", "state": "Blocked"}])
         db.record_escalation("SAMPLE-42", "run-42", "ambiguous_ac", "Which cache?", 2)
         resumed: list[tuple[str, str]] = []
 

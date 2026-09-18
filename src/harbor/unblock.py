@@ -780,6 +780,20 @@ def _extract_comment_id(result: Any) -> str | None:
     return _text(value).strip() or None
 
 
+def _reply_instruction(escalation_id: Any) -> str:
+    """Tell the operator both ways to answer an open escalation."""
+
+    answer = (
+        f", or run `/answer {escalation_id} <answer>` in the Harbor console"
+        if escalation_id is not None
+        else ""
+    )
+    return (
+        "Reply on this ticket starting with `Answer:` to record the answer and resume this same "
+        f"builder session{answer}."
+    )
+
+
 async def _linear_comment(linear: Any, db: Any, issue_id: str, body: str) -> bool:
     if linear is None:
         return False
@@ -929,22 +943,35 @@ class UnblockLadder:
         citation: str = "",
         answer: str = "",
         notified: bool = False,
+        status: str | None = None,
+        reason: str = "",
+        searched: Sequence[str] = (),
     ) -> Mapping[str, Any] | None:
         if self.db is None:
             return None
         method = getattr(self.db, "record_escalation", None)
         if not callable(method):
             return None
-        return method(
-            ticket_id,
-            run_id or None,
-            kind,
-            question,
-            rung,
-            citation=citation or None,
-            answer=answer or None,
-            notified=notified,
-        )
+        kwargs: dict[str, Any] = {
+            "citation": citation or None,
+            "answer": answer or None,
+            "notified": notified,
+        }
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "status" in parameters or any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+            # Older embedded ledgers predate escalation state; keep their
+            # audit row rather than failing the ladder.
+            kwargs.update({"status": status, "reason": reason or None, "searched": list(searched)})
+        return method(ticket_id, run_id or None, kind, question, rung, **kwargs)
+
+    def _mark_notified(self, escalation: Mapping[str, Any] | None) -> None:
+        escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
+        update = getattr(self.db, "update_escalation", None) if self.db is not None else None
+        if escalation_id is not None and callable(update):
+            update(escalation_id, notified=True)
 
     async def _resume(
         self,
@@ -975,10 +1002,57 @@ class UnblockLadder:
         target = getattr(self.notifier, "notify", None) or getattr(self.notifier, "send", None) or self.notifier
         if not callable(target):
             return False
-        value = target(reason)
-        if inspect.isawaitable(value):
-            await value
+        try:
+            value = target(reason)
+            if inspect.isawaitable(value):
+                await value
+        except Exception:
+            # The escalation row is already durable and visible in /status.
+            # A missing desktop notifier must not abort the park.
+            return False
         return True
+
+    async def escalate_handoff(
+        self,
+        ticket: Mapping[str, Any],
+        run: Mapping[str, Any],
+        *,
+        question: str,
+        reason: str,
+    ) -> UnblockResult | None:
+        """Page the operator about a merge or park that skipped the handoff gate.
+
+        The PR is already merged or waiting on a human, so Harbor leaves the
+        Linear state alone and only records, comments, and notifies.  An
+        identical open gate for the ticket is not paged twice.
+        """
+
+        ticket_id = _identifier(ticket)
+        run_id = _run_id(run)
+        kind = "handoff_gate"
+        finder = getattr(self.db, "open_escalations", None) if self.db is not None else None
+        if callable(finder) and any(
+            row.get("kind") == kind and " ".join(str(row.get("question", "")).split()) == " ".join(question.split())
+            for row in finder([ticket_id])
+        ):
+            return None
+        escalation = self._record(ticket_id, run_id, kind, question, 2, status="open", reason=reason)
+        escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
+        label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"
+        body = (
+            f"[harbor] Handoff gate for {ticket_id} ({label}).\n"
+            f"{question}\n"
+            f"Reason: {reason}\n"
+            + _reply_instruction(escalation_id)
+        )
+        writes = ("comment",) if await _linear_comment(self.linear, self.db, _issue_id(ticket), body) else ()
+        notified = await self._notify(f"{ticket_id} {label}: {question}")
+        if notified:
+            self._mark_notified(escalation)
+        return UnblockResult(
+            ticket_id, run_id, kind, question, 2, "escalate", False,
+            notified=notified, linear_writes=writes, reason=reason, escalation=escalation,
+        )
 
     async def handle(
         self,
@@ -1047,8 +1121,12 @@ class UnblockLadder:
                 "GitHub CLI authentication is unavailable. Run `gh auth login --hostname github.com` "
                 "in the environment that starts Harbor before retrying this builder session."
             )
-            escalation = self._record(ticket_id, run_id, kind, question, 0, answer=reason)
-            notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication: {reason}")
+            escalation = self._record(ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
+            escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
+            label = f" (escalation #{escalation_id})" if escalation_id is not None else ""
+            notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication{label}: {reason}")
+            if notified:
+                self._mark_notified(escalation)
             return UnblockResult(
                 ticket_id,
                 run_id,
@@ -1128,12 +1206,20 @@ class UnblockLadder:
         searched = triage_result.searched
         searched_text = ", ".join(searched) if searched else "none"
         reason = triage_result.reason or "no authoritative answer found"
+        # Record before any external write or notification: the row's id is
+        # what the operator answers, and a failed notifier must never leave an
+        # unanswerable park behind.
+        escalation = self._record(
+            ticket_id, run_id, kind, question, 2, status="open", reason=reason, searched=searched,
+        )
+        escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
+        label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"
         body = (
-            f"[harbor] Blocked {ticket_id} after deterministic remediation and rung-1 triage.\n"
+            f"[harbor] Blocked {ticket_id} after deterministic remediation and rung-1 triage ({label}).\n"
             f"Question: {question}\n"
             f"Reason: {reason}\n"
             f"Searched: {searched_text}\n"
-            f"Reply with an answer and citation to resume this same builder session."
+            + _reply_instruction(escalation_id)
         )
         writes: list[str] = []
         if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
@@ -1154,8 +1240,13 @@ class UnblockLadder:
         desired_state_id = self.human_review_state_id if human else self.blocked_state_id
         if await _linear_state(self.linear, _issue_id(ticket), desired_state, state_id=desired_state_id):
             writes.append("state")
-        notified = await self._notify(f"{ticket_id} parked in {desired_state}: {question} ({reason}; tried rung 0 and rung 1)")
-        escalation = self._record(ticket_id, run_id, kind, question, 2, answer="", notified=notified)
+        notified = await self._notify(
+            f"{ticket_id} parked in {desired_state} ({label}): {question} ({reason}; tried rung 0 and rung 1)"
+        )
+        if notified:
+            self._mark_notified(escalation)
+            if isinstance(escalation, Mapping):
+                escalation = {**escalation, "notified": 1}
         return UnblockResult(
             ticket_id,
             run_id,

@@ -502,7 +502,7 @@ class Console:
         if command == "/answer":
             answer_parts = argument.strip().split(None, 1)
             if len(answer_parts) != 2 or not answer_parts[0] or not answer_parts[1].strip():
-                return "Usage: /answer <escalation-id> <answer> (include Citation: path:line)"
+                return "Usage: /answer <escalation-id> <answer> (optional Citation: path:line; ids are listed by /status)"
             escalation_id, response = answer_parts
             try:
                 result = await self.supervisor.answer_escalation(escalation_id, response)

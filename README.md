@@ -152,11 +152,11 @@ The commands are:
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Render the deterministic fleet digest: Linear tickets, PR/CI/review facts, builder runs, outcomes, and escalations. Zero model calls. |
+| `/status` | Render the deterministic fleet digest: Linear tickets, PR/CI/review facts, open handoff gates, builder runs, outcomes, and each open escalation with its id, question, and what was already tried. Zero model calls. |
 | `/hold on/off <ticket>` | Change the durable merge hold for exactly one observed ticket. This does not pause polling or other agents. |
 | `/pause [reason]` | Pause the whole supervisor: no new dispatches or resumes; a running builder is allowed to finish and its deadline is suspended. |
 | `/resume` | Re-enable dispatch/resume, restart deadline accounting, and perform a fresh poll. |
-| `/answer <escalation-id> <answer>` | Record an operator decision and attempt to resume the retained builder session. |
+| `/answer <escalation-id> <answer>` | Record an operator decision, mark the escalation answered, and attempt to resume the retained builder session. `Citation: path:line` is optional; without it the answer is cited to the operator and is still reused for an identical future question. |
 | `/retry <ticket>` | Explicitly recover a terminated, orphaned, or failed builder in its retained Codex session and worktree. Running/waiting builders and missing session/worktree state are refused. |
 | `/kill [run-id]` | Request termination through an installed process-owner hook; reports when no hook is available. |
 | `/exit` | Stop polling, heartbeat, and active dispatches, then close the foreground console. It does not create a replacement agent. |
@@ -257,6 +257,22 @@ If a builder is blocked, Harbor first tries deterministic remediation. A
 remaining blocker goes to the configured First Mate for cited triage, then to
 the operator when judgment or authority is required. An operator answer resumes
 the retained builder session when it is still available.
+
+Every escalation is recorded before Harbor comments or notifies, so a missing
+desktop notifier never loses it. The Linear comment and notification name the
+escalation id. Answer with `/answer <id> <answer>`, or reply on the Linear
+ticket with a comment that starts with `Answer:`. Any human comment resumes the
+same builder, but only an `Answer:` reply created after the escalation opened,
+or `/answer`, marks it answered and replaces its stored reusable answer. A newer ladder result for the ticket supersedes an
+older open escalation, and only an answer, a clean handoff, or a verified merge
+closes one.
+
+Harbor also enforces a handoff gate. Every same-session resume lists external
+PR comments with no observed reply marker and a risk analysis that does not
+name the current head. If the builder still merges or parks for human review
+with either gap, or with a PR Linear still has not attached after three polls,
+Harbor opens a `handoff_gate` escalation. A clean park, and a
+builder that stops as failed, terminated, or orphaned, notifies the operator.
 
 ## Token efficiency
 

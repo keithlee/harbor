@@ -75,7 +75,12 @@ CREATE TABLE IF NOT EXISTS escalations (
     citation TEXT,
     answer TEXT,
     notified INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    status TEXT,
+    reason TEXT,
+    searched_json TEXT,
+    resolution_id INTEGER,
+    answered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS escalations_ticket_kind_idx
     ON escalations(ticket, kind, created_at);
@@ -258,6 +263,54 @@ def apply_phase9_migration(db: Any, path: str | Path | None = None) -> None:
         connection.commit()
 
 
+def apply_escalation_state_migration(db: Any, path: str | Path | None = None) -> None:
+    """Add open/answered state to an existing escalation ledger.
+
+    Fresh databases already receive these columns from ``SCHEMA``.  Each
+    ALTER is guarded because SQLite has no ``ADD COLUMN IF NOT EXISTS``.
+    """
+
+    connection = db if isinstance(db, sqlite3.Connection) else getattr(db, "connection", None)
+    if not isinstance(connection, sqlite3.Connection):
+        raise TypeError("escalation state migration requires a sqlite3.Connection or HarborDB")
+    migration = Path(path) if path is not None else runtime_asset("migrations", "010_escalation_state.sql")
+    if not migration.is_file():
+        raise FileNotFoundError(migration)
+    lock = getattr(db, "_lock", None)
+    lock_context = lock if lock is not None else threading.RLock()
+    with lock_context:
+        if not _table_exists(connection, "escalations"):
+            return
+        for statement in sql_statements(migration.read_text(encoding="utf-8")):
+            match = re.match(r"ALTER TABLE (\w+) ADD COLUMN (\w+)", statement, re.IGNORECASE)
+            if match and _column_exists(connection, *match.groups()):
+                continue
+            connection.execute(statement)
+        connection.commit()
+
+
+# Legacy rows carry a NULL status: a rung-2 row was an operator page, while a
+# rung-0/1 row was resolved by the ladder itself.
+_EFFECTIVE_ESCALATION_STATUS = (
+    "COALESCE(status, CASE WHEN rung_resolved >= 2 THEN 'open' ELSE 'resolved' END)"
+)
+ESCALATION_STATUSES = frozenset({"open", "answered", "superseded", "resolved"})
+
+
+def _escalation_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(row)
+    value["status_inferred"] = not value.get("status")
+    if value["status_inferred"]:
+        value["status"] = "open" if int(value.get("rung_resolved") or 0) >= 2 else "resolved"
+    raw = value.pop("searched_json", None)
+    try:
+        searched = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        searched = []
+    value["searched"] = [str(item) for item in searched] if isinstance(searched, list) else []
+    return value
+
+
 class HarborDB:
     """Thread-safe wrapper around one Harbor SQLite database."""
 
@@ -277,6 +330,7 @@ class HarborDB:
             # additive migration; fresh databases simply no-op here.
             apply_phase7_migration(self)
             apply_phase9_migration(self)
+            apply_escalation_state_migration(self)
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -717,6 +771,9 @@ class HarborDB:
         citation: str | None = None,
         answer: str | None = None,
         notified: bool = False,
+        status: str | None = None,
+        reason: str | None = None,
+        searched: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Record one ladder result, including successful lower rungs.
 
@@ -724,6 +781,10 @@ class HarborDB:
         audit, but it does not imply that the operator was paged.  This makes
         the acceptance evidence unambiguous and preserves the exact question
         that led to the decision.
+
+        A rung-2 row is ``open`` until it is answered.  Any newer ladder
+        result for the same ticket supersedes an older open row: the builder
+        has moved on to a different question.
         """
 
         kind_text = " ".join(str(kind).split())
@@ -738,11 +799,20 @@ class HarborDB:
             raise ValueError("rung_resolved must be an integer") from exc
         if rung not in (0, 1, 2):
             raise ValueError("rung_resolved must be 0, 1, or 2")
+        status_text = str(status or ("open" if rung == 2 else "resolved")).strip().casefold()
+        if status_text not in ESCALATION_STATUSES:
+            raise ValueError(f"unsupported escalation status: {status_text}")
         timestamp = _now()
         with self._lock:
+            if ticket:
+                self._connection.execute(
+                    f"UPDATE escalations SET status = 'superseded' WHERE ticket = ? AND {_EFFECTIVE_ESCALATION_STATUS} = 'open'",
+                    (str(ticket),),
+                )
             cursor = self._connection.execute(
-                "INSERT INTO escalations(ticket, run_id, kind, question, rung_resolved, citation, answer, notified, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO escalations(ticket, run_id, kind, question, rung_resolved, citation, answer, notified, "
+                "created_at, status, reason, searched_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(ticket) if ticket is not None else None,
                     str(run_id) if run_id is not None else None,
@@ -753,6 +823,9 @@ class HarborDB:
                     str(answer) if answer is not None else None,
                     int(bool(notified)),
                     timestamp,
+                    status_text,
+                    " ".join(str(reason).split()) or None if reason is not None else None,
+                    _json([str(item) for item in searched]) if searched else None,
                 ),
             )
             if ticket and _table_exists(self._connection, "tickets") and _column_exists(
@@ -766,7 +839,7 @@ class HarborDB:
             row = self._connection.execute(
                 "SELECT * FROM escalations WHERE id = ?", (cursor.lastrowid,)
             ).fetchone()
-        return dict(row) if row else {"id": cursor.lastrowid, "ticket": ticket, "run_id": run_id, "kind": kind_text, "question": question_text, "rung_resolved": rung}
+        return _escalation_row(row) if row else {"id": cursor.lastrowid, "ticket": ticket, "run_id": run_id, "kind": kind_text, "question": question_text, "rung_resolved": rung, "status": status_text}
 
     add_escalation = record_escalation
 
@@ -790,9 +863,81 @@ class HarborDB:
         query += " ORDER BY id"
         with self._lock:
             rows = self._connection.execute(query, args).fetchall()
-        return [dict(row) for row in rows]
+        return [_escalation_row(row) for row in rows]
 
     list_escalations = escalations
+
+    def open_escalations(self, tickets: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Return escalations still waiting on an operator, oldest first."""
+
+        query = f"SELECT * FROM escalations WHERE {_EFFECTIVE_ESCALATION_STATUS} = 'open'"
+        args: list[Any] = []
+        if tickets is not None:
+            names = sorted({str(item) for item in tickets if str(item).strip()})
+            if not names:
+                return []
+            query += f" AND ticket IN ({', '.join('?' for _ in names)})"
+            args.extend(names)
+        with self._lock:
+            rows = self._connection.execute(query + " ORDER BY id", args).fetchall()
+        return [_escalation_row(row) for row in rows]
+
+    def update_escalation(
+        self,
+        escalation_id: int | str,
+        *,
+        status: str | None = None,
+        notified: bool | None = None,
+        resolution_id: int | None = None,
+    ) -> bool:
+        """Change one escalation's operator state; ``answered`` stamps the time."""
+
+        updates: list[str] = []
+        args: list[Any] = []
+        if status is not None:
+            status_text = str(status).strip().casefold()
+            if status_text not in ESCALATION_STATUSES:
+                raise ValueError(f"unsupported escalation status: {status_text}")
+            updates.append("status = ?")
+            args.append(status_text)
+            if status_text == "answered":
+                updates.append("answered_at = ?")
+                args.append(_now())
+        if notified is not None:
+            updates.append("notified = ?")
+            args.append(int(bool(notified)))
+        if resolution_id is not None:
+            updates.append("resolution_id = ?")
+            args.append(int(resolution_id))
+        if not updates:
+            return False
+        with self._lock:
+            cursor = self._connection.execute(
+                f"UPDATE escalations SET {', '.join(updates)} WHERE id = ?", (*args, str(escalation_id))
+            )
+            self._connection.commit()
+        return cursor.rowcount == 1
+
+    def close_open_escalations(
+        self, ticket: str, *, status: str = "resolved", kinds: Iterable[str] | None = None
+    ) -> int:
+        """Close a ticket's open escalations, optionally only of ``kinds``."""
+
+        status_text = str(status).strip().casefold()
+        if status_text not in ESCALATION_STATUSES - {"open"}:
+            raise ValueError(f"unsupported closing status: {status_text}")
+        query = f"UPDATE escalations SET status = ? WHERE ticket = ? AND {_EFFECTIVE_ESCALATION_STATUS} = 'open'"
+        args: list[Any] = [status_text, str(ticket)]
+        if kinds is not None:
+            names = sorted({str(item) for item in kinds})
+            if not names:
+                return 0
+            query += f" AND kind IN ({', '.join('?' for _ in names)})"
+            args.extend(names)
+        with self._lock:
+            cursor = self._connection.execute(query, args)
+            self._connection.commit()
+        return int(cursor.rowcount or 0)
 
     def count_escalations(
         self,
@@ -831,12 +976,15 @@ class HarborDB:
         citation: str,
         *,
         source_ticket: str | None = None,
+        replace: bool = False,
     ) -> dict[str, Any]:
         """Persist an operator answer that is reusable by rung 1.
 
         A citation is the safety boundary: an answer without one is never a
         resolution, even when it sounds plausible.  The unique kind/hash key
-        makes repeated ``harbor answer`` commands idempotent.
+        makes repeated ``harbor answer`` commands idempotent.  ``replace``
+        lets an explicit operator answer correct an earlier stored answer;
+        an inferred answer (a Linear reply) never overwrites one.
         """
 
         kind_text = " ".join(str(kind).split())
@@ -856,7 +1004,13 @@ class HarborDB:
         with self._lock:
             self._connection.execute(
                 "INSERT INTO resolutions(kind, question_hash, question, answer, citation, source_ticket, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, question_hash) DO NOTHING",
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, question_hash) "
+                + (
+                    "DO UPDATE SET answer = excluded.answer, citation = excluded.citation, "
+                    "source_ticket = excluded.source_ticket, created_at = excluded.created_at"
+                    if replace
+                    else "DO NOTHING"
+                ),
                 (
                     kind_text,
                     digest,

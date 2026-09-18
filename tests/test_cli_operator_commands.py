@@ -16,6 +16,7 @@ import pytest
 import harbor.cli as cli
 from harbor.cli import build_parser
 from harbor.config.projects import ProjectConfig
+from harbor.db import HarborDB
 from harbor.poll.linear_poller import PollResult
 from harbor.supervisor import Supervisor
 
@@ -241,25 +242,28 @@ def test_shadow_does_not_deliver_pr_events() -> None:
     asyncio.run(scenario())
 
 
-def test_answer_requires_a_citation() -> None:
-    """AC-4: a resolution with an empty citation is never accepted."""
+def test_uncited_answer_cites_the_operator_and_marks_the_escalation_answered(tmp_path) -> None:
+    """A product call has no document to cite: the operator is the authority."""
 
-    class Ledger:
-        def set_runtime(self, *args: Any, **kwargs: Any) -> None:
-            return None
-
-        def escalations(self) -> list[dict[str, Any]]:
-            return [{"id": "7", "kind": "product_decision", "question": "Who owns it?", "ticket": "SAMPLE-42"}]
-
-        def record_resolution(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            raise AssertionError("must not record an uncited answer")
+    db = HarborDB(tmp_path / "harbor.db")
 
     async def scenario() -> None:
-        supervisor = Supervisor(TodoPoller(), db=Ledger(), shadow=True)
-        with pytest.raises(ValueError, match="citation"):
-            await supervisor.answer_escalation("7", "Keith owns it")
+        db.replace_tickets("SampleProject", [{"identifier": "SAMPLE-42", "title": "A ticket", "state": "Blocked"}])
+        escalation = db.record_escalation("SAMPLE-42", None, "product_decision", "Who owns it?", 2)
+        supervisor = Supervisor(TodoPoller(), db=db, shadow=True)
+        result = await supervisor.answer_escalation(str(escalation["id"]), "Keith owns it")
+        assert result["answer"] == "Keith owns it"
+        assert result["citation"] == f"operator:escalation-{escalation['id']}"
+        stored = db.find_resolution("product_decision", "Who owns it?")
+        assert stored and stored["citation"] == result["citation"]
+        assert db.open_escalations() == []
+        answered = db.escalations()[0]
+        assert answered["status"] == "answered" and answered["resolution_id"] == stored["id"]
 
-    asyncio.run(scenario())
+    try:
+        asyncio.run(scenario())
+    finally:
+        db.close()
 
 
 def test_answer_records_a_cited_resolution() -> None:
