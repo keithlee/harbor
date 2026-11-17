@@ -1,0 +1,77 @@
+{
+  "data": {
+    "repository": {
+      "pr_217": {
+        "number": 217,
+        "url": "https://github.com/example/SampleProject/pull/217",
+        "title": "manual deploy path",
+        "state": "OPEN",
+        "merged": false,
+        "mergeable": "MERGEABLE",
+        "headRefOid": "sha-217",
+        "statusCheckRollup": {
+          "state": "FAILURE",
+          "contexts": {
+            "nodes": [
+              {"__typename": "CheckRun", "name": "CI", "conclusion": "FAILURE", "status": "COMPLETED"}
+            ]
+          }
+        },
+        "reviewThreads": {"nodes": []}
+      },
+      "pr_221": {
+        "number": 221,
+        "url": "https://github.com/example/SampleProject/pull/221",
+        "title": "offline dictionary",
+        "state": "OPEN",
+        "merged": false,
+        "mergeable": "MERGEABLE",
+        "headRefOid": "sha-221",
+        "statusCheckRollup": {
+          "state": "SUCCESS",
+          "contexts": {
+            "nodes": [
+              {"__typename": "CheckRun", "name": "CI", "conclusion": "SUCCESS", "status": "COMPLETED"}
+            ]
+          }
+        },
+        "reviewThreads": {
+          "nodes": [
+            {
+              "id": "PRRT-1",
+              "isResolved": false,
+              "isOutdated": true,
+              "path": "docs/specs/proof/sample-29/live-web.md",
+              "line": null,
+              "comments": {"nodes": [{"body": "**<sub>![P1 Badge](https://img.shields.io/badge/P1-red)</sub> Title**", "author": {"login": "chatgpt-codex-connector", "isBot": true}}]}
+            },
+            {
+              "id": "PRRT-2",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "apps/mobile/app/book/[id]/read.tsx",
+              "line": 648,
+              "comments": {"nodes": [{"body": "**<sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub> Runtime**", "author": {"login": "chatgpt-codex-connector", "isBot": true}}]}
+            },
+            {
+              "id": "PRRT-3",
+              "isResolved": false,
+              "isOutdated": true,
+              "path": "apps/mobile/app/book/[id]/read.tsx",
+              "line": null,
+              "comments": {"nodes": [{"body": "**![P2 Badge](https://img.shields.io/badge/P2-yellow) Old**", "author": {"login": "chatgpt-codex-connector", "isBot": true}}]}
+            },
+            {
+              "id": "PRRT-4",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "packages/core/src/dictionary/index.ts",
+              "line": 99,
+              "comments": {"nodes": [{"body": "**![P2 Badge](https://img.shields.io/badge/P2-yellow) Resolved**", "author": {"login": "chatgpt-codex-connector", "isBot": true}}]}
+            }
+          ]
+        }
+      }
+    }
+  }
+}

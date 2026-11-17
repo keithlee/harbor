@@ -1,0 +1,40 @@
+{
+  "escalations": [
+    {
+      "id": 4,
+      "kind": "blocker",
+      "question": "Which API?",
+      "ticket": "DEMO-1"
+    }
+  ],
+  "github_healthy": true,
+  "has_error": true,
+  "lifecycle": "RUNNING",
+  "linear_healthy": true,
+  "observed_at": "2026-11-17T10:00:00+00:00",
+  "project": "demo",
+  "read_only": false,
+  "runs": [
+    {
+      "next_action": "Owner approves",
+      "pr_url": "https://github.com/acme/demo/pull/1",
+      "role": "builder",
+      "status": "waiting",
+      "ticket": "DEMO-1",
+      "waiting_on": "review"
+    }
+  ],
+  "tickets": [
+    {
+      "hold": false,
+      "identifier": "DEMO-1",
+      "owned": true,
+      "pr_urls": [
+        "https://github.com/acme/demo/pull/1"
+      ],
+      "state": "Human Review",
+      "title": "Ship",
+      "url": "https://linear.app/x/DEMO-1"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[
+  {
+    "confirmed": 0,
+    "delay": 300.0,
+    "failures": 1
+  },
+  {
+    "confirmed": 0,
+    "delay": 900.0,
+    "failures": 2
+  },
+  {
+    "confirmed": 0,
+    "delay": 1800.0,
+    "failures": 3
+  },
+  {
+    "confirmed": 0,
+    "delay": 1800.0,
+    "failures": 4
+  },
+  {
+    "confirmed": 0,
+    "delay": 1800.0,
+    "failures": 5
+  }
+]

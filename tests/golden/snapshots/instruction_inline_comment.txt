@@ -1,0 +1,6 @@
+Continue ticket DEMO-7 in the existing builder session builder-7. Review the external GitHub facts and comment below.
+<external-comment>
+head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa surface=review_thread path=src/a.py line=12
+off by one
+</external-comment>
+Return a structured disposition: valid requires the fix and tests plus a reply; invalid or out-of-scope requires evidence plus a reply; ambiguous requires a clarifying question or an explicit park decision plus a reply. Post the reply on GitHub yourself and include this exact receipt marker verbatim in its body: <!-- harbor:reply:b912cf2bc9ca829435ec1637 -->

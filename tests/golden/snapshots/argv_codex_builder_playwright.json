@@ -1,0 +1,22 @@
+[
+  "codex",
+  "exec",
+  "-m",
+  "gpt-5.6-luna",
+  "-C",
+  "<tmp>/wt",
+  "-c",
+  "model_reasoning_effort=xhigh",
+  "-c",
+  "default_permissions=\"harbor-playwright\"",
+  "-c",
+  "permissions.harbor-playwright.extends=\":workspace\"",
+  "-c",
+  "permissions.harbor-playwright.network.enabled=true",
+  "-c",
+  "permissions.harbor-playwright.filesystem={\"<tmp>/state\"=\"write\", \"<tmp>/repo/.git\"=\"write\", \"<tmp>/repo/.git/worktrees/wt\"=\"write\"}",
+  "--output-schema",
+  "<run-result schema>",
+  "--json",
+  "-"
+]

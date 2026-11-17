@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: No operator-specific data in tracked files
+        run: |
+          if git ls-files | grep -E '^(docs/pr-proof|plans)/'; then
+            echo "Local-only proof/plan artifacts must not be tracked"; exit 1
+          fi
+          if git grep -n -E '/Users/[A-Za-z0-9._-]+/' -- . ':!tests' | grep -v '/Users/someone/'; then
+            echo "Absolute operator home paths must not be committed"; exit 1
+          fi
+          if git grep -n -E 'linear\.app/[a-z0-9-]+/issue/[A-Z]+-[0-9]+' -- . ':!tests'; then
+            echo "Real Linear workspace URLs must not be committed"; exit 1
+          fi
+      - run: uv sync --locked
+      - run: uv run python -m compileall -q src tests
+      - run: uv run pytest
+      - run: uv build

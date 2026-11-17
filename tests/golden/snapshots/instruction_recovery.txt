@@ -1,0 +1,3 @@
+Recover ticket DEMO-7 in retained session sess-1 and worktree /worktrees/DEMO-7. Stop reason: unexpected_exit.
+Next step: run tests
+Re-read current Linear and GitHub facts; reconcile partial edits and existing PRs before acting. Do not create another session, worktree or PR. Report progress or a structured blocker; resuming alone is not proof the blocker is resolved.

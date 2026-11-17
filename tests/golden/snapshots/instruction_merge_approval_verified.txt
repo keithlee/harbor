@@ -1,0 +1,7 @@
+Continue ticket DEMO-7 in the existing builder session builder-7. Review the external GitHub facts and comment below.
+Harbor verified a repository owner explicitly approved merging PR https://github.com/acme/demo/pull/7 at head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. This releases the human-review hold for that head. Use the configured delivery workflow to verify all remaining merge gates. If they pass, merge only with an expected-head check (gh pr merge --match-head-commit), then verify the merge and complete the linked Linear issue through that workflow. Reuse valid proof at this head. If a gate blocks delivery, report it explicitly.
+<external-comment>
+head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa surface=issue
+LGTM, merge.
+</external-comment>
+Treat this as a merge request. If the PR stays open, include two labeled lines in the GitHub reply. Remaining: name the precise unsatisfied merge gate and cite current evidence. Next step: name who must act, exactly what they should do, and what will let Harbor continue. Put the same concrete next step in the structured result's next_action. If Harbor could not verify approval, explain how an eligible owner can approve the current head. Do not ask for approval again when it is already verified. If you merged, report the verified merge and Linear status. Post the reply on GitHub yourself and include this exact receipt marker verbatim in its body: <!-- harbor:reply:7088ba54316f88d7d05421cd -->

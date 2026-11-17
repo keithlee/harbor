@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Harbor — Project dashboard</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Harbor dashboard"><span class="mark" aria-hidden="true">H</span> Harbor</a>
+    <div class="connection" id="connection" role="status">Connecting…</div>
+  </header>
+  <main class="layout">
+    <div class="workspace">
+      <header class="project">
+        <div>
+          <p class="eyebrow">Project overview</p>
+          <h1 id="project">Harbor</h1>
+        </div>
+        <p id="updated" class="muted"></p>
+      </header>
+      <p id="notice" class="notice" role="status" hidden></p>
+
+      <section class="metrics" aria-label="Project counts">
+        <div class="metric"><span>Observed tickets</span><strong id="ticket-count">—</strong></div>
+        <div class="metric"><span>Running builders</span><strong id="running-count">—</strong></div>
+        <div class="metric attention"><span>Open decisions</span><strong id="decision-count">—</strong></div>
+      </section>
+
+      <section class="card" aria-labelledby="decisions-title">
+        <header class="section-heading"><h2 id="decisions-title">Needs a decision</h2></header>
+        <p id="actions-notice" class="feedback" hidden>Open the dashboard launch link to record a decision.</p>
+        <div id="decisions"><p class="empty">Waiting for Harbor…</p></div>
+        <form id="decision-form" class="decision-form" hidden>
+          <label for="decision-answer" id="decision-label">Your decision</label>
+          <textarea id="decision-answer" rows="3" maxlength="4000" required placeholder="Enter the decision to record"></textarea>
+          <div class="form-actions">
+            <button type="button" class="secondary" id="cancel-decision">Cancel</button>
+            <button type="submit" class="primary">Record decision</button>
+          </div>
+        </form>
+        <p id="decision-feedback" class="feedback" role="status" hidden></p>
+      </section>
+
+      <section class="card" aria-labelledby="tickets-title">
+        <header class="section-heading">
+          <h2 id="tickets-title">Ticket activity</h2>
+          <label class="filter"><span class="sr-only">Filter tickets</span>
+            <select id="filter">
+              <option value="all">All tickets</option>
+              <option value="working">Running builders</option>
+              <option value="review">In review</option>
+              <option value="attention">Needs attention</option>
+            </select>
+          </label>
+        </header>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">Ticket</th><th scope="col">State</th><th scope="col">Activity</th></tr></thead>
+            <tbody id="tickets"><tr><td colspan="3">Waiting for Harbor…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <aside class="chat" aria-labelledby="chat-title">
+      <header class="chat-header">
+        <span class="chat-icon" aria-hidden="true">✦</span>
+        <div><h2 id="chat-title">First Mate</h2><p>Project assistant</p></div>
+      </header>
+      <div id="messages" class="messages" role="log" aria-label="Conversation" tabindex="0">
+        <div class="welcome">
+          <h3>What would you like to know?</h3>
+          <p>Ask about active work, blockers, or what’s ready for review.</p>
+          <div class="suggestions">
+            <button type="button">What’s running right now?</button>
+            <button type="button">What needs my attention?</button>
+            <button type="button">Which PRs are in review?</button>
+          </div>
+        </div>
+      </div>
+      <form id="chat-form" class="chat-form">
+        <label for="question" class="sr-only">Message First Mate</label>
+        <textarea id="question" rows="2" maxlength="4000" placeholder="Ask First Mate…" required></textarea>
+        <div class="form-actions">
+          <button type="button" id="clear-chat" class="secondary">Clear chat</button>
+          <button type="submit" class="primary" aria-keyshortcuts="Meta+Enter">Send <span aria-hidden="true">⌘↵</span></button>
+        </div>
+        <p id="chat-feedback" class="feedback" role="status" hidden></p>
+      </form>
+    </aside>
+  </main>
+</body>
+</html>

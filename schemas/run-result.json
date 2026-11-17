@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harbor.local/schemas/run-result.json",
+  "title": "Harbor builder run result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "outcome",
+    "waiting_on",
+    "pr_url",
+    "summary",
+    "next_action",
+    "blocker"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "waiting", "blocked", "failed"]
+    },
+    "outcome": {
+      "type": ["string", "null"],
+      "enum": ["merged", "pr_open", "parked", "no_pr", null]
+    },
+    "waiting_on": {
+      "type": ["string", "null"],
+      "enum": ["ci", "review", "human", "none", null]
+    },
+    "pr_url": {
+      "type": ["string", "null"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "next_action": {
+      "type": ["string", "null"]
+    },
+    "blocker": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "question", "options", "recommendation", "evidence"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "product_decision",
+            "env_blocker",
+            "github_transport",
+            "ambiguous_ac",
+            "missing_proof_capability",
+            "conflicting_instruction"
+          ]
+        },
+        "question": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "recommendation": {"type": ["string", "null"]},
+        "evidence": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

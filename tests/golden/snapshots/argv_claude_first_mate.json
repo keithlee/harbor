@@ -1,0 +1,36 @@
+{
+  "with_effort": [
+    "claude",
+    "--print",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "claude-sonnet-5-5",
+    "--no-session-persistence",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands",
+    "--effort",
+    "medium"
+  ],
+  "without_effort": [
+    "claude",
+    "--print",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--model",
+    "claude-sonnet-5-5",
+    "--no-session-persistence",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands"
+  ]
+}

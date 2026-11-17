@@ -1,0 +1,11 @@
+Harbor: RUNNING · demo · Linear healthy
+DEMO-1  Human Review  Ship dashboard
+DEMO-2  In Progress  Add retry budget  PR #12
+DEMO-3 (observed)  Todo  Pre-existing
+Run run-a  builder  waiting  waiting on ci  pr_url=https://github.com/acme/demo/pull/11  next step: Owner comments `lgtm merge` on the PR
+Run run-b  builder  running  waiting on none
+Run run-c  builder  completed
+Run run-d  builder  failed  codex usage limit (confirmed reset 2027-01-15T08:00:00+00:00)  stop=usage_limit_exceeded
+Run run-e  reviewer  failed
+Escalations: 1 open
+Escalation #10  DEMO-1  blocker  Which API version?  (tried rung 0 and rung 1)  → /answer 10 <answer>

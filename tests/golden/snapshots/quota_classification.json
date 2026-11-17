@@ -1,0 +1,66 @@
+{
+  "absurd_reset_is_ignored": [
+    true,
+    null
+  ],
+  "assistant_message_quoting_limit_is_not_quota": [
+    false,
+    null
+  ],
+  "boolean_reset_is_ignored": [
+    true,
+    null
+  ],
+  "claude_rate_limit_allowed_warning": [
+    false,
+    null
+  ],
+  "claude_rate_limit_rejected": [
+    true,
+    1800000900.0
+  ],
+  "codex_code_field": [
+    true,
+    1800000000.0
+  ],
+  "codex_turn_failed_no_reset": [
+    true,
+    null
+  ],
+  "codex_turn_failed_with_reset": [
+    true,
+    1800000000.0
+  ],
+  "flattened_message_curly_quote": [
+    true,
+    null
+  ],
+  "flattened_message_straight_quote": [
+    true,
+    null
+  ],
+  "message_not_at_start_is_not_quota": [
+    false,
+    null
+  ],
+  "naive_iso_reset_is_ignored": [
+    true,
+    null
+  ],
+  "nan_reset_is_ignored": [
+    true,
+    null
+  ],
+  "nested_json_message": [
+    true,
+    1800000600.0
+  ],
+  "rate_limit_exceeded_is_not_quota": [
+    false,
+    null
+  ],
+  "unrelated_event": [
+    false,
+    null
+  ]
+}

@@ -1,0 +1,846 @@
+"""Command-line entry point for Harbor Phase 1."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import shlex
+import sys
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import Any
+
+from harbor.clients.github import GitHubClient
+from harbor.clients.linear import LinearClient, LinearClientError
+from harbor.config.profile import PipelineProfile
+from harbor.config.projects import get_project
+from harbor.console import Console
+from harbor.db import HarborDB
+from harbor.first_mate import FirstMate
+from harbor.lease import ProjectLease, ProjectLeaseError
+from harbor.notify import Notifier
+from harbor.poll.github_poller import GitHubPoller
+from harbor.poll.linear_poller import LinearPoller
+from harbor.pr_events import PREventProcessor
+from harbor.runner.codex import CodexRunner
+from harbor.supervisor import Supervisor, WorktreeDispatcher
+from harbor.wake import TicketScope
+from harbor.worktree import DEFAULT_DISK_FLOOR_GB, WorktreeManager, free_disk_gb
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="harbor", description="A calm project supervisor")
+    commands = parser.add_subparsers(dest="command", required=True)
+    from harbor.workflow_cli import add_commands
+    add_commands(commands)
+    from harbor.onboard import add_command
+    add_command(commands)
+    for name in ("doctor", "start", "status", "facts"):
+        command = commands.add_parser(name)
+        command.add_argument("project")
+    commands.choices["start"].add_argument("--once", action="store_true", help="poll once and print status")
+    commands.choices["start"].add_argument(
+        "--web", nargs="?", const=8765, type=int, metavar="PORT",
+        help="serve the local dashboard alongside the console (default port: 8765)",
+    )
+    commands.choices["start"].add_argument(
+        "--ticket",
+        metavar="IDENTIFIER",
+        help="limit builder custody to this exact ticket identifier (observations remain fleet-wide)",
+    )
+    commands.choices["start"].add_argument(
+        "--shadow",
+        action="store_true",
+        help="decide and print WOULD WAKE lines without dispatching or mutating anything",
+    )
+    commands.choices["status"].add_argument("--json", action="store_true", help="print machine-readable status")
+    commands.choices["facts"].add_argument("--json", action="store_true", help="print machine-readable PR facts")
+    answer = commands.add_parser("answer")
+    answer.add_argument("escalation")
+    answer.add_argument("text", nargs="+", help="the answer; include Citation: path:line when you have one")
+    answer.add_argument("--project", default=None, help="project whose ledger holds the escalation")
+    linear = commands.add_parser(
+        "linear",
+        help="make a narrow, non-interactive-safe Linear progress update",
+    )
+    linear_commands = linear.add_subparsers(dest="linear_command", required=True)
+    comment = linear_commands.add_parser("comment", help="post a comment on one Linear issue")
+    comment.add_argument("issue", metavar="IDENTIFIER", help="Linear issue id or identifier, e.g. ABC-123")
+    comment.add_argument("--body", required=True, help="comment body")
+    comment.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
+    state = linear_commands.add_parser("state", help="move one Linear issue to a non-terminal state")
+    state.add_argument("issue", metavar="IDENTIFIER", help="Linear issue id or identifier, e.g. ABC-123")
+    state.add_argument("--state", required=True, help="non-terminal Linear workflow state name or id")
+    state.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
+    return parser
+
+
+def _db_path() -> Path:
+    return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
+
+
+def _pipeline_text(config: Any) -> str:
+    """Read the configured pipeline document without interpreting its prose."""
+
+    if getattr(config, "workflow_path", None):
+        from harbor.config.workflow import load_workflow
+        registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
+        if not registry or not Path(registry).expanduser().is_file():
+            raise ValueError("workflow delivery requires its authoritative project registry")
+        runtime = shlex.join([
+            "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
+            f"HARBOR_DB_PATH={_db_path().resolve()}",
+            f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
+            sys.executable, "-P", "-m", "harbor.cli",
+        ])
+        return (load_workflow(Path(config.workflow_path)).prompt()
+                + "\nAuthoritative runtime invocation: " + runtime
+                + "\nReplace every `harbor` executable in workflow commands with the invocation above. "
+                + "Replace PROJECT with " + shlex.quote(config.name)
+                + "; IDENTIFIER is the supplied ticket identifier. "
+                + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
+                + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
+                + "shell initialization must not select another registry or ledger."
+                + "\nNative Codex agent provenance: spawn, wait, resume and close children through the native collaboration tools. "
+                + "Do not create child agents by shelling out to codex exec: those sessions are not observed by this run. "
+                + "Discover agent tools with a narrow names-only inventory, such as "
+                + "ALL_TOOLS.filter(x => /^multi_agent_v[0-9]+__/.test(x.name)).map(x => x.name), "
+                + "then read metadata only for the selected spawn/wait/resume/close tool. "
+                + "Do not print the whole tool catalogue; truncation hides available agent tools. "
+                + "Use the effective policy's role models and reasoning efforts. If native collaboration is unavailable, return a capability blocker.")
+    for name in ("pipeline_prompt", "raw_prompt", "builder_prompt"):
+        value = getattr(config, name, None)
+        if value:
+            return str(value)
+    path = getattr(config, "pipeline_path", None)
+    if path:
+        candidate = Path(path).expanduser()
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    return ""
+
+
+def _pipeline_setting(config: Any, name: str, default: str) -> str:
+    value = getattr(config, name, None)
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    return os.environ.get(f"HARBOR_{name.upper()}", default).strip() or default
+
+
+def _deadline_seconds(config: Any, default_minutes: float = 90.0) -> float:
+    """Resolve the configured builder deadline in seconds."""
+
+    value = getattr(config, "deadline_minutes", None)
+    try:
+        minutes = float(value) if value is not None else default_minutes
+    except (TypeError, ValueError):
+        minutes = default_minutes
+    return max(60.0, minutes * 60.0)
+
+
+def _worktree_root(config: Any) -> Path:
+    configured = getattr(config, "worktree_root", None)
+    if configured is None:
+        configured = os.environ.get("HARBOR_WORKTREE_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".harbor" / "wt" / str(getattr(config, "name", "project"))).resolve()
+
+
+def _disk_floor_gb(config: Any) -> float:
+    """The project's free-disk floor, or Harbor's default for every project."""
+
+    value = getattr(config, "disk_floor_gb", None)
+    return float(value) if value is not None else DEFAULT_DISK_FLOOR_GB
+
+
+def _is_terminal_linear_state(value: str | None) -> bool:
+    """Keep the direct CLI fail-closed even when a client is substituted.
+
+    ``LinearClient`` rejects terminal state names too, but this command is the
+    builder-facing authority boundary.  Checking here means an injected client
+    or future transport cannot accidentally turn a verified-merge transition
+    into ordinary builder custody.
+    """
+
+    state = str(value or "").strip().casefold()
+    return state in {"done", "completed", "canceled", "cancelled"} or any(
+        marker in state for marker in ("done", "completed", "canceled", "cancelled")
+    )
+
+
+def build_production_dispatcher(
+    config: Any,
+    db: Any,
+    *,
+    worktree_manager: Any | None = None,
+    runner_factory: Any | None = None,
+    builder_prompt: str = "",
+    ticket_scope: TicketScope | str | None = None,
+) -> tuple[Any, Any, Any]:
+    """Construct the real worktree manager, runner factory and dispatcher.
+
+    Shared by ``start`` and ``answer`` so an operator answer can hydrate and
+    resume the SAME retained builder session.  Without this, ``answer`` built
+    a dispatcher-less supervisor and could only ever report "builder session
+    not available" -- the run row and worktree were right there in the ledger.
+    """
+
+    manager = worktree_manager
+    workflow = None
+    if getattr(config, "workflow_path", None):
+        from harbor.config.workflow import load_workflow
+        workflow = load_workflow(Path(config.workflow_path))
+        if getattr(config, "install_command", None) is None:
+            raise ValueError("configure install_command explicitly, or use an empty command for no installation")
+    if manager is None:
+        manager = WorktreeManager(
+            config.repo_path,
+            root=_worktree_root(config),
+            repo_name=config.name,
+            base_branch=_pipeline_setting(config, "base_branch", "main"),
+            remote=_pipeline_setting(config, "git_remote", "origin"),
+            install_command=getattr(config, "install_command", None),
+            disk_floor_gb=_disk_floor_gb(config),
+            custody=db.connection,
+        )
+    factory = runner_factory
+    if factory is None:
+        from harbor.runner.claude import ClaudeRunner, validate_claude
+        from harbor.runner.quota import runner_identity
+
+        builder_provider = getattr(config, "builder_provider", "codex")
+        claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
+        if builder_provider == "claude":
+            validate_claude(claude_cli, config.builder_model, config.builder_effort)
+            if getattr(config, "playwright_browser_image", None):
+                raise ValueError("Claude Code builders require a project-native browser setup")
+
+        def factory(worktree: Any, wake: Any) -> CodexRunner:
+            ticket = str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
+            path = getattr(worktree, "path", worktree)
+            if workflow is not None:
+                from harbor.workflow_store import bind
+                bind(db.connection, config.name, ticket, wake.run_id, workflow)
+            identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
+            provider = identity[0] if identity else ("codex" if getattr(wake, "action", None) == "reengage" else builder_provider)
+            model = str(getattr(config, "builder_model", "gpt-5.6-luna"))
+            effort = str(getattr(config, "builder_effort", "xhigh"))
+            fallbacks = getattr(config, "builder_fallback_models", ())
+            if provider != builder_provider:
+                model, effort = (identity[1], identity[2]) if identity else ("gpt-5.6-luna", "xhigh")
+                fallbacks = ()
+            runner_type = ClaudeRunner if provider == "claude" else CodexRunner
+            if provider == "claude":
+                validate_claude(claude_cli, model, effort)
+            runner = runner_type(
+                path,
+                db=db,
+                ticket=ticket,
+                model=model,
+                fallback_models=fallbacks,
+                reasoning_effort=effort,
+                executable=claude_cli if provider == "claude" else os.environ.get("HARBOR_CODEX_EXECUTABLE", "codex"),
+                run_id=wake.run_id,
+                writable_roots=(_db_path().resolve().parent,) if workflow is not None else (),
+                playwright_browser_image=getattr(config, "playwright_browser_image", None),
+                # Without this the runner silently takes its own 90-minute
+                # default and ignores the project's deadline_minutes.
+                deadline_seconds=_deadline_seconds(config),
+            )
+            if workflow is not None:
+                runner.workflow_project = config.name
+            return runner
+    dispatcher = WorktreeDispatcher(
+        manager,
+        factory,
+        db=db,
+        project=config.name,
+        builder_prompt=builder_prompt,
+        ticket_scope=ticket_scope,
+    )
+    dispatcher.workflow = workflow
+    return dispatcher, manager, factory
+
+
+async def _doctor(project_name: str) -> int:
+    try:
+        config = get_project(project_name)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
+    client = LinearClient(endpoint=config.linear_api_url)
+    try:
+        healthy = await client.health()
+    except LinearClientError as exc:
+        healthy = False
+        print(f"Project: {config.name} · Linear: unavailable ({exc})")
+    else:
+        print(f"Project: {config.name} · Linear: healthy")
+    scope_ok = True
+    if healthy:
+        scope_ok = await _check_project_scope(client, config)
+    if config.workflow_path:
+        from harbor.config.workflow import load_workflow
+        import shutil
+        workflow = load_workflow(Path(config.workflow_path))
+        print(f"Workflow: {workflow.config['workflow']['package']} / {workflow.config['workflow']['preset']} · {workflow.digest}")
+        print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
+        if config.install_command is None:
+            print("Installation: missing explicit command or none")
+            scope_ok = False
+        provider = getattr(config, "builder_provider", "codex")
+        if not shutil.which(os.environ.get(f"HARBOR_{provider.upper()}_EXECUTABLE", provider)):
+            print(f"Runner: {provider} executable unavailable")
+            scope_ok = False
+    print(f"Poll states: {', '.join(config.poll_states)}")
+    print(f"Dispatch states: {', '.join(config.dispatch_states)}")
+    print("Backlog: ignored")
+    root = _worktree_root(config)
+    floor = _disk_floor_gb(config)
+    free = free_disk_gb(root)
+    verdict = "ok" if free >= floor else "BELOW FLOOR; builder dispatch will be refused"
+    print(f"Disk floor: {floor:.2f} GB · free {free:.2f} GB at {root} · {verdict}")
+    await client.close()
+    return 0 if healthy and scope_ok else 1
+
+
+async def _check_project_scope(client: Any, config: Any) -> bool:
+    """Verify every configured project slug actually exists in Linear.
+
+    A slug that matches nothing returns zero issues rather than an error, so a
+    typo makes Harbor poll forever and see an empty board.  Naming the real
+    slugs here turns a silent no-op into an actionable failure.
+    """
+
+    scope = tuple(getattr(config, "linear_project_scope", ()) or (config.linear_project_slug,))
+    lister = getattr(client, "list_projects", None)
+    if not callable(lister):
+        return True
+    try:
+        projects = await lister()
+    except LinearClientError as exc:
+        print(f"Projects: could not verify scope ({exc})")
+        return False
+    from harbor.project_identity import resolve
+    try:
+        canonical = resolve(scope,projects)
+    except ValueError as exc:
+        print(f"Project scope: {exc}")
+        return False
+    for identifier,slug in zip(scope,canonical):
+        print(f"Project scope: {identifier} -> {slug}")
+    return True
+
+
+async def _start(
+    project_name: str,
+    *,
+    once: bool = False,
+    shadow: bool = False,
+    read_only: bool = False,
+    ticket: str | None = None,
+    web_port: int | None = None,
+    # Dependency seams keep CLI assembly testable and let a delivery skill
+    # provide its own runner/worktree dispatcher without Harbor importing it.
+    linear_client: Any | None = None,
+    github_poller: Any | None = None,
+    dispatcher: Any | None = None,
+    runner: Any | None = None,
+    decider: Any | None = None,
+    first_mate: FirstMate | None = None,
+    migrations: Any | None = None,
+    heartbeat: Any | None = None,
+    unblock_ladder: Any | None = None,
+    worktree_manager: Any | None = None,
+    runner_factory: Any | None = None,
+    pr_event_processor: Any | None = None,
+    notifier: Any | None = None,
+) -> int:
+    try:
+        invocation_scope = TicketScope(ticket)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
+    try:
+        config = get_project(project_name)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
+    db = HarborDB(_db_path())
+    client = linear_client or LinearClient(endpoint=config.linear_api_url)
+    poller = LinearPoller(client, config, db=db)
+    profile = PipelineProfile.from_project(config)
+    event_processor = pr_event_processor or PREventProcessor(
+        db,
+        project=config.name,
+        profile=profile,
+    )
+    github_client: GitHubClient | None = None
+    if github_poller is None and profile.repository_owner and profile.repository_name:
+        github_client = GitHubClient.from_profile(profile)
+        github_poller = GitHubPoller(
+            github_client,
+            profile,
+            event_processor=event_processor,
+            project=config.name,
+        )
+
+    # The CLI is the production composition root.  Tests and embedders may
+    # inject any of these seams, but an ordinary ``harbor start SampleProject`` must
+    # still create an isolated worktree and a persistent Codex builder.
+    builder_prompt = _pipeline_text(config)
+    production_dispatcher = dispatcher
+    if production_dispatcher is None and runner is None and not read_only:
+        manager = worktree_manager
+        if manager is None:
+            manager = WorktreeManager(
+                config.repo_path,
+                root=_worktree_root(config),
+                repo_name=config.name,
+                base_branch=_pipeline_setting(config, "base_branch", "main"),
+                remote=_pipeline_setting(config, "git_remote", "origin"),
+                install_command=getattr(config, "install_command", None),
+                disk_floor_gb=_disk_floor_gb(config),
+            custody=db.connection,
+            )
+        production_dispatcher, manager, factory = build_production_dispatcher(
+            config, db,
+            worktree_manager=manager,
+            runner_factory=runner_factory,
+            builder_prompt=builder_prompt,
+            ticket_scope=invocation_scope,
+        )
+        # Retain the concrete seams for status and tests without changing the
+        # Supervisor API's existing duck-typed injection behavior.
+        worktree_manager = manager
+        runner_factory = factory
+
+    notifier = notifier if notifier is not None else Notifier()
+    supervisor = Supervisor(
+        poller,
+        db=db,
+        notifier=notifier,
+        shadow=shadow or read_only,
+        read_only=read_only,
+        github_poller=github_poller,
+        dispatcher=production_dispatcher,
+        runner=runner,
+        decider=decider,
+        heartbeat=heartbeat,
+        migrations=migrations,
+        unblock_ladder=unblock_ladder,
+        worktree_manager=worktree_manager,
+        runner_factory=runner_factory,
+        pr_event_processor=event_processor,
+        ticket_scope=invocation_scope,
+    )
+    if isinstance(production_dispatcher, WorktreeDispatcher):
+        production_dispatcher.push_recorder = supervisor.record_builder_push
+    if getattr(event_processor, "builder", None) is None and production_dispatcher is not None:
+        # This is useful for callers that invoke the processor directly.  The
+        # supervisor still passes the retained target explicitly on each poll.
+        try:
+            event_processor.builder = production_dispatcher
+        except (AttributeError, TypeError):
+            pass
+    mate = first_mate or FirstMate(
+        supervisor,
+        model=config.firstmate_model,
+        fallback_models=config.firstmate_fallback_models,
+        reasoning_effort=config.firstmate_effort,
+        notifier=notifier,
+        provider=getattr(config, "firstmate_provider", "codex"),
+    )
+    if supervisor.unblock_ladder is None:
+        # Phase 7 owns Linear comment/state semantics. Harbor only supplies
+        # the same-session resume seam and observed repository path.
+        #
+        # ``first_mate`` and ``notifier`` are what make rung 1 (cite or
+        # escalate, via the configured Terra) and rung 2 (park and page the
+        # operator) reachable from a real ``harbor start``.  Without them the
+        # ladder silently degrades to rung 0 only.
+        from harbor.unblock import UnblockLadder
+
+        supervisor.unblock_ladder = UnblockLadder(
+            db,
+            linear=client,
+            first_mate=mate,
+            notifier=notifier,
+            resumer=supervisor.resume_session,
+            repo_path=config.repo_path,
+            protected_paths=getattr(config, "protected_paths", ()) or (),
+            policy=config.blocker_policy,
+            base_branch=config.base_branch,
+            linear_projects=config.linear_project_scope,
+        )
+    workflow = getattr(production_dispatcher, "workflow", None)
+    if workflow is not None:
+        supervisor.unblock_ladder.workflow = workflow
+        supervisor.unblock_ladder.workflow_project = config.name
+    # Install the operator callbacks before the first poll can wake a builder.
+    # ``Supervisor.start`` delivers started-mode wakes in the background, so
+    # heartbeat and observation output are visible from the first long run.
+    console = Console(supervisor, first_mate=mate)
+    try:
+        async with AsyncExitStack() as stack:
+            if web_port is not None:
+                from harbor.dashboard import serve_dashboard
+
+                try:
+                    url = await stack.enter_async_context(serve_dashboard(console, web_port))
+                except OSError as exc:
+                    print(f"Harbor: could not start dashboard: {exc}", file=sys.stderr)
+                    return 2
+                print(f"Harbor dashboard: {url}", flush=True)
+            return await _run_console(supervisor, console, once=once, shadow=shadow)
+    finally:
+        await supervisor.exit()
+        close = getattr(client, "close", None)
+        if callable(close):
+            value = close()
+            if asyncio.iscoroutine(value):
+                await value
+        if github_client is not None and github_client is not client:
+            await github_client.close()
+        db.close()
+
+
+async def _run_console(supervisor: Supervisor, console: Console, *, once: bool, shadow: bool) -> int:
+    await supervisor.start()
+    if shadow:
+        # Phase 3 proof surface: one decided cycle, printed, nothing done.
+        print(console.banner())
+        print("Shadow: decisions only · no dispatch, no resume, no queue row, no Linear/GitHub write")
+        # Keep the observed Linear ticket state beside the decisions so a
+        # one-shot shadow run can be compared directly with the source
+        # board.  ``status_text`` is a pure formatter over this poll's
+        # in-memory observation and performs no additional I/O.
+        print(console.status_text())
+        print(_render_shadow(supervisor))
+        return 0 if supervisor.linear_healthy else 1
+    if once:
+        print(console.banner())
+        print(console.status_text())
+        return 0 if supervisor.linear_healthy else 1
+    await console.run()
+    return 0
+
+
+def _render_shadow(supervisor: Any) -> str:
+    """Render the decided-but-not-dispatched wakes for one cycle."""
+
+    wakes = list(getattr(supervisor, "shadow_wakes", ()) or ())
+    if not wakes:
+        return "WOULD WAKE: none"
+    lines: list[str] = []
+    for wake in wakes:
+        ticket = wake.ticket.get("identifier") or wake.ticket.get("id") or "(unknown)"
+        detail = f" · {wake.reason}" if getattr(wake, "reason", None) else ""
+        lines.append(f"WOULD WAKE {wake.action} {ticket} · idem_key={wake.idem_key}{detail}")
+    return "\n".join(sorted(lines))
+
+
+async def _facts(project_name: str, *, as_json: bool = True) -> int:
+    """Print the read-only PR facts for the tickets Harbor polls.
+
+    This performs exactly one Linear query and one aliased GitHub query, and
+    writes nothing anywhere.  It is the Phase 2 proof surface.
+    """
+
+    try:
+        config = get_project(project_name)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
+    db = HarborDB(_db_path())
+    client = LinearClient(endpoint=config.linear_api_url)
+    profile = PipelineProfile.from_project(config)
+    github_client: GitHubClient | None = None
+    github_poller = None
+    if profile.repository_owner and profile.repository_name:
+        github_client = GitHubClient.from_profile(profile)
+        github_poller = GitHubPoller(github_client, profile, project=config.name)
+    supervisor = Supervisor(
+        LinearPoller(client, config, db=db),
+        db=db,
+        github_poller=github_poller,
+        # Deciding is harmless, but shadow keeps this command strictly
+        # read-only: no queue row, no dispatch, no PR-event delivery.
+        shadow=True,
+    )
+    try:
+        await supervisor.poll_once()
+        facts = [dict(item) for item in supervisor.last_pr_facts]
+        if as_json:
+            print(json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            for item in facts:
+                ci = item.get("ci") or {}
+                threads = item.get("threads") or []
+                print(
+                    f"PR #{item.get('number')} {item.get('head_sha', '')[:8]} "
+                    f"CI {ci.get('state', 'absent')} · {len(threads)} threads"
+                )
+        if supervisor.github_error:
+            print(f"Harbor: GitHub: {supervisor.github_error}", file=sys.stderr)
+        return 0 if supervisor.linear_healthy else 1
+    finally:
+        await supervisor.exit()
+        await client.close()
+        if github_client is not None:
+            await github_client.close()
+        db.close()
+
+
+async def _answer(escalation_id: str, text: str, *, project_name: str | None = None) -> int:
+    """Record a cited operator answer and resume the same builder session.
+
+    This is the non-interactive twin of the console's ``/answer``: both call
+    ``Supervisor.answer_escalation``, so both write the same ``resolutions``
+    row and a later identical question resolves at rung 1 without paging you.
+    """
+
+    if not text.strip():
+        print("Harbor: an answer is required", file=sys.stderr)
+        return 2
+    db = HarborDB(_db_path())
+    client: Any = None
+    supervisor: Any = None
+    try:
+        config = None
+        if project_name:
+            try:
+                config = get_project(project_name)
+            except ValueError as exc:
+                print(f"Harbor: {exc}", file=sys.stderr)
+                return 2
+        if config is not None:
+            client = LinearClient(endpoint=config.linear_api_url)
+            poller = LinearPoller(client, config, db=db)
+        else:
+            poller = None
+        if poller is None:
+            print("Harbor: --project is required to answer an escalation", file=sys.stderr)
+            return 2
+        # Shadow keeps this command from DISPATCHING anything.  The dispatcher
+        # is still required so the explicit resume inside answer_escalation can
+        # hydrate the retained builder from the ledger and continue the SAME
+        # session, which is the whole point of answering an escalation.
+        dispatcher, _, _ = build_production_dispatcher(
+            config, db, builder_prompt=_pipeline_text(config)
+        )
+        supervisor = Supervisor(poller, db=db, dispatcher=dispatcher, shadow=True)
+        try:
+            result = await supervisor.answer_escalation(escalation_id, text, background=True, enqueue_only=True)
+        except ValueError as exc:
+            print(f"Harbor: answer not recorded: {exc}", file=sys.stderr)
+            return 1
+        except RuntimeError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 1
+        suffix = " · resume queued for the project supervisor" if result.get("queued") else " · builder session not available"
+        print(f"Harbor: answer recorded for escalation {escalation_id}{suffix}")
+        print(f"Citation: {result.get('citation', '')}")
+        return 0
+    finally:
+        if supervisor is not None:
+            await supervisor.exit()
+        if client is not None:
+            await client.close()
+        db.close()
+
+
+async def _linear_write(
+    command: str,
+    issue: str,
+    *,
+    body: str | None = None,
+    state: str | None = None,
+    project_name: str | None = None,
+) -> int:
+    """Apply one scoped Linear progress mutation without using Linear MCP.
+
+    Builders may invoke this command in a non-interactive sandbox, where MCP
+    mutation approval is unavailable.  The transport deliberately exposes only
+    comments and non-terminal state updates; ``Done`` remains merge-reconciled
+    Harbor custody.
+    """
+
+    endpoint: str | None = None
+    if project_name:
+        try:
+            endpoint = get_project(project_name).linear_api_url
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+    client = LinearClient(endpoint=endpoint or "https://api.linear.app/graphql")
+    try:
+        if not client.token:
+            print(
+                "Harbor: Linear writes require LINEAR_API_KEY or HARBOR_LINEAR_API_KEY",
+                file=sys.stderr,
+            )
+            return 2
+        if command == "comment":
+            await client.create_comment(issue, body or "")
+            print(f"Harbor: commented on {issue}")
+            return 0
+        if command == "state":
+            if _is_terminal_linear_state(state):
+                print(
+                    "Harbor: terminal Linear states are reconciled only after a verified merge",
+                    file=sys.stderr,
+                )
+                return 1
+            result = await client.update_issue_state(issue, state or "")
+            updated = ((result.get("issue") or {}).get("state") or {}).get("name") or state
+            print(f"Harbor: set {issue} to {updated}")
+            return 0
+        print(f"Harbor: unknown Linear command {command}", file=sys.stderr)
+        return 2
+    except (LinearClientError, ValueError) as exc:
+        print(f"Harbor: Linear {command} failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await client.close()
+
+
+async def _status(project_name: str, *, as_json: bool = False) -> int:
+    try:
+        config = get_project(project_name)
+    except ValueError as exc:
+        print(f"Harbor: {exc}", file=sys.stderr)
+        return 2
+    db = HarborDB(_db_path())
+    try:
+        tickets = db.tickets(config.name)
+        if not tickets:
+            if as_json:
+                print(json.dumps({"project": config.name, "tickets": []}, sort_keys=True))
+            else:
+                print(f"Harbor: no observations for {config.name}; run harbor start {project_name}")
+            return 0
+        if as_json:
+            print(json.dumps({"project": config.name, "tickets": tickets}, ensure_ascii=False, sort_keys=True))
+            return 0
+        for ticket in tickets:
+            observed = " (observed)" if not ticket.get("owned") else ""
+            print(f"{ticket['identifier']}{observed}  {ticket['state']}  {ticket['title']}")
+        return 0
+    finally:
+        db.close()
+
+
+async def _async_main(args: argparse.Namespace) -> int:
+    if args.command == "init":
+        from harbor.onboard import initialize
+        try:
+            return initialize(args)
+        except (ValueError,OSError) as exc:
+            print(f"Harbor: {exc}",file=sys.stderr)
+            return 2
+    if args.command == "workflow":
+        from harbor.workflow_cli import execute
+        db = HarborDB(_db_path())
+        try:
+            return await execute(args, get_project(args.project), db)
+        except (ValueError, OSError) as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            db.close()
+    if args.command == "doctor":
+        return await _doctor(args.project)
+    if args.command == "start":
+        web_options = {}
+        if args.web is not None:
+            if args.once or args.shadow or not 1 <= args.web <= 65535:
+                print("Harbor: --web requires a continuous start and a port between 1 and 65535", file=sys.stderr)
+                return 2
+            web_options["web_port"] = args.web
+        # Explicit shadow starts are already read-only and do not need to own
+        # the project's live supervisor lease.  A normal duplicate start is
+        # still useful as a status/question console, so keep it alive as a
+        # read-only observer instead of allowing a second dispatcher.
+        if args.shadow:
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=True,
+                read_only=True,
+                ticket=args.ticket,
+                **web_options,
+            )
+        try:
+            config = get_project(args.project)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+        lease = ProjectLease(_db_path(), config.name)
+        try:
+            lease.acquire()
+        except ProjectLeaseError as exc:
+            reason = (
+                f"Another Harbor instance is already running for {config.name}; "
+                "this instance is read-only. "
+                f"Owner: {exc.owner}"
+            )
+            print(f"Harbor: {reason}", file=sys.stderr)
+            try:
+                notification = Notifier().notify(reason)
+                if asyncio.iscoroutine(notification):
+                    await notification
+            except Exception as notify_exc:
+                # Notification Center is an operator convenience; losing it
+                # must not turn a safe read-only observer into a failed start.
+                print(f"Harbor: notification unavailable: {notify_exc}", file=sys.stderr)
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=False,
+                read_only=True,
+                ticket=args.ticket,
+                **web_options,
+            )
+        try:
+            return await _start(
+                args.project,
+                once=args.once,
+                shadow=False,
+                read_only=False,
+                ticket=args.ticket,
+                **web_options,
+            )
+        finally:
+            lease.release()
+    if args.command == "facts":
+        return await _facts(args.project, as_json=getattr(args, "json", True))
+    if args.command == "answer":
+        return await _answer(args.escalation, " ".join(args.text), project_name=args.project)
+    if args.command == "linear":
+        return await _linear_write(
+            args.linear_command,
+            args.issue,
+            body=getattr(args, "body", None),
+            state=getattr(args, "state", None),
+            project_name=getattr(args, "project", None),
+        )
+    return await _status(args.project, as_json=getattr(args, "json", False))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return asyncio.run(_async_main(args))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
+__all__ = ["build_parser", "main"]
