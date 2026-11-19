@@ -83,8 +83,11 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
-def _pipeline_text(config: Any) -> str:
-    """The builder prompt: the project's work-pipeline delivery skill plus policy."""
+def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
+    """The builder prompt: the project's work-pipeline delivery skill plus policy.
+
+    Pass the workflow snapshot a launch is bound to; otherwise it is loaded.
+    """
 
     from harbor.config.workflow import load_workflow
     registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
@@ -96,7 +99,8 @@ def _pipeline_text(config: Any) -> str:
         f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
         sys.executable, "-P", "-m", "harbor.cli",
     ])
-    return (load_workflow(Path(config.workflow_path)).prompt()
+    workflow = workflow or load_workflow(Path(config.workflow_path))
+    return (workflow.prompt()
             + "\nAuthoritative runtime invocation: " + runtime
             + "\nReplace every `harbor` executable in workflow commands with the invocation above. "
             + "Replace PROJECT with " + shlex.quote(config.name)
@@ -248,6 +252,7 @@ def build_production_dispatcher(
         project=config.name,
         builder_prompt=builder_prompt,
         ticket_scope=ticket_scope,
+        prompt_renderer=lambda current: _pipeline_text(config, current),
     )
     dispatcher.workflow = workflow
     return dispatcher, manager, factory

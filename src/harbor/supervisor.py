@@ -137,12 +137,16 @@ class WorktreeDispatcher:
         builder_prompt: str = "",
         push_recorder: Callable[..., Any] | None = None,
         ticket_scope: str | TicketScope | None = None,
+        prompt_renderer: Callable[[Any], str] | None = None,
     ) -> None:
         self.worktree_manager = worktree_manager
         self.runner_factory = runner_factory
         self.db = db
         self.project = str(project)
         self.builder_prompt = str(builder_prompt or "").strip()
+        # Renders the launch prompt from a workflow snapshot, so every launch
+        # (dispatch and First Mate fresh sessions) uses the current policy.
+        self.prompt_renderer = prompt_renderer
         self.push_recorder = push_recorder
         self.ticket_scope = normalize_ticket_scope(ticket_scope)
         # Set by Supervisor so a BaseRunner can normalize a final result
@@ -273,13 +277,30 @@ class WorktreeDispatcher:
             self._execution_locks[identifier] = lock
         return lock
 
-    def _initial_wake(self, wake: Wake) -> Wake:
+    def _current_workflow(self, identifier: str, run_id: str | None) -> Any:
+        """Reload the project workflow once per launch and bind that snapshot."""
+
+        workflow = getattr(self, "workflow", None)
+        if not workflow:
+            return None
+        from harbor.workflow_store import bind
+        workflow = self.workflow = workflow.reload()
+        if run_id and getattr(self.db, "connection", None) is not None:
+            bind(self.db.connection, self.project, identifier, run_id, workflow)
+        return workflow
+
+    def _launch_prompt(self, workflow: Any) -> str:
+        if self.prompt_renderer is not None and workflow is not None:
+            return str(self.prompt_renderer(workflow) or "").strip()
+        return self.builder_prompt
+
+    def _initial_wake(self, wake: Wake, workflow: Any = None) -> Wake:
         # Report which delivery tools actually work in the builder's sandbox.
         # A builder that reaches only for an MCP tool strands an approved
         # merge, because a non-interactive run refuses any MCP call that wants
         # approval -- even while plain `gh` is authenticated right there.
         environment = delivery_tools_fact(detect_delivery_tools())
-        base = self.builder_prompt
+        base = self._launch_prompt(workflow)
         if environment and wake.action == "build":
             base = f"{base}\n\n{environment}" if base else environment
         if not base or wake.action != "build":
@@ -395,13 +416,10 @@ class WorktreeDispatcher:
             return None
         async with lock:
             wake = self._with_run_id(wake, self._stable_run_id(wake))
-            wake = self._initial_wake(wake)
+            # Reload BEFORE rendering so the prompt and the bound policy agree.
+            workflow = self._current_workflow(identifier, wake.run_id)
+            wake = self._initial_wake(wake, workflow)
             self._remember_run_id(identifier, wake.run_id or "")
-            workflow = getattr(self, "workflow", None)
-            if workflow:
-                from harbor.workflow_store import bind
-                workflow = self.workflow = workflow.reload()
-                bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             create = getattr(self.worktree_manager, "create", None) or getattr(self.worktree_manager, "ensure", None)
             if not callable(create):
                 raise TypeError("worktree manager must expose create or ensure")
@@ -545,11 +563,15 @@ class WorktreeDispatcher:
         runner = await self.hydrate(identifier, recover_terminal=True)
         if runner is None:
             raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
+        # The old conversation is gone: the new session needs the full launch
+        # prompt (delivery skill, policy incl. merge authority, runtime
+        # invocation) before First Mate's hand-off.
+        prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
         wake = Wake(
             ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
             action="reengage",
             resume=row["id"],
-            instruction=instruction,
+            instruction=f"{prompt}\n\n{instruction}" if prompt else instruction,
             reason="first-mate-fresh-session",
         )
         result = await self._runner_call(runner, wake, resume=False)
