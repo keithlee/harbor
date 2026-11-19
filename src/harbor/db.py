@@ -936,9 +936,10 @@ class HarborDB:
         return cursor.rowcount == 1
 
     def close_open_escalations(
-        self, ticket: str, *, status: str = "resolved", kinds: Iterable[str] | None = None
+        self, ticket: str, *, status: str = "resolved", kinds: Iterable[str] | None = None,
+        run_id: str | None = None,
     ) -> int:
-        """Close a ticket's open escalations, optionally only of ``kinds``."""
+        """Close a ticket's open escalations, optionally only of ``kinds`` or one ``run_id``."""
 
         status_text = str(status).strip().casefold()
         if status_text not in ESCALATION_STATUSES - {"open"}:
@@ -951,6 +952,9 @@ class HarborDB:
                 return 0
             query += f" AND kind IN ({', '.join('?' for _ in names)})"
             args.extend(names)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            args.append(str(run_id))
         with self._lock:
             cursor = self._connection.execute(query, args)
             self._connection.commit()

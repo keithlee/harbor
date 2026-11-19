@@ -140,7 +140,8 @@ def backoff_seconds(settings: Mapping[str, Any], recent: list[dict]) -> float:
     return base * (1, 1, 3, 6)[min(streak, 3)]
 
 
-def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: float | None = None) -> list[Case]:
+def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: float | None = None,
+               in_scope=None) -> list[Case]:
     """Runs First Mate should look at now (respecting the per-run recheck delay)."""
     initialize(connection)
     now = time.time() if now is None else now
@@ -178,12 +179,20 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
         "SELECT e.id, e.identifier, e.payload_json FROM events e LEFT JOIN first_mate_flags_seen s ON s.event_id = e.id "
         "WHERE e.project = ? AND e.event_type = 'watchdog.flag' AND s.event_id IS NULL ORDER BY e.id", (project,)
     ).fetchall():
+        if in_scope is not None and not in_scope(str(ticket or "")):
+            continue  # leave the flag for the supervisor that owns this ticket
         flag = _final(payload)
         run = connection.execute(
-            "SELECT r.id, r.status, r.final_json, r.session_id, t.linear_id, t.title FROM runs r JOIN tickets t ON t.identifier=r.ticket "
+            "SELECT r.id, r.status, r.final_json, r.session_id, t.linear_id, t.title, t.hold, t.state_type "
+            "FROM runs r JOIN tickets t ON t.identifier=r.ticket "
             "WHERE r.ticket=? ORDER BY COALESCE(r.finished_at, r.started_at, r.id) DESC LIMIT 1", (ticket,)
         ).fetchone()
         if run is None:
+            mark_flag(connection, event_id)
+            continue
+        # Same eligibility as ledger cases: never restart a held or closed
+        # ticket. Cleaning up a merged (Done) ticket is the one exception.
+        if (run[6] or run[7] in {"completed", "canceled"}) and flag.get("kind") != "cleanup_stuck":
             mark_flag(connection, event_id)
             continue
         final = _final(run[2])

@@ -1694,7 +1694,7 @@ class Supervisor:
                 # Already verified: its escalations are moot (see _reconcile_runner_result).
                 close = getattr(self.db, "close_open_escalations", None)
                 if callable(close):
-                    close(identifier, status="resolved")
+                    close(identifier, status="resolved", run_id=run_id)
                 wake = Wake(
                     ticket=ticket,
                     action="reengage",
@@ -2265,8 +2265,9 @@ class Supervisor:
             # an open escalation must not keep a merged worktree alive.
             close = getattr(self.db, "close_open_escalations", None) if self.db is not None else None
             identifier = self._ticket_key(wake.ticket)
-            if callable(close) and identifier:
-                close(identifier, status="resolved")
+            run_id = self._run_id_for_result(wake, normalized) or wake.run_id
+            if callable(close) and identifier and run_id:
+                close(identifier, status="resolved", run_id=run_id)
         return normalized
 
     async def _report_result(self, wake: Wake, result: Mapping[str, Any]) -> None:
@@ -3818,11 +3819,13 @@ class Supervisor:
 
         settings = workflow.config.get("first_mate", {})
         try:
-            cases = recovery.find_cases(connection, self.project, settings)
+            cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope)
         except Exception as exc:
             self.last_error = f"First Mate monitor: {exc}"
             return
         for case in cases:
+            if not self._in_scope(case.ticket):
+                continue  # --ticket scope: no triage, comments or receipts for other tickets
             if case.ticket in self._dispatch_tasks and not self._dispatch_tasks[case.ticket].done():
                 continue
             if case.trigger == "watchdog:cleanup_stuck":

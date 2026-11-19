@@ -152,3 +152,45 @@ def test_retry_of_an_already_verified_merge_also_closes_escalations(tmp_path):
     asyncio.run(supervisor._reconcile_completed_merges())
     assert statuses == ["resolved"]  # closed before cleanup is attempted
     db.close()
+
+
+
+# ---- Review finding #8: close escalations per run ----
+
+def test_close_open_escalations_filters_by_run(tmp_path):
+    db = ledger(tmp_path)
+    db.record_escalation("HAN-86", "r1", "env_blocker", "first question", 2)
+    db.connection.execute("UPDATE escalations SET status='open'")  # keep both open (newer supersedes older)
+    db.connection.execute("INSERT INTO escalations(ticket,run_id,kind,question,rung_resolved,status,created_at) "
+                          "SELECT ticket,'r2',kind,'second question',rung_resolved,'open',created_at FROM escalations")
+    db.connection.commit()
+    assert db.close_open_escalations("HAN-86", run_id="r1") == 1
+    rows = dict(db.connection.execute("SELECT run_id, status FROM escalations"))
+    assert rows == {"r1": "resolved", "r2": "open"}
+    db.close()
+
+
+def test_verified_merge_closes_only_its_runs_escalations(tmp_path):
+    import asyncio
+    from test_first_mate_recovery import add_ticket, supervisor_for
+
+    pr = "https://github.com/x/y/pull/1"
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged", "pr_url": pr}, finished=45)
+    db.connection.execute("UPDATE runs SET merge_verified=1")
+    db.connection.execute("UPDATE tickets SET pr_urls_json=?", (json.dumps([pr]),))
+    # a newer blocked run on the same ticket with an open product question
+    db.connection.execute("INSERT INTO runs(id,ticket,status,started_at) VALUES ('run-new','HAN-86','blocked',?)", (iso(1),))
+    db.connection.execute("INSERT INTO escalations(ticket,run_id,kind,question,rung_resolved,status,created_at) VALUES "
+                          "('HAN-86','run-HAN-86','env_blocker','old',2,'open',?), ('HAN-86','run-new','product_decision','Which copy?',2,'open',?)",
+                          (iso(50), iso(1)))
+    db.connection.commit()
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "wait"})
+
+    async def cleanup(wake, result):
+        return None
+
+    supervisor._cleanup_merged_worktree = cleanup
+    asyncio.run(supervisor._reconcile_completed_merges())
+    rows = dict(db.connection.execute("SELECT run_id, status FROM escalations"))
+    assert rows == {"run-HAN-86": "resolved", "run-new": "open"}
+    db.close()

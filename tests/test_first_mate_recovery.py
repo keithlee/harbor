@@ -130,14 +130,38 @@ class Linear:
         return {"id": f"c{len(self.comments)}"}
 
 
-def supervisor_for(tmp_path, db, answer):
+def supervisor_for(tmp_path, db, answer, *, ticket=None):
     workflow = load_workflow(config(tmp_path))
-    dispatcher = WorktreeDispatcher(SimpleNamespace(), lambda *a: None, db=db, project="Demo")
+    dispatcher = WorktreeDispatcher(SimpleNamespace(), lambda *a: None, db=db, project="Demo", ticket_scope=ticket)
     dispatcher.workflow = workflow
     mate, linear = Mate(answer), Linear()
     ladder = SimpleNamespace(first_mate=mate, linear=linear, workflow=workflow)
-    supervisor = Supervisor(Poller(), db=db, dispatcher=dispatcher, unblock_ladder=ladder)
+    supervisor = Supervisor(Poller(), db=db, dispatcher=dispatcher, unblock_ladder=ladder, ticket=ticket)
     return supervisor, mate, linear
+
+
+def add_ticket(db, tmp_path, ticket, *, status="blocked", final=HAN86, finished=15, hold=False, state_type=None):
+    """Add a second ticket and its run without replacing the first."""
+    rows = [dict(r) for r in db.connection.execute("SELECT identifier, title, state, linear_id AS id, hold FROM tickets")]
+    tickets = [{**r, "owned": True} for r in rows] + [{"identifier": ticket, "state": "Blocked", "title": ticket,
+                                                        "owned": True, "hold": hold, "id": f"lin-{ticket}"}]
+    db.replace_tickets("Demo", tickets, emit_events=False)
+    if state_type:
+        db.connection.execute("UPDATE tickets SET state_type=? WHERE identifier=?", (state_type, ticket))
+    worktree = tmp_path / "wt" / ticket
+    worktree.mkdir(parents=True, exist_ok=True)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,session_id,worktree,final_json,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?)",
+        (f"run-{ticket}", ticket, status, "native-2", str(worktree), json.dumps(final), iso(60), iso(finished)),
+    )
+    db.connection.commit()
+
+
+def flag(db, ticket, kind="no_progress"):
+    db.connection.execute(
+        "INSERT INTO events(project, identifier, event_type, payload_json, snapshot_hash, at) VALUES (?,?,?,?,?,?)",
+        ("Demo", ticket, "watchdog.flag", json.dumps({"kind": kind, "detail": kind}), None, iso(0)))
+    db.connection.commit()
 
 
 def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
@@ -245,3 +269,67 @@ def test_only_usage_limits_back_off_exponentially():
     assert [recovery.backoff_seconds(SETTINGS, quota * n) for n in (1, 2, 3, 4)] == [600, 1800, 3600, 3600]
     # A non-quota result ends the streak.
     assert recovery.backoff_seconds(SETTINGS, quota * 3 + plain[:1]) == 600
+
+
+
+# ---- Review finding #3: watchdog flags respect hold and closed tickets ----
+
+def _flag_cases(db):
+    return [c for c in recovery.find_cases(db.connection, "Demo", SETTINGS) if c.flag_id is not None]
+
+
+def test_flag_for_held_ticket_is_dropped(tmp_path):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    flag(db, "HAN-86")
+    db.connection.execute("UPDATE tickets SET hold=1"); db.connection.commit()
+    assert _flag_cases(db) == []
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 1  # handled, not retried
+    db.close()
+
+
+def test_flag_for_canceled_ticket_is_dropped(tmp_path):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    flag(db, "HAN-86")
+    db.connection.execute("UPDATE tickets SET state_type='canceled'"); db.connection.commit()
+    assert _flag_cases(db) == []
+    db.close()
+
+
+def test_repeated_answer_flag_respects_hold(tmp_path):
+    db = ledger(tmp_path, finished=1)
+    flag(db, "HAN-86", "repeated_answer")
+    db.connection.execute("UPDATE tickets SET hold=1"); db.connection.commit()
+    assert _flag_cases(db) == []
+    db.close()
+
+
+def test_cleanup_flag_for_done_ticket_still_cleans(tmp_path):
+    db = ledger(tmp_path, status="completed", final={"outcome": "merged"}, finished=45)
+    flag(db, "HAN-86", "cleanup_stuck")
+    db.connection.execute("UPDATE tickets SET state_type='completed'"); db.connection.commit()
+    assert [c.trigger for c in _flag_cases(db)] == ["watchdog:cleanup_stuck"]
+    db.close()
+
+
+# ---- Review finding #7: First Mate respects the --ticket scope ----
+
+def test_scoped_supervisor_ignores_other_tickets(tmp_path):
+    db = ledger(tmp_path)                       # recoverable HAN-86
+    add_ticket(db, tmp_path, "HAN-99", status="completed", final={"status": "completed"})
+    flag(db, "HAN-86")
+    supervisor, mate, linear = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"}, ticket="HAN-99")
+    asyncio.run(supervisor._monitor_blocked())
+    assert mate.prompts == [] and linear.comments == []
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 0  # left for its owner
+    db.close()
+
+
+def test_unscoped_supervisor_then_handles_the_flag(tmp_path):
+    db = ledger(tmp_path)
+    flag(db, "HAN-86")
+    supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "wait", "reason": "later"})
+    asyncio.run(supervisor._monitor_blocked())
+    assert len(mate.prompts) == 1
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 1
+    db.close()
