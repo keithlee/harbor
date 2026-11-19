@@ -213,6 +213,9 @@ terminal Linear state, the exact local/merged PR head, stopped processes, no
 open escalation, no hold and passing `pre_cleanup` hooks. Modified or untracked
 files keep the worktree for inspection; git-ignored install and build output
 (`node_modules/`, `.next/`, ...) is removed with it. The branch is never deleted.
+All ignored files go, including any unique ignored content (local notes,
+generated `storage/` data, `.env` copies): keep anything you need outside the
+worktree or commit it.
 
 ## Migrating
 
