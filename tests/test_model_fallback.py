@@ -137,19 +137,17 @@ def test_firstmate_fallback_applies_to_answers_and_triage():
     asyncio.run(scenario())
 
 
-def test_workflow_and_legacy_profiles_parse_explicit_fallbacks(tmp_path):
+def test_workflow_profile_parses_explicit_fallbacks(tmp_path):
     from harbor.config.projects import ProjectConfig
     from harbor.config.workflow import load_workflow
-    from test_workflow_config import config
-    workflow=config(tmp_path,extra='[roles.controller]\nmodel="primary"\nfallback_models=["fallback"]\n[skills.blocker_assessment]\nfallback_models=["fallback"]\n')
-    pipeline=tmp_path/'pipeline.md'
-    pipeline.write_text('linear_project_slug: demo\nlinear_team: DEM\nworkflow_path: workflow.toml\ninstall_command: none\n')
+    from workflow_support import materialize
+    workflow=materialize(tmp_path,extra='[roles.controller]\nmodel="primary"\nfallback_models=["fallback"]\n')
+    pipeline=tmp_path/'.harbor'/'pipeline.md'
+    pipeline.write_text('linear_project_slug: demo\nlinear_team: DEM\ninstall_command: none\n')
     profile=ProjectConfig.from_pipeline('Demo',pipeline)
+    # First Mate inherits the controller's model and fallbacks unless configured.
     assert profile.builder_fallback_models==profile.firstmate_fallback_models==('fallback',)
     assert load_workflow(workflow).config['roles']['controller']['fallback_models']==['fallback']
-    pipeline.write_text('linear_project_slug: demo\nlinear_team: DEM\nbuilder_model: primary\nfirstmate_model: primary\nbuilder_fallback_models: ["fallback"]\nfirstmate_fallback_models: ["fallback"]\n')
-    profile=ProjectConfig.from_pipeline('Demo',pipeline)
-    assert profile.builder_fallback_models==profile.firstmate_fallback_models==('fallback',)
 
 
 def test_deadline_and_operator_stop_do_not_trigger_fallback(tmp_path):
@@ -175,7 +173,9 @@ def test_production_dispatcher_receives_configured_fallback(tmp_path,monkeypatch
     from harbor.db import HarborDB
     from harbor.wake import Wake
     db=HarborDB(tmp_path/'state.db')
-    cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=tmp_path,builder_model='primary',builder_fallback_models=('fallback',))
+    from workflow_support import materialize
+    workflow=materialize(tmp_path,models={'controller':{'model':'primary','fallback_models':['fallback']}})
+    cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=tmp_path,builder_model='primary',builder_fallback_models=('fallback',),workflow_path=str(workflow),install_command='none')
     dispatcher,manager,factory=build_production_dispatcher(cfg,db)
     runner=factory(tmp_path,Wake(ticket={'identifier':'DEM-1','run_id':'run'},action='build'))
     assert runner.primary_model=='primary' and runner.fallback_models==('fallback',)

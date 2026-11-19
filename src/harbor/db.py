@@ -13,6 +13,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -548,6 +549,22 @@ class HarborDB:
 
     count_events = event_count
 
+    def heartbeat_path(self, project: str) -> Path | None:
+        """File the supervisor's heartbeat is mirrored to for ``harbor watch``."""
+        if self.path == ":memory:":
+            return None
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in project)
+        return Path(self.path).parent / f"heartbeat-{safe}.json"
+
+    def record_heartbeat(self, project: str, payload: Mapping[str, Any]) -> None:
+        """Mirror the latest heartbeat to a small JSON file (atomic replace)."""
+        target = self.heartbeat_path(project)
+        if target is None:
+            return
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps({**dict(payload), "recorded_at": time.time()}, default=str))
+        temporary.replace(target)
+
     def set_runtime(self, project: str, lifecycle: str, reason: str | None = None) -> None:
         with self._lock:
             self._connection.execute(
@@ -919,9 +936,10 @@ class HarborDB:
         return cursor.rowcount == 1
 
     def close_open_escalations(
-        self, ticket: str, *, status: str = "resolved", kinds: Iterable[str] | None = None
+        self, ticket: str, *, status: str = "resolved", kinds: Iterable[str] | None = None,
+        run_id: str | None = None,
     ) -> int:
-        """Close a ticket's open escalations, optionally only of ``kinds``."""
+        """Close a ticket's open escalations, optionally only of ``kinds`` or one ``run_id``."""
 
         status_text = str(status).strip().casefold()
         if status_text not in ESCALATION_STATUSES - {"open"}:
@@ -934,6 +952,9 @@ class HarborDB:
                 return 0
             query += f" AND kind IN ({', '.join('?' for _ in names)})"
             args.extend(names)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            args.append(str(run_id))
         with self._lock:
             cursor = self._connection.execute(query, args)
             self._connection.commit()

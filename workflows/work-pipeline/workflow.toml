@@ -1,95 +1,73 @@
+# Harbor work-pipeline. `harbor init` copies this package into
+# <repo>/.harbor/workflow/. Edit your copy to change the dev workflow.
+# Role models live in config.toml beside this file.
 version = 1
-[defaults.delivery]
+
+[delivery]
+# "human": a person merges. "workflow_checked" lets pre_merge readiness allow
+# automatic merges for the risks listed below.
 merge_mode = "human"
 auto_merge_risks = []
-[defaults.review]
-enabled = false
-require_independence = false
-max_failed_rounds = 3
-[defaults.recovery]
-enabled = false
+
+[recovery]
+# Automatic retries after an unexpected builder exit.
+enabled = true
 delays_seconds = [30, 120, 300]
 max_attempts = 3
-[defaults.decisions]
+
+[decisions]
+# How First Mate may answer blockers: human | cite_only | bounded.
 mode = "cite_only"
 require_citation = true
 require_rationale = true
-[defaults.cleanup]
+
+[cleanup]
 mode = "after_merge"
 delay_seconds = 0
-[defaults.skills.delivery]
+
+[evidence]
+# Readiness evidence: required | advisory | off.
+ci = "required"
+feedback = "advisory"
+
+[skills.delivery]
 ref = "skills/delivery/SKILL.md"
-[defaults.skills.review]
-enabled = false
+[skills.planning]
+ref = "skills/planning/SKILL.md"
+[skills.review]
 ref = "skills/review/SKILL.md"
-[defaults.skills.blocker_assessment]
-enabled = true
+[skills.risk]
+ref = "skills/risk/SKILL.md"
+[skills.blocker_assessment]
 ref = "skills/blocker-assessment/SKILL.md"
-[defaults.hooks.readiness]
-event = "pre_merge"
-mode = "required"
-executor = "script"
-command = ["python3", "scripts/readiness.py"]
-protocol = "json"
-timeout_seconds = 60
-[defaults.hooks.handoff]
+
+[hooks.handoff]
 event = "pre_handoff"
 mode = "required"
 executor = "script"
 command = ["python3", "scripts/readiness.py"]
 protocol = "json"
 timeout_seconds = 60
-[presets.minimal]
-[defaults.hooks.decision_policy]
+
+[hooks.readiness]
+event = "pre_merge"
+mode = "required"
+executor = "script"
+command = ["python3", "scripts/readiness.py"]
+protocol = "json"
+timeout_seconds = 60
+
+[hooks.decision_policy]
 event = "blocker"
 mode = "required"
 executor = "script"
 command = ["python3", "scripts/decision_policy.py"]
 protocol = "json"
 timeout_seconds = 15
-[presets.reviewed.review]
-enabled = true
-require_independence = true
-[presets.reviewed.skills.review]
-enabled = true
-[presets.autonomous.review]
-enabled = true
-require_independence = true
-[presets.autonomous.skills.review]
-enabled = true
-[presets.autonomous.delivery]
-merge_mode = "workflow_checked"
-auto_merge_risks = ["low"]
-[presets.autonomous.recovery]
-enabled = true
-[presets.autonomous.decisions]
-mode = "bounded"
 
-[defaults.evidence]
-ci = "required"
-feedback = "off"
-risk = "off"
-proof = "off"
-[presets.reviewed.evidence]
-feedback = "required"
-risk = "required"
-proof = "required"
-[presets.autonomous.evidence]
-feedback = "required"
-risk = "required"
-proof = "required"
-
-[defaults.skills.planning]
-enabled = false
-ref = "skills/planning/SKILL.md"
-[defaults.skills.risk]
-enabled = false
-ref = "skills/risk/SKILL.md"
-[presets.reviewed.skills.planning]
-enabled = true
-[presets.reviewed.skills.risk]
-enabled = true
-[presets.autonomous.skills.planning]
-enabled = true
-[presets.autonomous.skills.risk]
-enabled = true
+# Optional repository checks the delivery skill can run with
+# `harbor workflow checks PROJECT --ticket ID --parallel`.
+# [checks.tests]
+# command = ["pnpm", "test"]
+# required = true
+# timeout_seconds = 600

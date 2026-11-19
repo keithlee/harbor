@@ -1,0 +1,17 @@
+# Models for the work-pipeline. Harbor launches the builder with [controller]
+# and runs First Mate with [first_mate]; the delivery skill reads the child
+# roles. A role without a model uses the controller's.
+[controller]
+model = "REPLACE_WITH_MODEL"
+reasoning_effort = "medium"
+
+[planner]
+[reviewer]
+[implementor]
+
+[first_mate]
+# model defaults to the controller's.
+max_recoveries = 3
+allow_fresh_session = true
+recheck_minutes = 10
+stall_minutes = 30

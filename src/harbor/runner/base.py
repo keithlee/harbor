@@ -906,9 +906,6 @@ class BaseRunner:
 
     def _touch(self, context: RunContext, event: StreamEvent) -> None:
         context.last_activity = self.clock()
-        if getattr(self, "workflow_project", None) and event.data:
-            from harbor.role_bindings import observe
-            observe(_db_connection(self.db), self.workflow_project, self.ticket, context.run_id, event.data)
         if event.session_id and context.expected_session_id and event.session_id != context.expected_session_id:
             context.session_mismatch = True
             return

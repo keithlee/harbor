@@ -6,6 +6,7 @@ import pytest
 
 from harbor.config.profile import PipelineProfile
 from harbor.config.projects import get_project
+from workflow_support import materialize
 
 
 def _pipeline(
@@ -78,7 +79,9 @@ def test_two_registered_projects_keep_identity_and_pipeline_separate(
     alpha_repo = tmp_path / "alpha"
     beta_repo = tmp_path / "beta"
     alpha_repo.mkdir()
+    materialize(alpha_repo)
     beta_repo.mkdir()
+    materialize(beta_repo)
     alpha_pipeline = _pipeline(tmp_path / "alpha-pipeline.md", slug="alpha-a1", team="ALPHA")
     beta_pipeline = _pipeline(tmp_path / "beta-pipeline.md", slug="beta-b2", team="BETA")
     registry = _registry(
@@ -120,6 +123,7 @@ def test_registry_identity_overrides_conflicting_pipeline_identity(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = _pipeline(tmp_path / "pipeline.md", slug="pipeline-shared", team="PIPE")
     registry = _registry(
         tmp_path / "projects.md",
@@ -138,6 +142,7 @@ def test_registry_preserves_additional_linear_projects(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = _pipeline(
         tmp_path / "pipeline.md",
         slug="alpha-primary",
@@ -175,6 +180,7 @@ def test_required_linear_identity_never_inherits_product_defaults(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = _pipeline(tmp_path / "pipeline.md", slug=slug, team=team)
     registry = _registry(
         tmp_path / "projects.md",
@@ -191,6 +197,7 @@ def test_missing_pipeline_fails_with_the_registered_path(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     missing = tmp_path / "missing-pipeline.md"
     registry = _registry(
         tmp_path / "projects.md",
@@ -207,6 +214,7 @@ def test_github_repository_is_optional_for_linear_only_supervision(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = _pipeline(tmp_path / "pipeline.md")
     registry = _registry(
         tmp_path / "projects.md",
@@ -222,6 +230,7 @@ def test_linear_only_project_ignores_ambient_github_repository(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = _pipeline(tmp_path / "pipeline.md")
     registry = _registry(
         tmp_path / "projects.md",

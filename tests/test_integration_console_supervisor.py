@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import asyncio
 from pathlib import Path
 from typing import Any
@@ -52,9 +54,12 @@ class FakeRunner:
 
 
 def test_pipeline_and_registry_are_human_editable(tmp_path: Path, monkeypatch: Any) -> None:
+    from workflow_support import materialize
+    materialize(tmp_path, models={"controller": {"model": "custom-builder", "reasoning_effort": "high"},
+                                  "first_mate": {"model": "custom-terra", "reasoning_effort": "medium"}})
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text(
-        """# Pipeline\n\n| role | model | reasoning_effort |\n| --- | --- | --- |\n| builder | custom-builder | high |\n| firstmate | custom-terra | medium |\nheartbeat_seconds: 7\nlinear_project_slug: demo-abc123\nlinear_team: DEMO\n""",
+        """# Pipeline\n\nheartbeat_seconds: 7\nlinear_project_slug: demo-abc123\nlinear_team: DEMO\n""",
         encoding="utf-8",
     )
     registry = tmp_path / "projects.md"
@@ -63,17 +68,18 @@ def test_pipeline_and_registry_are_human_editable(tmp_path: Path, monkeypatch: A
         encoding="utf-8",
     )
     parsed = PipelineConfig.from_file(pipeline)
-    assert parsed.builder_model == "custom-builder"
-    assert parsed.builder_effort == "high"
-    assert parsed.firstmate_model == "custom-terra"
-    assert parsed.firstmate_effort == "medium"
     assert parsed.heartbeat_seconds == 7
     assert load_projects(registry)[0].name == "Demo"
     assert parse_projects_markdown(registry.read_text(), source=registry)[0].repo_path == tmp_path
     monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(registry))
     config = get_project("Demo")
+    # Models live in .harbor/workflow/config.toml, never in pipeline.md.
     assert config.first_mate_model == "custom-terra"
     assert config.builder_model == "custom-builder"
+    assert config.builder_effort == "high" and config.firstmate_effort == "medium"
+    pipeline.write_text(pipeline.read_text() + "| role | model |\n| --- | --- |\n| builder | custom-builder |\n")
+    with pytest.raises(ValueError, match="no longer belongs? in pipeline.md"):
+        get_project("Demo")
 
 
 def test_plain_question_refreshes_once_and_calls_first_mate_once() -> None:

@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_commands(commands)
     from harbor.onboard import add_command
     add_command(commands)
+    from harbor.watchdog import add_command as add_watch
+    add_watch(commands)
     for name in ("doctor", "start", "status", "facts"):
         command = commands.add_parser(name)
         command.add_argument("project")
@@ -81,45 +83,35 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
-def _pipeline_text(config: Any) -> str:
-    """Read the configured pipeline document without interpreting its prose."""
+def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
+    """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
-    if getattr(config, "workflow_path", None):
-        from harbor.config.workflow import load_workflow
-        registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
-        if not registry or not Path(registry).expanduser().is_file():
-            raise ValueError("workflow delivery requires its authoritative project registry")
-        runtime = shlex.join([
-            "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
-            f"HARBOR_DB_PATH={_db_path().resolve()}",
-            f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
-            sys.executable, "-P", "-m", "harbor.cli",
-        ])
-        return (load_workflow(Path(config.workflow_path)).prompt()
-                + "\nAuthoritative runtime invocation: " + runtime
-                + "\nReplace every `harbor` executable in workflow commands with the invocation above. "
-                + "Replace PROJECT with " + shlex.quote(config.name)
-                + "; IDENTIFIER is the supplied ticket identifier. "
-                + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
-                + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
-                + "shell initialization must not select another registry or ledger."
-                + "\nNative Codex agent provenance: spawn, wait, resume and close children through the native collaboration tools. "
-                + "Do not create child agents by shelling out to codex exec: those sessions are not observed by this run. "
-                + "Discover agent tools with a narrow names-only inventory, such as "
-                + "ALL_TOOLS.filter(x => /^multi_agent_v[0-9]+__/.test(x.name)).map(x => x.name), "
-                + "then read metadata only for the selected spawn/wait/resume/close tool. "
-                + "Do not print the whole tool catalogue; truncation hides available agent tools. "
-                + "Use the effective policy's role models and reasoning efforts. If native collaboration is unavailable, return a capability blocker.")
-    for name in ("pipeline_prompt", "raw_prompt", "builder_prompt"):
-        value = getattr(config, name, None)
-        if value:
-            return str(value)
-    path = getattr(config, "pipeline_path", None)
-    if path:
-        candidate = Path(path).expanduser()
-        if candidate.is_file():
-            return candidate.read_text(encoding="utf-8")
-    return ""
+    Pass the workflow snapshot a launch is bound to; otherwise it is loaded.
+    """
+
+    from harbor.config.workflow import load_workflow
+    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
+    if not registry or not Path(registry).expanduser().is_file():
+        raise ValueError("workflow delivery requires its authoritative project registry")
+    runtime = shlex.join([
+        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
+        f"HARBOR_DB_PATH={_db_path().resolve()}",
+        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
+        sys.executable, "-P", "-m", "harbor.cli",
+    ])
+    workflow = workflow or load_workflow(Path(config.workflow_path))
+    return (workflow.prompt()
+            + "\nAuthoritative runtime invocation: " + runtime
+            + "\nReplace every `harbor` executable in workflow commands with the invocation above. "
+            + "Replace PROJECT with " + shlex.quote(config.name)
+            + "; IDENTIFIER is the supplied ticket identifier. "
+            + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
+            + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
+            + "shell initialization must not select another registry or ledger."
+            + "\nChild agents: use the native collaboration tools (spawn, list, wait, resume, close). "
+            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`."
+            + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
+            + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 
 
 def _pipeline_setting(config: Any, name: str, default: str) -> str:
@@ -188,13 +180,11 @@ def build_production_dispatcher(
     not available" -- the run row and worktree were right there in the ledger.
     """
 
+    from harbor.config.workflow import load_workflow
     manager = worktree_manager
-    workflow = None
-    if getattr(config, "workflow_path", None):
-        from harbor.config.workflow import load_workflow
-        workflow = load_workflow(Path(config.workflow_path))
-        if getattr(config, "install_command", None) is None:
-            raise ValueError("configure install_command explicitly, or use an empty command for no installation")
+    workflow = load_workflow(Path(config.workflow_path))
+    if getattr(config, "install_command", None) is None:
+        raise ValueError("configure install_command explicitly, or use an empty command for no installation")
     if manager is None:
         manager = WorktreeManager(
             config.repo_path,
@@ -221,14 +211,17 @@ def build_production_dispatcher(
         def factory(worktree: Any, wake: Any) -> CodexRunner:
             ticket = str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
             path = getattr(worktree, "path", worktree)
-            if workflow is not None:
-                from harbor.workflow_store import bind
-                bind(db.connection, config.name, ticket, wake.run_id, workflow)
+            from harbor.workflow_store import bind
+            # Adopt edits to .harbor/workflow on the next turn instead of failing.
+            current = dispatcher.workflow = dispatcher.workflow.reload()
+            if wake.run_id:
+                bind(db.connection, config.name, ticket, wake.run_id, current)
             identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
             provider = identity[0] if identity else ("codex" if getattr(wake, "action", None) == "reengage" else builder_provider)
-            model = str(getattr(config, "builder_model", "gpt-5.6-luna"))
-            effort = str(getattr(config, "builder_effort", "xhigh"))
-            fallbacks = getattr(config, "builder_fallback_models", ())
+            controller = current.config["roles"]["controller"]
+            model = str(controller["model"])
+            effort = str(controller.get("reasoning_effort") or getattr(config, "builder_effort", "high"))
+            fallbacks = tuple(controller.get("fallback_models", ()))
             if provider != builder_provider:
                 model, effort = (identity[1], identity[2]) if identity else ("gpt-5.6-luna", "xhigh")
                 fallbacks = ()
@@ -244,14 +237,13 @@ def build_production_dispatcher(
                 reasoning_effort=effort,
                 executable=claude_cli if provider == "claude" else os.environ.get("HARBOR_CODEX_EXECUTABLE", "codex"),
                 run_id=wake.run_id,
-                writable_roots=(_db_path().resolve().parent,) if workflow is not None else (),
+                writable_roots=(_db_path().resolve().parent,),
                 playwright_browser_image=getattr(config, "playwright_browser_image", None),
                 # Without this the runner silently takes its own 90-minute
                 # default and ignores the project's deadline_minutes.
                 deadline_seconds=_deadline_seconds(config),
             )
-            if workflow is not None:
-                runner.workflow_project = config.name
+            runner.workflow_project = config.name
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -260,6 +252,7 @@ def build_production_dispatcher(
         project=config.name,
         builder_prompt=builder_prompt,
         ticket_scope=ticket_scope,
+        prompt_renderer=lambda current: _pipeline_text(config, current),
     )
     dispatcher.workflow = workflow
     return dispatcher, manager, factory
@@ -282,19 +275,24 @@ async def _doctor(project_name: str) -> int:
     scope_ok = True
     if healthy:
         scope_ok = await _check_project_scope(client, config)
-    if config.workflow_path:
-        from harbor.config.workflow import load_workflow
-        import shutil
+    from harbor.config.workflow import load_workflow
+    import shutil
+    try:
         workflow = load_workflow(Path(config.workflow_path))
-        print(f"Workflow: {workflow.config['workflow']['package']} / {workflow.config['workflow']['preset']} · {workflow.digest}")
-        print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
-        if config.install_command is None:
-            print("Installation: missing explicit command or none")
-            scope_ok = False
-        provider = getattr(config, "builder_provider", "codex")
-        if not shutil.which(os.environ.get(f"HARBOR_{provider.upper()}_EXECUTABLE", provider)):
-            print(f"Runner: {provider} executable unavailable")
-            scope_ok = False
+    except ValueError as exc:
+        print(f"Workflow: invalid ({exc})")
+        return 1
+    controller = workflow.config["roles"]["controller"]
+    print(f"Workflow: {workflow.package} · {workflow.digest}")
+    print(f"Models: {workflow.models_path} · controller {controller['model']} · First Mate {workflow.config['first_mate']['model']}")
+    print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
+    if config.install_command is None:
+        print("Installation: missing explicit command or none")
+        scope_ok = False
+    provider = getattr(config, "builder_provider", "codex")
+    if not shutil.which(os.environ.get(f"HARBOR_{provider.upper()}_EXECUTABLE", provider)):
+        print(f"Runner: {provider} executable unavailable")
+        scope_ok = False
     print(f"Poll states: {', '.join(config.poll_states)}")
     print(f"Dispatch states: {', '.join(config.dispatch_states)}")
     print("Backlog: ignored")
@@ -391,9 +389,9 @@ async def _start(
     # The CLI is the production composition root.  Tests and embedders may
     # inject any of these seams, but an ordinary ``harbor start SampleProject`` must
     # still create an isolated worktree and a persistent Codex builder.
-    builder_prompt = _pipeline_text(config)
     production_dispatcher = dispatcher
     if production_dispatcher is None and runner is None and not read_only:
+        builder_prompt = _pipeline_text(config)
         manager = worktree_manager
         if manager is None:
             manager = WorktreeManager(
@@ -741,6 +739,13 @@ async def _async_main(args: argparse.Namespace) -> int:
             return initialize(args)
         except (ValueError,OSError) as exc:
             print(f"Harbor: {exc}",file=sys.stderr)
+            return 2
+    if args.command == "watch":
+        from harbor.watchdog import watch
+        try:
+            return await watch(args.project, minutes=args.minutes, interval=args.interval, once=args.once)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
             return 2
     if args.command == "workflow":
         from harbor.workflow_cli import execute

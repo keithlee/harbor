@@ -19,6 +19,9 @@ project-specific path, token, or local-agent assumption.
 
 ### 2. User-owned project bootstrap
 
+> Status: `harbor init` exists and copies the work-pipeline into
+> `<repo>/.harbor/workflow/` (packages and presets were removed).
+
 - Add `harbor init` to create a user-owned registry and a target repository
   `.harbor/pipeline.md` from generic examples.
 - Keep project rows out of the default registry. Ship
@@ -31,6 +34,9 @@ project-specific path, token, or local-agent assumption.
 files or inheriting another product's configuration.
 
 ### 3. Self-contained delivery contract
+
+> Status: done. The bundled work-pipeline replaces the symbolic
+> `skill: /work-pipeline`, and each project edits its own copy.
 
 - Replace the symbolic default `skill: /work-pipeline` with a bundled,
   documented baseline delivery contract, or implement explicit skill-path

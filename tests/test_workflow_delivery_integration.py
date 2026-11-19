@@ -10,20 +10,21 @@ from harbor.wake import apply_phase3_migration,Wake
 from harbor.worktree import WorktreeManager
 from harbor.workflow_cli import execute
 from harbor.workflow_lifecycle import handoff
-from harbor.role_bindings import observe
 from test_workflow_config import config
 from test_worktree_phase4 import disposable_repo,git
 from test_runner_phase4 import fake_codex,slow_codex
 
 
-def test_native_adapter_dispatch_roles_checks_handoff_and_reconcile(tmp_path,monkeypatch,capsys):
+def test_native_adapter_dispatch_checks_handoff_and_policy_edits(tmp_path,monkeypatch,capsys):
     async def scenario():
         repo,_=disposable_repo(tmp_path)
         db=HarborDB(tmp_path/'state.db')
         apply_phase3_migration(db);apply_phase4_migration(db)
         db.replace_tickets('Demo',[{'identifier':'DEM-1','owned':True,'hold':False,'state':'In Progress'}])
         workflow_path=config(tmp_path,extra='[checks.tests]\ncommand=["python3","-c","pass"]\n')
-        cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=repo,workflow_path=str(workflow_path),install_command='none',worktree_root=str(tmp_path/'wt'))
+        registry=tmp_path/'projects.md'
+        registry.write_text('# registry')  # launches render the prompt, which requires the authoritative registry
+        cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=repo,workflow_path=str(workflow_path),install_command='none',worktree_root=str(tmp_path/'wt'),registry_path=registry)
         executable=fake_codex(tmp_path)
         content=executable.read_text().replace("if 'resume' not in args:","print(json.dumps({'item':{'type':'collab_agent_tool_call','status':'completed','tool':'spawn_agent','receiver_thread_ids':['reviewer']}}),flush=True)\nif 'resume' not in args:")
         executable.write_text(content)
@@ -35,8 +36,6 @@ def test_native_adapter_dispatch_roles_checks_handoff_and_reconcile(tmp_path,mon
         assert result.session_id=='session-123'
         async def command(*parts):
             return await execute(build_parser().parse_args(['workflow',*parts,'Demo','--ticket','DEM-1']),cfg,db)
-        assert await command('role','--role','reviewer','--agent','reviewer')==0
-        assert await command('roles')==0
         assert await command('checks','--parallel')==0
         head=git(repo,'rev-parse','HEAD')
         context={'project':'Demo','ticket':'DEM-1','run_id':run['id'],'event':'pre_handoff','fresh':True,'hold':False,'head_sha':head,'facts':{'url':'https://example.test/pr/1','head_sha':head,'ci':'green','mergeable':'MERGEABLE'}}
@@ -49,15 +48,12 @@ def test_native_adapter_dispatch_roles_checks_handoff_and_reconcile(tmp_path,mon
         context['hold']=True
         with pytest.raises(ValueError,match='held'):
             await handoff(supervisor,SimpleNamespace(ticket={}),{})
-        old=dispatcher.workflow.digest
-        workflow_path.write_text(workflow_path.read_text()+'[cleanup]\nmode="off"\n')
-        with pytest.raises(ValueError,match='changed'):
-            await command('roles')
-        with pytest.raises(ValueError,match='active child'):
-            await command('reconcile','--expected-digest',old)
-        observe(db.connection,'Demo','DEM-1',run['id'],{'item':{'type':'collab_agent_tool_call','status':'completed','tool':'close_agent','receiver_thread_ids':['reviewer']}})
-        assert await command('reconcile','--expected-digest',old)==0
-        assert db.connection.execute("SELECT COUNT(*) FROM workflow_receipts WHERE kind='policy_reconciliation'").fetchone()[0]==1
+        # Editing the project's workflow mid-run never blocks it: the next
+        # command adopts the edit and records a policy_change receipt.
+        context['hold']=False
+        workflow_path.write_text(workflow_path.read_text().replace('mode = "after_merge"','mode = "off"'))
+        assert await command('check','--event','pre_handoff')==0
+        assert db.connection.execute("SELECT COUNT(*) FROM workflow_receipts WHERE kind='policy_change'").fetchone()[0]==1
         db.close()
     asyncio.run(scenario())
 
@@ -83,7 +79,7 @@ def test_cancel_native_subprocess_persists_operator_stop(tmp_path):
     asyncio.run(scenario())
 
 
-def test_cached_runner_resume_rejects_changed_policy(tmp_path):
+def test_cached_runner_resume_adopts_changed_policy(tmp_path):
     from harbor.supervisor import WorktreeDispatcher
     from harbor.workflow_store import bind
     db=HarborDB(tmp_path/'state.db')
@@ -92,19 +88,31 @@ def test_cached_runner_resume_rejects_changed_policy(tmp_path):
     from harbor.config.workflow import load_workflow
     workflow=load_workflow(path)
     bind(db.connection,'Demo','DEM-1','retained',workflow)
-    runner=SimpleNamespace(default_run_id='retained')
+    calls=[]
+    class Runner:
+        default_run_id='retained'
+        async def resume(self,*args,**kwargs):
+            calls.append(args)
+            return {'status':'completed','outcome':'no_pr','summary':'ok'}
+    runner=Runner()
     dispatcher=WorktreeDispatcher(SimpleNamespace(),lambda *a:runner,db=db,project='Demo')
     dispatcher.workflow=workflow
     dispatcher.runners['DEM-1']=runner
-    path.write_text(path.read_text()+'\n[cleanup]\nmode="off"\n')
-    with pytest.raises(ValueError,match='configuration changed'):
+    path.write_text(path.read_text().replace('mode = "after_merge"','mode = "off"'))
+    try:
         asyncio.run(dispatcher.resume(Wake(ticket={'identifier':'DEM-1'},action='resume',instruction='continue')))
+    except Exception:
+        pass  # the fake runner is minimal; only the policy adoption matters here
+    assert dispatcher.workflow.config['cleanup']['mode']=='off'
+    assert db.connection.execute("SELECT COUNT(*) FROM workflow_receipts WHERE kind='policy_change'").fetchone()[0]==1
     db.close()
 
 
 def test_production_start_supplies_worktree_custody(tmp_path,monkeypatch):
     from harbor import cli
-    cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=tmp_path,install_command='none',worktree_root=str(tmp_path/'wt'))
+    registry=tmp_path/'projects.md'
+    registry.write_text('# registry')
+    cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=tmp_path,install_command='none',worktree_root=str(tmp_path/'wt'),workflow_path=str(config(tmp_path)),registry_path=registry)
     monkeypatch.setattr(cli,'get_project',lambda _:cfg)
     monkeypatch.setattr(cli,'_db_path',lambda:tmp_path/'state.db')
     class Captured(Exception):pass
@@ -143,8 +151,10 @@ def test_delivery_prompt_pins_registry_ledger_and_runtime(tmp_path, monkeypatch)
     assert 'shadow Harbor loaded' not in result.stderr
     assert 'A calm project supervisor' in result.stdout
     assert "Replace PROJECT with 'Demo Project'" in prompt
-    assert "Do not create child agents by shelling out to codex exec" in prompt
-    assert "names-only inventory" in prompt
+    assert "Do not shell out to codex exec for children" in prompt
+    assert "overrides any merge or auto-merge policy" in prompt
+    assert "Harbor setting wins" in prompt
+    assert "roles" in prompt
     monkeypatch.delenv('HARBOR_PROJECTS_FILE')
     with pytest.raises(ValueError, match='authoritative project registry'):
         _pipeline_text(cfg)
@@ -171,7 +181,7 @@ def test_runtime_prefers_resolved_registry_and_survives_login_shell(tmp_path, mo
     assert result.returncode == 0 and 'A calm project supervisor' in result.stdout
 
 
-def test_only_workflow_factory_grants_operational_ledger_root(tmp_path, monkeypatch):
+def test_factory_grants_operational_ledger_root(tmp_path, monkeypatch):
     ledger = tmp_path / 'custody' / 'state.db'
     ledger.parent.mkdir()
     monkeypatch.setenv('HARBOR_DB_PATH', str(ledger))
@@ -182,7 +192,4 @@ def test_only_workflow_factory_grants_operational_ledger_root(tmp_path, monkeypa
     wake = SimpleNamespace(ticket={'identifier':'DEM-1'}, run_id='test')
     workflow_runner = factory(tmp_path, wake)
     assert str(ledger.parent.resolve()) in workflow_runner.writable_roots
-    from dataclasses import replace
-    _, _, legacy_factory = build_production_dispatcher(replace(cfg, workflow_path=None), db, worktree_manager=object())
-    assert str(ledger.parent.resolve()) not in legacy_factory(tmp_path, wake).writable_roots
     db.close()

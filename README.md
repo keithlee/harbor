@@ -2,18 +2,19 @@
 
 Harbor is a calm, deterministic supervisor for one explicitly configured
 project at a time. It
-polls Linear and GitHub without making model calls, dispatches a configured
-delivery skill in an isolated worktree, keeps the same builder session across
-re-engagement, and gives the operator a First Mate console in the same
-terminal.
+polls Linear and GitHub without making model calls, persists what it sees in
+SQLite, hands each ticket to the project's **work-pipeline** in an isolated
+worktree, keeps the same builder session across re-engagement, and gives the
+operator a First Mate console in the same terminal. First Mate also monitors
+stuck runs and recovers them.
 
 The boundary is deliberate:
 
-> The skill decides. Harbor watches, wakes, unblocks, and reports.
+> The work-pipeline decides. Harbor watches, wakes, unblocks, and reports.
 
-The skill is a Markdown-controlled prompt. A team can replace
-`/work-pipeline` with its own ticket-to-PR instructions without changing
-Harbor or adding a Harbor-specific implementation role.
+`harbor init` copies the bundled work-pipeline into `<repo>/.harbor/workflow/`.
+To change how tickets are delivered, edit that copy: its `skills/*.md`, its
+`workflow.toml` policy and its `config.toml` models.
 
 ## Why Harbor exists
 
@@ -58,19 +59,19 @@ Harbor verifies the merge before removing the retained worktree.
 
 ## Manual multi-project setup
 
-Harbor does not currently provide `harbor init`. Each user owns a private
-registry and one pipeline document per workflow. The checked-in `projects.md`
-and `templates/pipeline.md` files are neutral format examples; Harbor never
-uses them as real product configuration.
-
-Create pipelines wherever they make sense for the user or team. A repository-
-local `.harbor/pipeline.md` can be shared with that repository; a pipeline in a
-private directory can customize one operator's models, commands, and policy.
+`harbor init` is the quickest path (see
+[the work-pipeline workflow](docs/configurable-workflows.md)). Manually, each
+user owns a private registry and one pipeline document per project, and each
+repository needs its own copy of the work-pipeline. The checked-in
+`projects.md` and `templates/pipeline.md` files are neutral format examples;
+Harbor never uses them as real product configuration.
 
 ```bash
 mkdir -p "$HOME/.harbor"
 mkdir -p "$HOME/Pipelines"
 cp templates/pipeline.md "$HOME/Pipelines/sample-project.md"
+cp -R workflows/work-pipeline ~/Projects/SampleProject/.harbor/workflow
+$EDITOR ~/Projects/SampleProject/.harbor/workflow/config.toml   # set [controller] model
 ```
 
 Create `$HOME/.harbor/projects.md` with one row per repository:
@@ -131,12 +132,14 @@ uv run harbor status SampleProject --json
 dispatching, queuing, or writing Linear/GitHub. `facts` performs the read-only
 PR-facts query; `status` reads the local runtime ledger.
 
-## Configurable workflow packages
+## The work-pipeline workflow
 
-New users can select bundled skills with `harbor init`, then inspect effective
-policy using `harbor workflow inspect`. See [setup, presets, hooks, recovery and
-cleanup](docs/configurable-workflows.md) for the complete configuration and test map.
-Existing `skill:` pipelines remain supported.
+Harbor runs exactly one workflow: the project's copy of the work-pipeline in
+`<repo>/.harbor/workflow/`. There are no packages or presets to choose. Edit
+the copy to change the dev workflow, and inspect the effective policy with
+`harbor workflow inspect`. Edits are adopted on the next builder turn, not
+treated as a blocker. See [the work-pipeline workflow](docs/configurable-workflows.md)
+for layout, models, recovery, the watchdog and migration from older setups.
 
 ## Local web dashboard
 
@@ -341,17 +344,16 @@ token budget.
 
 | Developer choice | Change now | Harbor keeps owning | Current limit |
 | --- | --- | --- | --- |
-| Project identity | Private registry via `HARBOR_PROJECTS_FILE`; repository, pipeline, Linear scope, GitHub repository, and base branch | Polling, worktree isolation, and custody | No `harbor init` command yet |
-| Builder and First Mate models | Model and reasoning settings in `pipeline.md` | Wake lifecycle and same-session resume | Available models depend on the runner |
-| Delivery flow | Replace `skill: /work-pipeline` and its surrounding Markdown instructions | Scheduling, liveness, escalation, receipts, and worktree lifecycle | The runner environment must already provide the replacement skill |
+| Project identity | `harbor init` or a private registry via `HARBOR_PROJECTS_FILE`; repository, pipeline, Linear scope, GitHub repository, and base branch | Polling, worktree isolation, and custody | One Harbor process per project |
+| Builder and First Mate models | `.harbor/workflow/config.toml` (controller, planner, reviewer, implementor, first_mate) | Wake lifecycle and same-session resume | Available models depend on the runner |
+| Delivery flow | Edit the project's `.harbor/workflow/` copy of the work-pipeline (skills, policy, hooks) | Scheduling, liveness, escalation, recovery, receipts, and worktree lifecycle | Review, risk and proof are enforced by the skill, not by Harbor |
 | Supervision policy | Poll and dispatch states, cadence, deadline, hold, checks, worktree root, and rework cap | Idempotency and safety boundaries | A deadline is not a token budget |
 | Execution harness | Implement and inject another runner | Worktree dispatch and run lifecycle | Codex is the only built-in production runner |
 | Tracker | Extend the client and poller boundary | Snapshot, wake, and receipt model | Linear is the only built-in tracker |
 
-Harbor treats `skill` and the rest of `pipeline.md` as workflow data. Replacing
-the skill does not change Harbor's supervision contract: the workflow receives
-the same ticket facts, worktree, wake and re-engagement lifecycle, and status
-context.
+Editing the work-pipeline does not change Harbor's supervision contract: the
+workflow receives the same ticket facts, worktree, wake and re-engagement
+lifecycle, and status context.
 
 ### Heartbeat
 
@@ -379,12 +381,11 @@ Linear and GitHub remain authoritative for external state:
 
 ### Blocker decisions and automatic recovery
 
-The project pipeline file controls `firstmate_decisions` (`bounded`,
-`cite_only`, or `human`), `unblock_attempts`, `recovery_delays`, and
-`decision_authors`. See [the editable template](templates/pipeline.md).
-Invalid settings fail configuration loading. `recovery_delays: []` disables
-automatic retries; the default is three attempts after 30, 120, and 300
-seconds, dispatched on the next healthy poll. Budgets survive restarts.
+The project's `.harbor/workflow/workflow.toml` controls `[decisions] mode`
+(`bounded`, `cite_only`, or `human`) and `[recovery]` crash retries
+(`delays_seconds`, `max_attempts`; default 30, 120 and 300 seconds).
+`pipeline.md` keeps `unblock_attempts` and `decision_authors`. Invalid settings
+fail configuration loading. Budgets survive restarts.
 
 Before triage, First Mate reads the current ticket description and paginated
 comments, checks repository authority and observed changed paths, and looks
@@ -403,6 +404,32 @@ recovery. Missing custody or exhausted budgets require operator action.
 A resumed decision stays `resume_pending` until a later successful delivery
 result shows progress. `/status --full` includes stop reason and retry receipts.
 First Mate decisions do not relax PR proof, review or merge gates.
+
+#### First Mate monitor and recover
+
+Every poll, First Mate reviews runs that are stuck: blocked runs older than
+`recheck_minutes`, running builders with no activity for `stall_minutes`,
+failed or orphaned runs whose crash retries are spent, and watchdog flags. It
+proposes one action (`resume` with a concrete instruction, `retry`,
+`fresh_session`, `wait` or `escalate`), and Harbor validates it
+deterministically. Product, design and sensitive blockers always escalate to a
+human. Each run gets `max_recoveries` attempts, re-checked every
+`recheck_minutes` (only a model usage limit backs off, to 30 then 60 minutes),
+and at most one fresh session (a new builder session in the same worktree).
+A spent budget escalates once and never loops. Every action posts a
+`[First Mate recovery]` Linear comment, notifies the operator and is recorded
+in `first_mate_recoveries`. Settings live in `[first_mate]` in `config.toml`.
+
+#### Progress watchdog
+
+`harbor watch SampleProject` runs separately from `harbor start`. It reads the
+supervisor heartbeat (`~/.harbor/heartbeat-<project>.json`) and the ledger,
+and flags runs with no new commit or receipt for `--minutes` (default 30), the
+same question answered or the same comment re-delivered three or more times,
+merged worktrees still waiting for cleanup, and a stale supervisor heartbeat.
+Flags become `watchdog.flag` events that First Mate handles on the next poll.
+Stuck cleanups are retried deterministically, with no model call. The watchdog
+never modifies worktrees, Linear or GitHub.
 
 The isolated scenarios in `tests/test_blocker_recovery.py` use real killed
 subprocesses, Git worktrees and SQLite with mock Linear HTTP responses and
@@ -423,9 +450,8 @@ Copy the neutral template to the pipeline path named in the private registry:
 cp templates/pipeline.md "$HOME/Pipelines/sample-project.md"
 ```
 
-To swap a project to a different workflow, update only that project's
-`pipeline_path` cell in `$HARBOR_PROJECTS_FILE`, run `harbor doctor <name>`,
-then restart that named Harbor process. Existing users keep their private
+To change a project's workflow, edit `<repo>/.harbor/workflow/`, then run
+`harbor doctor <name>`. Existing users keep their private
 registry and project-owned pipelines when the Harbor CLI itself is upgraded;
 an update changes executable code, not those configuration files.
 
@@ -461,13 +487,6 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
-## Models
-| role | model | reasoning_effort |
-| --- | --- | --- |
-| builder | gpt-5.6-luna | xhigh |
-| firstmate | gpt-6-luna | high |
-
-skill: /work-pipeline
 heartbeat_seconds: 60
 poll_interval_seconds: 60
 deadline_minutes: 90
@@ -485,8 +504,10 @@ required_checks: [CI]
 bot_rework_cap: 1
 ```
 
-Change `skill`, the builder/First Mate models, reasoning effort, heartbeat,
-poll interval, scope, or worktree settings in this file.
+Change heartbeat, poll interval, scope, or worktree settings in this file.
+Models do not belong here: set them in `.harbor/workflow/config.toml`.
+`workflow_path`, `skill`, model and fallback keys are rejected with a
+migration hint.
 `disk_floor_gb` is the free space, in GB, Harbor requires before it creates a
 builder worktree. Every project defaults to 5 GB; raise it for a repository
 with a larger install or build footprint. A non-numeric or non-positive value
@@ -500,7 +521,10 @@ needs and keeps the delivery instructions opaque.
 | File/module | Responsibility |
 | --- | --- |
 | `projects.md` | Human-editable project registry: checkout, pipeline, Linear scope, GitHub repository, and base branch. |
-| `templates/pipeline.md` | Starting point for a project's swappable skill/model/heartbeat configuration. |
+| `templates/pipeline.md` | Starting point for a project's scope, cadence and worktree configuration. |
+| `workflows/work-pipeline/` | The work-pipeline `harbor init` copies into `<repo>/.harbor/workflow/`: skills, policy, hooks and `config.toml` models. |
+| `src/harbor/first_mate_recovery.py` | First Mate monitor-and-recover: find stuck runs, validate the proposed action, record it. |
+| `src/harbor/watchdog.py` | `harbor watch`: separate progress watchdog writing `watchdog.flag` events. |
 | `src/harbor/cli.py` | Production composition root and `doctor`, `start`, `status`, `facts`, and `answer` commands. |
 | `src/harbor/console.py` | Same-terminal prompt, slash commands, prompt-safe background output, and plain-question routing. |
 | `src/harbor/supervisor.py` | Async lifecycle, polling loop, wake scheduling, background dispatch, pause/resume, merge reconciliation, and status assembly. |
@@ -510,7 +534,7 @@ needs and keeps the delivery instructions opaque.
 | `src/harbor/first_mate.py` | Read-only ephemeral Terra question/triage invocation. |
 | `src/harbor/notify.py` | Operator notifications for escalations and capped rework. |
 | `src/harbor/config/projects.py` | Resolve named projects and require the live pipeline document. |
-| `src/harbor/config/pipeline.py` | Parse Markdown pipeline settings while retaining skill data as opaque configuration. |
+| `src/harbor/config/pipeline.py` | Parse Markdown pipeline settings and reject keys that moved to `.harbor/workflow/`. |
 | `src/harbor/config/profile.py` | Parse read-only GitHub/project profile facts used by pollers and event handling. |
 | `src/harbor/clients/linear.py` | Async Linear GraphQL reads plus narrow cited blocker/progress writes; rejects terminal `Done` writes. |
 | `src/harbor/clients/github.py` | Async query-only GitHub GraphQL client; builds aliased PR queries. |

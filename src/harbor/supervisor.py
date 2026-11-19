@@ -137,12 +137,16 @@ class WorktreeDispatcher:
         builder_prompt: str = "",
         push_recorder: Callable[..., Any] | None = None,
         ticket_scope: str | TicketScope | None = None,
+        prompt_renderer: Callable[[Any], str] | None = None,
     ) -> None:
         self.worktree_manager = worktree_manager
         self.runner_factory = runner_factory
         self.db = db
         self.project = str(project)
         self.builder_prompt = str(builder_prompt or "").strip()
+        # Renders the launch prompt from a workflow snapshot, so every launch
+        # (dispatch and First Mate fresh sessions) uses the current policy.
+        self.prompt_renderer = prompt_renderer
         self.push_recorder = push_recorder
         self.ticket_scope = normalize_ticket_scope(ticket_scope)
         # Set by Supervisor so a BaseRunner can normalize a final result
@@ -273,13 +277,30 @@ class WorktreeDispatcher:
             self._execution_locks[identifier] = lock
         return lock
 
-    def _initial_wake(self, wake: Wake) -> Wake:
+    def _current_workflow(self, identifier: str, run_id: str | None) -> Any:
+        """Reload the project workflow once per launch and bind that snapshot."""
+
+        workflow = getattr(self, "workflow", None)
+        if not workflow:
+            return None
+        from harbor.workflow_store import bind
+        workflow = self.workflow = workflow.reload()
+        if run_id and getattr(self.db, "connection", None) is not None:
+            bind(self.db.connection, self.project, identifier, run_id, workflow)
+        return workflow
+
+    def _launch_prompt(self, workflow: Any) -> str:
+        if self.prompt_renderer is not None and workflow is not None:
+            return str(self.prompt_renderer(workflow) or "").strip()
+        return self.builder_prompt
+
+    def _initial_wake(self, wake: Wake, workflow: Any = None) -> Wake:
         # Report which delivery tools actually work in the builder's sandbox.
         # A builder that reaches only for an MCP tool strands an approved
         # merge, because a non-interactive run refuses any MCP call that wants
         # approval -- even while plain `gh` is authenticated right there.
         environment = delivery_tools_fact(detect_delivery_tools())
-        base = self.builder_prompt
+        base = self._launch_prompt(workflow)
         if environment and wake.action == "build":
             base = f"{base}\n\n{environment}" if base else environment
         if not base or wake.action != "build":
@@ -395,12 +416,10 @@ class WorktreeDispatcher:
             return None
         async with lock:
             wake = self._with_run_id(wake, self._stable_run_id(wake))
-            wake = self._initial_wake(wake)
+            # Reload BEFORE rendering so the prompt and the bound policy agree.
+            workflow = self._current_workflow(identifier, wake.run_id)
+            wake = self._initial_wake(wake, workflow)
             self._remember_run_id(identifier, wake.run_id or "")
-            workflow = getattr(self, "workflow", None)
-            if workflow:
-                from harbor.workflow_store import bind
-                bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             create = getattr(self.worktree_manager, "create", None) or getattr(self.worktree_manager, "ensure", None)
             if not callable(create):
                 raise TypeError("worktree manager must expose create or ensure")
@@ -510,6 +529,54 @@ class WorktreeDispatcher:
         self.worktrees[identifier] = worktree
         self.runners[identifier] = runner
         return runner
+
+    async def fresh_session(self, identifier: str, instruction: str) -> Any:
+        """Start a NEW builder session for a stuck ticket in its retained worktree.
+
+        Only First Mate recovery calls this. The logical run id, worktree and
+        branch are kept; the old native session id is dropped so the runner
+        starts a clean conversation with a hand-off instruction.
+        """
+
+        identifier = str(identifier or "").strip()
+        if not identifier or not self._in_scope(identifier):
+            raise ValueError(f"ticket is outside this supervisor's scope: {identifier or '(empty)'}")
+        row = self._persisted_run(identifier)
+        if row is None or not row.get("worktree"):
+            raise RuntimeError(f"no retained worktree exists for {identifier}")
+        live = self.runners.get(identifier)
+        terminate = getattr(live, "terminate", None)
+        if row.get("status") == "running":
+            if not callable(terminate):
+                raise RuntimeError(f"{identifier} is running in another process; cannot replace its session")
+            value = terminate(reason="first_mate_fresh_session")
+            if inspect.isawaitable(value):
+                await value
+        connection = getattr(self.db, "connection", None)
+        if connection is not None:
+            with connection:
+                connection.execute(
+                    "UPDATE runs SET session_id=NULL, status='terminated', terminal_reason='first_mate_fresh_session' WHERE id=?",
+                    (row["id"],),
+                )
+        self.runners.pop(identifier, None)
+        runner = await self.hydrate(identifier, recover_terminal=True)
+        if runner is None:
+            raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
+        # The old conversation is gone: the new session needs the full launch
+        # prompt (delivery skill, policy incl. merge authority, runtime
+        # invocation) before First Mate's hand-off.
+        prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
+        wake = Wake(
+            ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
+            action="reengage",
+            resume=row["id"],
+            instruction=f"{prompt}\n\n{instruction}" if prompt else instruction,
+            reason="first-mate-fresh-session",
+        )
+        result = await self._runner_call(runner, wake, resume=False)
+        await self._record_push_result(wake, result)
+        return result
 
     async def retry(self, identifier: str, instruction: str | None = None) -> Any:
         """Explicitly resume a terminated/orphaned run in its retained session.
@@ -645,6 +712,8 @@ class WorktreeDispatcher:
                 from harbor.workflow_store import bind
                 if not wake.run_id:
                     raise ValueError("workflow resume requires retained run identity")
+                # Adopt edits to the project's workflow instead of failing the run.
+                workflow = self.workflow = workflow.reload()
                 bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             wake = replace(wake, instruction=self._with_handoff_gate(identifier, wake.instruction))
             result = await self._runner_call(runner, wake, resume=True)
@@ -931,6 +1000,8 @@ class Supervisor:
         self._background_dispatch = False
         self._dispatch_tasks: dict[str, asyncio.Task[Any]] = {}
         self._dispatch_wakes: dict[str, Wake] = {}
+        # Tickets with a First Mate recovery task in flight (one at a time).
+        self._recovery_tickets: set[str] = set()
         self._started_build_tickets: set[str] = set()
         # A process-local marker for a merge receipt obtained from an
         # observed PR fact.  Builder JSON alone never enters this set.
@@ -1562,7 +1633,41 @@ class Supervisor:
                 f"Run /retry {identifier} to resume the same session.",
             )
 
-    async def _reconcile_completed_merges(self) -> None:
+    async def _refresh_ticket_pr_links(self, identifier: str) -> bool:
+        """Re-read one ticket's PR attachments and state from Linear.
+
+        A ticket that went Done before Harbor observed its PR attachment
+        leaves the poll scope with ``pr_urls = []``; its merged worktree would
+        then never be cleaned up. Linear stays the authority for which PR
+        belongs to the ticket, so refresh from it instead of trusting the
+        builder's claim.
+        """
+
+        fetch = None
+        for linear in (getattr(self.unblock_ladder, "linear", None), getattr(self.poller, "client", None),
+                       getattr(self, "linear", None)):
+            fetch = getattr(linear, "fetch_issue_status", None)
+            if callable(fetch):
+                break
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if not callable(fetch) or connection is None or not identifier:
+            return False
+        try:
+            issue = await fetch(identifier)
+        except Exception as exc:
+            self.last_error = f"PR link refresh for {identifier}: {exc}"
+            return False
+        nodes = (issue.get("attachments") or {}).get("nodes") or []
+        urls = [str(n["url"]) for n in nodes if n.get("url") and str(n.get("sourceType", "")).lower() == "github"]
+        state = issue.get("state") or {}
+        with connection:
+            connection.execute(
+                "UPDATE tickets SET pr_urls_json=?, state=COALESCE(?, state), state_type=COALESCE(?, state_type) WHERE identifier=?",
+                (json.dumps(urls), state.get("name"), state.get("type"), identifier),
+            )
+        return True
+
+    async def _reconcile_completed_merges(self, only: str | None = None, *, refresh: bool = False) -> None:
         """Recover merge receipts that arrived just after a builder exited.
 
         A successful skill can merge a PR and return before Harbor's next
@@ -1588,7 +1693,7 @@ class Supervisor:
         for row in rows:
             run_id = str(row[0])
             identifier = str(row[1])
-            if not self._in_scope(identifier):
+            if not self._in_scope(identifier) or (only is not None and identifier != only):
                 continue
             try:
                 payload = json.loads(row[3]) if row[3] else {}
@@ -1600,6 +1705,9 @@ class Supervisor:
             if not isinstance(pr_url, str) or not pr_url.strip():
                 continue
             ticket = self._authoritative_ticket({"identifier": identifier})
+            if not self._ticket_has_pr_url(ticket, pr_url) and refresh:
+                if await self._refresh_ticket_pr_links(identifier):
+                    ticket = self._authoritative_ticket({"identifier": identifier})
             if not self._ticket_has_pr_url(ticket, pr_url):
                 continue
             # A merge receipt can be durable even when cleanup failed (for
@@ -1607,6 +1715,10 @@ class Supervisor:
             # that Harbor receipt alone, but keep it bound to the exact PR URL
             # stored when the positive observation was recorded.
             if row[4] == 1 and row[5] is None:
+                # Already verified: its escalations are moot (see _reconcile_runner_result).
+                close = getattr(self.db, "close_open_escalations", None)
+                if callable(close):
+                    close(identifier, status="resolved", run_id=run_id)
                 wake = Wake(
                     ticket=ticket,
                     action="reengage",
@@ -2173,6 +2285,13 @@ class Supervisor:
             if receipt_key:
                 self._verified_merge_runs.add(receipt_key)
             self._update_run_receipt(wake, normalized)
+            # A verified merge resolves the ticket's outstanding questions;
+            # an open escalation must not keep a merged worktree alive.
+            close = getattr(self.db, "close_open_escalations", None) if self.db is not None else None
+            identifier = self._ticket_key(wake.ticket)
+            run_id = self._run_id_for_result(wake, normalized) or wake.run_id
+            if callable(close) and identifier and run_id:
+                close(identifier, status="resolved", run_id=run_id)
         return normalized
 
     async def _report_result(self, wake: Wake, result: Mapping[str, Any]) -> None:
@@ -3054,6 +3173,7 @@ class Supervisor:
             from harbor.answer_queue import drain
             drain(self)
             await self._retry_stopped_builders()
+            await self._monitor_blocked()
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -3708,6 +3828,129 @@ class Supervisor:
             if candidate and (value in contexts or str(getattr(direct, "default_run_id", "")) == value):
                 return str(candidate)
         return ""
+
+    async def _monitor_blocked(self) -> None:
+        """First Mate monitor-and-recover pass over stuck runs and watchdog flags."""
+
+        workflow = getattr(self.dispatcher, "workflow", None)
+        ladder = self.unblock_ladder
+        mate = getattr(ladder, "first_mate", None) if ladder is not None else None
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if workflow is None or mate is None or connection is None or self._dispatch_suspended:
+            return
+        from harbor import first_mate_recovery as recovery
+        from harbor.first_mate import FirstMateError, FirstMateQuotaError
+
+        settings = workflow.config.get("first_mate", {})
+        try:
+            cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope)
+        except Exception as exc:
+            self.last_error = f"First Mate monitor: {exc}"
+            return
+        for case in cases:
+            if not self._in_scope(case.ticket):
+                continue  # --ticket scope: no triage, comments or receipts for other tickets
+            if case.ticket in self._recovery_tickets:
+                continue  # one recovery at a time per ticket
+            active = self._dispatch_tasks.get(case.ticket)
+            if active is not None and not active.done() and case.trigger not in {"stalled", "watchdog:no_progress"}:
+                continue  # a live delivery that is not stalled is left alone
+            if case.trigger == "watchdog:cleanup_stuck":
+                # Deterministic: re-run the verified merge cleanup; no model call.
+                recovery.record(connection, case, {"action": "cleanup", "instruction": "", "reason": case.detail})
+                try:
+                    await self._reconcile_completed_merges(case.ticket, refresh=True)
+                except Exception as exc:  # never abort the rest of the monitor pass
+                    self.last_error = f"First Mate cleanup for {case.ticket}: {exc}"
+                    await self._notify_operator(f"cleanup-failed:{case.run_id}:{len(case.history)}",
+                                                f"First Mate could not clean up {case.ticket}: {exc}")
+                continue
+            try:
+                proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
+            except FirstMateQuotaError as exc:
+                # The only case that backs off exponentially (see backoff_seconds).
+                proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
+            except FirstMateError as exc:
+                proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
+            decision = recovery.validate(proposal, case, settings)
+            recovery.record(connection, case, decision)
+            if decision["action"] == "wait":
+                continue
+            await self._post_recovery_comment(case, decision)
+            # Never await the builder here: recovery runs as a tracked
+            # background task so polling and other tickets keep moving.
+            self._schedule_recovery(case, decision)
+
+    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        connection = getattr(self.db, "connection", None)
+        self._recovery_tickets.add(case.ticket)
+        # Capture the delivery this recovery replaces BEFORE registering
+        # ourselves under the same ticket key.
+        previous = self._dispatch_tasks.get(case.ticket)
+
+        async def run() -> None:
+            try:
+                if previous is not None and not previous.done():
+                    # A stalled live delivery: cancel it through the normal
+                    # path (kills the process group, records the stop) first.
+                    previous.cancel()
+                    await asyncio.gather(previous, return_exceptions=True)
+                await self._apply_recovery(case, decision)
+            except Exception as exc:
+                if connection is not None:
+                    recovery.record(connection, case, {"action": "escalate", "instruction": "",
+                                                       "reason": f"{decision['action']} failed: {exc}"})
+                await self._notify_operator(f"recovery-failed:{case.run_id}:{len(case.history)}",
+                                            f"First Mate could not {decision['action']} {case.ticket}: {exc}")
+                return
+            finally:
+                self._recovery_tickets.discard(case.ticket)
+            await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
+                                        f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
+
+        task = asyncio.create_task(run(), name=f"harbor-recovery-{case.ticket}")
+        # Tracked like a delivery, so no second builder starts for this ticket.
+        self._dispatch_tasks[case.ticket] = task
+        task.add_done_callback(lambda finished, key=case.ticket: self._dispatch_finished(key, finished))
+
+    async def _drain_recoveries(self) -> None:
+        """Wait for in-flight First Mate recoveries (shutdown and tests)."""
+        tasks = [t for t in self._dispatch_tasks.values() if t.get_name().startswith("harbor-recovery-") and not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _post_recovery_comment(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        from harbor.unblock import _linear_comment
+        linear = getattr(self.unblock_ladder, "linear", None) or getattr(self, "linear", None)
+        if linear is None or not case.linear_id:
+            return
+        try:
+            await _linear_comment(linear, self.db, case.linear_id, recovery.comment(case, decision))
+        except Exception as exc:  # a comment failure never stops recovery
+            self.last_error = f"First Mate comment: {exc}"
+
+    async def _apply_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        action, instruction = decision["action"], decision.get("instruction") or ""
+        if action == "resume":
+            if not await self.resume_session(case.run_id, instruction):
+                raise RuntimeError("retained builder session is not available to resume")
+        elif action == "retry":
+            result = await self.dispatcher.retry(case.ticket, instruction)
+            run_id = str((result.get("run_id") if isinstance(result, Mapping) else getattr(result, "run_id", "")) or case.run_id)
+            wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": run_id, "run_id": run_id},
+                        action="reengage", resume=run_id, reason="first-mate-retry")
+            await self._handle_runner_result(wake, result)
+        elif action == "fresh_session":
+            result = await self.dispatcher.fresh_session(case.ticket, recovery.fresh_session_instruction(case, instruction))
+            wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": case.run_id, "run_id": case.run_id},
+                        action="reengage", resume=case.run_id, reason="first-mate-fresh-session")
+            await self._handle_runner_result(wake, result)
+        elif action == "escalate":
+            await self._notify_operator(f"recovery-escalate:{case.run_id}",
+                                        f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
     async def resume_session(self, run_id: str, prompt: str) -> bool:
         """Resume one persistent builder session, without creating a replacement."""

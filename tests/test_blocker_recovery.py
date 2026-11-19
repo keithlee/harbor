@@ -10,6 +10,7 @@ import pytest
 from harbor.config.pipeline import PipelineConfig
 from harbor.recovery import BlockerPolicy, claim_retry, recoverable
 from harbor.unblock import AuthoritySource, _validated_triage, triage
+from workflow_support import materialize
 
 
 def test_retry_budget_survives_reopen(tmp_path):
@@ -71,6 +72,7 @@ def test_real_sigkill_restart_recovery_with_mock_linear(tmp_path, checkpoint):
 
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     def git(*args):
         return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
     git("init", "-b", "main")
@@ -264,6 +266,7 @@ def test_committed_protected_path_parks_with_full_context(tmp_path):
     from harbor.unblock import UnblockLadder
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     def git(*args):
         return subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.test", *args], capture_output=True, text=True, check=True)
     git("init", "-b", "main")
@@ -446,8 +449,11 @@ elif {mode!r} == "different_session":
 
 def test_pipeline_settings_reach_project_runtime(tmp_path):
     from harbor.config.projects import ProjectConfig
-    pipeline = tmp_path / "pipeline.md"
-    pipeline.write_text("linear_project_slug: mock\nlinear_team: MOCK\nfirstmate_decisions: cite_only\nrecovery_delays: [1, 5]\nunblock_attempts: 1\ndecision_authors: [owner, backup]\n")
+    from workflow_support import materialize
+    # Delays and decision mode come from the workflow; attempts/authors from pipeline.md.
+    materialize(tmp_path, extra='[recovery]\nenabled=true\ndelays_seconds=[1, 5]\nmax_attempts=2\n')
+    pipeline = tmp_path / ".harbor" / "pipeline.md"
+    pipeline.write_text("linear_project_slug: mock\nlinear_team: MOCK\nunblock_attempts: 1\ndecision_authors: [owner, backup]\n")
     config = ProjectConfig.from_pipeline("mock", pipeline)
     assert config.blocker_policy == BlockerPolicy((1,5), "cite_only", 1, ("owner","backup"))
 

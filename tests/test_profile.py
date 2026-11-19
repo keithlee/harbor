@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from harbor.config.profile import PipelineProfile
+from workflow_support import materialize
 
 
 def test_profile_accepts_pipeline_table_and_scalar_forms() -> None:
@@ -41,6 +42,7 @@ def test_registered_pipeline_parses_without_a_maintainer_checkout(
 
     repo = tmp_path / "repo"
     repo.mkdir()
+    materialize(repo)
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text(
         """linear_project_slug: sample-project-abc123

@@ -43,7 +43,7 @@ def test_setup_wrong_branch_and_symlink_are_preserved(tmp_path):
         manager.create('DEMO-3')
 
 
-def test_ignored_files_survive_cleanup(tmp_path):
+def test_ignored_output_is_removed_but_untracked_and_modified_work_is_kept(tmp_path):
     repo,_=disposable_repo(tmp_path)
     manager=WorktreeManager(repo,root=tmp_path/'wt',disk_usage=lambda _:30,install_command='none')
     wt=manager.create('DEMO-4')
@@ -51,11 +51,24 @@ def test_ignored_files_survive_cleanup(tmp_path):
     if not exclude.is_absolute():
         exclude=repo/exclude
     with exclude.open('a') as f:
-        f.write('\ncache\n')
-    (wt.path/'cache').write_text('retained')
-    with pytest.raises(WorktreeError,match='ignored'):
+        f.write('\ncache\nnode_modules/\n')
+    (wt.path/'cache').write_text('build output')
+    (wt.path/'node_modules'/'pkg').mkdir(parents=True)
+    (wt.path/'node_modules'/'pkg'/'index.js').write_text('x')
+    (wt.path/'notes.txt').write_text('untracked work')
+    with pytest.raises(WorktreeError,match='untracked'):
         manager.remove(wt)
-    assert (wt.path/'cache').exists()
+    assert (wt.path/'notes.txt').exists() and (wt.path/'cache').exists()
+    (wt.path/'notes.txt').unlink()
+    tracked=next(p for p in wt.path.iterdir() if p.is_file() and p.name not in {'cache','.git'})
+    original=tracked.read_text()
+    tracked.write_text(original+'\nmodified')
+    with pytest.raises(WorktreeError,match='modified'):
+        manager.remove(wt)
+    tracked.write_text(original)
+    manager.remove(wt)  # only ignored output remains: removed
+    assert not wt.path.exists()
+    assert 'harbor/DEMO-4' in git(repo,'branch','--list','harbor/DEMO-4')  # branch kept for audit
 
 
 def test_setup_hook_failure_reuses_prepared_worktree(tmp_path):

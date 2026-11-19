@@ -371,9 +371,21 @@ class WorktreeManager:
         with git_lock(self.repo):
             if _common_git_dir(target) != _common_git_dir(self.repo):
                 raise WorktreeConfinementError("cleanup repository mismatch")
-            if _run_git(target, ["status", "--porcelain", "--ignored"]).stdout:
-                raise WorktreeError("cleanup retained dirty or ignored files")
-            _run_git(self.repo, ["worktree", "remove", str(target)])
+            # Modified or untracked files are work someone may want: keep the
+            # worktree for inspection. Ignored files are install/build output
+            # (node_modules, .next, ...) that every worktree accumulates; they
+            # never block cleanup, or no worktree could ever be removed.
+            if _run_git(target, ["status", "--porcelain", "--untracked-files=all"]).stdout:
+                raise WorktreeError("cleanup retained modified or untracked files")
+            for line in _run_git(target, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).stdout.splitlines():
+                if not line.startswith("!! "):
+                    continue
+                ignored = (target / line[3:].rstrip("/")).resolve() if not (target / line[3:]).is_symlink() else target / line[3:]
+                if not _inside(ignored, target):
+                    raise WorktreeConfinementError(f"ignored path escapes the worktree: {line[3:]}")
+            # --force is required because git also refuses ignored content;
+            # the status check above already proved nothing else remains.
+            _run_git(self.repo, ["worktree", "remove", "--force", str(target)])
             _run_git(self.repo, ["worktree", "prune"])
 
     def path_for(self, ticket: str) -> Path:

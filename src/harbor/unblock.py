@@ -1249,7 +1249,7 @@ class UnblockLadder:
                     "worktree": str(authority_repo) if authority_repo else None,
                     "stop_reason": run.get("terminal_reason"),
                     "remaining_execution_seconds": run.get("deadline_seconds"),
-                    "workflow_assessment": self.workflow.asset(self.workflow.config["skills"]["blocker_assessment"]["ref"]).read_text() if getattr(self,"workflow",None) and self.workflow.config.get("skills",{}).get("blocker_assessment",{}).get("enabled") else None,
+                    "workflow_assessment": self.workflow.asset(self.workflow.config["skills"]["blocker_assessment"]["ref"]).read_text() if getattr(self,"workflow",None) and self.workflow.config.get("skills",{}).get("blocker_assessment",{}).get("enabled", True) else None,
                     "failed_operation": blocker_value.get("evidence") or final.get("summary"),
                     "next_action": final.get("next_action") or "Resolve the question, then verify the ticket acceptance criteria.",
                     "attempts": {"deterministic": self._prior_rung_zero(ticket_id, kind), "first_mate": self._prior_rung_one(ticket_id, kind)},

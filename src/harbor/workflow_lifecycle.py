@@ -25,10 +25,9 @@ async def handoff(supervisor,wake,result):
 
 
 async def cleanup_allowed(supervisor,wake,result,target,run_id):
-    workflow = getattr(supervisor.dispatcher,"workflow",None)
-    if not workflow:
+    workflow = getattr(supervisor.dispatcher, "workflow", None)
+    if not workflow:  # only unit-test fakes run without a project workflow
         return True
-    workflow.verify_package()
     policy = workflow.config['cleanup']
     if policy['mode'] != 'after_merge':
         return False
@@ -47,10 +46,6 @@ async def cleanup_allowed(supervisor,wake,result,target,run_id):
         return False
     elapsed = (datetime.now(timezone.utc)-datetime.fromisoformat(ended.replace('Z','+00:00')).replace(tzinfo=timezone.utc)).total_seconds()
     if elapsed < policy['delay_seconds']:
-        return False
-    from harbor.role_bindings import initialize
-    initialize(db)
-    if db.execute("SELECT 1 FROM workflow_agents WHERE project=? AND ticket=? AND run_id=? AND state='running'",(supervisor.project,identifier,run_id)).fetchone():
         return False
     # Re-fetch after restart and immediately before deletion. A saved merge bit
     # cannot authorize deletion of newer local commits or a held ticket.

@@ -6,4 +6,5 @@ Read the existing ticket, project constitution and relevant code. Add numbered,
 observable acceptance criteria and targeted tests to the same ticket. Include
 adversarial cases, affected files and the smallest safe implementation. Identify
 missing authority with options and evidence instead of inventing requirements.
-Use configured roles/models; preserve the planner identity across continuation.
+Use the planner model from config.toml. On continuation resume the existing planner; if it is gone
+or interrupted, close it and spawn a fresh one with the plan already on the ticket.

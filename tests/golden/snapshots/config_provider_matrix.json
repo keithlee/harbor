@@ -16,19 +16,19 @@
     ],
     "firstmate": [
       "codex",
-      "gpt-6-luna",
-      "medium"
+      "claude-opus-5-5",
+      "high"
     ],
     "playwright_browser_image": null
   },
-  "claude_builder_without_model": {
-    "error": "configure builder_model explicitly for Claude Code"
+  "claude_first_mate_with_gpt_model": {
+    "error": "configure firstmate_model explicitly for Claude Code"
   },
   "claude_first_mate_with_model": {
     "builder": [
       "codex",
-      "gpt-5.6-luna",
-      "xhigh"
+      "test-model",
+      "medium"
     ],
     "firstmate": [
       "claude",
@@ -37,18 +37,15 @@
     ],
     "playwright_browser_image": null
   },
-  "claude_first_mate_without_model": {
-    "error": "configure firstmate_model explicitly for Claude Code"
-  },
   "default_is_codex": {
     "builder": [
       "codex",
-      "gpt-5.6-luna",
-      "xhigh"
+      "test-model",
+      "medium"
     ],
     "firstmate": [
       "codex",
-      "gpt-6-luna",
+      "test-model",
       "medium"
     ],
     "playwright_browser_image": null
@@ -56,12 +53,12 @@
   "playwright_digest_pinned": {
     "builder": [
       "codex",
-      "gpt-5.6-luna",
-      "xhigh"
+      "test-model",
+      "medium"
     ],
     "firstmate": [
       "codex",
-      "gpt-6-luna",
+      "test-model",
       "medium"
     ],
     "playwright_browser_image": "mcr.microsoft.com/playwright@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -75,18 +72,21 @@
   "playwright_tag_and_digest": {
     "builder": [
       "codex",
-      "gpt-5.6-luna",
-      "xhigh"
+      "test-model",
+      "medium"
     ],
     "firstmate": [
       "codex",
-      "gpt-6-luna",
+      "test-model",
       "medium"
     ],
     "playwright_browser_image": "mcr.microsoft.com/playwright:v1.50.0@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   },
   "playwright_tag_only": {
     "error": "playwright_browser_image must be a digest-pinned Docker image"
+  },
+  "retired_model_key": {
+    "error": "<tmp>/pipeline.md: builder_model no longer belongs in pipeline.md; see docs/configurable-workflows.md#migrating: copy workflows/work-pipeline into <repo>/.harbor/workflow and move role models into .harbor/workflow/config.toml"
   },
   "unknown_provider": {
     "error": "invalid builder_provider: use codex or claude"

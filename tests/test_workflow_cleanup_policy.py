@@ -4,12 +4,11 @@ from types import SimpleNamespace
 from harbor.db import HarborDB
 from harbor.config.workflow import load_workflow
 from harbor.workflow_lifecycle import cleanup_allowed
-from harbor.role_bindings import observe
 from test_workflow_config import config
 from test_worktree_phase4 import disposable_repo,git
 
 
-def test_cleanup_requires_fresh_terminal_merge_exact_head_and_stopped_agents(tmp_path,monkeypatch):
+def test_cleanup_requires_fresh_terminal_merge_and_exact_head(tmp_path,monkeypatch):
     repo,_=disposable_repo(tmp_path)
     head=git(repo,'rev-parse','HEAD')
     db=HarborDB(':memory:')
@@ -31,6 +30,4 @@ def test_cleanup_requires_fresh_terminal_merge_exact_head_and_stopped_agents(tmp
     workflow.config['cleanup']['delay_seconds']=100
     assert not allowed()
     workflow.config['cleanup']['delay_seconds']=0
-    observe(db.connection,'A','A-1','r',{'item':{'type':'collab_agent_tool_call','status':'completed','tool':'spawn_agent','receiver_thread_ids':['child']}})
-    assert not allowed()
     db.close()

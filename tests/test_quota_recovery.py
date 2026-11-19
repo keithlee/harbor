@@ -146,7 +146,10 @@ def test_configured_claude_factory_preserves_recorded_provider(tmp_path, monkeyp
 
     monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/usr/bin/true")
     db = HarborDB(tmp_path / "harbor.db")
-    config = SimpleNamespace(name="mock", builder_provider="claude", builder_model="sonnet", builder_effort="low")
+    from workflow_support import materialize
+    workflow = materialize(tmp_path, models={"controller": {"model": "sonnet", "reasoning_effort": "low"}})
+    config = SimpleNamespace(name="mock", builder_provider="claude", builder_model="sonnet", builder_effort="low",
+                             workflow_path=str(workflow), install_command="none")
     _, _, factory = build_production_dispatcher(config, db, worktree_manager=object())
     new = Wake({"identifier": "MOCK-1"}, "build", resume="new-logical-id")
     assert isinstance(factory(tmp_path, new), ClaudeRunner)

@@ -12,8 +12,9 @@ IMAGE = "sha256:" + "1" * 64
 
 
 def test_project_playwright_image_is_opt_in_and_must_be_pinned(tmp_path):
+    from workflow_support import materialize
+    materialize(tmp_path)
     profile = tmp_path / ".harbor" / "pipeline.md"
-    profile.parent.mkdir()
     settings = "linear_project_slug: sample\nlinear_team: SAM\n"
     profile.write_text(settings)
     assert ProjectConfig.from_pipeline("Sample", profile).playwright_browser_image is None
