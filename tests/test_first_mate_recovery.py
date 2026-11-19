@@ -13,7 +13,7 @@ from harbor.db import HarborDB, apply_phase9_migration
 from harbor.poll.linear_poller import PollResult
 from harbor.runner.base import apply_phase4_migration
 from harbor.supervisor import Supervisor, WorktreeDispatcher
-from harbor.wake import apply_phase3_migration
+from harbor.wake import Wake, apply_phase3_migration
 from workflow_support import config
 
 SETTINGS = {"max_recoveries": 3, "allow_fresh_session": True, "recheck_minutes": 10, "stall_minutes": 30}
@@ -140,6 +140,14 @@ def supervisor_for(tmp_path, db, answer, *, ticket=None):
     return supervisor, mate, linear
 
 
+def monitor(supervisor):
+    """One monitor pass, then wait for the recoveries it scheduled."""
+    async def run():
+        await supervisor._monitor_blocked()
+        await supervisor._drain_recoveries()
+    asyncio.run(run())
+
+
 def add_ticket(db, tmp_path, ticket, *, status="blocked", final=HAN86, finished=15, hold=False, state_type=None):
     """Add a second ticket and its run without replacing the first."""
     rows = [dict(r) for r in db.connection.execute("SELECT identifier, title, state, linear_id AS id, hold FROM tickets")]
@@ -176,13 +184,13 @@ def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
         return True
 
     supervisor.resume_session = resume_session
-    asyncio.run(supervisor._monitor_blocked())
+    monitor(supervisor)
     assert resumed == [("run-HAN-86", answer["instruction"])]
     assert "planner child exited" in mate.prompts[0]
     assert linear.comments and linear.comments[0][1].startswith("[First Mate recovery] resume (blocked)")
     rows = db.connection.execute("SELECT action FROM first_mate_recoveries").fetchall()
     assert [r[0] for r in rows] == ["resume"]
-    asyncio.run(supervisor._monitor_blocked())  # backoff: no second attempt this poll
+    monitor(supervisor)  # backoff: no second attempt this poll
     assert len(resumed) == 1
     db.close()
 
@@ -199,7 +207,7 @@ def test_han86_replay_fresh_session_keeps_worktree_and_drops_old_session(tmp_pat
             return {"status": "completed", "outcome": "no_pr", "summary": "continuing", "run_id": run_id}
 
     supervisor.dispatcher.runner_factory = lambda worktree, wake: Runner()
-    asyncio.run(supervisor._monitor_blocked())
+    monitor(supervisor)
     assert len(started) == 1 and started[0][1] == "run-HAN-86"
     assert "fresh builder session" in started[0][0] and "Respawn all roles." in started[0][0]
     row = db.connection.execute("SELECT worktree, session_id FROM runs WHERE id='run-HAN-86'").fetchone()
@@ -221,7 +229,7 @@ def test_product_question_is_never_recovered(tmp_path):
         return True
 
     supervisor.resume_session = resume_session
-    asyncio.run(supervisor._monitor_blocked())
+    monitor(supervisor)
     assert calls == []
     assert [r[0] for r in db.connection.execute("SELECT action FROM first_mate_recoveries")] == ["escalate"]
     db.close()
@@ -318,7 +326,7 @@ def test_scoped_supervisor_ignores_other_tickets(tmp_path):
     add_ticket(db, tmp_path, "HAN-99", status="completed", final={"status": "completed"})
     flag(db, "HAN-86")
     supervisor, mate, linear = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"}, ticket="HAN-99")
-    asyncio.run(supervisor._monitor_blocked())
+    monitor(supervisor)
     assert mate.prompts == [] and linear.comments == []
     assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
     assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 0  # left for its owner
@@ -329,7 +337,212 @@ def test_unscoped_supervisor_then_handles_the_flag(tmp_path):
     db = ledger(tmp_path)
     flag(db, "HAN-86")
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "wait", "reason": "later"})
-    asyncio.run(supervisor._monitor_blocked())
+    monitor(supervisor)
     assert len(mate.prompts) == 1
     assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 1
+    db.close()
+
+
+
+# ---- Review findings #2 and #4: recovery runs in the background ----
+
+NEUTRAL = {"status": "blocked", "outcome": "no_pr", "waiting_on": "human", "summary": "builder stopped",
+           "blocker": {"kind": "env_blocker", "question": "builder process exited"}}
+
+
+async def settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+def test_recovery_does_not_block_polling(tmp_path):
+    db = ledger(tmp_path, final=NEUTRAL)
+    supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "continue", "reason": "r"})
+    never = asyncio.Event()
+    calls = []
+
+    async def resume_session(run_id, prompt):
+        calls.append(run_id)
+        await never.wait()  # a builder that never returns
+        return True
+
+    supervisor.resume_session = resume_session
+
+    async def scenario():
+        await asyncio.wait_for(supervisor._monitor_blocked(), timeout=1)
+        await asyncio.wait_for(supervisor._monitor_blocked(), timeout=1)  # a second poll is not stuck either
+        await settle()
+        names = [t.get_name() for t in supervisor._dispatch_tasks.values()]
+        assert names == ["harbor-recovery-HAN-86"]
+        assert calls == ["run-HAN-86"] and len(mate.prompts) == 1  # one recovery per ticket
+        for task in list(supervisor._dispatch_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*supervisor._dispatch_tasks.values(), return_exceptions=True)
+
+    asyncio.run(scenario())
+    db.close()
+
+
+def test_recovery_task_blocks_duplicate_wake(tmp_path):
+    db = ledger(tmp_path, final=NEUTRAL)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "continue", "reason": "r"})
+    never = asyncio.Event()
+    delivered = []
+
+    async def resume_session(run_id, prompt):
+        await never.wait()
+        return True
+
+    async def deliver(wake):
+        delivered.append(wake)
+
+    supervisor.resume_session = resume_session
+    supervisor._deliver_scheduled_wake = deliver
+
+    async def scenario():
+        await supervisor._monitor_blocked()
+        supervisor._schedule_wake(Wake(ticket={"identifier": "HAN-86"}, action="reengage", resume="run-HAN-86"))
+        await asyncio.sleep(0)
+        assert delivered == []  # never two builders on one ticket
+        for task in list(supervisor._dispatch_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*supervisor._dispatch_tasks.values(), return_exceptions=True)
+
+    asyncio.run(scenario())
+    db.close()
+
+
+def test_stalled_live_delivery_is_cancelled_and_replaced(tmp_path):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=45)
+    flag(db, "HAN-86", "no_progress")
+    supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
+    replaced = []
+
+    async def fresh_session(identifier, instruction):
+        replaced.append(identifier)
+        return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "run-HAN-86"}
+
+    supervisor.dispatcher.fresh_session = fresh_session
+
+    async def scenario():
+        hung = asyncio.create_task(asyncio.Event().wait(), name="harbor-dispatch-HAN-86")
+        supervisor._dispatch_tasks["HAN-86"] = hung
+        await supervisor._monitor_blocked()
+        await supervisor._drain_recoveries()
+        assert hung.cancelled()
+        assert replaced == ["HAN-86"] and len(mate.prompts) == 1
+
+    asyncio.run(scenario())
+    db.close()
+
+
+def test_live_delivery_that_is_not_stalled_is_left_alone(tmp_path):
+    db = ledger(tmp_path)  # blocked-looking case, but a delivery is active
+    supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"})
+
+    async def scenario():
+        active = asyncio.create_task(asyncio.Event().wait(), name="harbor-dispatch-HAN-86")
+        supervisor._dispatch_tasks["HAN-86"] = active
+        await supervisor._monitor_blocked()
+        assert mate.prompts == [] and not active.cancelled()
+        active.cancel()
+        await asyncio.gather(active, return_exceptions=True)
+
+    asyncio.run(scenario())
+    db.close()
+
+
+def test_recovery_failure_escalates_and_frees_the_ticket(tmp_path):
+    db = ledger(tmp_path, final=NEUTRAL)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"})
+    notices = []
+
+    async def resume_session(run_id, prompt):
+        raise RuntimeError("session gone")
+
+    async def notify(key, message):
+        notices.append(message)
+        return True
+
+    supervisor.resume_session = resume_session
+    supervisor._notify_operator = notify
+    monitor(supervisor)
+    actions = [r[0] for r in db.connection.execute("SELECT action FROM first_mate_recoveries ORDER BY id")]
+    assert actions == ["resume", "escalate"]
+    assert any("could not resume" in n for n in notices)
+    assert supervisor._recovery_tickets == set() and "HAN-86" not in supervisor._dispatch_tasks
+    db.close()
+
+
+def test_successful_recovery_notifies_after_completion(tmp_path):
+    db = ledger(tmp_path, final=NEUTRAL)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"})
+    events = []
+    gate = asyncio.Event()
+
+    async def resume_session(run_id, prompt):
+        events.append("builder-start")
+        await gate.wait()
+        events.append("builder-done")
+        return True
+
+    async def notify(key, message):
+        events.append("notify")
+        return True
+
+    supervisor.resume_session = resume_session
+    supervisor._notify_operator = notify
+
+    async def scenario():
+        await supervisor._monitor_blocked()
+        await settle()
+        assert events == ["builder-start"]  # not announced at scheduling time  # not announced at scheduling time
+        gate.set()
+        await supervisor._drain_recoveries()
+
+    asyncio.run(scenario())
+    assert events == ["builder-start", "builder-done", "notify"]
+    db.close()
+
+
+def test_stalled_real_codex_process_is_killed_before_replacement(tmp_path):
+    """Live-shape check for finding #4: a hung `codex exec` subprocess."""
+    import sys
+    from harbor.runner.base import process_alive
+    from harbor.runner.codex import CodexRunner
+
+    hung = tmp_path / "hung-codex.py"
+    hung.write_text("#!/usr/bin/env python3\nimport json, time\n"
+                    "print(json.dumps({'type': 'heartbeat'}), flush=True)\ntime.sleep(120)\n")
+    hung.chmod(0o755)
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1, ticket="DEM-2")
+    db.connection.execute("DELETE FROM runs")  # the real runner owns its run row
+    db.connection.commit()
+    supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
+    replaced = []
+
+    async def fresh_session(identifier, instruction):
+        replaced.append(identifier)
+        return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "retained"}
+
+    supervisor.dispatcher.fresh_session = fresh_session
+
+    async def scenario():
+        runner = CodexRunner(tmp_path / "wt" / "DEM-2", db=db, ticket="DEM-2", executable=str(hung), run_id="retained")
+        delivery = asyncio.create_task(runner.start("continue"), name="harbor-dispatch-DEM-2")
+        supervisor._dispatch_tasks["DEM-2"] = delivery
+        for _ in range(200):
+            if runner.active:
+                break
+            await asyncio.sleep(0.01)
+        pid = runner.active.pid
+        db.connection.execute("UPDATE runs SET last_activity_at=?, started_at=? WHERE id='retained'", (iso(45), iso(60)))
+        db.connection.commit()
+        await supervisor._monitor_blocked()
+        await supervisor._drain_recoveries()
+        assert delivery.done() and not process_alive(pid)
+        row = db.connection.execute("SELECT status, terminal_reason FROM runs WHERE id='retained'").fetchone()
+        assert row[0] == "terminated"
+        assert replaced == ["DEM-2"] and len(mate.prompts) == 1
+
+    asyncio.run(scenario())
     db.close()

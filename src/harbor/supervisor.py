@@ -1000,6 +1000,8 @@ class Supervisor:
         self._background_dispatch = False
         self._dispatch_tasks: dict[str, asyncio.Task[Any]] = {}
         self._dispatch_wakes: dict[str, Wake] = {}
+        # Tickets with a First Mate recovery task in flight (one at a time).
+        self._recovery_tickets: set[str] = set()
         self._started_build_tickets: set[str] = set()
         # A process-local marker for a merge receipt obtained from an
         # observed PR fact.  Builder JSON alone never enters this set.
@@ -3848,8 +3850,11 @@ class Supervisor:
         for case in cases:
             if not self._in_scope(case.ticket):
                 continue  # --ticket scope: no triage, comments or receipts for other tickets
-            if case.ticket in self._dispatch_tasks and not self._dispatch_tasks[case.ticket].done():
-                continue
+            if case.ticket in self._recovery_tickets:
+                continue  # one recovery at a time per ticket
+            active = self._dispatch_tasks.get(case.ticket)
+            if active is not None and not active.done() and case.trigger not in {"stalled", "watchdog:no_progress"}:
+                continue  # a live delivery that is not stalled is left alone
             if case.trigger == "watchdog:cleanup_stuck":
                 # Deterministic: re-run the verified merge cleanup; no model call.
                 recovery.record(connection, case, {"action": "cleanup", "instruction": "", "reason": case.detail})
@@ -3872,16 +3877,48 @@ class Supervisor:
             if decision["action"] == "wait":
                 continue
             await self._post_recovery_comment(case, decision)
+            # Never await the builder here: recovery runs as a tracked
+            # background task so polling and other tickets keep moving.
+            self._schedule_recovery(case, decision)
+
+    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        connection = getattr(self.db, "connection", None)
+        self._recovery_tickets.add(case.ticket)
+        # Capture the delivery this recovery replaces BEFORE registering
+        # ourselves under the same ticket key.
+        previous = self._dispatch_tasks.get(case.ticket)
+
+        async def run() -> None:
             try:
+                if previous is not None and not previous.done():
+                    # A stalled live delivery: cancel it through the normal
+                    # path (kills the process group, records the stop) first.
+                    previous.cancel()
+                    await asyncio.gather(previous, return_exceptions=True)
                 await self._apply_recovery(case, decision)
             except Exception as exc:
-                failed = {"action": "escalate", "instruction": "", "reason": f"{decision['action']} failed: {exc}"}
-                recovery.record(connection, case, failed)
+                if connection is not None:
+                    recovery.record(connection, case, {"action": "escalate", "instruction": "",
+                                                       "reason": f"{decision['action']} failed: {exc}"})
                 await self._notify_operator(f"recovery-failed:{case.run_id}:{len(case.history)}",
                                             f"First Mate could not {decision['action']} {case.ticket}: {exc}")
-                continue
+                return
+            finally:
+                self._recovery_tickets.discard(case.ticket)
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
+
+        task = asyncio.create_task(run(), name=f"harbor-recovery-{case.ticket}")
+        # Tracked like a delivery, so no second builder starts for this ticket.
+        self._dispatch_tasks[case.ticket] = task
+        task.add_done_callback(lambda finished, key=case.ticket: self._dispatch_finished(key, finished))
+
+    async def _drain_recoveries(self) -> None:
+        """Wait for in-flight First Mate recoveries (shutdown and tests)."""
+        tasks = [t for t in self._dispatch_tasks.values() if t.get_name().startswith("harbor-recovery-") and not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _post_recovery_comment(self, case: Any, decision: Mapping[str, Any]) -> None:
         from harbor import first_mate_recovery as recovery

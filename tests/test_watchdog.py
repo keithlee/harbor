@@ -69,7 +69,8 @@ def test_cleanup_stuck_flag_refreshes_pr_links_and_cleans_up(tmp_path):
 
     supervisor._reconcile_runner_result = reconcile
     supervisor._cleanup_merged_worktree = cleanup
-    asyncio.run(supervisor._monitor_blocked())
+    from test_first_mate_recovery import monitor
+    monitor(supervisor)
     assert cleaned == [("HAN-86", pr)]
     row = db.connection.execute("SELECT pr_urls_json, state_type FROM tickets").fetchone()
     assert json.loads(row[0]) == [pr] and row[1] == "completed"
@@ -97,14 +98,15 @@ def test_cleanup_without_a_linear_attachment_is_never_trusted(tmp_path):
         cleaned.append(result)
 
     supervisor._cleanup_merged_worktree = cleanup
-    asyncio.run(supervisor._monitor_blocked())
+    from test_first_mate_recovery import monitor
+    monitor(supervisor)
     assert cleaned == []  # the builder's claim alone never authorizes cleanup
     db.close()
 
 
 def test_cleanup_stuck_reflags_hourly(tmp_path):
     db = ledger(tmp_path, status="completed", final={"outcome": "merged"}, finished=45)
-    now = time.time()
+    now = (time.time() // 3600 + 1) * 3600 + 10  # start of the next hour: no boundary inside the test
     assert len(tick(db.connection, "Demo", minutes=30, now=now)) == 1
     assert tick(db.connection, "Demo", minutes=30, now=now + 60) == []
     assert len(tick(db.connection, "Demo", minutes=30, now=now + 3600)) == 1
