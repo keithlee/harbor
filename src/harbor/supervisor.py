@@ -512,6 +512,50 @@ class WorktreeDispatcher:
         self.runners[identifier] = runner
         return runner
 
+    async def fresh_session(self, identifier: str, instruction: str) -> Any:
+        """Start a NEW builder session for a stuck ticket in its retained worktree.
+
+        Only First Mate recovery calls this. The logical run id, worktree and
+        branch are kept; the old native session id is dropped so the runner
+        starts a clean conversation with a hand-off instruction.
+        """
+
+        identifier = str(identifier or "").strip()
+        if not identifier or not self._in_scope(identifier):
+            raise ValueError(f"ticket is outside this supervisor's scope: {identifier or '(empty)'}")
+        row = self._persisted_run(identifier)
+        if row is None or not row.get("worktree"):
+            raise RuntimeError(f"no retained worktree exists for {identifier}")
+        live = self.runners.get(identifier)
+        terminate = getattr(live, "terminate", None)
+        if row.get("status") == "running":
+            if not callable(terminate):
+                raise RuntimeError(f"{identifier} is running in another process; cannot replace its session")
+            value = terminate(reason="first_mate_fresh_session")
+            if inspect.isawaitable(value):
+                await value
+        connection = getattr(self.db, "connection", None)
+        if connection is not None:
+            with connection:
+                connection.execute(
+                    "UPDATE runs SET session_id=NULL, status='terminated', terminal_reason='first_mate_fresh_session' WHERE id=?",
+                    (row["id"],),
+                )
+        self.runners.pop(identifier, None)
+        runner = await self.hydrate(identifier, recover_terminal=True)
+        if runner is None:
+            raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
+        wake = Wake(
+            ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
+            action="reengage",
+            resume=row["id"],
+            instruction=instruction,
+            reason="first-mate-fresh-session",
+        )
+        result = await self._runner_call(runner, wake, resume=False)
+        await self._record_push_result(wake, result)
+        return result
+
     async def retry(self, identifier: str, instruction: str | None = None) -> Any:
         """Explicitly resume a terminated/orphaned run in its retained session.
 
@@ -3057,6 +3101,7 @@ class Supervisor:
             from harbor.answer_queue import drain
             drain(self)
             await self._retry_stopped_builders()
+            await self._monitor_blocked()
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -3711,6 +3756,84 @@ class Supervisor:
             if candidate and (value in contexts or str(getattr(direct, "default_run_id", "")) == value):
                 return str(candidate)
         return ""
+
+    async def _monitor_blocked(self) -> None:
+        """First Mate monitor-and-recover pass over stuck runs and watchdog flags."""
+
+        workflow = getattr(self.dispatcher, "workflow", None)
+        ladder = self.unblock_ladder
+        mate = getattr(ladder, "first_mate", None) if ladder is not None else None
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if workflow is None or mate is None or connection is None or self._dispatch_suspended:
+            return
+        from harbor import first_mate_recovery as recovery
+        from harbor.first_mate import FirstMateError
+
+        settings = workflow.config.get("first_mate", {})
+        try:
+            cases = recovery.find_cases(connection, self.project, settings)
+        except Exception as exc:
+            self.last_error = f"First Mate monitor: {exc}"
+            return
+        for case in cases:
+            if case.ticket in self._dispatch_tasks and not self._dispatch_tasks[case.ticket].done():
+                continue
+            if case.trigger == "watchdog:cleanup_stuck":
+                # Deterministic: re-run the verified merge cleanup; no model call.
+                recovery.record(connection, case, {"action": "cleanup", "instruction": "", "reason": case.detail})
+                await self._reconcile_completed_merges()
+                continue
+            try:
+                proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
+            except FirstMateError as exc:
+                proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
+            decision = recovery.validate(proposal, case, settings)
+            recovery.record(connection, case, decision)
+            if decision["action"] == "wait":
+                continue
+            await self._post_recovery_comment(case, decision)
+            try:
+                await self._apply_recovery(case, decision)
+            except Exception as exc:
+                failed = {"action": "escalate", "instruction": "", "reason": f"{decision['action']} failed: {exc}"}
+                recovery.record(connection, case, failed)
+                await self._notify_operator(f"recovery-failed:{case.run_id}:{len(case.history)}",
+                                            f"First Mate could not {decision['action']} {case.ticket}: {exc}")
+                continue
+            await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
+                                        f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
+
+    async def _post_recovery_comment(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        from harbor.unblock import _linear_comment
+        linear = getattr(self.unblock_ladder, "linear", None) or self.linear
+        if linear is None or not case.linear_id:
+            return
+        try:
+            await _linear_comment(linear, self.db, case.linear_id, recovery.comment(case, decision))
+        except Exception as exc:  # a comment failure never stops recovery
+            self.last_error = f"First Mate comment: {exc}"
+
+    async def _apply_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+        from harbor import first_mate_recovery as recovery
+        action, instruction = decision["action"], decision.get("instruction") or ""
+        if action == "resume":
+            if not await self.resume_session(case.run_id, instruction):
+                raise RuntimeError("retained builder session is not available to resume")
+        elif action == "retry":
+            result = await self.dispatcher.retry(case.ticket, instruction)
+            run_id = str((result.get("run_id") if isinstance(result, Mapping) else getattr(result, "run_id", "")) or case.run_id)
+            wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": run_id, "run_id": run_id},
+                        action="reengage", resume=run_id, reason="first-mate-retry")
+            await self._handle_runner_result(wake, result)
+        elif action == "fresh_session":
+            result = await self.dispatcher.fresh_session(case.ticket, recovery.fresh_session_instruction(case, instruction))
+            wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": case.run_id, "run_id": case.run_id},
+                        action="reengage", resume=case.run_id, reason="first-mate-fresh-session")
+            await self._handle_runner_result(wake, result)
+        elif action == "escalate":
+            await self._notify_operator(f"recovery-escalate:{case.run_id}",
+                                        f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
     async def resume_session(self, run_id: str, prompt: str) -> bool:
         """Resume one persistent builder session, without creating a replacement."""

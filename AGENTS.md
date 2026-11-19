@@ -6,7 +6,9 @@ change:
 - Linear and GitHub are authoritative for external state; SQLite stores only
   operational custody, idempotency, and receipts.
 - Never persist or print Linear, GitHub, or model credentials.
-- A ticket keeps the same builder session and worktree across re-engagement.
+- A ticket keeps the same builder session and worktree across re-engagement,
+  unless First Mate recovery deliberately starts a fresh session (same
+  worktree, recorded in `first_mate_recoveries`).
 - Harbor observes GitHub but leaves GitHub mutations and terminal Linear
   completion to the configured delivery workflow.
 - Configuration must fail closed; never substitute a product-specific project,
@@ -51,7 +53,7 @@ domain_rules:
   - Linear and GitHub remain authoritative; SQLite is an operational ledger only
   - secrets are never persisted or logged
   - project configuration is explicit and never inherits product-specific defaults
-  - same-ticket re-engagement resumes the retained builder session
+  - same-ticket re-engagement resumes the retained builder session (First Mate recovery may start one fresh session)
   - protected-path or project-custody changes require review even when within the size budget
 spec_approval: auto
 ```

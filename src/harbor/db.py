@@ -13,6 +13,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -547,6 +548,22 @@ class HarborDB:
             return int(self._connection.execute(query, args).fetchone()[0])
 
     count_events = event_count
+
+    def heartbeat_path(self, project: str) -> Path | None:
+        """File the supervisor's heartbeat is mirrored to for ``harbor watch``."""
+        if self.path == ":memory:":
+            return None
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in project)
+        return Path(self.path).parent / f"heartbeat-{safe}.json"
+
+    def record_heartbeat(self, project: str, payload: Mapping[str, Any]) -> None:
+        """Mirror the latest heartbeat to a small JSON file (atomic replace)."""
+        target = self.heartbeat_path(project)
+        if target is None:
+            return
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps({**dict(payload), "recorded_at": time.time()}, default=str))
+        temporary.replace(target)
 
     def set_runtime(self, project: str, lifecycle: str, reason: str | None = None) -> None:
         with self._lock:

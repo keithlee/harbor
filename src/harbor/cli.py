@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_commands(commands)
     from harbor.onboard import add_command
     add_command(commands)
+    from harbor.watchdog import add_command as add_watch
+    add_watch(commands)
     for name in ("doctor", "start", "status", "facts"):
         command = commands.add_parser(name)
         command.add_argument("project")
@@ -730,6 +732,13 @@ async def _async_main(args: argparse.Namespace) -> int:
             return initialize(args)
         except (ValueError,OSError) as exc:
             print(f"Harbor: {exc}",file=sys.stderr)
+            return 2
+    if args.command == "watch":
+        from harbor.watchdog import watch
+        try:
+            return await watch(args.project, minutes=args.minutes, interval=args.interval, once=args.once)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
             return 2
     if args.command == "workflow":
         from harbor.workflow_cli import execute
