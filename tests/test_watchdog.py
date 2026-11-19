@@ -38,3 +38,73 @@ def test_stale_heartbeat_and_heartbeat_file(tmp_path):
     assert tick(db.connection, "Demo", heartbeat_path=path) == []
     assert kinds(tick(db.connection, "Demo", heartbeat_path=path, now=time.time() + 3600)) == ["supervisor_stale"]
     db.close()
+
+
+def test_cleanup_stuck_flag_refreshes_pr_links_and_cleans_up(tmp_path):
+    """Live HAN-86: Done in Linear before Harbor saw the PR attachment."""
+    import asyncio
+    from test_first_mate_recovery import supervisor_for
+
+    pr = "https://github.com/keithlee/Bookgen/pull/294"
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged", "pr_url": pr}, finished=45)
+    assert db.connection.execute("SELECT pr_urls_json FROM tickets").fetchone()[0] == "[]"
+    assert [f["kind"] for f in tick(db.connection, "Demo", minutes=30)] == ["cleanup_stuck"]
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "wait"})
+
+    class Linear:
+        async def fetch_issue_status(self, identifier):
+            return {"identifier": identifier, "state": {"name": "Done", "type": "completed"},
+                    "attachments": {"nodes": [{"url": pr, "sourceType": "github"}]}}
+
+    supervisor.linear = Linear()
+    supervisor.github_poller = object()
+    cleaned = []
+
+    async def reconcile(wake, result):
+        return {**result, "merge_verified": True}
+
+    async def cleanup(wake, result):
+        cleaned.append((wake.ticket["identifier"], result["pr_url"]))
+
+    supervisor._reconcile_runner_result = reconcile
+    supervisor._cleanup_merged_worktree = cleanup
+    asyncio.run(supervisor._monitor_blocked())
+    assert cleaned == [("HAN-86", pr)]
+    row = db.connection.execute("SELECT pr_urls_json, state_type FROM tickets").fetchone()
+    assert json.loads(row[0]) == [pr] and row[1] == "completed"
+    db.close()
+
+
+def test_cleanup_without_a_linear_attachment_is_never_trusted(tmp_path):
+    import asyncio
+    from test_first_mate_recovery import supervisor_for
+
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged",
+                                                     "pr_url": "https://github.com/other/repo/pull/1"}, finished=45)
+    tick(db.connection, "Demo", minutes=30)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "wait"})
+
+    class Linear:
+        async def fetch_issue_status(self, identifier):
+            return {"identifier": identifier, "state": {"name": "Done", "type": "completed"}, "attachments": {"nodes": []}}
+
+    supervisor.linear = Linear()
+    supervisor.github_poller = object()
+    cleaned = []
+
+    async def cleanup(wake, result):
+        cleaned.append(result)
+
+    supervisor._cleanup_merged_worktree = cleanup
+    asyncio.run(supervisor._monitor_blocked())
+    assert cleaned == []  # the builder's claim alone never authorizes cleanup
+    db.close()
+
+
+def test_cleanup_stuck_reflags_hourly(tmp_path):
+    db = ledger(tmp_path, status="completed", final={"outcome": "merged"}, finished=45)
+    now = time.time()
+    assert len(tick(db.connection, "Demo", minutes=30, now=now)) == 1
+    assert tick(db.connection, "Demo", minutes=30, now=now + 60) == []
+    assert len(tick(db.connection, "Demo", minutes=30, now=now + 3600)) == 1
+    db.close()

@@ -115,7 +115,8 @@ def tick(connection, project: str, *, minutes: float = 30, heartbeat_path: Path 
             done = status == "completed" and (merged == 1 or outcome == "merged")
             ended = _ts(finished)
             if done and not cleanup_at and worktree and Path(worktree).is_dir() and ended and now - ended >= limit:
-                flag = _flag_once(connection, project, ticket, "cleanup_stuck", run_id,
+                # Re-flag hourly while it stays stuck, so a failed cleanup is retried.
+                flag = _flag_once(connection, project, ticket, "cleanup_stuck", f"{run_id}:{int(now // 3600)}",
                                   f"merged run's worktree {worktree} still present after {int((now - ended) // 60)} minutes", run_id, now)
                 flags += [flag] if flag else []
         try:

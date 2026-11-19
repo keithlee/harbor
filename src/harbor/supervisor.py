@@ -1609,7 +1609,37 @@ class Supervisor:
                 f"Run /retry {identifier} to resume the same session.",
             )
 
-    async def _reconcile_completed_merges(self) -> None:
+    async def _refresh_ticket_pr_links(self, identifier: str) -> bool:
+        """Re-read one ticket's PR attachments and state from Linear.
+
+        A ticket that went Done before Harbor observed its PR attachment
+        leaves the poll scope with ``pr_urls = []``; its merged worktree would
+        then never be cleaned up. Linear stays the authority for which PR
+        belongs to the ticket, so refresh from it instead of trusting the
+        builder's claim.
+        """
+
+        linear = self.linear or getattr(self.unblock_ladder, "linear", None)
+        fetch = getattr(linear, "fetch_issue_status", None)
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if not callable(fetch) or connection is None or not identifier:
+            return False
+        try:
+            issue = await fetch(identifier)
+        except Exception as exc:
+            self.last_error = f"PR link refresh for {identifier}: {exc}"
+            return False
+        nodes = (issue.get("attachments") or {}).get("nodes") or []
+        urls = [str(n["url"]) for n in nodes if n.get("url") and str(n.get("sourceType", "")).lower() == "github"]
+        state = issue.get("state") or {}
+        with connection:
+            connection.execute(
+                "UPDATE tickets SET pr_urls_json=?, state=COALESCE(?, state), state_type=COALESCE(?, state_type) WHERE identifier=?",
+                (json.dumps(urls), state.get("name"), state.get("type"), identifier),
+            )
+        return True
+
+    async def _reconcile_completed_merges(self, only: str | None = None, *, refresh: bool = False) -> None:
         """Recover merge receipts that arrived just after a builder exited.
 
         A successful skill can merge a PR and return before Harbor's next
@@ -1635,7 +1665,7 @@ class Supervisor:
         for row in rows:
             run_id = str(row[0])
             identifier = str(row[1])
-            if not self._in_scope(identifier):
+            if not self._in_scope(identifier) or (only is not None and identifier != only):
                 continue
             try:
                 payload = json.loads(row[3]) if row[3] else {}
@@ -1647,6 +1677,9 @@ class Supervisor:
             if not isinstance(pr_url, str) or not pr_url.strip():
                 continue
             ticket = self._authoritative_ticket({"identifier": identifier})
+            if not self._ticket_has_pr_url(ticket, pr_url) and refresh:
+                if await self._refresh_ticket_pr_links(identifier):
+                    ticket = self._authoritative_ticket({"identifier": identifier})
             if not self._ticket_has_pr_url(ticket, pr_url):
                 continue
             # A merge receipt can be durable even when cleanup failed (for
@@ -3781,7 +3814,7 @@ class Supervisor:
             if case.trigger == "watchdog:cleanup_stuck":
                 # Deterministic: re-run the verified merge cleanup; no model call.
                 recovery.record(connection, case, {"action": "cleanup", "instruction": "", "reason": case.detail})
-                await self._reconcile_completed_merges()
+                await self._reconcile_completed_merges(case.ticket, refresh=True)
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
