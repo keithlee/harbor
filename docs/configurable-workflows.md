@@ -104,8 +104,8 @@ and crash-retry delays come from `workflow.toml`.
 ### Editing mid-run
 
 Editing `.harbor/workflow/` while a ticket is in flight never blocks it. The
-next builder turn (dispatch or resume) reloads the copy and uses the new models
-and policy, and Harbor records a `policy_change` receipt. There is no
+next builder launch reloads the copy and renders its prompt from it, so the new
+models and policy (including `merge_mode`) reach the builder, and Harbor records a `policy_change` receipt. There is no
 `reconcile` step.
 
 ## Hooks and checks
@@ -164,9 +164,23 @@ Guardrails:
   Only a model usage limit backs off exponentially (30, then 60 minutes).
 - A spent budget escalates once and never loops.
 
+- Watchdog flags get the same eligibility checks: a held or closed ticket is
+  never restarted (cleaning up a merged ticket is the one exception).
+- A supervisor started with `--ticket` only triages that ticket and leaves other
+  tickets' flags for the supervisor that owns them.
+
+Recoveries run as background tasks (`harbor-recovery-<ticket>`), one per
+ticket, so polling and other tickets keep moving while a builder recovers. A
+stalled live builder is stopped through the normal cancel path (process group
+killed, run recorded as terminated) before its replacement starts. A fresh
+session receives the full launch prompt (delivery skill, current policy
+including merge authority, runtime invocation) followed by First Mate's
+hand-off.
+
 Every action posts a `[First Mate recovery]` Linear comment, notifies the
 operator and is stored in `first_mate_recoveries`. The cite-or-escalate ladder
-for ticket questions is unchanged.
+for ticket questions is unchanged. A verified merge resolves that run's open
+escalations, not those of newer runs on the same ticket.
 
 ## Progress watchdog
 
