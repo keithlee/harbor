@@ -12,6 +12,9 @@ def observe(db, project, ticket, run_id, event):
         return
     payload = event.get("payload")
     item = event.get("item") or (payload.get("item") if isinstance(payload, dict) else None) or {}
+    if isinstance(item, dict) and item.get("type") in ("SubAgentActivity", "sub_agent_activity"):
+        _observe_sub_agent_activity(db, project, ticket, run_id, item)
+        return
     if not isinstance(item, dict) or item.get("type") not in ("collab_agent_tool_call", "CollabAgentToolCall", "collab_tool_call"):
         return
     initialize(db)
@@ -60,6 +63,19 @@ def observe(db, project, ticket, run_id, event):
             except (ValueError, TypeError, AttributeError):
                 pass
             db.execute("UPDATE workflow_agents SET state=?, verdict=? WHERE project=? AND ticket=? AND run_id=? AND agent=?", (status,verdict,project,ticket,run_id,agent))
+
+
+def _observe_sub_agent_activity(db, project, ticket, run_id, item):
+    # Multi-agent V2 names children by task path; the controller passes that path to `workflow role`.
+    path = item.get("agent_path")
+    thread = item.get("agent_thread_id")
+    if item.get("kind") != "started" or not isinstance(path, str) or not path or path == "/root":
+        return
+    if not isinstance(thread, str) or not thread:
+        return
+    initialize(db)
+    with db:
+        db.execute("INSERT OR IGNORE INTO workflow_agents VALUES (?,?,?,?,?,NULL)", (project, ticket, run_id, path, "running"))
 
 
 def register(db, project, ticket, run_id, role, agent, controller):

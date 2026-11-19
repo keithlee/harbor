@@ -198,6 +198,8 @@ required checks fail the aggregate, and dependent commands are skipped. No
 configured checks returns `disabled`, not proof of success.
 
 Role registration accepts only child IDs observed in that run's Codex JSON stream.
+Multi-agent V2 children are observed from `SubAgentActivity` (`sub_agent_activity`)
+`started` items and are registered by their `agent_path` (for example `/root/planner`).
 It rejects controller/self-review, cross-ticket identities and reviewer/implementor
 reuse. The same bindings survive restart. The reviewer returns structured JSON
 binding verdict, proof and risk to the PR head and current feedback digest. A

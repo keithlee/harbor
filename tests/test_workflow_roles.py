@@ -76,3 +76,54 @@ def test_ambiguous_or_malformed_verdict_never_approves(state):
     item.update(tool='wait',agents_states={'reviewer':state})
     observe(db,'A','A-1','r',{'item':item})
     assert not review_receipt(db,'A','A-1','r','head')
+
+
+def _v2(path="/root/planner", thread="thread-1", kind="started", item_type="SubAgentActivity", **extra):
+    item = {"type": item_type, "kind": kind, "agent_thread_id": thread, "agent_path": path, "model": "gpt-6.2-sol"}
+    item.update(extra)
+    return {"item": item}
+
+
+def test_v2_sub_agent_start_registers_by_path_and_keeps_independence():
+    db = sqlite3.connect(":memory:")
+    observe(db, "A", "A-1", "r", _v2("/root/planner", "t-planner"))
+    observe(db, "A", "A-1", "r", {"payload": _v2("/root/impl", "t-impl")})
+    register(db, "A", "A-1", "r", "planner", "/root/planner", "controller")
+    register(db, "A", "A-1", "r", "implementor", "/root/impl", "controller")
+    with pytest.raises(ValueError):
+        register(db, "A", "A-1", "r", "reviewer", "/root/impl", "controller")
+    with pytest.raises(ValueError):
+        register(db, "A", "A-1", "r", "reviewer", "/root/never-spawned", "controller")
+    with pytest.raises(ValueError):
+        register(db, "A", "A-1", "r", "reviewer", "t-planner", "controller")
+    db.close()
+
+
+@pytest.mark.parametrize("patch", [
+    {"kind": "completed"}, {"kind": None}, {"agent_path": None}, {"agent_path": ""},
+    {"agent_path": ["/root/x"]}, {"agent_thread_id": None}, {"agent_thread_id": ""},
+    {"agent_path": "/root"},
+])
+def test_v2_malformed_or_root_activity_does_not_create_identity(patch):
+    db = sqlite3.connect(":memory:")
+    event = _v2()
+    event["item"].update(patch)
+    observe(db, "A", "A-1", "r", event)
+    table = db.execute("SELECT 1 FROM sqlite_master WHERE name='workflow_agents'").fetchone()
+    assert not table or db.execute("SELECT count(*) FROM workflow_agents").fetchone()[0] == 0
+    db.close()
+
+
+def test_v2_activity_is_scoped_to_its_run():
+    db = sqlite3.connect(":memory:")
+    observe(db, "A", "A-1", "r1", _v2())
+    with pytest.raises(ValueError):
+        register(db, "A", "A-1", "r2", "planner", "/root/planner", "controller")
+    db.close()
+
+
+def test_v2_exec_stream_snake_case_item_type_is_observed():
+    db = sqlite3.connect(":memory:")
+    observe(db, "A", "A-1", "r", _v2("/root/reviewer", "t-r", item_type="sub_agent_activity"))
+    register(db, "A", "A-1", "r", "reviewer", "/root/reviewer", "controller")
+    db.close()
