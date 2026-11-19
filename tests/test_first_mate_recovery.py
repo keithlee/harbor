@@ -141,7 +141,7 @@ def supervisor_for(tmp_path, db, answer):
 
 
 def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
-    db = ledger(tmp_path)
+    db = ledger(tmp_path, final={**HAN86, "summary": "planner child stopped", "blocker": {"kind": "env_blocker", "question": "planner child exited"}})
     answer = {"action": "resume", "reason": "stale interrupted planner holds the name",
               "instruction": "List agents, close the interrupted /root/planner, spawn planner-2 and continue."}
     supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
@@ -154,7 +154,7 @@ def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
     supervisor.resume_session = resume_session
     asyncio.run(supervisor._monitor_blocked())
     assert resumed == [("run-HAN-86", answer["instruction"])]
-    assert "/root/planner already exists" in mate.prompts[0]
+    assert "planner child exited" in mate.prompts[0]
     assert linear.comments and linear.comments[0][1].startswith("[First Mate recovery] resume (blocked)")
     rows = db.connection.execute("SELECT action FROM first_mate_recoveries").fetchall()
     assert [r[0] for r in rows] == ["resume"]
@@ -164,7 +164,7 @@ def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
 
 
 def test_han86_replay_fresh_session_keeps_worktree_and_drops_old_session(tmp_path):
-    db = ledger(tmp_path)
+    db = ledger(tmp_path, final={**HAN86, "summary": "agent state wedged", "blocker": {"kind": "env_blocker", "question": "builder loops"}})
     answer = {"action": "fresh_session", "reason": "agent state is wedged", "instruction": "Respawn all roles."}
     supervisor, _, _ = supervisor_for(tmp_path, db, answer)
     started = []
@@ -186,6 +186,8 @@ def test_han86_replay_fresh_session_keeps_worktree_and_drops_old_session(tmp_pat
 
 
 def test_product_question_is_never_recovered(tmp_path):
+    # Even with a summary that mentions the retired registration gate, a
+    # product question is never "recovered".
     db = ledger(tmp_path, final={**HAN86, "blocker": {"kind": "product_decision", "question": "Which spacing?"}})
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "pick 8px", "reason": "guess"})
     calls = []
@@ -217,15 +219,21 @@ def test_watchdog_flag_reaches_first_mate(tmp_path):
     db.close()
 
 
-def test_obsolete_bookkeeping_blocker_is_resumed_even_if_first_mate_escalates():
+def test_obsolete_bookkeeping_blocker_starts_a_fresh_session_then_resumes():
     proposal = {"action": "escalate", "reason": "Harbor cannot verify the planner's provenance"}
     decision = recovery.validate(proposal, case(summary=HAN86["summary"]), SETTINGS)
-    assert decision["action"] == "resume"
+    assert decision["action"] == "fresh_session"
     assert "no longer registers" in decision["instruction"] and "planner-2" in decision["instruction"]
-    # A real product question is still escalated.
+    used = case(summary=HAN86["summary"], history=[{"action": "fresh_session"}])
+    assert recovery.validate(proposal, used, SETTINGS)["action"] == "resume"
+    # Live HAN-86 follow-up: the retained session reported a conflict with its old contract.
+    conflict = case(blocker={"kind": "conflicting_instruction",
+                             "question": "Should the effective Harbor policy be updated to permit delivery without registered roles?",
+                             "evidence": "`workflow roles` returned invalid choice"}, history=[{"action": "resume"}])
+    assert recovery.validate({"action": "escalate"}, conflict, SETTINGS)["action"] == "fresh_session"
+    # Real product questions still escalate; the budget still applies.
     product = case(blocker={"kind": "product_decision", "question": "Which spacing?"})
     assert recovery.validate(proposal, product, SETTINGS)["action"] == "escalate"
-    # The obsolete rule respects the recovery budget.
     spent = case(summary=HAN86["summary"], history=[{"action": "resume"}] * 3)
     assert recovery.validate(proposal, spent, SETTINGS)["action"] == "escalate"
 

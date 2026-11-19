@@ -28,8 +28,9 @@ HUMAN_KINDS = {"product_decision", "design_decision", "new_product_decision", "a
 # provenance, policy digests/reconcile, agent-name collisions). These are
 # always recoverable: tell the builder to clean up its children and continue.
 OBSOLETE = re.compile(
-    r"provenance|role registration|register(?:ed|ing)? (?:the )?(?:planner|reviewer|implementor|role)|"
-    r"harbor workflow roles?\b|not observed by this run|reconcil|policy digest|agent path .{0,80}already exists",
+    r"provenance|role[- ]?(?:registration|binding)|(?:un)?registered roles?|"
+    r"register(?:ed|ing)? (?:the )?(?:planner|reviewer|implementor|role)|"
+    r"workflow roles?\b|not observed by this run|reconcil|policy digest|agent path .{0,80}already exists",
     re.I,
 )
 OBSOLETE_INSTRUCTION = (
@@ -268,14 +269,23 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
             return {"action": "wait", "instruction": "", "reason": f"already escalated; {why}"}
         return {"action": "escalate", "instruction": "", "reason": why}
 
+    budget_left = case.attempts < int(settings.get("max_recoveries", 3))
+    human_question = case.kind in HUMAN_KINDS - {"conflicting_instruction"} or SENSITIVE.search(json.dumps(case.blocker))
+    if (not human_question and OBSOLETE.search(" ".join([json.dumps(case.blocker), case.summary]))
+            and case.status != "running" and budget_left):
+        # The blocker only exists because of retired Harbor gates (role
+        # registration, provenance, reconcile). A retained session still holds
+        # the old delivery skill that demands them, so a resume just reports a
+        # conflict: start a fresh session (new skill) once, otherwise resume.
+        if settings.get("allow_fresh_session", True) and not case.fresh_sessions:
+            return {"action": "fresh_session", "instruction": OBSOLETE_INSTRUCTION,
+                    "reason": f"obsolete Harbor bookkeeping blocker; the retained session carries the retired "
+                              f"delivery contract (First Mate proposed {action or 'nothing'})"}
+        if action not in {"resume", "retry", "fresh_session"}:
+            return {"action": "resume" if case.status == "blocked" else "retry", "instruction": OBSOLETE_INSTRUCTION,
+                    "reason": f"obsolete Harbor bookkeeping blocker (First Mate proposed {action or 'nothing'})"}
     if case.kind in HUMAN_KINDS or SENSITIVE.search(json.dumps(case.blocker)):
         return escalate(f"{case.kind or 'sensitive'} blockers need a human or cited authority")
-    obsolete = bool(OBSOLETE.search(" ".join([json.dumps(case.blocker), case.summary])))
-    if obsolete and case.status != "running" and case.attempts < int(settings.get("max_recoveries", 3)) \
-            and action not in {"resume", "retry", "fresh_session"}:
-        # Never escalate a blocker that only exists because of retired Harbor gates.
-        return {"action": "resume" if case.status == "blocked" else "retry", "instruction": OBSOLETE_INSTRUCTION,
-                "reason": f"obsolete Harbor bookkeeping blocker (First Mate proposed {action or 'nothing'})"}
     if case.attempts >= int(settings.get("max_recoveries", 3)):
         return escalate(f"recovery budget exhausted after {case.attempts} attempts")
     if action not in ACTIONS:
