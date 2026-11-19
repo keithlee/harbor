@@ -1691,6 +1691,10 @@ class Supervisor:
             # that Harbor receipt alone, but keep it bound to the exact PR URL
             # stored when the positive observation was recorded.
             if row[4] == 1 and row[5] is None:
+                # Already verified: its escalations are moot (see _reconcile_runner_result).
+                close = getattr(self.db, "close_open_escalations", None)
+                if callable(close):
+                    close(identifier, status="resolved")
                 wake = Wake(
                     ticket=ticket,
                     action="reengage",

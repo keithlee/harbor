@@ -130,3 +130,25 @@ def test_verified_merge_closes_open_escalations(tmp_path):
                                                             "pr_url": "https://github.com/x/y/pull/1", "run_id": "run-HAN-86"}))
     assert db.connection.execute("SELECT status FROM escalations").fetchone()[0] == "resolved"
     db.close()
+
+
+def test_retry_of_an_already_verified_merge_also_closes_escalations(tmp_path):
+    import asyncio
+    from test_first_mate_recovery import supervisor_for
+
+    pr = "https://github.com/x/y/pull/1"
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged", "pr_url": pr}, finished=45)
+    db.connection.execute("UPDATE runs SET merge_verified=1")
+    db.connection.execute("UPDATE tickets SET pr_urls_json=?", (json.dumps([pr]),))
+    db.connection.commit()
+    db.record_escalation("HAN-86", "run-HAN-86", "conflicting_instruction", "Permit unregistered roles?", 2)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "wait"})
+    statuses = []
+
+    async def cleanup(wake, result):
+        statuses.append(db.connection.execute("SELECT status FROM escalations").fetchone()[0])
+
+    supervisor._cleanup_merged_worktree = cleanup
+    asyncio.run(supervisor._reconcile_completed_merges())
+    assert statuses == ["resolved"]  # closed before cleanup is attempted
+    db.close()
