@@ -120,13 +120,27 @@ def history(connection, run_id: str) -> list[dict]:
     return [{"trigger": r[0], "action": r[1], "reason": r[2], "at": r[3]} for r in rows]
 
 
-def backoff_seconds(settings: Mapping[str, Any], attempts: int) -> float:
+USAGE_LIMIT = "usage limit:"
+
+
+def backoff_seconds(settings: Mapping[str, Any], recent: list[dict]) -> float:
+    """Wait before re-checking a run: a flat ``recheck_minutes``.
+
+    Only a model usage limit backs off exponentially (x1, x3, x6 per
+    consecutive usage-limit wait), so a quota outage is not hammered while
+    ordinary recoveries are retried on the normal cadence.
+    """
     base = float(settings.get("recheck_minutes", 10)) * 60
-    return base * (1, 3, 6)[min(attempts, 2)]
+    streak = 0
+    for row in reversed(recent):
+        if not str(row.get("reason") or "").startswith(USAGE_LIMIT):
+            break
+        streak += 1
+    return base * (1, 1, 3, 6)[min(streak, 3)]
 
 
 def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: float | None = None) -> list[Case]:
-    """Runs First Mate should look at now (respecting per-run backoff)."""
+    """Runs First Mate should look at now (respecting the per-run recheck delay)."""
     initialize(connection)
     now = time.time() if now is None else now
     recheck = float(settings.get("recheck_minutes", 10)) * 60
@@ -182,7 +196,7 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     ready = []
     for case in cases.values():
         last = case.history[-1]["at"] if case.history else None
-        if case.flag_id is None and last is not None and now - last < backoff_seconds(settings, case.attempts):
+        if case.flag_id is None and last is not None and now - last < backoff_seconds(settings, case.history):
             continue
         ready.append(case)
     return ready

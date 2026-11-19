@@ -413,7 +413,8 @@ failed or orphaned runs whose crash retries are spent, and watchdog flags. It
 proposes one action (`resume` with a concrete instruction, `retry`,
 `fresh_session`, `wait` or `escalate`), and Harbor validates it
 deterministically. Product, design and sensitive blockers always escalate to a
-human. Each run gets `max_recoveries` attempts with 10/30/60-minute backoff
+human. Each run gets `max_recoveries` attempts, re-checked every
+`recheck_minutes` (only a model usage limit backs off, to 30 then 60 minutes),
 and at most one fresh session (a new builder session in the same worktree).
 A spent budget escalates once and never loops. Every action posts a
 `[First Mate recovery]` Linear comment, notifies the operator and is recorded

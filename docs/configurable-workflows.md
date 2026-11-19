@@ -160,7 +160,8 @@ Guardrails:
 - Product, design, ambiguous-AC and conflicting-instruction blockers, and
   anything touching security, auth, billing, privacy, deletion or migrations,
   always escalate.
-- Each run gets `max_recoveries` attempts with 10/30/60-minute backoff.
+- Each run gets `max_recoveries` attempts, re-checked every `recheck_minutes`.
+  Only a model usage limit backs off exponentially (30, then 60 minutes).
 - A spent budget escalates once and never loops.
 
 Every action posts a `[First Mate recovery]` Linear comment, notifies the

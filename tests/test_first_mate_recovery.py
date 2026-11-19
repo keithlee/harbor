@@ -48,14 +48,15 @@ def ledger(tmp_path, *, status="blocked", final=HAN86, finished=15, activity=Non
     return db
 
 
-def test_blocked_run_becomes_a_case_after_recheck_and_backs_off(tmp_path):
+def test_blocked_run_is_rechecked_on_a_flat_cadence(tmp_path):
     db = ledger(tmp_path, finished=15)
     cases = recovery.find_cases(db.connection, "Demo", SETTINGS)
     assert [(c.ticket, c.trigger) for c in cases] == [("HAN-86", "blocked")]
     recovery.record(db.connection, cases[0], {"action": "resume", "instruction": "x", "reason": "r"})
-    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []  # backoff
-    later = time.time() + 31 * 60
-    assert len(recovery.find_cases(db.connection, "Demo", SETTINGS, now=later)) == 1
+    recovery.record(db.connection, cases[0], {"action": "escalate", "instruction": "", "reason": "r"})
+    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []  # recheck delay
+    # Ordinary recoveries never back off: the next check is one recheck later.
+    assert len(recovery.find_cases(db.connection, "Demo", SETTINGS, now=time.time() + 11 * 60)) == 1
     db.close()
 
 
@@ -227,3 +228,12 @@ def test_obsolete_bookkeeping_blocker_is_resumed_even_if_first_mate_escalates():
     # The obsolete rule respects the recovery budget.
     spent = case(summary=HAN86["summary"], history=[{"action": "resume"}] * 3)
     assert recovery.validate(proposal, spent, SETTINGS)["action"] == "escalate"
+
+
+def test_only_usage_limits_back_off_exponentially():
+    plain = [{"action": "resume", "reason": "x"}] * 3
+    assert recovery.backoff_seconds(SETTINGS, plain) == 600
+    quota = [{"action": "wait", "reason": "usage limit: resets 10:00"}]
+    assert [recovery.backoff_seconds(SETTINGS, quota * n) for n in (1, 2, 3, 4)] == [600, 1800, 3600, 3600]
+    # A non-quota result ends the streak.
+    assert recovery.backoff_seconds(SETTINGS, quota * 3 + plain[:1]) == 600

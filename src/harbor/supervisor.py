@@ -3767,7 +3767,7 @@ class Supervisor:
         if workflow is None or mate is None or connection is None or self._dispatch_suspended:
             return
         from harbor import first_mate_recovery as recovery
-        from harbor.first_mate import FirstMateError
+        from harbor.first_mate import FirstMateError, FirstMateQuotaError
 
         settings = workflow.config.get("first_mate", {})
         try:
@@ -3785,6 +3785,9 @@ class Supervisor:
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
+            except FirstMateQuotaError as exc:
+                # The only case that backs off exponentially (see backoff_seconds).
+                proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
             except FirstMateError as exc:
                 proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
             decision = recovery.validate(proposal, case, settings)
