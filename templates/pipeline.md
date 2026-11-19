@@ -1,18 +1,11 @@
 # Harbor pipeline profile
 
 Copy this file for SampleProject and replace every placeholder before running
-`harbor doctor`. Values are data only. Harbor keeps
-`skill` opaque: the configured runner owns how that skill is loaded and
-executed. Unknown keys remain available to the delivery skill.
+`harbor doctor`. Values are data only. The delivery workflow and its models
+live in the repository's `.harbor/workflow/` (a copy of `workflows/work-pipeline`,
+with models in `config.toml`); do not put `skill`, `workflow_path` or model keys
+here. Unknown keys remain available to the delivery skill.
 
-## Models
-
-| role | model | reasoning_effort |
-| --- | --- | --- |
-| builder | gpt-5.6-luna | xhigh |
-| firstmate | gpt-6-luna | high |
-
-skill: /work-pipeline
 deadline_minutes: 90
 disk_floor_gb: 5 # free GB required before a builder worktree is created
 
@@ -37,10 +30,10 @@ bot_rework_cap: 1
 
 ## Blocker decisions and recovery
 
-firstmate_decisions: bounded # bounded | cite_only | human
 unblock_attempts: 2 # maximum attempts per blocker kind and rung
-recovery_delays: [30, 120, 300] # seconds before up to three retries; [] disables retries
 decision_authors: [] # optional Linear user IDs allowed to supply decision authority
+# Decision mode and crash-retry delays live in .harbor/workflow/workflow.toml
+# ([decisions] and [recovery]); First Mate recovery budgets in config.toml.
 
 Bounded decisions choose a supplied, reversible implementation option within
 the ticket's acceptance criteria and record the rationale. Protected paths,

@@ -78,7 +78,7 @@ def test_pipeline_and_registry_are_human_editable(tmp_path: Path, monkeypatch: A
     assert config.builder_model == "custom-builder"
     assert config.builder_effort == "high" and config.firstmate_effort == "medium"
     pipeline.write_text(pipeline.read_text() + "| role | model |\n| --- | --- |\n| builder | custom-builder |\n")
-    with pytest.raises(ValueError, match="no longer belong in pipeline.md"):
+    with pytest.raises(ValueError, match="no longer belongs? in pipeline.md"):
         get_project("Demo")
 
 

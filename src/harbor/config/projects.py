@@ -374,7 +374,8 @@ class ProjectConfig:
         from harbor.config.workflow import MIGRATION_HINT, load_workflow, project_workflow_path
         retired = retired_keys(path.read_text(encoding="utf-8"))
         if retired:
-            raise ValueError(f"{path}: {', '.join(retired)} no longer belong in pipeline.md; {MIGRATION_HINT}")
+            verb = "no longer belongs" if len(retired) == 1 else "no longer belong"
+            raise ValueError(f"{path}: {', '.join(retired)} {verb} in pipeline.md; {MIGRATION_HINT}")
         workflow_path = project_workflow_path(values["repo_path"]).resolve()
         workflow = load_workflow(workflow_path)
         values["workflow_path"] = str(workflow_path)

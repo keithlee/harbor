@@ -134,7 +134,7 @@ def test_pipeline_md_rejects_retired_keys(tmp_path, line):
     config(tmp_path)
     pipeline = tmp_path / ".harbor" / "pipeline.md"
     pipeline.write_text(f'linear_project_slug: demo\nlinear_team: DEM\ninstall_command: none\n{line}\n')
-    with pytest.raises(ValueError, match="no longer belong in pipeline.md"):
+    with pytest.raises(ValueError, match="no longer belongs? in pipeline.md"):
         ProjectConfig.from_pipeline('Demo', pipeline)
 
 

@@ -86,7 +86,7 @@
     "error": "playwright_browser_image must be a digest-pinned Docker image"
   },
   "retired_model_key": {
-    "error": "<tmp>/pipeline.md: builder_model no longer belong in pipeline.md; see docs/configurable-workflows.md#migrating: copy workflows/work-pipeline into <repo>/.harbor/workflow and move role models into .harbor/workflow/config.toml"
+    "error": "<tmp>/pipeline.md: builder_model no longer belongs in pipeline.md; see docs/configurable-workflows.md#migrating: copy workflows/work-pipeline into <repo>/.harbor/workflow and move role models into .harbor/workflow/config.toml"
   },
   "unknown_provider": {
     "error": "invalid builder_provider: use codex or claude"
