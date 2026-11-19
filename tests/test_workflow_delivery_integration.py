@@ -22,7 +22,9 @@ def test_native_adapter_dispatch_checks_handoff_and_policy_edits(tmp_path,monkey
         apply_phase3_migration(db);apply_phase4_migration(db)
         db.replace_tickets('Demo',[{'identifier':'DEM-1','owned':True,'hold':False,'state':'In Progress'}])
         workflow_path=config(tmp_path,extra='[checks.tests]\ncommand=["python3","-c","pass"]\n')
-        cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=repo,workflow_path=str(workflow_path),install_command='none',worktree_root=str(tmp_path/'wt'))
+        registry=tmp_path/'projects.md'
+        registry.write_text('# registry')  # launches render the prompt, which requires the authoritative registry
+        cfg=ProjectConfig(name='Demo',linear_project_slug='demo',repo_path=repo,workflow_path=str(workflow_path),install_command='none',worktree_root=str(tmp_path/'wt'),registry_path=registry)
         executable=fake_codex(tmp_path)
         content=executable.read_text().replace("if 'resume' not in args:","print(json.dumps({'item':{'type':'collab_agent_tool_call','status':'completed','tool':'spawn_agent','receiver_thread_ids':['reviewer']}}),flush=True)\nif 'resume' not in args:")
         executable.write_text(content)
