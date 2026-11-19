@@ -2,10 +2,10 @@
 name: harbor-review
 description: Review current-head implementation and durable proof against ticket acceptance criteria.
 ---
-# Independent review
+# Review
 Read the live ticket, current diff, proof and CI; do not consume implementor reasoning.
 Report PASS/FAIL per acceptance criterion with reproducible findings.
-Approve only the exact reviewed head and record your actual registered agent ID.
+Approve only the exact reviewed head. You must not be the implementor of this change.
 Do not claim proof for missing live evidence. Do not merge. A human-review handoff does not authorize merge.
 
 Reproduce adversarial cases and verify each acceptance criterion against the current
@@ -14,6 +14,6 @@ retained implementor. Return ONLY one JSON object for your entire final message 
 {"review":{"head_sha":"<full reviewed commit>","verdict":"approve or reject","proof_verified":true,"feedback_digest":"<current readiness feedback_digest>","risk":"low or medium or high"}}
 Set proof_verified=false when required proof is missing. Keep any existing ticket
 risk floor; an implementation or wording change cannot downgrade it.
-A verdict is only accepted from observed adapter events for the registered reviewer.
+Post the verdict as a PR comment so the human merger can see it.
 
 Obtain feedback_digest from the current `harbor workflow check` result before review. A failed check still reports this digest. New feedback invalidates the previous approval.
