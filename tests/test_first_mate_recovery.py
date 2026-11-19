@@ -214,3 +214,16 @@ def test_watchdog_flag_reaches_first_mate(tmp_path):
     recovery.record(db.connection, cases[0], {"action": "wait", "instruction": "", "reason": "progressing"})
     assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []  # flag consumed
     db.close()
+
+
+def test_obsolete_bookkeeping_blocker_is_resumed_even_if_first_mate_escalates():
+    proposal = {"action": "escalate", "reason": "Harbor cannot verify the planner's provenance"}
+    decision = recovery.validate(proposal, case(summary=HAN86["summary"]), SETTINGS)
+    assert decision["action"] == "resume"
+    assert "no longer registers" in decision["instruction"] and "planner-2" in decision["instruction"]
+    # A real product question is still escalated.
+    product = case(blocker={"kind": "product_decision", "question": "Which spacing?"})
+    assert recovery.validate(proposal, product, SETTINGS)["action"] == "escalate"
+    # The obsolete rule respects the recovery budget.
+    spent = case(summary=HAN86["summary"], history=[{"action": "resume"}] * 3)
+    assert recovery.validate(proposal, spent, SETTINGS)["action"] == "escalate"

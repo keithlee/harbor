@@ -24,6 +24,20 @@ from typing import Any, Mapping
 ACTIONS = ("resume", "retry", "fresh_session", "wait", "escalate")
 # Kinds a recovery must never answer: those need cited authority or a human.
 HUMAN_KINDS = {"product_decision", "design_decision", "new_product_decision", "ambiguous_ac", "conflicting_instruction"}
+# Blockers about Harbor bookkeeping that no longer exists (role registration,
+# provenance, policy digests/reconcile, agent-name collisions). These are
+# always recoverable: tell the builder to clean up its children and continue.
+OBSOLETE = re.compile(
+    r"provenance|role registration|register(?:ed|ing)? (?:the )?(?:planner|reviewer|implementor|role)|"
+    r"harbor workflow roles?\b|not observed by this run|reconcil|policy digest|agent path .{0,80}already exists",
+    re.I,
+)
+OBSOLETE_INSTRUCTION = (
+    "Harbor no longer registers or verifies child agents, and policy edits no longer need reconcile; "
+    "that blocker is obsolete. List agents, close any interrupted or unknown children (for example "
+    "/root/planner), spawn fresh planner/implementor/reviewer children under new names (planner-2, ...) "
+    "with the models in config.toml, and continue delivering the ticket from where it stopped."
+)
 SENSITIVE = re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
 
 
@@ -211,6 +225,10 @@ def build_prompt(case: Case, settings: Mapping[str, Any]) -> str:
         "- wait: the run is making progress or waiting on something external; check again later.\n"
         "- escalate: a human must decide (product/design question, missing access, repeated failure).\n"
         "Never answer product or design questions. Never weaken checks or merge rules.\n"
+        "Current Harbor facts: Harbor does NOT register or verify child agents, does NOT require reviewer "
+        "receipts, and adopts workflow edits without reconcile. Blockers about role registration, provenance, "
+        "agent-name collisions or policy reconciliation are obsolete: resume with an instruction to close stale "
+        "children, respawn them under new names and continue.\n"
         "Return JSON only: {\"action\": \"resume|retry|fresh_session|wait|escalate\", \"instruction\": \"...\", \"reason\": \"...\"}\n"
         "Case:\n" + json.dumps(packet, sort_keys=True, default=str)
     )
@@ -238,6 +256,12 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
 
     if case.kind in HUMAN_KINDS or SENSITIVE.search(json.dumps(case.blocker)):
         return escalate(f"{case.kind or 'sensitive'} blockers need a human or cited authority")
+    obsolete = bool(OBSOLETE.search(" ".join([json.dumps(case.blocker), case.summary])))
+    if obsolete and case.status != "running" and case.attempts < int(settings.get("max_recoveries", 3)) \
+            and action not in {"resume", "retry", "fresh_session"}:
+        # Never escalate a blocker that only exists because of retired Harbor gates.
+        return {"action": "resume" if case.status == "blocked" else "retry", "instruction": OBSOLETE_INSTRUCTION,
+                "reason": f"obsolete Harbor bookkeeping blocker (First Mate proposed {action or 'nothing'})"}
     if case.attempts >= int(settings.get("max_recoveries", 3)):
         return escalate(f"recovery budget exhausted after {case.attempts} attempts")
     if action not in ACTIONS:
