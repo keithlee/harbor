@@ -93,7 +93,9 @@ def test_built_wheel_installs_with_assets_and_runs_an_offline_shadow_cycle(
         names = set(archive.namelist())
     assert {f"harbor/migrations/{path.name}" for path in (ROOT / "migrations").glob("*.sql")} <= names
     assert "harbor/schemas/run-result.json" in names
-    assert "harbor/workflows/reference/skills/delivery/SKILL.md" in names
+    assert "harbor/workflows/work-pipeline/skills/delivery/SKILL.md" in names
+    assert "harbor/workflows/work-pipeline/config.toml" in names
+    assert not any(name.startswith("harbor/workflows/reference/") for name in names)
     assert "harbor/workflows/work-pipeline/scripts/readiness.py" in names
     assert not any("projects.md" in name or ".harbor/" in name for name in names)
 
@@ -141,6 +143,12 @@ def test_built_wheel_installs_with_assets_and_runs_an_offline_shadow_cycle(
         root = Path(tempfile.mkdtemp())
         repo = root / "repo"
         repo.mkdir()
+        # The installed wheel must carry the work-pipeline that init copies.
+        import shutil
+        from harbor.resources import runtime_asset
+        package = repo / ".harbor" / "workflow"
+        shutil.copytree(runtime_asset("workflows", "work-pipeline/workflow.toml").parent, package)
+        (package / "config.toml").write_text('[controller]\\nmodel = "offline-model"\\n')
         pipeline = root / "pipeline.md"
         pipeline.write_text(
             "linear_project_slug: sample-a1\\n"

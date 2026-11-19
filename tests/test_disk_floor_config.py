@@ -13,6 +13,7 @@ from harbor.config.pipeline import PipelineConfig
 from harbor.config.projects import ProjectConfig, get_project
 from harbor.db import HarborDB
 from harbor.worktree import DEFAULT_DISK_FLOOR_GB, DiskFloor, WorktreeManager
+from workflow_support import materialize
 
 
 PIPELINE = """# Pipeline
@@ -26,6 +27,7 @@ install_command: none
 def registry(tmp_path: Path, floor_line: str) -> Path:
     repo = tmp_path / "SampleProject"
     repo.mkdir()
+    materialize(repo)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text(PIPELINE.format(floor=floor_line), encoding="utf-8")

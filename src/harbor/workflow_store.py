@@ -8,13 +8,21 @@ def initialize(connection):
 
 
 def bind(connection, project, ticket, run_id, workflow):
-    workflow.verify_package()
+    """Snapshot the policy a run uses. Edits never block a run: a changed
+    package is adopted for the next turn and recorded as a receipt."""
     initialize(connection)
     row = connection.execute("SELECT policy_digest FROM workflow_runs WHERE project=? AND ticket=? AND run_id=?", (project, ticket, run_id)).fetchone()
-    if row and row[0] != workflow.digest:
-        raise ValueError("workflow changed: retained run requires explicit policy reconciliation")
+    config = json.dumps(workflow.config, sort_keys=True)
     with connection:
-        connection.execute("INSERT OR IGNORE INTO workflow_runs VALUES (?,?,?,?,?)", (project, ticket, run_id, workflow.digest, json.dumps(workflow.config, sort_keys=True)))
+        if row is None:
+            connection.execute("INSERT INTO workflow_runs VALUES (?,?,?,?,?)", (project, ticket, run_id, workflow.digest, config))
+            return
+        if row[0] == workflow.digest:
+            return
+        connection.execute("UPDATE workflow_runs SET policy_digest=?, config_json=? WHERE project=? AND ticket=? AND run_id=?",
+                           (workflow.digest, config, project, ticket, run_id))
+    record(connection, {"project": project, "ticket": ticket, "run_id": run_id, "hook": "policy_change",
+                        "previous": row[0], "policy_digest": workflow.digest})
 
 
 def record(connection, receipt):
@@ -22,18 +30,3 @@ def record(connection, receipt):
     with connection:
         connection.execute("INSERT INTO workflow_receipts(project,ticket,run_id,kind,payload) VALUES (?,?,?,?,?)",
             (receipt["project"], receipt["ticket"], receipt["run_id"], receipt.get("hook", "readiness"), json.dumps(receipt, sort_keys=True)))
-
-
-def reconcile(connection,project,ticket,run,workflow,expected):
-    initialize(connection)
-    row = connection.execute("SELECT policy_digest FROM workflow_runs WHERE project=? AND ticket=? AND run_id=?",(project,ticket,run['id'])).fetchone()
-    if not row or row[0] != expected or run.get('status') in {'running','starting'}:
-        raise ValueError("reconciliation requires the previous digest and an inactive retained run")
-    from harbor.role_bindings import initialize as roles_init
-    roles_init(connection)
-    if connection.execute("SELECT 1 FROM workflow_agents WHERE project=? AND ticket=? AND run_id=? AND state='running'",(project,ticket,run['id'])).fetchone():
-        raise ValueError("stop active child agents before reconciliation")
-    with connection:
-        connection.execute("UPDATE workflow_runs SET policy_digest=?,config_json=? WHERE project=? AND ticket=? AND run_id=?",(workflow.digest,json.dumps(workflow.config,sort_keys=True),project,ticket,run['id']))
-        connection.execute("UPDATE workflow_agents SET verdict=NULL WHERE project=? AND ticket=? AND run_id=?",(project,ticket,run['id']))
-    record(connection,{"project":project,"ticket":ticket,"run_id":run['id'],"hook":"policy_reconciliation","previous":expected,"policy_digest":workflow.digest})

@@ -32,5 +32,5 @@ def test_packaged_script_is_executed_and_fails_closed(tmp_path):
     async def check(ctx):
         return await execute_event(workflow,'pre_merge',ctx,cwd=tmp_path)
     assert not any(r['blocking'] for r in asyncio.run(check(base)))
-    for change in ({'risk':'medium'},{'hold':True},{'review_verified':False},{'linear_feedback':[{'id':'new'}]},{'gaps':{'risk':'stale'}},{'fresh':False}):
+    for change in ({'risk':'medium'},{'hold':True},{'linear_feedback':[{'id':'new'}]},{'fresh':False}):
         assert any(r['blocking'] for r in asyncio.run(check({**base,**change})))

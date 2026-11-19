@@ -20,7 +20,8 @@ def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
             return {'pr_1':{'number':1,'headRefOid':'abc','url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE','comments':{'nodes':[]}}}
     monkeypatch.setattr('harbor.clients.linear.LinearClient',Linear)
     monkeypatch.setattr('harbor.clients.github.GitHubClient',GitHub)
-    cfg=SimpleNamespace(name='A',linear_api_url='https://linear.invalid',linear_project_scope=('canonical',),github_repository='example/repo',required_checks=())
+    from test_workflow_config import config
+    cfg=SimpleNamespace(name='A',linear_api_url='https://linear.invalid',linear_project_scope=('canonical',),github_repository='example/repo',required_checks=(),workflow_path=str(config(tmp_path)))
     ctx=asyncio.run(fresh_context(cfg,db,'A-1',{'id':'run'},'pre_merge'))
     assert ctx['risk']=='medium' and ctx['head_sha']=='abc' and not ctx['hold']
     raw['project']['slugId']='foreign'

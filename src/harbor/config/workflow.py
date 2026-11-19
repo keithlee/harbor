@@ -1,7 +1,12 @@
-"""Versioned, portable workflow configuration. No project-specific defaults."""
+"""The project's work-pipeline: one package copied into ``<repo>/.harbor/workflow``.
+
+There is no package selection, preset or override layer. Users change the dev
+workflow by editing their copy. Model settings live in ``config.toml`` beside
+``workflow.toml`` and are read by both Harbor (controller, First Mate) and the
+delivery skill (child roles).
+"""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
@@ -9,36 +14,41 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from harbor.resources import runtime_asset
-
 EVENTS = {"setup", "blocker", "pre_handoff", "pre_merge", "pre_cleanup"}
+WORKFLOW_DIR = Path(".harbor") / "workflow"
+MIGRATION_HINT = ("see docs/configurable-workflows.md#migrating: copy workflows/work-pipeline into "
+                  "<repo>/.harbor/workflow and move role models into .harbor/workflow/config.toml")
 SECTIONS = {
-    "workflow": {"package", "preset"},
     "delivery": {"merge_mode", "auto_merge_risks"},
-    "review": {"enabled", "require_independence", "max_failed_rounds"},
     "recovery": {"enabled", "delays_seconds", "max_attempts"},
     "decisions": {"mode", "require_citation", "require_rationale"},
     "cleanup": {"mode", "delay_seconds"},
     "execution": {"deadline_minutes"},
-    "evidence": {"feedback", "risk", "proof", "ci"},
+    "evidence": {"feedback", "ci"},
     "states": {"ready", "paused", "terminal"},
 }
 ENTRY_FIELDS = {
-    "skills": {"ref", "enabled", "model", "reasoning_effort", "role", "fallback_models"},
-    "roles": {"model", "reasoning_effort", "reuse", "fallback_models"},
+    "skills": {"ref", "enabled"},
     "hooks": {"event", "mode", "executor", "command", "protocol", "timeout_seconds", "skill"},
     "checks": {"command", "required", "timeout_seconds", "after"},
 }
+ROLES = ("controller", "planner", "reviewer", "implementor")
+ROLE_FIELDS = {"model", "reasoning_effort", "fallback_models"}
+FIRST_MATE_FIELDS = ROLE_FIELDS | {"max_recoveries", "allow_fresh_session", "recheck_minutes", "stall_minutes"}
+FIRST_MATE_DEFAULTS = {"max_recoveries": 3, "allow_fresh_session": True, "recheck_minutes": 10, "stall_minutes": 30}
+EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+LEGACY_SECTIONS = {"workflow", "defaults", "presets", "review", "roles"}
 
 
-def merge(base, patch):
-    result = copy.deepcopy(base)
-    for key, value in patch.items():
-        result[key] = merge(result[key], value) if isinstance(value, dict) and isinstance(result.get(key), dict) else copy.deepcopy(value)
-    return result
+def project_workflow_path(repo_path) -> Path:
+    """The only workflow location Harbor reads for a project."""
+    return Path(repo_path).expanduser() / WORKFLOW_DIR / "workflow.toml"
 
 
 def validate_keys(data):
+    legacy = sorted(set(data) & LEGACY_SECTIONS)
+    if legacy:
+        raise ValueError(f"unsupported workflow section(s) {', '.join(legacy)}; {MIGRATION_HINT}")
     for section, value in data.items():
         if section == "version":
             if value != 1:
@@ -56,20 +66,77 @@ def validate_keys(data):
             raise ValueError(f"unknown workflow section: {section}")
 
 
+def load_models(path: Path) -> dict:
+    """Parse ``config.toml``: role models plus First Mate recovery settings."""
+    if not path.is_file():
+        raise ValueError(f"missing model config {path}; create it with [controller] model = \"...\"")
+    data = tomllib.loads(path.read_text())
+    unknown = set(data) - {*ROLES, "first_mate"}
+    if unknown:
+        raise ValueError(f"unknown config.toml section(s): {', '.join(sorted(unknown))}")
+    from harbor.model_policy import validate_fallbacks
+    roles = {}
+    for name in ROLES:
+        entry = data.get(name, {})
+        if not isinstance(entry, dict) or set(entry) - ROLE_FIELDS:
+            raise ValueError(f"unknown config.toml {name} setting")
+        roles[name] = _role(name, entry, validate_fallbacks)
+    if not roles["controller"].get("model"):
+        raise ValueError(f"{path}: [controller] model is required")
+    for name in ROLES[1:]:
+        # A missing child-role model is never a blocker: inherit the controller.
+        for key in ("model", "reasoning_effort"):
+            roles[name].setdefault(key, roles["controller"].get(key))
+        roles[name] = {k: v for k, v in roles[name].items() if v is not None}
+    mate = data.get("first_mate", {})
+    if not isinstance(mate, dict) or set(mate) - FIRST_MATE_FIELDS:
+        raise ValueError("unknown config.toml first_mate setting")
+    first_mate = {**FIRST_MATE_DEFAULTS, **_role("first_mate", mate, validate_fallbacks)}
+    if not mate.get("model"):
+        for key in ("model", "reasoning_effort", "fallback_models"):
+            if key in roles["controller"]:
+                first_mate[key] = roles["controller"][key]
+    for key in ("max_recoveries", "recheck_minutes", "stall_minutes"):
+        value = first_mate[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"first_mate.{key} must be a nonnegative number")
+    if type(first_mate["allow_fresh_session"]) is not bool:
+        raise ValueError("first_mate.allow_fresh_session must be boolean")
+    return {"roles": roles, "first_mate": first_mate}
+
+
+def _role(name, entry, validate_fallbacks):
+    result = dict(entry)
+    if "model" in result and (not isinstance(result["model"], str) or not result["model"].strip()):
+        raise ValueError(f"{name}.model must be a non-empty string")
+    if result.get("reasoning_effort", "high") not in EFFORTS:
+        raise ValueError(f"invalid {name} reasoning effort")
+    if "fallback_models" in result:
+        result["fallback_models"] = list(validate_fallbacks(result.get("model"), result["fallback_models"]))
+    return result
+
+
 @dataclass(frozen=True)
 class Workflow:
     package: Path
     config: dict
     digest: str
-    origins: dict
     package_digest: str = ""
 
-    def verify_package(self):
-        source = self.origins.get("overrides")
-        if source and load_workflow(Path(source)).digest != self.digest:
-            raise ValueError("workflow configuration changed; reconcile policy before continuing")
-        if self.package_digest and package_hash(self.package) != self.package_digest:
-            raise ValueError("workflow package changed; reconcile policy before continuing")
+    @property
+    def models_path(self) -> Path:
+        return self.package / "config.toml"
+
+    def changed(self) -> bool:
+        """True when the project's copy was edited after this snapshot was loaded."""
+        try:
+            return package_hash(self.package) != self.package_digest
+        except (OSError, ValueError):
+            return True
+
+    def reload(self) -> "Workflow":
+        """Pick up edits on the next turn instead of failing the run."""
+        return load_workflow(self.package / "workflow.toml") if self.changed() else self
 
     def asset(self, relative):
         path = (self.package / relative).resolve()
@@ -78,10 +145,10 @@ class Workflow:
         return path
 
     def prompt(self):
-        self.verify_package()
         skill = self.config["skills"]["delivery"]
         return (self.asset(skill["ref"]).read_text() + "\nEffective Harbor workflow policy (authoritative):\n"
-                + json.dumps(self.config, sort_keys=True) + f"\nPolicy digest: {self.digest}\nTrusted workflow package: {self.package}\n"
+                + json.dumps(self.config, sort_keys=True) + f"\nPolicy digest: {self.digest}\nWorkflow package: {self.package}\n"
+                + f"Role models: read {self.models_path} (the `roles` above mirror it).\n"
                 + "Managed execution: continue the supplied ticket and retained worktree even when it is no longer Todo. "
                 "Do not select a different ticket. Run required hooks before advancing; disabled checks are not passes.")
 
@@ -91,41 +158,27 @@ def package_hash(package):
     for asset in sorted(package.rglob("*")):
         if asset.is_symlink():
             raise ValueError("workflow package must not contain symlinks")
-        if asset.is_file() and "__pycache__" not in asset.parts:
+        if asset.is_file() and "__pycache__" not in asset.parts and asset.name != ".DS_Store":
             digest.update(str(asset.relative_to(package)).encode())
             digest.update(asset.read_bytes())
     return digest.hexdigest()
 
 
 def load_workflow(path: Path) -> Workflow:
-    path = path.resolve()
-    overrides = tomllib.loads(path.read_text())
-    validate_keys(overrides)
-    if overrides.get("version") != 1:
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"missing workflow {path}; {MIGRATION_HINT}")
+    package = path.parent
+    data = tomllib.loads(path.read_text())
+    validate_keys(data)
+    if data.get("version") != 1:
         raise ValueError("workflow version=1 is required")
-    selection = overrides.get("workflow", {})
-    name = selection.get("package", "")
-    if name.startswith("builtin:"):
-        if name not in {"builtin:reference", "builtin:work-pipeline"}:
-            raise ValueError("unknown bundled workflow")
-        package = runtime_asset("workflows", name.split(":")[1] + "/workflow.toml").parent.resolve()
-    elif name:
-        package = (path.parent / name).resolve()
-    else:
-        raise ValueError("workflow.package is required")
-    manifest = tomllib.loads((package / "workflow.toml").read_text())
-    if manifest.get("version") != 1 or set(manifest) - {"version", "defaults", "presets"}:
-        raise ValueError("invalid workflow manifest")
-    preset = selection.get("preset")
-    if not preset or preset not in manifest.get("presets", {}):
-        raise ValueError("select an available workflow preset")
-    defaults = manifest.get("defaults", {})
-    validate_keys(defaults)
-    validate_keys(manifest["presets"][preset])
-    data = merge(merge(defaults, manifest["presets"][preset]), overrides)
-    for group in ("recovery", "review"):
-        if not isinstance(data.get(group, {}).get("enabled"), bool):
-            raise ValueError(f"{group}.enabled must be explicit")
+    data = {**data, **load_models(package / "config.toml")}
+    for section in ("delivery", "recovery", "decisions", "cleanup", "skills"):
+        if section not in data:
+            raise ValueError(f"workflow.toml is missing [{section}]")
+    if not isinstance(data["recovery"].get("enabled"), bool):
+        raise ValueError("recovery.enabled must be explicit")
     if data["delivery"]["merge_mode"] not in {"human", "workflow_checked"}:
         raise ValueError("unsupported merge mode; enforced merging is not implemented")
     if data["cleanup"]["mode"] not in {"after_merge", "manual", "off"}:
@@ -135,28 +188,11 @@ def load_workflow(path: Path) -> Workflow:
     for value in [data["cleanup"]["delay_seconds"], *data["recovery"]["delays_seconds"]]:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError("delays must be finite nonnegative numbers")
-    if data["review"]["enabled"] and not data.get("skills", {}).get("review", {}).get("enabled", False):
-        raise ValueError("required review skill is disabled")
-    if data["review"]["enabled"] and data["review"].get("require_independence") is not True:
-        raise ValueError("bundled review requires independence; disable review or replace its validator")
-    if not data["review"]["enabled"] and data["review"].get("require_independence"):
-        raise ValueError("independence requires review")
     if not data.get("skills", {}).get("delivery", {}).get("ref"):
         raise ValueError("delivery skill is required")
-    from harbor.model_policy import validate_fallbacks
-    for entries in (data.get("roles",{}), data.get("skills",{})):
-        for entry in entries.values():
-            validate_fallbacks(entry.get("model"), entry.get("fallback_models", []))
-    for name, role in data.get("roles",{}).items():
-        if name not in {"controller","planner","reviewer","implementor"}:
-            raise ValueError("unknown workflow role")
-        if role.get("reuse") and (role["reuse"] not in data.get("roles",{}) or role["reuse"] == name or {role["reuse"],name} == {"reviewer","implementor"}):
-            raise ValueError("invalid role reuse")
     for skill in data.get("skills",{}).values():
         if type(skill.get("enabled",True)) is not bool:
             raise ValueError("skill enabled must be boolean")
-        if skill.get("reasoning_effort","high") not in {"none","minimal","low","medium","high","xhigh","max","ultra"}:
-            raise ValueError("invalid skill reasoning effort")
     if data["skills"]["delivery"].get("enabled",True) is not True:
         raise ValueError("delivery skill cannot be disabled")
     if not isinstance(data["delivery"].get("auto_merge_risks"),list) or any(r not in {"low","medium","high"} for r in data["delivery"]["auto_merge_risks"]):
@@ -184,8 +220,6 @@ def load_workflow(path: Path) -> Workflow:
         value = data["recovery"][key]
         if type(value) is not int or not 0 <= value <= len(data["recovery"]["delays_seconds"]):
             raise ValueError("recovery max_attempts must fit configured delays")
-    if type(data["review"]["max_failed_rounds"]) is not int or data["review"]["max_failed_rounds"] < 1:
-        raise ValueError("review max_failed_rounds must be positive")
     for value in data.get("evidence", {}).values():
         if value not in {"required", "advisory", "off"}:
             raise ValueError("invalid evidence mode")
@@ -219,7 +253,7 @@ def load_workflow(path: Path) -> Workflow:
             del remaining[name]
     assets = package_hash(package)
     digest = hashlib.sha256((json.dumps(data, sort_keys=True) + assets).encode()).hexdigest()
-    result = Workflow(package, data, digest, {"package": str(package), "preset": preset, "overrides": str(path)}, assets)
+    result = Workflow(package, data, digest, assets)
     for skill in data.get("skills", {}).values():
         if skill.get("enabled", True) and "ref" in skill:
             result.asset(skill["ref"])

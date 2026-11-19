@@ -220,6 +220,26 @@ def _table_fields(text: str) -> dict[str, str]:
     return result
 
 
+RETIRED_KEYS = (
+    "workflow_path", "skill", "delivery_skill", "pipeline_skill",
+    "builder_model", "implementor_model", "implementation_model", "worker_model", "models_builder_model",
+    "firstmate_model", "first_mate_model", "planner_model", "planning_model",
+    "models_firstmate_model", "models_first_mate_model",
+    "builder_effort", "builder_reasoning_effort", "implementor_effort", "implementation_effort",
+    "firstmate_effort", "first_mate_effort", "firstmate_reasoning_effort", "planner_effort", "planning_effort",
+    "builder_fallback_models", "firstmate_fallback_models",
+    # Owned by workflow.toml [recovery] and [decisions].
+    "recovery_delays", "firstmate_decisions",
+)
+
+
+def retired_keys(text: str) -> tuple[str, ...]:
+    """pipeline.md keys that moved to ``.harbor/workflow`` (workflow + models)."""
+    fields = _fields(text)
+    fields.update(_table_fields(text))
+    return tuple(key for key in RETIRED_KEYS if _normal_key(key) in fields)
+
+
 def parse_pipeline_markdown(text: str, *, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return normalized pipeline settings parsed from Markdown."""
 

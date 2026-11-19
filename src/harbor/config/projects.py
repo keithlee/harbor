@@ -367,42 +367,36 @@ class ProjectConfig:
         values["required_checks"] = tuple(values.get("required_checks", ()))
         values["repo_path"] = Path(values["repo_path"])
         values["pipeline_path"] = Path(values["pipeline_path"])
-        if values.get("workflow_path"):
-            from harbor.config.workflow import load_workflow
-            workflow_path = (path.parent / str(values["workflow_path"])).resolve()
-            workflow = load_workflow(workflow_path)
-            values["workflow_path"] = str(workflow_path)
-            policy = workflow.config
-            values["deadline_minutes"] = policy.get("execution",{}).get("deadline_minutes", values["deadline_minutes"])
-            explicit_models = parse_pipeline_settings(path.read_text(encoding="utf-8"), defaults={"builder_model":"","firstmate_model":""})
-            controller = policy.get("roles",{}).get("controller",{})
-            builder_model = controller.get("model") or overrides.get("builder_model") or explicit_models.get("builder_model")
-            if not builder_model:
-                raise ValueError("workflow profile requires an explicit controller or builder model")
-            values["builder_model"] = builder_model
-            values["firstmate_model"] = overrides.get("firstmate_model") or explicit_models.get("firstmate_model") or builder_model
-            assessor = policy.get("skills",{}).get("blocker_assessment",{})
-            for settings, prefix in ((controller,"builder"),(assessor,"firstmate")):
-                if settings.get("model"):
-                    values[prefix+"_model"] = settings["model"]
-                if "fallback_models" in settings:
-                    values[prefix+"_fallback_models"] = tuple(settings["fallback_models"])
-                if settings.get("reasoning_effort"):
-                    values[prefix+"_effort"] = settings["reasoning_effort"]
-            from harbor.recovery import BlockerPolicy
-            recovery = policy["recovery"]
-            values["blocker_policy"] = BlockerPolicy(
-                retry_delays=tuple(recovery["delays_seconds"][:recovery["max_attempts"]]) if recovery["enabled"] else (),
-                decision_mode=policy["decisions"]["mode"],
-                authorized_authors=values["blocker_policy"].authorized_authors,
-            )
-            if "states" in policy:
-                states = policy["states"]
-                values["dispatch_states"] = tuple(states.get("ready", values["dispatch_states"]))
-                values["poll_states"] = tuple(dict.fromkeys((*values["poll_states"], *states.get("ready", []), *states.get("paused", []))))
         for field_name in ("linear_project_slug", "linear_team"):
             if not str(values.get(field_name, "")).strip():
                 raise ValueError(f"Harbor project {name} is missing required {field_name}")
+        from harbor.config.pipeline import retired_keys
+        from harbor.config.workflow import MIGRATION_HINT, load_workflow, project_workflow_path
+        retired = retired_keys(path.read_text(encoding="utf-8"))
+        if retired:
+            raise ValueError(f"{path}: {', '.join(retired)} no longer belong in pipeline.md; {MIGRATION_HINT}")
+        workflow_path = project_workflow_path(values["repo_path"]).resolve()
+        workflow = load_workflow(workflow_path)
+        values["workflow_path"] = str(workflow_path)
+        policy = workflow.config
+        values["deadline_minutes"] = policy.get("execution",{}).get("deadline_minutes", values["deadline_minutes"])
+        for settings, prefix in ((policy["roles"]["controller"], "builder"), (policy["first_mate"], "firstmate")):
+            values[prefix+"_model"] = settings["model"]
+            values[prefix+"_fallback_models"] = tuple(settings.get("fallback_models", ()))
+            if settings.get("reasoning_effort"):
+                values[prefix+"_effort"] = settings["reasoning_effort"]
+        from harbor.recovery import BlockerPolicy
+        recovery = policy["recovery"]
+        values["blocker_policy"] = BlockerPolicy(
+            retry_delays=tuple(recovery["delays_seconds"][:recovery["max_attempts"]]) if recovery["enabled"] else (),
+            decision_mode=policy["decisions"]["mode"],
+            unblock_attempts=values["blocker_policy"].unblock_attempts,
+            authorized_authors=values["blocker_policy"].authorized_authors,
+        )
+        if "states" in policy:
+            states = policy["states"]
+            values["dispatch_states"] = tuple(states.get("ready", values["dispatch_states"]))
+            values["poll_states"] = tuple(dict.fromkeys((*values["poll_states"], *states.get("ready", []), *states.get("paused", []))))
         return cls(name=name, **values)  # type: ignore[arg-type]
 
     @classmethod

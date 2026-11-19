@@ -24,8 +24,9 @@ def test_timeout_and_snapshot_change(tmp_path):
     db = sqlite3.connect(":memory:")
     bind(db,"A","A-1","r",workflow)
     record(db,result)
-    with pytest.raises(ValueError, match="changed"):
-        bind(db,"A","A-1","r",load_workflow(config(tmp_path,"reviewed")))
+    # A policy edit is adopted and recorded, never a blocker.
+    bind(db,"A","A-1","r",load_workflow(config(tmp_path,"reviewed")))
+    assert [r[0] for r in db.execute("SELECT kind FROM workflow_receipts")][-1] == "policy_change"
 
 
 def test_skill_hook_and_oversized_invalid_json(tmp_path,monkeypatch):

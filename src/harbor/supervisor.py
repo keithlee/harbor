@@ -400,6 +400,7 @@ class WorktreeDispatcher:
             workflow = getattr(self, "workflow", None)
             if workflow:
                 from harbor.workflow_store import bind
+                workflow = self.workflow = workflow.reload()
                 bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             create = getattr(self.worktree_manager, "create", None) or getattr(self.worktree_manager, "ensure", None)
             if not callable(create):
@@ -645,6 +646,8 @@ class WorktreeDispatcher:
                 from harbor.workflow_store import bind
                 if not wake.run_id:
                     raise ValueError("workflow resume requires retained run identity")
+                # Adopt edits to the project's workflow instead of failing the run.
+                workflow = self.workflow = workflow.reload()
                 bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             wake = replace(wake, instruction=self._with_handoff_gate(identifier, wake.instruction))
             result = await self._runner_call(runner, wake, resume=True)
