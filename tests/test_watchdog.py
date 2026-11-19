@@ -56,7 +56,8 @@ def test_cleanup_stuck_flag_refreshes_pr_links_and_cleans_up(tmp_path):
             return {"identifier": identifier, "state": {"name": "Done", "type": "completed"},
                     "attachments": {"nodes": [{"url": pr, "sourceType": "github"}]}}
 
-    supervisor.linear = Linear()
+    supervisor.unblock_ladder.linear = Linear()  # production wiring: the ladder owns the client
+    assert not hasattr(supervisor, "linear")
     supervisor.github_poller = object()
     cleaned = []
 
@@ -88,7 +89,7 @@ def test_cleanup_without_a_linear_attachment_is_never_trusted(tmp_path):
         async def fetch_issue_status(self, identifier):
             return {"identifier": identifier, "state": {"name": "Done", "type": "completed"}, "attachments": {"nodes": []}}
 
-    supervisor.linear = Linear()
+    supervisor.unblock_ladder.linear = Linear()
     supervisor.github_poller = object()
     cleaned = []
 

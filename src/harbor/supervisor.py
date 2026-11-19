@@ -1619,8 +1619,12 @@ class Supervisor:
         builder's claim.
         """
 
-        linear = self.linear or getattr(self.unblock_ladder, "linear", None)
-        fetch = getattr(linear, "fetch_issue_status", None)
+        fetch = None
+        for linear in (getattr(self.unblock_ladder, "linear", None), getattr(self.poller, "client", None),
+                       getattr(self, "linear", None)):
+            fetch = getattr(linear, "fetch_issue_status", None)
+            if callable(fetch):
+                break
         connection = getattr(self.db, "connection", None) if self.db is not None else None
         if not callable(fetch) or connection is None or not identifier:
             return False
@@ -3814,7 +3818,12 @@ class Supervisor:
             if case.trigger == "watchdog:cleanup_stuck":
                 # Deterministic: re-run the verified merge cleanup; no model call.
                 recovery.record(connection, case, {"action": "cleanup", "instruction": "", "reason": case.detail})
-                await self._reconcile_completed_merges(case.ticket, refresh=True)
+                try:
+                    await self._reconcile_completed_merges(case.ticket, refresh=True)
+                except Exception as exc:  # never abort the rest of the monitor pass
+                    self.last_error = f"First Mate cleanup for {case.ticket}: {exc}"
+                    await self._notify_operator(f"cleanup-failed:{case.run_id}:{len(case.history)}",
+                                                f"First Mate could not clean up {case.ticket}: {exc}")
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
@@ -3842,7 +3851,7 @@ class Supervisor:
     async def _post_recovery_comment(self, case: Any, decision: Mapping[str, Any]) -> None:
         from harbor import first_mate_recovery as recovery
         from harbor.unblock import _linear_comment
-        linear = getattr(self.unblock_ladder, "linear", None) or self.linear
+        linear = getattr(self.unblock_ladder, "linear", None) or getattr(self, "linear", None)
         if linear is None or not case.linear_id:
             return
         try:
