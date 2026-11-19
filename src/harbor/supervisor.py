@@ -2257,6 +2257,12 @@ class Supervisor:
             if receipt_key:
                 self._verified_merge_runs.add(receipt_key)
             self._update_run_receipt(wake, normalized)
+            # A verified merge resolves the ticket's outstanding questions;
+            # an open escalation must not keep a merged worktree alive.
+            close = getattr(self.db, "close_open_escalations", None) if self.db is not None else None
+            identifier = self._ticket_key(wake.ticket)
+            if callable(close) and identifier:
+                close(identifier, status="resolved")
         return normalized
 
     async def _report_result(self, wake: Wake, result: Mapping[str, Any]) -> None:

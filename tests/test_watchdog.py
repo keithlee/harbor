@@ -109,3 +109,24 @@ def test_cleanup_stuck_reflags_hourly(tmp_path):
     assert tick(db.connection, "Demo", minutes=30, now=now + 60) == []
     assert len(tick(db.connection, "Demo", minutes=30, now=now + 3600)) == 1
     db.close()
+
+
+def test_verified_merge_closes_open_escalations(tmp_path):
+    import asyncio
+    from test_first_mate_recovery import supervisor_for
+    from harbor.wake import Wake
+
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged"}, finished=45)
+    db.record_escalation("HAN-86", "run-HAN-86", "conflicting_instruction", "Permit unregistered roles?", 2)
+    supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "wait"})
+
+    async def observed(wake, result):
+        return {"merged": True, "url": "https://github.com/x/y/pull/1", "head_sha": "a"}
+
+    supervisor._observe_merge_for_result = observed
+    supervisor._fact_confirms_merge = lambda fact: bool(fact and fact.get("merged"))
+    wake = Wake(ticket={"identifier": "HAN-86"}, action="reengage", resume="run-HAN-86")
+    asyncio.run(supervisor._reconcile_runner_result(wake, {"status": "completed", "outcome": "merged",
+                                                            "pr_url": "https://github.com/x/y/pull/1", "run_id": "run-HAN-86"}))
+    assert db.connection.execute("SELECT status FROM escalations").fetchone()[0] == "resolved"
+    db.close()
