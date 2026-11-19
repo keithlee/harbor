@@ -36,6 +36,13 @@ Keep one planner, one implementor and one reviewer per ticket; the reviewer must
    `harbor workflow check PROJECT --ticket IDENTIFIER --event pre_merge` reports ready; use its head SHA.
    Human mode never merges. Only after an observed merge may you set terminal Linear completion.
 
+## Merge authority (Harbor setting wins)
+`delivery.merge_mode` in this workflow is the only merge authority. It overrides any merge or
+auto-merge policy in the repository's AGENTS.md, CLAUDE.md, Pipeline Profile or standing
+authorizations. With `merge_mode = "human"`: never run `gh pr merge`, never enable auto-merge,
+never push to the base branch. Stop at the PR, move the ticket to review, and return
+`outcome = "parked"` with `waiting_on = "human"`.
+
 ## Blockers
 Report a blocker only for a real product/design question, ambiguous acceptance criteria, or an
 environment failure you cannot work around. Never block on Harbor bookkeeping, agent names or

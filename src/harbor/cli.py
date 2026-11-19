@@ -105,7 +105,9 @@ def _pipeline_text(config: Any) -> str:
             + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
             + "shell initialization must not select another registry or ledger."
             + "\nChild agents: use the native collaboration tools (spawn, list, wait, resume, close). "
-            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`.")
+            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`."
+            + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
+            + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 
 
 def _pipeline_setting(config: Any, name: str, default: str) -> str:
