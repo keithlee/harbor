@@ -196,8 +196,9 @@ budgets block automatic recovery.
 
 Cleanup requires an independently observed merge, a completed delivery, a
 terminal Linear state, the exact local/merged PR head, stopped processes, no
-open escalation, no hold and passing `pre_cleanup` hooks. Dirty, untracked and
-ignored files are retained. There is no force removal or branch deletion.
+open escalation, no hold and passing `pre_cleanup` hooks. Modified or untracked
+files keep the worktree for inspection; git-ignored install and build output
+(`node_modules/`, `.next/`, ...) is removed with it. The branch is never deleted.
 
 ## Migrating
 
