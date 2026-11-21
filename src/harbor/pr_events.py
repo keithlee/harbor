@@ -23,7 +23,7 @@ import time
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -47,6 +47,10 @@ _REPLY_MARKER_SUFFIX = " -->"
 _RISK_MARKER_PREFIX = "<!-- harbor:risk-sha:"
 _RISK_MARKER_SUFFIX = " -->"
 _DEFAULT_RISK_SKILL = "risk-analysis"
+# GitHub and the local host do not share a clock, and a builder posts its last
+# comment a moment before its process exits.  This is the slack allowed when
+# deciding that a comment belongs to the run that just finished.
+_BUILDER_ECHO_SKEW = timedelta(seconds=60)
 _DEFAULT_MAX_INSTRUCTION_BYTES = 4096
 
 
@@ -229,6 +233,19 @@ def risk_analysis_marker(head_sha: str) -> str:
     """Return the exact PR-body marker binding risk analysis to one SHA."""
 
     return f"{_RISK_MARKER_PREFIX}{str(head_sha).strip()}{_RISK_MARKER_SUFFIX}"
+
+
+def _parse_time(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` or naive means UTC), or ``None``."""
+
+    text = _text(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _event_key(event_type: str, key: str) -> str:
@@ -954,6 +971,9 @@ class PREventProcessor:
                 continue
             version = comment_version_key(source)
             merge_approval = _owner_merge_approval(ticket, facts, source, previous)
+            echo = not merge_approval and self._is_builder_echo(
+                source, self._latest_run(ticket, run), previous
+            )
             key = f"{state_key}:{version}"
             event = PREvent(
                 NEW_COMMENT_VERSION,
@@ -972,12 +992,18 @@ class PREventProcessor:
                     "reply_marker": comment_reply_marker(version),
                     "surface": surface,
                     "merge_approval": merge_approval,
+                    **({"suppressed": "builder_echo"} if echo else {}),
                 },
                 build_comment_instruction(ticket, facts, source, run=run, merge_approval=merge_approval),
                 _run_id(ticket, facts, run),
             )
             if self._insert_event(event):
-                events.append(event)
+                if echo:
+                    # Keep the receipt so later polls stay idempotent, but
+                    # close it: it is neither offered nor awaiting a reply.
+                    self._mark_replied(event.event_key)
+                else:
+                    events.append(event)
 
         # A builder reply is an external side effect owned by the configured
         # skill.  Harbor only records the local receipt after a later poll
@@ -1173,6 +1199,64 @@ class PREventProcessor:
                 (event_key,),
             )
             connection.commit()
+
+    def _latest_run(self, ticket: Any, run: Any | None) -> Any | None:
+        """Return the supplied run row, else the ticket's latest ledger row.
+
+        ``GitHubPoller`` calls :meth:`observe` without a run, and that call is
+        the one that creates comment events, so the ledger is the fallback.
+        """
+
+        if run is not None:
+            return run
+        connection = _connection(self.db)
+        identifier = _ticket_id(ticket)
+        if connection is None or not identifier or not _table_exists(connection, "runs"):
+            return None
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+        if "status" not in columns:
+            return None
+        cursor = connection.execute(
+            "SELECT * FROM runs WHERE ticket=? ORDER BY COALESCE(finished_at, started_at, id) DESC, id DESC LIMIT 1",
+            (identifier,),
+        )
+        row = cursor.fetchone()
+        return dict(zip((column[0] for column in cursor.description), row)) if row is not None else None
+
+    def _is_builder_echo(
+        self,
+        comment: Mapping[str, Any],
+        run: Any | None,
+        previous: Mapping[str, Any] | None,
+    ) -> bool:
+        """Whether *comment* was most likely posted by the builder itself.
+
+        The builder posts through the operator's own ``gh`` login, so authorship
+        cannot tell it from the human.  Timing can: a comment by that account
+        that first appears after the previous poll, while the builder's process
+        is running or had finished no longer than the clock skew ago, was made
+        by the run Harbor is already handling.  Offering it back would resume the
+        same session for feedback it wrote itself, and its reply would loop.
+
+        Fail-open on every missing fact (no earlier poll, no run, unparseable
+        times) so genuine feedback is never dropped on a guess.  Comments from
+        anyone else, and the owner's exact merge approval, are never echoes.
+        """
+
+        if comment.get("is_bot") or comment.get("author_association") != "OWNER":
+            return False
+        if not _text(comment.get("author")):
+            return False
+        since = _parse_time(previous.get("observed_at")) if previous else None
+        stamp = _parse_time(
+            _value(comment, "updated_at", "updatedAt", "created_at", "createdAt", default=None)
+        )
+        if since is None or stamp is None or stamp <= since or run is None:
+            return False
+        if _text(_value(run, "status", "run_status", default=None)).casefold() == "running":
+            return True
+        finished = _parse_time(_value(run, "finished_at", default=None))
+        return finished is not None and stamp <= finished + _BUILDER_ECHO_SKEW
 
     def _run_is_running(self, ticket: Any, run: Any | None) -> bool:
         """Return whether delivery would race a live builder process.

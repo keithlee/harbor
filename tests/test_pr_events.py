@@ -6,6 +6,7 @@ import pytest
 
 from harbor.clients.github import build_pull_requests_query
 from harbor.db import HarborDB
+from harbor.wake import apply_phase3_migration
 from harbor.facts.threads import parse_comment_surfaces
 from harbor.pr_events import (
     CommentContractError,
@@ -996,4 +997,137 @@ def test_pending_merge_approval_is_not_delivered_after_head_changes(tmp_path):
     facts["headRefOid"] = "b" * 40
     run(processor.process(ticket, facts))
     assert not any(call["event_type"] == NEW_COMMENT_VERSION for call in calls)
+    db.close()
+
+
+# --- Builder echo guard -------------------------------------------------
+#
+# Harbor's builder posts PR comments through the operator's own ``gh`` login,
+# so its comments are indistinguishable from the human's by author.  A comment
+# the builder posts while a run is executing (or just as it finishes) must not
+# be offered back to that same builder as "new feedback".
+
+OWNER = {"author": "keithlee", "author_association": "OWNER", "is_bot": False, "surface": "issue"}
+
+
+def _owner_comment(comment_id: str, created: str, body: str = "Disposition: informational status.", **extra: Any) -> dict[str, Any]:
+    return {"id": comment_id, "body": body, "created_at": created, "updated_at": created, **OWNER, **extra}
+
+
+def _echo_fixture(tmp_path):
+    """A PR that was already polled once at 10:00:00, so a lower bound exists."""
+
+    db = HarborDB(tmp_path / "harbor.sqlite")
+    calls: list[dict[str, Any]] = []
+
+    async def builder(event: dict[str, Any]) -> dict[str, Any] | None:
+        calls.append(event)
+        return {"status": "waiting", "summary": "handled"}
+
+    processor = PREventProcessor(db, project="demo", builder=builder)
+    ticket = linked_ticket(run_id="run-7")
+    facts = {**pr(), "state": "OPEN", "comments": []}
+    processor.observe(ticket, facts)
+    db.connection.execute("UPDATE github_pr_states SET observed_at='2026-09-02T10:00:00+00:00'")
+    db.connection.execute("UPDATE github_pr_events SET offered=1, replied=1 WHERE event_type=?", (PR_CREATED,))
+    db.connection.commit()
+    return db, processor, ticket, facts, calls
+
+
+def _comment_events(processor: PREventProcessor) -> list[dict[str, Any]]:
+    return [item for item in processor.events() if item["event_type"] == NEW_COMMENT_VERSION]
+
+
+def test_comment_posted_by_the_builder_during_its_run_does_not_re_engage_it(tmp_path) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts["comments"] = [_owner_comment("echo-1", "2026-09-02T10:01:00Z")]
+
+    observed = processor.observe(ticket, facts, run={"id": "run-7", "status": "running"})
+    assert [item for item in observed if item["event_type"] == NEW_COMMENT_VERSION] == []
+
+    # The run ends; the next poll must not turn the same comment into feedback.
+    waiting = {"id": "run-7", "status": "waiting", "finished_at": "2026-09-02T10:02:00+00:00"}
+    assert run(processor.process(ticket, facts, run=waiting)) == []
+    assert calls == []
+    assert processor.pending_comments() == []
+    row = db.connection.execute(
+        "SELECT offered, replied FROM github_pr_events WHERE event_type=?", (NEW_COMMENT_VERSION,)
+    ).fetchone()
+    assert tuple(row) == (1, 1), "the suppression is recorded so it stays suppressed"
+    db.close()
+
+
+def test_comment_posted_just_before_the_run_finished_is_not_feedback(tmp_path) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts["comments"] = [_owner_comment("echo-2", "2026-09-02T10:01:50Z")]
+    waiting = {"id": "run-7", "status": "waiting", "finished_at": "2026-09-02T10:01:55+00:00"}
+
+    assert run(processor.process(ticket, facts, run=waiting)) == []
+    assert calls == []
+    assert processor.pending_comments() == []
+    db.close()
+
+
+def test_builder_echo_is_recognised_from_the_run_ledger_when_the_poller_has_no_run(tmp_path) -> None:
+    # GitHubPoller calls observe() without a run row; that is the call that
+    # creates the event, so the guard has to read the run ledger itself.
+    db = HarborDB(tmp_path / "harbor.sqlite")
+    apply_phase3_migration(db)
+    apply_phase8_migration(db)
+    db.replace_tickets("Demo", [{"identifier": "DEMO-7", "state": "In Progress", "title": "t",
+                                 "owned": True, "hold": False, "id": "lin-7"}], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,started_at) VALUES ('run-7','DEMO-7','running',?,?)",
+        (str(tmp_path), "2026-09-02T09:00:00+00:00"),
+    )
+    db.connection.commit()
+    processor = PREventProcessor(db, project="demo")
+    ticket = linked_ticket()
+    processor.observe(ticket, {**pr(), "state": "OPEN", "comments": []})
+    db.connection.execute("UPDATE github_pr_states SET observed_at='2026-09-02T10:00:00+00:00'")
+    db.connection.commit()
+
+    observed = processor.observe(
+        ticket, {**pr(), "state": "OPEN", "comments": [_owner_comment("echo-3", "2026-09-02T10:01:00Z")]}
+    )
+    assert [item for item in observed if item["event_type"] == NEW_COMMENT_VERSION] == []
+    db.close()
+
+
+def test_human_comment_while_the_builder_is_idle_still_re_engages_it(tmp_path) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    # The run finished at 10:00:30; the operator comments afterwards, from the
+    # very same GitHub account the builder uses.
+    facts["comments"] = [_owner_comment("human-1", "2026-09-02T10:05:00Z", body="Please also handle the timeout.")]
+    waiting = {"id": "run-7", "status": "waiting", "finished_at": "2026-09-02T10:00:30+00:00"}
+
+    delivered = run(processor.process(ticket, facts, run=waiting))
+    assert [item["event_type"] for item in delivered] == [NEW_COMMENT_VERSION]
+    assert len(calls) == 1
+    db.close()
+
+
+def test_other_reviewers_still_re_engage_the_builder_during_its_run(tmp_path) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts["comments"] = [
+        {"id": "rev-1", "body": "Could this handle an empty response?", "created_at": "2026-09-02T10:01:00Z",
+         "updated_at": "2026-09-02T10:01:00Z", "author": "reviewer", "author_association": "NONE",
+         "is_bot": False, "surface": "issue"}
+    ]
+    observed = processor.observe(ticket, facts, run={"id": "run-7", "status": "running"})
+    assert len([item for item in observed if item["event_type"] == NEW_COMMENT_VERSION]) == 1
+    db.close()
+
+
+def test_owner_merge_approval_is_never_treated_as_a_builder_echo(tmp_path) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts = {**facts, "headRefOid": "a" * 40}
+    processor.observe(ticket, facts)
+    db.connection.execute("UPDATE github_pr_states SET observed_at='2026-09-02T10:00:00+00:00'")
+    db.connection.commit()
+    facts["comments"] = [_owner_comment("approval", "2026-09-02T10:01:00Z", body="lgtm merge")]
+
+    observed = processor.observe(ticket, facts, run={"id": "run-7", "status": "running"})
+    comment = [item for item in observed if item["event_type"] == NEW_COMMENT_VERSION]
+    assert len(comment) == 1 and comment[0]["payload"]["merge_approval"] is True
     db.close()
