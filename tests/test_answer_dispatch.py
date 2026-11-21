@@ -75,3 +75,41 @@ def test_queued_answer_survives_restart_and_does_not_replay_stop(tmp_path):
         assert len(calls)==1
         db.close()
     asyncio.run(scenario())
+
+
+def _drain_with_ticket_state(tmp_path, state, *, paused=(), terminal=()):
+    """Queue one answer for ticket A-1 in ``state``; return the resume calls and queue status."""
+    from harbor.answer_queue import enqueue,drain
+    from types import SimpleNamespace
+    async def scenario():
+        db=HarborDB(tmp_path/'queue.db')
+        enqueue(db.connection,'nine','A','A-1','run','Answer for the blocker')
+        calls=[]
+        async def resume(run,instruction):calls.append((run,instruction));return True
+        run={'id':'run','terminal_reason':None}
+        supervisor=SimpleNamespace(db=db,project='A',read_only=False,_dispatch_suspended=False,_fleet_tickets=[{'identifier':'A-1','hold':False,'state':state}],_latest_run=lambda _:run,_in_scope=lambda _:True,_dispatch_tasks={},_dispatch_wakes={},resume_session=resume,_dispatch_finished=lambda *args:None)
+        supervisor.dispatcher=SimpleNamespace(workflow=SimpleNamespace(config={'states':{'paused':list(paused),'terminal':list(terminal)}}))
+        drain(supervisor)
+        await asyncio.gather(*supervisor._dispatch_tasks.values())
+        status=db.connection.execute("SELECT status FROM answer_queue WHERE escalation='nine'").fetchone()[0]
+        db.close()
+        return calls,status
+    return asyncio.run(scenario())
+
+
+def test_queued_answer_is_delivered_while_ticket_is_in_human_review(tmp_path):
+    # Harbor itself parks product-decision escalations in Human Review, so the
+    # operator's answer to that escalation must still reach the builder.
+    for state in ('Human Review','human review'):
+        calls,status=_drain_with_ticket_state(tmp_path,state)
+        assert calls==[('run','Answer for the blocker')],state
+        assert status=='delivered'
+        (tmp_path/'queue.db').unlink()
+
+
+def test_queued_answer_still_waits_for_paused_backlog_and_terminal_states(tmp_path):
+    for state in ('Paused','Backlog','Awaiting Approval','Archived'):
+        calls,status=_drain_with_ticket_state(tmp_path,state,paused=['Awaiting Approval'],terminal=['Archived'])
+        assert calls==[],state
+        assert status=='queued',state
+        (tmp_path/'queue.db').unlink()
