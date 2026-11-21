@@ -59,7 +59,9 @@ def drain(supervisor):
             continue
         workflow = getattr(getattr(supervisor,'dispatcher',None),'workflow',None)
         states = workflow.config.get('states',{}) if workflow else {}
-        inactive = {'paused','human review','backlog',*(str(s).casefold() for s in states.get('paused',[])),*(str(s).casefold() for s in states.get('terminal',[]))}
+        # Human Review is deliberately not inactive: Harbor parks product-decision
+        # escalations there, so an operator answer must still reach the builder.
+        inactive = {'paused','backlog',*(str(s).casefold() for s in states.get('paused',[])),*(str(s).casefold() for s in states.get('terminal',[]))}
         if run.get('id') != row[3] or ticket.get('state_type') in {'completed','canceled','backlog'} or str(ticket.get('state','')).casefold() in inactive:
             continue
         if str(run.get('terminal_reason','')).startswith('operator'):
