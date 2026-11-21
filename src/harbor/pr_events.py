@@ -17,6 +17,7 @@ import hashlib
 import html
 import inspect
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -30,6 +31,9 @@ from typing import Any, Awaitable, Callable
 from harbor.db import sql_statements
 from harbor.facts.threads import is_harbor_marked
 from harbor.resources import runtime_asset
+
+
+logger = logging.getLogger(__name__)
 
 
 PR_CREATED = "PR_CREATED"
@@ -776,7 +780,13 @@ class PREventProcessor:
         row = self._state_row(key)
         return bool(row and row.get("risk_status") == "valid" and row.get("risk_head_sha") == _head(facts))
 
-    def _insert_event(self, event: PREvent) -> bool:
+    def _insert_event(self, event: PREvent, *, closed: bool = False) -> bool:
+        """Record one event receipt; ``closed`` inserts it already offered and replied.
+
+        A closed receipt is written in the same INSERT, so no crash can leave
+        a suppressed event deliverable.
+        """
+
         event_dict = event.as_dict()
         key = event.event_key
         connection = _connection(self.db)
@@ -784,12 +794,15 @@ class PREventProcessor:
             if key in self._events:
                 return False
             self._events[key] = event_dict
+            if closed:
+                self._offered.add(key)
+                self._replied.add(key)
             return True
         with _lock(self.db):
             try:
                 connection.execute(
                     "INSERT INTO github_pr_events(event_key, project, ticket, pr_number, pr_url, event_type, "
-                    "head_sha, payload_json, offered, replied, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+                    "head_sha, payload_json, offered, replied, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         key,
                         self.project,
@@ -799,6 +812,8 @@ class PREventProcessor:
                         event.event_type,
                         event.head_sha,
                         _json(event_dict),
+                        int(closed),
+                        int(closed),
                         _now(),
                     ),
                 )
@@ -971,9 +986,7 @@ class PREventProcessor:
                 continue
             version = comment_version_key(source)
             merge_approval = _owner_merge_approval(ticket, facts, source, previous)
-            echo = not merge_approval and self._is_builder_echo(
-                source, self._latest_run(ticket, run), previous
-            )
+            echo = self._is_builder_echo(source, self._latest_run(ticket, run), previous)
             key = f"{state_key}:{version}"
             event = PREvent(
                 NEW_COMMENT_VERSION,
@@ -997,11 +1010,17 @@ class PREventProcessor:
                 build_comment_instruction(ticket, facts, source, run=run, merge_approval=merge_approval),
                 _run_id(ticket, facts, run),
             )
-            if self._insert_event(event):
+            # An echo keeps its receipt so later polls stay idempotent, but it
+            # is inserted closed: neither offered nor awaiting a reply.
+            if self._insert_event(event, closed=echo):
                 if echo:
-                    # Keep the receipt so later polls stay idempotent, but
-                    # close it: it is neither offered nor awaiting a reply.
-                    self._mark_replied(event.event_key)
+                    logger.warning(
+                        "suppressed comment %s on %s (ticket %s) as a builder echo: "
+                        "posted by the owner account while the builder run was active",
+                        _text(_value(source, "id", "comment_id", default="")),
+                        pr_url,
+                        identifier,
+                    )
                 else:
                     events.append(event)
 
@@ -1240,9 +1259,13 @@ class PREventProcessor:
 
         Fail-open on every missing fact (no earlier poll, no run, unparseable
         times) so genuine feedback is never dropped on a guess.  Comments from
-        anyone else, and the owner's exact merge approval, are never echoes.
+        anyone else, and any merge request (``lgtm merge``), are never echoes:
+        whether a merge request is an approval depends on the head, hold and
+        PR state, which can change after this comment was classified.
         """
 
+        if _is_merge_request(comment):
+            return False
         if comment.get("is_bot") or comment.get("author_association") != "OWNER":
             return False
         if not _text(comment.get("author")):

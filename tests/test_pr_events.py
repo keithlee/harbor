@@ -1131,3 +1131,75 @@ def test_owner_merge_approval_is_never_treated_as_a_builder_echo(tmp_path) -> No
     comment = [item for item in observed if item["event_type"] == NEW_COMMENT_VERSION]
     assert len(comment) == 1 and comment[0]["payload"]["merge_approval"] is True
     db.close()
+
+
+def test_merge_request_is_never_an_echo_even_when_it_is_not_yet_an_approval(tmp_path) -> None:
+    # The builder pushes a fixup (sha-a -> sha-b) and the operator says
+    # "lgtm merge" before the next poll, while the run is still running.  It is
+    # not an approval for the new head, so merge_approval is False, but the
+    # comment must still reach the builder instead of vanishing as an echo.
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts = {**facts, "headRefOid": "a" * 40}
+    processor.observe(ticket, facts)
+    db.connection.execute("UPDATE github_pr_states SET observed_at='2026-09-02T10:00:00+00:00'")
+    db.connection.commit()
+    facts = {**facts, "headRefOid": "b" * 40,
+             "comments": [_owner_comment("approval-2", "2026-09-02T10:01:00Z", body="lgtm merge")]}
+
+    observed = processor.observe(ticket, facts, run={"id": "run-7", "status": "running"})
+    comment = [item for item in observed if item["event_type"] == NEW_COMMENT_VERSION]
+    assert len(comment) == 1
+    assert comment[0]["payload"]["merge_approval"] is False
+    row = db.connection.execute(
+        "SELECT offered, replied FROM github_pr_events WHERE event_key=?", (comment[0]["event_key"],)
+    ).fetchone()
+    assert tuple(row) == (0, 0), "the merge request stays deliverable"
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("label", "comment", "run_row", "previous_poll"),
+    [
+        ("no earlier poll", {}, {"id": "run-7", "status": "running"}, None),
+        ("comment older than the last poll", {"created_at": "2026-09-02T09:59:00Z", "updated_at": "2026-09-02T09:59:00Z"},
+         {"id": "run-7", "status": "running"}, "2026-09-02T10:00:00+00:00"),
+        ("bot author", {"is_bot": True}, {"id": "run-7", "status": "running"}, "2026-09-02T10:00:00+00:00"),
+        ("no run row", {}, None, "2026-09-02T10:00:00+00:00"),
+        ("waiting run without finished_at", {}, {"id": "run-7", "status": "waiting", "finished_at": None},
+         "2026-09-02T10:00:00+00:00"),
+        ("comment long after the run finished", {}, {"id": "run-7", "status": "waiting",
+         "finished_at": "2026-09-02T09:58:00+00:00"}, "2026-09-02T10:00:00+00:00"),
+    ],
+)
+def test_builder_echo_guard_fails_open_when_a_fact_is_missing(tmp_path, label, comment, run_row, previous_poll) -> None:
+    db = HarborDB(tmp_path / "harbor.sqlite")
+    processor = PREventProcessor(db, project="demo")
+    ticket = linked_ticket(run_id="run-7")
+    facts = {**pr(), "state": "OPEN", "comments": []}
+    if previous_poll is not None:
+        processor.observe(ticket, facts)
+        db.connection.execute("UPDATE github_pr_states SET observed_at=?", (previous_poll,))
+        db.connection.commit()
+    facts["comments"] = [_owner_comment("c-1", "2026-09-02T10:01:00Z", **comment)]
+
+    observed = processor.observe(ticket, facts, run=run_row)
+    assert len([item for item in observed if item["event_type"] == NEW_COMMENT_VERSION]) == 1, label
+    db.close()
+
+
+def test_suppressed_echo_is_inserted_closed_and_logged(tmp_path, caplog) -> None:
+    db, processor, ticket, facts, calls = _echo_fixture(tmp_path)
+    facts["comments"] = [_owner_comment("echo-9", "2026-09-02T10:01:00Z")]
+
+    with caplog.at_level("WARNING", logger="harbor.pr_events"):
+        processor.observe(ticket, facts, run={"id": "run-7", "status": "running"})
+
+    # Closed by the INSERT itself: there is no moment where it is deliverable.
+    row = db.connection.execute(
+        "SELECT offered, replied, payload_json FROM github_pr_events WHERE event_type=?", (NEW_COMMENT_VERSION,)
+    ).fetchone()
+    assert (row[0], row[1]) == (1, 1)
+    assert json.loads(row[2])["payload"]["suppressed"] == "builder_echo"
+    message = " ".join(record.getMessage() for record in caplog.records)
+    assert "echo-9" in message and "DEMO-7" in message and "builder echo" in message
+    db.close()
