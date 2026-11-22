@@ -117,6 +117,36 @@ class SupervisorStatus:
         }
 
 
+def _switch_snapshot(connection: Any, run_id: str) -> Callable[[], None]:
+    """Capture what a provider switch rewrites; the returned callable puts it back."""
+
+    def read(sql: str) -> tuple[list[str], list[tuple]] | None:
+        try:
+            cursor = connection.execute(sql, (run_id,))
+        except sqlite3.OperationalError:
+            return None  # table not created yet
+        return [column[0] for column in cursor.description], [tuple(item) for item in cursor.fetchall()]
+
+    run = connection.execute("SELECT session_id, status, terminal_reason FROM runs WHERE id=?", (run_id,)).fetchone()
+    saved = {table: read(f"SELECT * FROM {table} WHERE run_id=?") for table in ("runner_identity", "quota_recovery")}
+
+    def restore() -> None:
+        with connection:
+            if run is not None:
+                connection.execute("UPDATE runs SET session_id=?, status=?, terminal_reason=? WHERE id=?", (*tuple(run), run_id))
+            for table, rows in saved.items():
+                try:
+                    connection.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
+                except sqlite3.OperationalError:
+                    continue
+                if rows:
+                    columns, values = rows
+                    marks = ", ".join("?" for _ in columns)
+                    connection.executemany(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({marks})", values)
+
+    return restore
+
+
 class WorktreeDispatcher:
     """Small adapter from deterministic ``Wake`` values to delivery seams.
 
@@ -553,6 +583,8 @@ class WorktreeDispatcher:
             if inspect.isawaitable(value):
                 await value
         connection = getattr(self.db, "connection", None)
+        # A provider switch that cannot build its runner must leave the run waiting for the reset.
+        restore = _switch_snapshot(connection, row["id"]) if switch is not None and connection is not None else None
         if connection is not None:
             with connection:
                 connection.execute(
@@ -568,8 +600,15 @@ class WorktreeDispatcher:
                 except sqlite3.OperationalError:
                     pass  # no quota table: nothing was waiting
         self.runners.pop(identifier, None)
-        runner = await self.hydrate(identifier, recover_terminal=True)
+        try:
+            runner = await self.hydrate(identifier, recover_terminal=True)
+        except BaseException:
+            if restore is not None:
+                restore()
+            raise
         if runner is None:
+            if restore is not None:
+                restore()
             raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
         # The old conversation is gone: the new session needs the full launch
         # prompt (delivery skill, policy incl. merge authority, runtime

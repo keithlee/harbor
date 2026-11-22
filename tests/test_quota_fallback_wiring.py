@@ -95,7 +95,7 @@ def test_doctor_report_lines(setup):
 
 
 def test_invalid_fallback_fails_policy_construction(tmp_path):
-    models = {**MODELS, "quota_fallback": {"controller": {"provider": "claude", "model": "claude-opus-5-5"}}}
+    models = {**MODELS, "quota_fallback": {"controller": {"provider": "claude", "model": "claude-opus-5-5", "reasoning_effort": "high"}}}
     workflow = materialize(tmp_path, models=models)
     config = SimpleNamespace(name="mock", builder_provider="claude", firstmate_provider="claude", workflow_path=str(workflow))
     with pytest.raises(ValueError, match="differ"):

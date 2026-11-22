@@ -39,7 +39,7 @@ model = "gpt-6-luna"
 
 
 def test_max_switches_defaults_to_two(tmp_path):
-    result = models(tmp_path, '[quota_fallback.controller]\nprovider = "codex"\nmodel = "gpt-6.1-terra"\n')
+    result = models(tmp_path, '[quota_fallback.controller]\nprovider = "codex"\nmodel = "gpt-6.1-terra"\nreasoning_effort = "high"\n')
     assert result["quota_fallback"]["max_switches"] == 2
     assert result["quota_fallback"]["first_mate"] is None
 

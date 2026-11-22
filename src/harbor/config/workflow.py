@@ -146,6 +146,9 @@ def _fallback_profile(name, entry, *, provider=None):
         raise ValueError(f"quota_fallback.{name}.model {model!r} is not a Claude model")
     if provider == "codex" and model.startswith("claude"):
         raise ValueError(f"quota_fallback.{name}.model {model!r} is not a Codex model")
+    if effort is None and name == "controller":
+        # A builder runner needs an effort valid for ITS provider; never borrow the primary's.
+        raise ValueError("quota_fallback.controller.reasoning_effort is required")
     if effort is not None and effort not in (CLAUDE_EFFORTS if provider == "claude" else EFFORTS):
         raise ValueError(f"invalid quota_fallback.{name} reasoning effort")
     return {"provider": provider, "model": model, "reasoning_effort": effort}

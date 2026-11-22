@@ -259,7 +259,7 @@ def build_production_dispatcher(
                 import time
                 start = quota_policy.starting_builder_profile(db.connection, time.time())
                 if start is not None:
-                    provider, model, effort, fallbacks = start.provider, start.model, start.effort or effort, ()
+                    provider, model, effort, fallbacks = start.provider, start.model, start.effort, ()
             runner_type = ClaudeRunner if provider == "claude" else CodexRunner
             if provider == "claude":
                 validate_claude(claude_cli, model, effort)
