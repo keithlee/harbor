@@ -52,6 +52,12 @@ Without a reliable reset time, it waits 5 minutes, then 15 minutes, then
 30 minutes between attempts. First Mate and the dashboard show the next
 retry time. The existing crash retry budget is separate.
 
+Instead of waiting, a project can opt in to continue on the other provider
+(Codex or Claude) with a `[quota_fallback]` section in `config.toml`. A builder
+stopped by a usage limit restarts in a fresh session in the same worktree, and
+First Mate retries on the fallback provider. See
+[Provider fallback on usage limits](docs/configurable-workflows.md#provider-fallback-on-usage-limits-quota_fallback).
+
 On an attached open PR, a GitHub repository owner's `lgtm merge` comment
 authorizes the delivery workflow to merge the head Harbor observed before the
 comment. The workflow checks the remaining merge gates and updates Linear.

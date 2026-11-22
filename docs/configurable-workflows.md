@@ -81,6 +81,62 @@ Fallbacks are opt-in and switch only after a structured provider error rejects
 the model. Authentication, quota, timeout, cancellation and tool failures never
 switch models.
 
+### Provider fallback on usage limits (`[quota_fallback]`)
+
+Model fallbacks never cross providers. To keep working when a provider reports a
+usage limit, add a second provider profile. It is opt-in; without the section
+Harbor waits for the reset exactly as before.
+
+```toml
+[quota_fallback]
+max_switches = 2            # per run; default 2, 0 disables
+
+[quota_fallback.controller] # builder; planner/reviewer/implementor inherit it
+provider = "codex"          # must differ from builder_provider in pipeline.md
+model = "gpt-6.1-terra"
+reasoning_effort = "medium" # required; must be valid for this provider
+
+[quota_fallback.reviewer]   # optional per-role override (model / reasoning_effort)
+model = "gpt-6.2-sol"
+
+[quota_fallback.first_mate] # must differ from firstmate_provider in pipeline.md
+provider = "codex"
+model = "gpt-6-luna"
+```
+
+- **Two profiles, symmetric.** The primary profile is your roles plus the
+  providers in `pipeline.md`; the fallback is this section. A run on either one
+  that hits a usage limit moves to the other, unless that provider is also known
+  to be out of usage.
+- **Builder.** A run that ends on a usage limit, and is still waiting for its
+  provider's reset, continues in a *fresh* session in the same worktree and
+  branch. If the reset has already passed (for example Harbor was down across
+  it), Harbor resumes the retained session in place instead, which keeps its
+  memory. The old native session cannot move between
+  providers, so the new session starts from a hand-off built from the ledger:
+  ticket, PRs, open questions, operator answers not yet acted on, and the role
+  models for the new provider. Conversation memory is not carried over. Each
+  switch is recorded in `first_mate_recoveries` as `quota_fallback` (it does not
+  spend First Mate's recovery budget), the operator is notified, and
+  `/status --full` shows `switched <from> -> <to>`.
+- **Stays until done.** A switched builder keeps its new provider until its run
+  ends. At most `max_switches` switches happen per run, counted from the ledger
+  so a restart does not reset it.
+- **First Mate.** Its triage calls retry on the fallback profile after a quota
+  error and use the primary again once the recorded reset passes.
+- **New tickets** start on the fallback profile while the primary is known to be
+  out of usage. Their launch prompt still lists the primary roles' models; a child
+  agent whose model the provider rejects retries with the controller model, as the
+  delivery skill already instructs.
+- **Readiness.** Harbor only switches to a provider that can run: the executable
+  exists, and for Claude the CLI is logged in (`claude auth status`) and the
+  project has no `playwright_browser_image`. Otherwise it keeps waiting and
+  notifies once. `harbor doctor` prints each fallback's readiness.
+- **Claude limits.** Claude Code builders allow only github.com, api.github.com,
+  api.linear.app and registry.npmjs.org, and refuse `playwright_browser_image`.
+- **Reload.** The fallback policy is read when Harbor starts; restart to apply
+  edits. An invalid section stops startup instead of silently disabling it.
+
 ## Policy (`workflow.toml`)
 
 | Section | Bundled default | Meaning |
