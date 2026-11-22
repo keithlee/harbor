@@ -78,7 +78,8 @@ class Case:
 
     @property
     def attempts(self) -> int:
-        return sum(1 for row in self.history if row["action"] not in {"wait"})
+        # A wait and a quota provider switch never spend First Mate's recovery budget.
+        return sum(1 for row in self.history if row["action"] not in {"wait", "quota_fallback"})
 
     @property
     def fresh_sessions(self) -> int:

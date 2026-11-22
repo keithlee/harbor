@@ -72,7 +72,7 @@ def selected_model(db, project, ticket, run_id, primary, fallbacks):
     return primary
 
 
-def record_fallback(db, project, ticket, run_id, primary, rejected, selected):
+def record_fallback(db, project, ticket, run_id, primary, rejected, selected, reason='model_unavailable'):
     from harbor.workflow_store import record
     record(db, {'project':project,'ticket':ticket,'run_id':run_id,'hook':'model_fallback',
-                'primary':primary,'rejected':rejected,'selected':selected,'reason':'model_unavailable'})
+                'primary':primary,'rejected':rejected,'selected':selected,'reason':reason})

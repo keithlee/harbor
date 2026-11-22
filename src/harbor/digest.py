@@ -253,6 +253,9 @@ def render_digest(source: Any, *, detailed: bool = True) -> str:
             when = datetime.fromtimestamp(quota["next_retry"], timezone.utc).isoformat()
             label = "confirmed reset" if quota["confirmed"] else "estimated retry"
             line += f"  {quota['provider']} usage limit ({label} {when})"
+        switched = _get(run, "provider_switch", default=None)
+        if isinstance(switched, Mapping):
+            line += f"  switched {switched.get('from')} -> {switched.get('to')} after usage limit"
         reason = _get(run, "terminal_reason", default=None)
         if reason:
             line += f"  stop={reason}"

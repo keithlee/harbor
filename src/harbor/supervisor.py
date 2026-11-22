@@ -528,12 +528,14 @@ class WorktreeDispatcher:
         self.runners[identifier] = runner
         return runner
 
-    async def fresh_session(self, identifier: str, instruction: str) -> Any:
+    async def fresh_session(self, identifier: str, instruction: str, *, switch: Any | None = None) -> Any:
         """Start a NEW builder session for a stuck ticket in its retained worktree.
 
-        Only First Mate recovery calls this. The logical run id, worktree and
-        branch are kept; the old native session id is dropped so the runner
-        starts a clean conversation with a hand-off instruction.
+        First Mate recovery and the quota provider fallback call this. The
+        logical run id, worktree and branch are kept; the old native session id
+        is dropped so the runner starts a clean conversation with a hand-off
+        instruction. ``switch`` (a ``quota_fallback.Profile``) moves the run to
+        another provider: it is the only path allowed to rebind runner identity.
         """
 
         identifier = str(identifier or "").strip()
@@ -557,6 +559,14 @@ class WorktreeDispatcher:
                     "UPDATE runs SET session_id=NULL, status='terminated', terminal_reason='first_mate_fresh_session' WHERE id=?",
                     (row["id"],),
                 )
+            if switch is not None:
+                from harbor.runner.quota import rebind_runner_identity
+                rebind_runner_identity(connection, row["id"], switch.provider, switch.model, switch.effort or "")
+                try:
+                    with connection:
+                        connection.execute("DELETE FROM quota_recovery WHERE run_id=?", (row["id"],))
+                except sqlite3.OperationalError:
+                    pass  # no quota table: nothing was waiting
         self.runners.pop(identifier, None)
         runner = await self.hydrate(identifier, recover_terminal=True)
         if runner is None:
@@ -906,7 +916,9 @@ class Supervisor:
         unblock_ladder: Any | None = None,
         ticket_scope: str | TicketScope | None = None,
         ticket: str | None = None,
+        quota_fallback: Any | None = None,
     ) -> None:
+        self.quota_fallback = quota_fallback  # harbor.quota_fallback.FallbackPolicy, or None
         self.poller = poller
         self.db = db if db is not None else getattr(poller, "db", None)
         self.project = poller.project_name
@@ -3193,6 +3205,92 @@ class Supervisor:
         when = datetime.fromtimestamp(float(row[1]), timezone.utc).isoformat(timespec="minutes")
         return f"{row[0]} usage limit; resets {when} ({'confirmed' if row[2] else 'estimated'})"
 
+    async def _switch_provider_on_quota(self, ticket: Mapping[str, Any], identifier: str, row: Mapping[str, Any]) -> bool:
+        """Continue a quota-stopped builder on the other provider; ``True`` when a switch started.
+
+        Deterministic and model-free, because First Mate's own model may be the
+        one that is out of usage. Any refusal returns ``False`` and the caller
+        waits for the provider reset exactly as before.
+        """
+
+        import time
+        from harbor import first_mate_recovery as recovery
+        from harbor.quota_fallback import handoff_text
+        from harbor.recovery import provider_exhausted
+        from harbor.runner.quota import runner_identity
+
+        policy = self.quota_fallback
+        connection = getattr(self.db, "connection", None)
+        if policy is None or connection is None or policy.max_switches <= 0:
+            return False
+        identity = runner_identity(connection, row["id"])
+        target = policy.builder_target(identity[0]) if identity else None
+        if target is None:
+            return False
+        current = identity[0]
+        waiting = connection.execute("SELECT next_retry FROM quota_recovery WHERE run_id=?", (row["id"],)).fetchone()
+        if waiting is None or float(waiting[0]) <= time.time():
+            # The provider reset has passed (for example Harbor was down across it): resume the
+            # retained session in place, which keeps its memory, instead of switching providers.
+            return False
+        recovery.initialize(connection)
+        used = connection.execute(
+            "SELECT COUNT(*) FROM first_mate_recoveries WHERE run_id=? AND action='quota_fallback'", (row["id"],)
+        ).fetchone()[0]
+        if used >= policy.max_switches or provider_exhausted(connection, target.provider, time.time()) is not None:
+            return False
+        problem = await asyncio.to_thread(policy.check, target)
+        if problem:
+            await self._notify_operator(
+                f"quota-fallback-unready:{row['id']}:{target.provider}",
+                f"{identifier}: {current} is out of usage but {target.provider} is not ready ({problem}); "
+                f"waiting for the {current} reset.",
+            )
+            return False
+        try:
+            summary = str(json.loads(row.get("final_json") or "{}").get("summary") or "")
+        except (TypeError, ValueError, AttributeError):
+            summary = ""
+        questions = [str(item.get("question") or "") for item in self.db.open_escalations([identifier])
+                     if item.get("run_id") == row["id"]]
+        try:
+            answers = [str(item[0]) for item in connection.execute(
+                "SELECT instruction FROM answer_queue WHERE ticket=? AND run_id=? AND status IN ('queued','failed','stopped')",
+                (identifier, row["id"]))]
+        except sqlite3.OperationalError:
+            answers = []  # no answer queue yet
+        handoff = handoff_text(
+            ticket=identifier, run_id=str(row["id"]), worktree=str(row.get("worktree") or ""), source=current,
+            target=target, summary=summary, pr_urls=sorted(self._ticket_pr_urls(self._authoritative_ticket(ticket))),
+            open_questions=questions, answers=answers, roles=policy.roles_for(target.provider),
+        )
+        case = recovery.Case(self.project, identifier, str(row["id"]), "failed", "failed",
+                             session_id=str(row.get("session_id") or ""))
+        recovery.record(connection, case, {"action": "quota_fallback", "instruction": handoff,
+                                           "reason": f"quota_fallback: {current} -> {target.provider}"})
+        await self._notify_operator(
+            f"quota-fallback:{row['id']}:{used}",
+            f"{identifier}: {current} is out of usage; continuing on {target.provider} ({target.model}) in a fresh session.",
+        )
+        wake = Wake(ticket=ticket, action="reengage", resume=row["id"], reason="quota-fallback")
+
+        async def switch() -> None:
+            try:
+                result = await self.dispatcher.fresh_session(identifier, handoff, switch=target)
+            except Exception as exc:
+                await self._notify_operator(
+                    f"quota-fallback-failed:{row['id']}:{used}",
+                    f"{identifier}: switching to {target.provider} failed ({exc}); inspect it and use /retry {identifier}.",
+                )
+                raise
+            await self._handle_runner_result(wake, result)
+
+        task = asyncio.create_task(switch(), name=f"harbor-quota-fallback-{identifier}")
+        self._dispatch_tasks[identifier] = task
+        self._dispatch_wakes[identifier] = wake
+        task.add_done_callback(lambda done, key=identifier: self._dispatch_finished(key, done))
+        return True
+
     async def _retry_stopped_builders(self) -> None:
         from harbor.recovery import (
             claim_quota_retry, claim_retry, defer_quota, interrupted_retry_instruction, quota_schema, recoverable,
@@ -3260,6 +3358,8 @@ class Supervisor:
                         f"{identifier}: {self._quota_wait_text(connection, str(row.get('id')))}; "
                         f"automatic resume is blocked because {blocked}; run /retry {identifier} after then.",
                     )
+                    continue
+                if self.quota_fallback is not None and await self._switch_provider_on_quota(ticket, identifier, row):
                     continue
             triage_retry = (row.get("status") == "blocked" and connection.execute("SELECT 1 FROM recovery_receipts WHERE run_id=?", ("triage:" + str(row.get("id")),)).fetchone() is not None)
             triage_quota = row.get("status") == "blocked" and connection.execute(
@@ -3562,6 +3662,14 @@ class Supervisor:
                                 ).fetchone()
                                 if receipt:
                                     item["quota_recovery"] = dict(receipt)
+                            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='first_mate_recoveries'").fetchone():
+                                switched = connection.execute(
+                                    "SELECT reason FROM first_mate_recoveries WHERE run_id=? AND action='quota_fallback' ORDER BY id DESC LIMIT 1",
+                                    (item["id"],),
+                                ).fetchone()
+                                parsed = re.fullmatch(r"quota_fallback: (\S+) -> (\S+)", str(switched[0])) if switched else None
+                                if parsed:
+                                    item["provider_switch"] = {"from": parsed[1], "to": parsed[2]}
                             raw_final = item.pop("final_json", None)
                             if raw_final:
                                 try:

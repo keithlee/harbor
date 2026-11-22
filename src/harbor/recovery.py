@@ -168,6 +168,41 @@ def claim_quota_retry(connection: Any, run_id: str, now: float, *, triage: bool 
         return result.rowcount == 1
 
 
+PROVIDER_QUOTA_BACKOFF = 900  # seconds assumed when a provider gives no usable reset time
+
+
+def provider_quota_schema(connection: Any) -> None:
+    connection.execute("""CREATE TABLE IF NOT EXISTS provider_quota (
+        provider TEXT PRIMARY KEY, exhausted_until REAL NOT NULL, observed_at REAL NOT NULL)""")
+
+
+def record_provider_quota(connection: Any, provider: str, reset: float | None, now: float) -> None:
+    """Remember that *provider* is out of usage; ``quota_recovery`` stays per-run."""
+    provider_quota_schema(connection)
+    until = reset if reset is not None and reset > now else now + PROVIDER_QUOTA_BACKOFF
+    with connection:
+        connection.execute(
+            """INSERT INTO provider_quota VALUES (?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET exhausted_until=excluded.exhausted_until,
+            observed_at=excluded.observed_at""",
+            (provider, until, now),
+        )
+
+
+def clear_provider_quota(connection: Any, provider: str) -> None:
+    """A successful turn proves the provider works again."""
+    provider_quota_schema(connection)
+    with connection:
+        connection.execute("DELETE FROM provider_quota WHERE provider=?", (provider,))
+
+
+def provider_exhausted(connection: Any, provider: str, now: float) -> float | None:
+    """Return when *provider* is expected back, or ``None`` when it is not known to be exhausted."""
+    provider_quota_schema(connection)
+    row = connection.execute("SELECT exhausted_until FROM provider_quota WHERE provider=?", (provider,)).fetchone()
+    return float(row[0]) if row is not None and float(row[0]) > now else None
+
+
 def pr_event_schema(connection: Any) -> None:
     """Bounded delivery receipts for PR events whose builder handoff failed."""
     connection.execute("""CREATE TABLE IF NOT EXISTS pr_event_attempts (
