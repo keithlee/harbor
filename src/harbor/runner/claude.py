@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -18,6 +19,7 @@ def validate_claude(executable: str, model: str, effort: str | None) -> None:
         raise ValueError("configure a Claude Code model explicitly")
     if effort not in {None, "low", "medium", "high", "xhigh", "max"}:
         raise ValueError("unsupported Claude Code reasoning effort")
+    attribution_off()  # fail at startup, not on the first dispatch, when HARBOR_CLAUDE_ATTRIBUTION is invalid
 
 
 def claude_read_only(executable: str, model: str, effort: str | None) -> list[str]:
@@ -48,6 +50,19 @@ def github_mcp_config(github_mcp: dict | None) -> dict | None:
     }}}
 
 
+ATTRIBUTION_ENV = "HARBOR_CLAUDE_ATTRIBUTION"
+
+
+def attribution_off() -> bool:
+    """True when the operator opted out of Claude's commit and PR attribution (``HARBOR_CLAUDE_ATTRIBUTION=off``)."""
+    value = os.environ.get(ATTRIBUTION_ENV, "").strip().lower()
+    if value == "off":
+        return True
+    if value in ("", "on"):
+        return False
+    raise ValueError(f"{ATTRIBUTION_ENV} must be 'off', 'on', or unset; got {value!r}")
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
@@ -69,6 +84,9 @@ class ClaudeRunner(CodexRunner):
         if mcp:
             # Pre-approve only the GitHub server's tools; dontAsk refuses everything else.
             settings["permissions"] = {"allow": ["mcp__github"]}
+        if attribution_off():
+            # Empty strings hide the commit trailer and the PR text; they supersede the deprecated includeCoAuthoredBy.
+            settings["attribution"] = {"commit": "", "pr": ""}
         schema = json.loads(Path(self.schema_path).read_text(encoding="utf-8"))
         # Claude's validator supplies its own draft. Harbor's result schema
         # uses the shared subset of keywords from both drafts.
