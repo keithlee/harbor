@@ -324,3 +324,125 @@ def test_harbor_start_reports_a_transport_misconfiguration_without_a_traceback(t
     assert result.returncode == 2, result.stderr
     assert "Harbor: github.transport = \"mcp\" requires builder_provider: claude" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+# ------------------------------------------- builder sandbox network allowlist
+
+GITHUB_COM_DOMAINS = ["github.com", "api.github.com", "api.linear.app", "registry.npmjs.org"]
+
+
+def sandbox_domains(argv: list[str]) -> list[str]:
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    return settings["sandbox"]["network"]["allowedDomains"]
+
+
+def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", **config):
+    import subprocess
+    from harbor.cli import build_production_dispatcher
+    from harbor.config.projects import ProjectConfig
+    from harbor.db import HarborDB
+    from workflow_support import materialize
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    path = materialize(tmp_path, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
+    if pipeline:
+        (tmp_path / ".harbor" / "pipeline.md").write_text(f"# Pipeline\n{pipeline}\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
+    project_config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
+                                   workflow_path=str(path), install_command="none", github_repository="owner/repo",
+                                   builder_provider="claude", builder_model="claude-sonnet-5-5", **config)
+    db = HarborDB(tmp_path / "state.db")
+    try:
+        return build_production_dispatcher(project_config, db), db
+    except BaseException:
+        db.close()
+        raise
+
+
+def production_claude_domains(tmp_path: Path, monkeypatch, pipeline: str = "", **config) -> list[str]:
+    from harbor.wake import Wake
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch, pipeline, **config)
+    try:
+        runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build"))
+        return sandbox_domains(runner.command("x", run_id="harbor-run-1"))
+    finally:
+        db.close()
+
+
+def test_a_github_com_project_keeps_the_default_sandbox_allowlist(tmp_path: Path, monkeypatch) -> None:
+    assert production_claude_domains(tmp_path, monkeypatch) == GITHUB_COM_DOMAINS
+
+
+def test_a_github_enterprise_project_lets_the_builder_sandbox_reach_its_host(tmp_path: Path, monkeypatch) -> None:
+    # The REST helper calls https://ghe.example.test/api/v3 and git pushes to
+    # ghe.example.test; the hardcoded GitHub.com allowlist blocked both.
+    domains = production_claude_domains(tmp_path, monkeypatch, "github_api_url: https://ghe.example.test/api/graphql")
+    assert domains == [*GITHUB_COM_DOMAINS, "ghe.example.test"]
+
+
+def test_a_custom_linear_endpoint_is_allowed_through_the_sandbox(tmp_path: Path, monkeypatch) -> None:
+    domains = production_claude_domains(tmp_path, monkeypatch, linear_api_url="https://linear.example.test/graphql")
+    assert domains == [*GITHUB_COM_DOMAINS, "linear.example.test"]
+
+
+def test_an_api_host_also_allows_its_git_host() -> None:
+    from harbor.runner.claude import sandbox_hosts
+    assert sandbox_hosts("https://api.acme.ghe.com/graphql") == ("api.acme.ghe.com", "acme.ghe.com")
+    assert sandbox_hosts("https://api.github.com/graphql") == ("api.github.com", "github.com")
+    assert sandbox_hosts("https://GHE.example.test:8443/api/graphql") == ("ghe.example.test",)
+
+
+@pytest.mark.parametrize("url", [
+    "http://ghe.example.test/api/graphql",
+    "https://*.example.test/api/graphql",
+    "https://ghe example.test/api/graphql",
+    "https://user@ghe.example.test/api/graphql",
+    "https:///api/graphql",
+    "https://ghe.example.test\n/api/graphql",
+    "https://-bad.example.test/graphql",
+    "https://[::1]/graphql",
+    "https://10.0.0.1/api/graphql",
+    "ghe.example.test",
+    "",
+])
+def test_a_malformed_endpoint_fails_closed_instead_of_widening_the_sandbox(url: str) -> None:
+    from harbor.runner.claude import sandbox_hosts
+    with pytest.raises(ValueError):
+        sandbox_hosts(url)
+
+
+def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Path, monkeypatch) -> None:
+    with pytest.raises(ValueError, match="GitHub API URL"):
+        claude_production(tmp_path, monkeypatch, "github_api_url: https://*.example.test/api/graphql")
+
+
+def test_doctor_lists_the_builder_sandbox_hosts_for_github_enterprise(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+    from workflow_support import materialize
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    materialize(repo, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
+                        "builder_provider: claude\nlinear_api_url: https://linear.invalid/graphql\n"
+                        "github_api_url: https://ghe.example.test/api/graphql\n")
+    projects = tmp_path / "projects.md"
+    projects.write_text(
+        "| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        f"| SampleProject | {repo} | {pipeline} | sample | SAMPLE | owner/repo |\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
+    env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
+               GITHUB_TOKEN="dummy-token-value", HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
+               HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
+    result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
+                             "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
+    assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
+            "ghe.example.test, linear.invalid") in result.stdout, result.stdout + result.stderr
+    assert "dummy-token-value" not in result.stdout + result.stderr

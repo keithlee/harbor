@@ -281,6 +281,8 @@ def build_production_dispatcher(
             runner.workflow_project = config.name
             runner.github_env = github["env"]
             runner.github_mcp = github["mcp"] if provider == "claude" else None
+            if provider == "claude":
+                runner.sandbox_hosts = github["sandbox_hosts"]
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -329,6 +331,16 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     if token_env:
         child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env
     mcp = {"url": settings["mcp_url"], "token_env": token_env} if settings["transport"] == "mcp" and token_env else None
+    # The Claude builder's Bash sandbox reaches only these hosts (plus Harbor's
+    # GitHub.com/Linear defaults): the configured GitHub API and git host, and
+    # the configured Linear endpoint. A malformed value raises here, so start
+    # and doctor fail closed instead of launching a builder that cannot push.
+    from harbor.runner.claude import sandbox_hosts
+    hosts = (
+        *sandbox_hosts(rest_url, "GitHub API"),
+        *sandbox_hosts(str(getattr(config, "linear_api_url", "") or "https://api.linear.app/graphql"),
+                       "Linear API", git_host=False),
+    )
     return {
         "transport": settings["transport"],
         "mcp_url": settings["mcp_url"],
@@ -336,6 +348,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "token_names": token_names,
         "env": child_env,
         "mcp": mcp,
+        "sandbox_hosts": tuple(dict.fromkeys(hosts)),
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
         ),
@@ -383,6 +396,9 @@ async def _doctor(project_name: str) -> int:
             print(f"GitHub transport: {github['transport']} · {where} · no token: set {github['token_names']}")
             if getattr(config, "github_repository", ""):
                 scope_ok = False
+        if getattr(config, "builder_provider", "codex") == "claude":
+            from harbor.runner.claude import sandbox_domains
+            print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
