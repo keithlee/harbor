@@ -862,12 +862,13 @@ def github_transport_fact(
     rest = f"`{helper} <op>`{target} ({ops}). It prints JSON."
     if not token_available:
         return (
-            "GitHub transport: none. No GitHub token is set for this run, so GitHub reads and "
-            "writes will fail. Do not use the gh CLI, MCP or gh-axi; report a delivery-transport blocker."
+            "GitHub transport: no GitHub token is set in this run's environment, so the REST helper "
+            f"`{helper}` cannot authenticate. If the gh CLI works in your sandbox you may use it; "
+            "if it fails or hangs, report a delivery-transport blocker. Do not use MCP or gh-axi."
         )
     common = (
-        "Never print or echo the token. Do not use the gh CLI: inside the builder sandbox it "
-        "cannot reach GitHub on every platform (on macOS it hangs). `git push` works as usual."
+        "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
+        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual."
     )
     if transport == "mcp":
         return (

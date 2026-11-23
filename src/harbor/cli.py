@@ -281,10 +281,16 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     if settings["transport"] == "mcp" and provider != "claude":
         raise ValueError("github.transport = \"mcp\" requires builder_provider: claude (Codex refuses MCP calls that need approval)")
     profile = PipelineProfile.from_project(config)
+    rest_url = rest_base_url(profile.github_api_url)
+    explicit_mcp_url = "mcp_url" in dict((workflow.config or {}).get("github") or {})
+    if settings["transport"] == "mcp" and rest_url != "https://api.github.com" and not explicit_mcp_url:
+        # The default hosted MCP server is GitHub.com only; never send an Enterprise token there.
+        raise ValueError("github.mcp_url is required for GitHub Enterprise Server; the default MCP server serves GitHub.com only")
     token_env = token_env_name(environ, profile.github_token_env)
+    token_names = " or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
     repository = str(getattr(config, "github_repository", "") or "")
     helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
-    child_env = {"HARBOR_GITHUB_API_URL": rest_base_url(profile.github_api_url)}
+    child_env = {"HARBOR_GITHUB_API_URL": rest_url}
     if repository:
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
     if token_env:
@@ -294,6 +300,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "transport": settings["transport"],
         "mcp_url": settings["mcp_url"],
         "token_env": token_env,
+        "token_names": token_names,
         "env": child_env,
         "mcp": mcp,
         "fact": github_transport_fact(
@@ -340,7 +347,7 @@ async def _doctor(project_name: str) -> int:
         if github["token_env"]:
             print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
         else:
-            print(f"GitHub transport: {github['transport']} · {where} · no token: set GITHUB_TOKEN or GH_TOKEN")
+            print(f"GitHub transport: {github['transport']} · {where} · no token: set {github['token_names']}")
             if getattr(config, "github_repository", ""):
                 scope_ok = False
     if config.install_command is None:

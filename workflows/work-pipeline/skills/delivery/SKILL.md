@@ -8,7 +8,7 @@ On continuation reconcile partial edits, the existing PR and current comments; d
 Do not create a separate ticket or select another Todo on resume.
 Read the project's AGENTS.md and Pipeline Profile. Never invent install, proof or project settings.
 For GitHub reads and writes use the transport named in your launch prompt ("GitHub transport: ...");
-do not fall back to the `gh` CLI, which cannot reach GitHub from inside the builder sandbox on macOS.
+prefer it over the `gh` CLI, which cannot reach GitHub from inside Claude Code's sandbox on macOS.
 
 ## Roles and models
 Models come from `config.toml` in this workflow package (mirrored in the policy's `roles`).

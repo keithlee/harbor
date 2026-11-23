@@ -88,6 +88,9 @@ def test_the_token_reaches_curl_on_stdin_never_on_argv(fake_curl, monkeypatch) -
     assert not any(TOKEN in arg for arg in call["argv"])
     assert f'header = "Authorization: Bearer {TOKEN}"' in call["config"]
     assert 'url = "https://api.github.com/user"' in call["config"]
+    # ~/.curlrc is ignored (-q must be first) and URL globbing is off.
+    assert call["argv"][1] == "-q"
+    assert call["config"].splitlines()[0] == "globoff"
 
 
 def test_an_http_error_is_reported_without_the_token(fake_curl, monkeypatch) -> None:
@@ -209,14 +212,16 @@ def test_mcp_transport_configures_the_server_with_a_token_reference(tmp_path: Pa
 def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path) -> None:
     github = builder_github(project(tmp_path), workflow(), "claude", env={})
     assert github["token_env"] is None and "HARBOR_GITHUB_TOKEN_ENV" not in github["env"]
-    assert "No GitHub token" in github["fact"] and "blocker" in github["fact"]
+    assert "no GitHub token" in github["fact"] and "blocker" in github["fact"]
+    assert "If the gh CLI works" in github["fact"]  # keychain-only gh users are not stranded
 
 
 # --------------------------------------------------------------- builder view
 
 def test_the_fact_never_advertises_gh_and_reaches_the_instruction() -> None:
     fact = github_transport_fact("rest", helper="python -m harbor.github_rest", repository="o/r")
-    assert "Do not use the gh CLI" in fact and "pr-create" in fact
+    assert "Prefer this over the gh CLI" in fact and "pr-create" in fact
+    assert "Available and authenticated" not in fact
     text = build_instruction({"identifier": "SAMPLE-1", "title": "t", "state": "Todo"}, github_fact=fact)
     assert fact in text
     assert github_transport_fact("rest", helper="") == ""
@@ -227,3 +232,95 @@ def test_claude_mcp_config_references_the_token_variable_not_its_value() -> None
     assert config["mcpServers"]["github"]["headers"] == {"Authorization": "Bearer ${GITHUB_TOKEN}"}
     assert github_mcp_config(None) is None
 
+
+
+def test_mcp_on_github_enterprise_requires_an_explicit_endpoint(tmp_path: Path) -> None:
+    ghes = project(tmp_path)
+    ghes.github_api_url = "https://ghe.example.test/api/graphql"
+    with pytest.raises(ValueError, match="mcp_url is required"):
+        builder_github(ghes, workflow({"transport": "mcp"}), "claude", env={"GITHUB_TOKEN": TOKEN})
+    own = "https://ghe.example.test/mcp/"
+    github = builder_github(ghes, workflow({"transport": "mcp", "mcp_url": own}), "claude", env={"GITHUB_TOKEN": TOKEN})
+    assert github["mcp"]["url"] == own
+    assert github["env"]["HARBOR_GITHUB_API_URL"] == "https://ghe.example.test/api/v3"
+
+
+# ------------------------------------------------- production wiring (HAN-87)
+
+def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model"):
+    import subprocess
+    from harbor.cli import build_production_dispatcher
+    from harbor.config.projects import ProjectConfig
+    from harbor.db import HarborDB
+    from workflow_support import materialize
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    path = materialize(tmp_path, extra=extra, models={"controller": {"model": model, "reasoning_effort": "medium"}})
+    monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
+                           workflow_path=str(path), install_command="none", github_repository="owner/repo",
+                           builder_provider=provider, builder_model=model)
+    db = HarborDB(tmp_path / "state.db")
+    dispatcher, _, factory = build_production_dispatcher(config, db)
+    return dispatcher, factory, db
+
+
+def test_the_production_dispatcher_tells_a_new_build_its_transport(tmp_path: Path, monkeypatch) -> None:
+    from harbor.wake import Wake
+    dispatcher, factory, db = production(tmp_path, monkeypatch)
+    try:
+        wake = dispatcher._initial_wake(Wake(ticket={"identifier": "SAMPLE-1"}, action="build", instruction="ticket"))
+        assert "GitHub transport: REST helper" in wake.instruction and "owner/repo" in wake.instruction
+        assert "Available and authenticated in your sandbox: gh" not in wake.instruction
+        runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build"))
+        env = runner.environment()
+        assert env["HARBOR_GITHUB_REPOSITORY"] == "owner/repo"
+        assert env["HARBOR_GITHUB_TOKEN_ENV"] == "GITHUB_TOKEN"
+        assert env["HARBOR_GITHUB_API_URL"] == "https://api.github.com"
+        assert getattr(runner, "github_mcp", None) is None
+    finally:
+        db.close()
+
+
+def test_the_production_claude_runner_gets_the_github_mcp_server(tmp_path: Path, monkeypatch) -> None:
+    from harbor.runner.claude import ClaudeRunner
+    from harbor.wake import Wake
+    dispatcher, factory, db = production(tmp_path, monkeypatch, extra='[github]\ntransport = "mcp"\n',
+                                         provider="claude", model="claude-sonnet-5-5")
+    try:
+        assert "GitHub transport: MCP" in dispatcher.github_fact
+        runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build"))
+        assert isinstance(runner, ClaudeRunner)
+        argv = runner.command("x", run_id="harbor-run-1")
+        mcp = json.loads(argv[argv.index("--mcp-config") + 1])
+        assert mcp["mcpServers"]["github"]["headers"]["Authorization"] == "Bearer ${GITHUB_TOKEN}"
+        assert TOKEN not in json.dumps(argv)
+    finally:
+        db.close()
+
+
+def test_harbor_start_reports_a_transport_misconfiguration_without_a_traceback(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+    from workflow_support import materialize
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    materialize(repo, extra='[github]\ntransport = "mcp"\n')
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n")
+    projects = tmp_path / "projects.md"
+    projects.write_text(
+        "| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository |\n"
+        "| --- | --- | --- | --- | --- | --- |\n"
+        f"| SampleProject | {repo} | {pipeline} | sample | SAMPLE | owner/repo |\n"
+    )
+    env = {k: v for k, v in __import__("os").environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
+    env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"), GITHUB_TOKEN="dummy")
+    result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
+                             "start", "SampleProject", "--once"], env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2, result.stderr
+    assert "Harbor: github.transport = \"mcp\" requires builder_provider: claude" in result.stderr
+    assert "Traceback" not in result.stderr

@@ -105,9 +105,12 @@ and crash-retry delays come from `workflow.toml`.
 ### GitHub transport (`[github]`)
 
 The builder needs GitHub to open, update, comment on, check and (when the
-workflow allows) merge its PR. The GitHub CLI is not used for this: inside
-Claude Code's macOS sandbox `gh` cannot complete a TLS handshake and hangs,
-while plain HTTPS to the API works. Harbor tells the builder which transport it
+workflow allows) merge its PR. Harbor does not rely on the GitHub CLI for this:
+inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake and
+hangs, while plain HTTPS to the API works. The builder is told to prefer the
+configured transport; where `gh` does work (for example Codex, or Linux) it may
+still use it, and with no token in the environment it is told to try `gh` before
+reporting a blocker. Harbor tells the builder which transport it
 has in the launch prompt.
 
 ```toml
@@ -133,7 +136,8 @@ network allowlist are unchanged. The server runs outside the Bash sandbox. The
 which Claude Code expands, so the token is never written into the command.
 The default endpoint is GitHub's hosted server, which serves GitHub.com only and
 is a dependency on that service; set `mcp_url` to a self-hosted
-`github-mcp-server` for GitHub Enterprise Server or to avoid it. Codex builders
+`github-mcp-server` to avoid it. On GitHub Enterprise Server `mcp_url` is
+required, so an Enterprise token is never sent to the GitHub.com server. Codex builders
 are refused at startup, because a non-interactive Codex run refuses MCP calls
 that need approval. The REST helper stays available as a fallback.
 

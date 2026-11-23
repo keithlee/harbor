@@ -71,6 +71,8 @@ def _config_quote(value: str) -> str:
 
 def curl_config(method: str, url: str, token: str, body: str | None) -> str:
     lines = [
+        # No URL globbing: "{a,b}" or "[1-2]" in a path must not fan one write out into several.
+        "globoff",
         f"url = {_config_quote(url)}",
         f"request = {_config_quote(method)}",
         f"header = {_config_quote('Authorization: Bearer ' + token)}",
@@ -104,7 +106,9 @@ class Client:
         config = curl_config(method.upper(), self.base + path, self._token, body)
         try:
             result = subprocess.run(
-                [self.curl, "--silent", "--show-error", "--max-time", str(self.timeout),
+                # -q first: ignore ~/.curlrc, which could add redirects, includes or output
+                # that would forward the token or corrupt the status parsing.
+                [self.curl, "-q", "--silent", "--show-error", "--max-time", str(self.timeout),
                  "--config", "-", "--write-out", "\n%{http_code}"],
                 input=config, capture_output=True, text=True, timeout=self.timeout + 15, check=False,
             )
