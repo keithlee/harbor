@@ -3988,7 +3988,9 @@ class Supervisor:
 
         settings = workflow.config.get("first_mate", {})
         try:
-            cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope)
+            states = workflow.config.get("states", {})
+            cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope,
+                                        stopped_states=(*states.get("paused", []), *states.get("terminal", [])))
         except Exception as exc:
             self.last_error = f"First Mate monitor: {exc}"
             return

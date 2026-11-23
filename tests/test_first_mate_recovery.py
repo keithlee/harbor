@@ -546,3 +546,82 @@ def test_stalled_real_codex_process_is_killed_before_replacement(tmp_path):
 
     asyncio.run(scenario())
     db.close()
+
+
+# ---- First Mate never recovers a shelved (backlog-type or paused) ticket ----
+
+def _shelve(db, *, state, state_type):
+    db.connection.execute("UPDATE tickets SET state=?, state_type=?", (state, state_type)); db.connection.commit()
+
+
+def _recording_supervisor(tmp_path, db):
+    answer = {"action": "resume", "instruction": "close the stale child and continue", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
+    resumed = []
+
+    async def resume_session(run_id, prompt):
+        resumed.append(run_id)
+        return True
+
+    supervisor.resume_session = resume_session
+    return supervisor, mate, linear, resumed
+
+
+ENV_BLOCKED = {**HAN86, "summary": "builder stopped", "blocker": {"kind": "env_blocker", "question": "builder exited"}}
+
+
+def test_blocked_run_on_custom_backlog_state_is_not_recovered(tmp_path):
+    # The operator moved the ticket to a custom backlog-type state ("Icebox").
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    _shelve(db, state="Icebox", state_type="backlog")
+    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    monitor(supervisor)
+    assert mate.prompts == [] and linear.comments == [] and resumed == []
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    db.close()
+
+
+def test_failed_and_stalled_runs_on_backlog_state_are_not_recovered(tmp_path):
+    db = ledger(tmp_path, status="failed", final={"status": "failed"})
+    _shelve(db, state="Icebox", state_type="backlog")
+    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []
+    db.close()
+    (tmp_path / "stalled").mkdir()
+    stalled = ledger(tmp_path / "stalled", status="running", final={}, finished=None, activity=60)
+    _shelve(stalled, state="Icebox", state_type="backlog")
+    assert recovery.find_cases(stalled.connection, "Demo", SETTINGS) == []
+    stalled.close()
+
+
+def test_watchdog_flag_for_backlog_ticket_is_dropped(tmp_path):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    flag(db, "HAN-86")
+    _shelve(db, state="Icebox", state_type="backlog")
+    assert _flag_cases(db) == []
+    assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 1  # handled, not retried
+    db.close()
+
+
+def _monitor_in_state(tmp_path, name):
+    root = tmp_path / name.replace(" ", "-")
+    root.mkdir()
+    db = ledger(root, final=ENV_BLOCKED)
+    _shelve(db, state=name, state_type="started")
+    supervisor, mate, _, resumed = _recording_supervisor(root, db)
+    supervisor.dispatcher.workflow.config["states"] = {"paused": ["On Hold"], "terminal": ["Shipped"]}
+    monitor(supervisor)
+    db.close()
+    return mate.prompts, resumed
+
+
+def test_workflow_paused_and_terminal_states_are_not_recovered(tmp_path):
+    for name in ("On Hold", "Shipped", "Paused"):
+        prompts, resumed = _monitor_in_state(tmp_path, name)
+        assert prompts == [] and resumed == [], name
+
+
+def test_in_progress_and_human_review_are_still_recovered(tmp_path):
+    for name in ("In Progress", "Human Review"):
+        prompts, resumed = _monitor_in_state(tmp_path, name)
+        assert len(prompts) == 1 and resumed == ["run-HAN-86"], name
