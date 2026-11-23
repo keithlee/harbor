@@ -89,7 +89,9 @@ Harbor waits for the reset exactly as before.
 
 ```toml
 [quota_fallback]
-max_switches = 2            # per run; default 2, 0 disables
+max_switches = 2            # builder switches per run; default 2. 0 stops in-flight
+                            # builder switches only: First Mate and new tickets
+                            # still fall back. Remove the section to turn fallback off.
 
 [quota_fallback.controller] # builder; planner/reviewer/implementor inherit it
 provider = "codex"          # must differ from builder_provider in pipeline.md
@@ -128,10 +130,13 @@ model = "gpt-6-luna"
   out of usage. Their launch prompt still lists the primary roles' models; a child
   agent whose model the provider rejects retries with the controller model, as the
   delivery skill already instructs.
-- **Readiness.** Harbor only switches to a provider that can run: the executable
-  exists, and for Claude the CLI is logged in (`claude auth status`) and the
-  project has no `playwright_browser_image`. Otherwise it keeps waiting and
-  notifies once. `harbor doctor` prints each fallback's readiness.
+- **Readiness.** A builder switch, and a new ticket starting on the fallback,
+  happen only when that provider can run: the executable exists, and for Claude
+  the CLI is logged in (`claude auth status`) and the project has no
+  `playwright_browser_image`. Otherwise the builder keeps waiting and Harbor
+  notifies once. First Mate's fallback call does not check readiness first; an
+  unready fallback simply fails that call. `harbor doctor` prints each
+  fallback's readiness.
 - **Claude limits.** Claude Code builders allow only github.com, api.github.com,
   api.linear.app and registry.npmjs.org, and refuse `playwright_browser_image`.
 - **Reload.** The fallback policy is read when Harbor starts; restart to apply

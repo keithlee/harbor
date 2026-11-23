@@ -1,6 +1,10 @@
 # Provider fallback on usage limits — design
 
-Status: draft for approval. Approach A of three considered (see Approaches).
+Status: implemented in #4. This is the pre-implementation design; where it
+differs from the code (table columns, receipt names, status text, reload
+behaviour), the "Implementation notes" section at the end and
+`docs/configurable-workflows.md` are authoritative. Approach A of three
+considered (see Approaches).
 
 ## Intent and why
 
