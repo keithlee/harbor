@@ -336,7 +336,7 @@ def sandbox_domains(argv: list[str]) -> list[str]:
     return settings["sandbox"]["network"]["allowedDomains"]
 
 
-def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", **config):
+def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", *, provider: str = "claude", **config):
     import subprocess
     from harbor.cli import build_production_dispatcher
     from harbor.config.projects import ProjectConfig
@@ -351,7 +351,7 @@ def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", **config)
     monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
     project_config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
                                    workflow_path=str(path), install_command="none", github_repository="owner/repo",
-                                   builder_provider="claude", builder_model="claude-sonnet-5-5", **config)
+                                   builder_provider=provider, builder_model="claude-sonnet-5-5", **config)
     db = HarborDB(tmp_path / "state.db")
     try:
         return build_production_dispatcher(project_config, db), db
@@ -366,6 +366,54 @@ def production_claude_domains(tmp_path: Path, monkeypatch, pipeline: str = "", *
     try:
         runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build"))
         return sandbox_domains(runner.command("x", run_id="harbor-run-1"))
+    finally:
+        db.close()
+
+
+IP_GHES = "github_api_url: https://10.0.0.5/api/graphql"
+
+
+@pytest.mark.parametrize("pipeline", [IP_GHES, "github_api_url: https://github/api/graphql"])
+def test_a_codex_project_is_not_held_to_the_claude_sandbox_host_rules(tmp_path: Path, monkeypatch, pipeline) -> None:
+    # Codex's sandbox does not filter by host, so a GHES on an IP literal or a
+    # single-label name must keep working for Codex builders.
+    from harbor.runner.codex import CodexRunner
+    from harbor.wake import Wake
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch, pipeline, provider="codex")
+    try:
+        runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build"))
+        assert type(runner) is CodexRunner
+        assert runner.environment()["HARBOR_GITHUB_API_URL"].endswith("/api/v3")
+    finally:
+        db.close()
+
+
+def test_a_resumed_claude_session_on_a_codex_project_still_gets_the_ghes_host(tmp_path: Path, monkeypatch) -> None:
+    from harbor.runner.claude import ClaudeRunner
+    from harbor.runner.quota import bind_runner_identity
+    from harbor.wake import Wake
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (_, _, factory), db = claude_production(
+        tmp_path, monkeypatch, "github_api_url: https://ghe.example.test/api/graphql", provider="codex")
+    try:
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        runner = factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build", resume="harbor-run-1"))
+        assert isinstance(runner, ClaudeRunner)
+        assert sandbox_domains(runner.command("x", run_id="harbor-run-1"))[-1] == "ghe.example.test"
+    finally:
+        db.close()
+
+
+def test_a_resumed_claude_session_refuses_an_ip_literal_ghes(tmp_path: Path, monkeypatch) -> None:
+    from harbor.runner.quota import bind_runner_identity
+    from harbor.wake import Wake
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch, IP_GHES, provider="codex")
+    try:
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        with pytest.raises(ValueError, match="GitHub API URL"):
+            factory(tmp_path, Wake(ticket={"identifier": "SAMPLE-1"}, action="build", resume="harbor-run-1"))
     finally:
         db.close()
 
@@ -417,7 +465,7 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
         claude_production(tmp_path, monkeypatch, "github_api_url: https://*.example.test/api/graphql")
 
 
-def test_doctor_lists_the_builder_sandbox_hosts_for_github_enterprise(tmp_path: Path) -> None:
+def run_doctor(tmp_path: Path, provider: str, github_api_url: str):
     import os
     import subprocess
     import sys
@@ -429,8 +477,8 @@ def test_doctor_lists_the_builder_sandbox_hosts_for_github_enterprise(tmp_path: 
     materialize(repo, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
-                        "builder_provider: claude\nlinear_api_url: https://linear.invalid/graphql\n"
-                        "github_api_url: https://ghe.example.test/api/graphql\n")
+                        f"builder_provider: {provider}\nlinear_api_url: https://linear.invalid/graphql\n"
+                        f"github_api_url: {github_api_url}\n")
     projects = tmp_path / "projects.md"
     projects.write_text(
         "| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository |\n"
@@ -440,9 +488,26 @@ def test_doctor_lists_the_builder_sandbox_hosts_for_github_enterprise(tmp_path: 
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
                GITHUB_TOKEN="dummy-token-value", HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
-               HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
+               HARBOR_CODEX_EXECUTABLE="/bin/echo", HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
                              "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
+    assert "dummy-token-value" not in result.stdout + result.stderr
+    return result
+
+
+def test_doctor_lists_the_builder_sandbox_hosts_for_github_enterprise(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "claude", "https://ghe.example.test/api/graphql")
     assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
             "ghe.example.test, linear.invalid") in result.stdout, result.stdout + result.stderr
-    assert "dummy-token-value" not in result.stdout + result.stderr
+
+
+def test_doctor_does_not_call_an_ip_literal_ghes_invalid_for_a_codex_builder(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "codex", "https://10.0.0.5/api/graphql")
+    assert "GitHub transport: rest" in result.stdout, result.stdout + result.stderr
+    assert "invalid" not in result.stdout and "Builder sandbox network" not in result.stdout
+
+
+def test_doctor_reports_an_ip_literal_ghes_invalid_for_a_claude_builder(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "claude", "https://10.0.0.5/api/graphql")
+    assert "GitHub transport: invalid (the GitHub API URL must be" in result.stdout, result.stdout
+    assert result.returncode == 1

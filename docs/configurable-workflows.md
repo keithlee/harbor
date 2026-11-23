@@ -223,8 +223,15 @@ sandbox. A GitHub.com project gets exactly the default list. `harbor doctor`
 prints the list as `Builder sandbox network:` for Claude builders; it shows
 what the sandbox allows, not that the host answers. A git remote on a host
 other than the API host (for example SSH through a separate hostname) is not
-added; Codex builders are unaffected, since their sandbox does not filter by
-host. Verified with unit tests and the production runner factory on macOS
+added. A Claude builder therefore cannot use a GitHub Enterprise Server that is
+addressed by an IP address or a single-label name such as `https://github/`;
+Harbor refuses it instead of guessing, so give the server a DNS name. Codex
+builders are unaffected, since their sandbox does not filter by host, and these
+rules are applied only to Claude builders, including a retained Claude session
+on a project since switched to Codex. A configured DNS name is trusted as-is:
+whoever can set `github_api_url` (the registry, `.harbor/pipeline.md` or
+`AGENTS.md` in the main checkout) already decides where the GitHub token is
+sent, so allowing that host gives them nothing new. Verified with unit tests and the production runner factory on macOS
 (generated `--settings` for GitHub.com and a GitHub Enterprise Server config);
 not run against a real GitHub Enterprise Server, a custom Linear endpoint, or
 on Linux.
