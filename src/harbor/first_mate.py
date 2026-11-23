@@ -193,6 +193,23 @@ class CodexExecRunner:
         return output
 
 
+def _claude_result(result: Any) -> Any:
+    """The final text of a Claude Code stream-json run, or a quota/First Mate error."""
+
+    from harbor.runner.quota import quota_error
+    from harbor.runner.stream import parse_events
+    final = None
+    for event in parse_events(_result_text(result).splitlines()):
+        limited, reset = quota_error(event.data or {}, datetime.now(timezone.utc))
+        if limited:
+            raise FirstMateQuotaError(reset, "claude")
+        if event.type == "result":
+            final = event
+    if final is None or final.get("is_error"):
+        raise FirstMateError("Claude Code did not return a successful First Mate result")
+    return final.get("result")
+
+
 async def _invoke(runner: Any, command: Sequence[str], prompt: str) -> Any:
     """Invoke a callable or runner object without making fallback calls.
 
@@ -255,6 +272,8 @@ class FirstMate:
         status_provider: Any | None = None,
         digest_provider: Any | None = None,
         provider: str = "codex",
+        fallback: Any | None = None,
+        fallback_runner: Any | None = None,
     ) -> None:
         if status_source is None:
             status_source = status_provider if status_provider is not None else digest_provider
@@ -279,6 +298,12 @@ class FirstMate:
         self.notifier = notifier
         self._active_answer: asyncio.Task[Any] | None = None
         self._quota_wait: tuple[float, FirstMateQuotaError] | None = None
+        # Optional second provider (a ``quota_fallback.Profile``) used only while the primary is out of usage.
+        self.fallback = fallback
+        self.fallback_runner = fallback_runner if fallback_runner is not None else (
+            CodexExecRunner(provider=fallback.provider) if fallback is not None else None)
+        self._fallback_wait: tuple[float, FirstMateQuotaError] | None = None
+        self._using_fallback = False
 
     def digest(self, status: Any | None = None) -> str:
         """Return the same synchronous digest used by ``/status``."""
@@ -331,6 +356,45 @@ class FirstMate:
         return await self._generate(prompt)
 
     async def _generate(self, prompt):
+        """Primary provider first; the fallback profile only after a usage-limit error."""
+        try:
+            text = await self._generate_primary(prompt)
+        except FirstMateQuotaError:
+            if self.fallback is None:
+                raise
+            return await self._generate_fallback(prompt)
+        self._using_fallback = False
+        return text
+
+    async def _generate_fallback(self, prompt):
+        profile = self.fallback
+        if self._fallback_wait and time.time() < self._fallback_wait[0]:
+            raise self._fallback_wait[1]  # both providers are out of usage
+        try:
+            if profile.provider == "claude":
+                from harbor.runner.claude import claude_read_only
+                command = claude_read_only(self.claude_cli, profile.model, profile.effort)
+            else:
+                command = build_command(profile.model, reasoning_effort=profile.effort)
+            result = await _invoke(self.fallback_runner, command, prompt)
+            if profile.provider == "claude":
+                result = _claude_result(result)
+        except FirstMateQuotaError as exc:
+            now = time.time()
+            self._fallback_wait = (exc.reset if exc.reset and exc.reset > now else now + 300, exc)
+            raise
+        self._fallback_wait = None
+        if not self._using_fallback:
+            self._using_fallback = True
+            from harbor.model_policy import record_fallback
+            db = getattr(self.status_source, "db", None)
+            if db is not None:
+                record_fallback(db.connection, getattr(self.status_source, "project", ""), "firstmate", "firstmate",
+                                f"{self.provider}:{self.active_model}", f"{self.provider}:{self.active_model}",
+                                f"{profile.provider}:{profile.model}", reason="usage_limit")
+        return _result_text(result)
+
+    async def _generate_primary(self, prompt):
         from harbor.model_policy import record_fallback
         if self._quota_wait and time.time() < self._quota_wait[0]:
             raise self._quota_wait[1]
@@ -346,18 +410,7 @@ class FirstMate:
                     command = build_command(model, reasoning_effort=self.reasoning_effort)
                 result = await _invoke(self.runner, command, prompt)
                 if self.provider == "claude":
-                    from harbor.runner.quota import quota_error
-                    from harbor.runner.stream import parse_events
-                    final = None
-                    for event in parse_events(_result_text(result).splitlines()):
-                        limited, reset = quota_error(event.data or {}, datetime.now(timezone.utc))
-                        if limited:
-                            raise FirstMateQuotaError(reset, "claude")
-                        if event.type == "result":
-                            final = event
-                    if final is None or final.get("is_error"):
-                        raise FirstMateError("Claude Code did not return a successful First Mate result")
-                    result = final.get("result")
+                    result = _claude_result(result)
             except FirstMateQuotaError as exc:
                 now = time.time()
                 self._quota_wait = (exc.reset if exc.reset and exc.reset > now else now + 300, exc)

@@ -149,6 +149,32 @@ def _disk_floor_gb(config: Any) -> float:
     return float(value) if value is not None else DEFAULT_DISK_FLOOR_GB
 
 
+def _quota_policy(config: Any, workflow: Any | None = None) -> Any:
+    """The project's provider-fallback policy, or ``None`` when ``[quota_fallback]`` is not configured."""
+
+    from harbor.config.workflow import load_workflow
+    from harbor.quota_fallback import default_readiness, policy_from_config
+    workflow = workflow or load_workflow(Path(config.workflow_path))
+    image = getattr(config, "playwright_browser_image", None)
+    return policy_from_config(
+        config, workflow.config, check=lambda profile: default_readiness(profile, playwright_image=image)
+    )
+
+
+def _fallback_report(policy: Any) -> list[str]:
+    """``harbor doctor`` lines: whether each configured fallback profile could run right now."""
+
+    if policy is None:
+        return ["Fallback: none"]
+    lines = []
+    for label, pair in (("builder", policy.builder), ("First Mate", policy.mate)):
+        if pair is not None:
+            problem = policy.check(pair[1])
+            state = f"not ready ({problem})" if problem else "ready"
+            lines.append(f"Fallback {label}: {pair[1].provider} {pair[1].model} {state}")
+    return lines
+
+
 def _is_terminal_linear_state(value: str | None) -> bool:
     """Keep the direct CLI fail-closed even when a client is substituted.
 
@@ -172,6 +198,7 @@ def build_production_dispatcher(
     runner_factory: Any | None = None,
     builder_prompt: str = "",
     ticket_scope: TicketScope | str | None = None,
+    quota_policy: Any | None = None,
 ) -> tuple[Any, Any, Any]:
     """Construct the real worktree manager, runner factory and dispatcher.
 
@@ -227,6 +254,12 @@ def build_production_dispatcher(
             if provider != builder_provider:
                 model, effort = (identity[1], identity[2]) if identity else ("gpt-5.6-luna", "xhigh")
                 fallbacks = ()
+            if identity is None and quota_policy is not None and getattr(wake, "action", None) != "reengage":
+                # A new ticket never starts on a provider known to be out of usage.
+                import time
+                start = quota_policy.starting_builder_profile(db.connection, time.time())
+                if start is not None:
+                    provider, model, effort, fallbacks = start.provider, start.model, start.effort, ()
             runner_type = ClaudeRunner if provider == "claude" else CodexRunner
             if provider == "claude":
                 validate_claude(claude_cli, model, effort)
@@ -357,6 +390,12 @@ async def _doctor(project_name: str) -> int:
     if not shutil.which(os.environ.get(f"HARBOR_{provider.upper()}_EXECUTABLE", provider)):
         print(f"Runner: {provider} executable unavailable")
         scope_ok = False
+    try:
+        for line in _fallback_report(_quota_policy(config, workflow)):
+            print(line)
+    except ValueError as exc:
+        print(f"Fallback: invalid ({exc})")
+        scope_ok = False
     print(f"Poll states: {', '.join(config.poll_states)}")
     print(f"Dispatch states: {', '.join(config.dispatch_states)}")
     print("Backlog: ignored")
@@ -454,7 +493,9 @@ async def _start(
     # inject any of these seams, but an ordinary ``harbor start SampleProject`` must
     # still create an isolated worktree and a persistent Codex builder.
     production_dispatcher = dispatcher
+    quota_policy = None
     if production_dispatcher is None and runner is None and not read_only:
+        quota_policy = _quota_policy(config)  # invalid [quota_fallback] fails startup, never silently disables
         builder_prompt = _pipeline_text(config)
         manager = worktree_manager
         if manager is None:
@@ -475,6 +516,7 @@ async def _start(
                 runner_factory=runner_factory,
                 builder_prompt=builder_prompt,
                 ticket_scope=invocation_scope,
+                quota_policy=quota_policy,
             )
         except ValueError as exc:
             # Configuration errors are for the operator, not a traceback.
@@ -511,6 +553,7 @@ async def _start(
         runner_factory=runner_factory,
         pr_event_processor=event_processor,
         ticket_scope=invocation_scope,
+        quota_fallback=quota_policy,
     )
     if isinstance(production_dispatcher, WorktreeDispatcher):
         production_dispatcher.push_recorder = supervisor.record_builder_push
@@ -528,6 +571,7 @@ async def _start(
         reasoning_effort=config.firstmate_effort,
         notifier=notifier,
         provider=getattr(config, "firstmate_provider", "codex"),
+        fallback=quota_policy.mate[1] if quota_policy is not None and quota_policy.mate else None,
     )
     if supervisor.unblock_ladder is None:
         # Phase 7 owns Linear comment/state semantics. Harbor only supplies

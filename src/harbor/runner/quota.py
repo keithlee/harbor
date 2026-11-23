@@ -123,6 +123,14 @@ def runner_identity(connection: Any, run_id: str) -> Any:
     ).fetchone()
 
 
+def rebind_runner_identity(connection: Any, run_id: str, provider: str, model: str, effort: str) -> None:
+    """Move a run to another provider. Only the recorded quota fallback may call this."""
+    with connection:
+        connection.execute("""CREATE TABLE IF NOT EXISTS runner_identity (
+            run_id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL)""")
+        connection.execute("INSERT OR REPLACE INTO runner_identity VALUES (?, ?, ?, ?)", (run_id, provider, model, effort))
+
+
 def bind_runner_identity(connection: Any, run_id: str, provider: str, model: str, effort: str) -> None:
     with connection:
         connection.execute("""CREATE TABLE IF NOT EXISTS runner_identity (

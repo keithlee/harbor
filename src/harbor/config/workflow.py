@@ -88,7 +88,7 @@ def load_models(path: Path) -> dict:
     if not path.is_file():
         raise ValueError(f"missing model config {path}; create it with [controller] model = \"...\"")
     data = tomllib.loads(path.read_text())
-    unknown = set(data) - {*ROLES, "first_mate"}
+    unknown = set(data) - {*ROLES, "first_mate", "quota_fallback"}
     if unknown:
         raise ValueError(f"unknown config.toml section(s): {', '.join(sorted(unknown))}")
     from harbor.model_policy import validate_fallbacks
@@ -119,7 +119,70 @@ def load_models(path: Path) -> dict:
             raise ValueError(f"first_mate.{key} must be a nonnegative number")
     if type(first_mate["allow_fresh_session"]) is not bool:
         raise ValueError("first_mate.allow_fresh_session must be boolean")
-    return {"roles": roles, "first_mate": first_mate}
+    result = {"roles": roles, "first_mate": first_mate}
+    if "quota_fallback" in data:
+        # Only present when configured, so existing workflows keep their policy digest.
+        result["quota_fallback"] = _quota_fallback(data["quota_fallback"])
+    return result
+
+
+FALLBACK_PROVIDERS = ("codex", "claude")
+CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+FALLBACK_KEYS = {"max_switches", "controller", "first_mate", *ROLES[1:]}
+
+
+def _fallback_profile(name, entry, *, provider=None):
+    """One validated ``[quota_fallback.<name>]`` table; child roles pass the controller's provider."""
+    allowed = {"model", "reasoning_effort"} | ({"provider"} if provider is None else set())
+    if not isinstance(entry, dict) or set(entry) - allowed:
+        raise ValueError(f"unknown quota_fallback.{name} setting")
+    provider = provider if provider is not None else entry.get("provider")
+    if provider not in FALLBACK_PROVIDERS:
+        raise ValueError(f"quota_fallback.{name}.provider must be one of {', '.join(FALLBACK_PROVIDERS)}")
+    model, effort = entry.get("model"), entry.get("reasoning_effort")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"quota_fallback.{name}.model must be a non-empty string")
+    if provider == "claude" and model.startswith("gpt-"):
+        raise ValueError(f"quota_fallback.{name}.model {model!r} is not a Claude model")
+    if provider == "codex" and model.startswith("claude"):
+        raise ValueError(f"quota_fallback.{name}.model {model!r} is not a Codex model")
+    if effort is None and name == "controller":
+        # A builder runner needs an effort valid for ITS provider; never borrow the primary's.
+        raise ValueError("quota_fallback.controller.reasoning_effort is required")
+    if effort is not None and effort not in (CLAUDE_EFFORTS if provider == "claude" else EFFORTS):
+        raise ValueError(f"invalid quota_fallback.{name} reasoning effort")
+    return {"provider": provider, "model": model, "reasoning_effort": effort}
+
+
+def _quota_fallback(section):
+    """Resolve ``[quota_fallback]``: a second provider profile used when the primary hits a usage limit."""
+    if not isinstance(section, dict) or set(section) - FALLBACK_KEYS:
+        raise ValueError("unknown quota_fallback setting")
+    switches = section.get("max_switches", 2)
+    if type(switches) is not int or switches < 0:
+        raise ValueError("quota_fallback.max_switches must be a nonnegative integer")
+    controller = section.get("controller")
+    mate = section.get("first_mate")
+    if controller is None and mate is None:
+        raise ValueError("quota_fallback needs a controller or first_mate profile")
+    roles = {}
+    if controller is not None:
+        controller = _fallback_profile("controller", controller)
+        roles["controller"] = {k: controller[k] for k in ("model", "reasoning_effort")}
+        for name in ROLES[1:]:
+            child = _fallback_profile(name, section.get(name, {}) or {"model": controller["model"]}, provider=controller["provider"])
+            child.pop("provider")
+            if "reasoning_effort" not in section.get(name, {}):
+                child["reasoning_effort"] = controller["reasoning_effort"]
+            roles[name] = child
+    elif any(name in section for name in ROLES[1:]):
+        raise ValueError("quota_fallback child roles need a controller profile")
+    return {
+        "max_switches": switches,
+        "controller": controller,
+        "roles": roles,
+        "first_mate": _fallback_profile("first_mate", mate) if mate is not None else None,
+    }
 
 
 def _role(name, entry, validate_fallbacks):

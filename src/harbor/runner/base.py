@@ -1058,11 +1058,12 @@ class BaseRunner:
                     reset = timestamp
                     break
         if quota and connection is not None:
-            from harbor.recovery import defer_quota
+            from harbor.recovery import defer_quota, record_provider_quota
             now = utc_now().timestamp()
             if reset is not None and reset <= now:
                 reset = None
             defer_quota(connection, context.run_id, getattr(self, "provider", "codex"), reset, now)
+            record_provider_quota(connection, getattr(self, "provider", "codex"), reset, now)
             _update_run_sql(self.db, context.run_id, {"terminal_reason": "usage_limit_exceeded"})
         if context.session_mismatch:
             _update_run_sql(self.db, context.run_id, {"terminal_reason": "session_mismatch"})
@@ -1114,6 +1115,10 @@ class BaseRunner:
         if not quota and connection is not None and _table_exists(connection, "quota_recovery"):
             with connection:
                 connection.execute("DELETE FROM quota_recovery WHERE run_id=?", (context.run_id,))
+        if not quota and final is not None and exit_code == 0 and connection is not None:
+            # A schema-valid final result proves this provider is usable again.
+            from harbor.recovery import clear_provider_quota
+            clear_provider_quota(connection, getattr(self, "provider", "codex"))
         queue_status = "waiting" if status == RunState.WAITING.value else "completed" if status == RunState.COMPLETED.value else "failed"
         self._queue_transition(context, queue_status, error=result.error)
         if (
