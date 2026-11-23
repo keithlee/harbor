@@ -45,6 +45,9 @@ from harbor.pr_events import PREventDeliveryExhausted, PREventError, handoff_gat
 # Terminal runner states that stop a builder until an operator ``/retry``.
 _STOPPED_RUN_STATUSES = frozenset({"failed", "terminated", "orphaned"})
 _MAX_NOTICE_CHARS = 300
+# A runner-factory reason shown to the operator is capped so the guidance that
+# follows it in a notice is not truncated out of _MAX_NOTICE_CHARS.
+_MAX_RESUME_REASON_CHARS = 160
 # A handoff whose PR Linear has not attached yet is re-checked on later polls
 # and escalated as unverified after this many polls.
 _HANDOFF_OBSERVATION_POLLS = 3
@@ -203,6 +206,11 @@ class WorktreeDispatcher:
 
         wanted = str(identifier or "").casefold()
         return next((v for k, v in self._resume_errors.items() if k.casefold() == wanted), None)
+
+    def _clear_resume_error(self, identifier: str) -> None:
+        wanted = str(identifier or "").casefold()
+        for key in [k for k in self._resume_errors if k.casefold() == wanted]:
+            del self._resume_errors[key]
 
     def _in_scope(self, value: Any) -> bool:
         """Check one ticket identifier against this invocation's custody scope."""
@@ -473,6 +481,7 @@ class WorktreeDispatcher:
                 if any(r["blocking"] for r in receipts):
                     raise ValueError("required setup hook failed; worktree retained")
             runner = await self._factory(worktree, wake)
+            self._clear_resume_error(identifier)
             self.worktrees[identifier] = worktree
             self.runners[identifier] = runner
             result = await self._runner_call(runner, wake, resume=False)
@@ -517,6 +526,8 @@ class WorktreeDispatcher:
         """
 
         identifier = str(identifier or "").strip()
+        # A reason is reported only when THIS attempt failed in the factory.
+        self._clear_resume_error(identifier)
         if not identifier or not self._in_scope(identifier):
             return None
         existing_key = next(
@@ -563,9 +574,11 @@ class WorktreeDispatcher:
             # A factory that cannot rebuild a handle is not a supervision
             # failure; the resume stays unavailable (fail closed). Keep the
             # factory's reason so the operator can see what to fix.
-            self._resume_errors[identifier] = str(exc) or type(exc).__name__
+            reason = " ".join((str(exc) or type(exc).__name__).split())
+            if len(reason) > _MAX_RESUME_REASON_CHARS:
+                reason = reason[: _MAX_RESUME_REASON_CHARS - 1] + "…"
+            self._resume_errors[identifier] = reason
             return None
-        self._resume_errors.pop(identifier, None)
         self.worktrees[identifier] = worktree
         self.runners[identifier] = runner
         return runner
@@ -741,6 +754,8 @@ class WorktreeDispatcher:
 
     async def resume(self, wake: Wake) -> Any:
         identifier = self._identifier(wake)
+        # Guard misses below never reach the factory; do not report an old reason.
+        self._clear_resume_error(identifier)
         if not identifier or not self._in_scope(identifier):
             return None
         lock = self._execution_lock(identifier)
@@ -987,8 +1002,8 @@ class Supervisor:
         self.lifecycle = Lifecycle.STOPPED
         self.linear_healthy = False
         self.last_error: str | None = None
-        # Why the most recent resume_session could not rebuild its builder.
-        self.last_resume_error: str | None = None
+        # Per run id: why its latest resume_session could not rebuild the builder.
+        self._resume_failures: dict[str, str] = {}
         self.last_result: PollResult | None = None
         self._poll_sequence = 0
         self._published_poll = 0
@@ -4163,9 +4178,15 @@ class Supervisor:
             await self._notify_operator(f"recovery-escalate:{case.run_id}",
                                         f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
+    def resume_failure_reason(self, run_id: str) -> str | None:
+        """Why the latest ``resume_session(run_id)`` could not rebuild its builder."""
+
+        return self._resume_failures.get(str(run_id))
+
     async def resume_session(self, run_id: str, prompt: str) -> bool:
         """Resume one persistent builder session, without creating a replacement."""
 
+        self._resume_failures.pop(str(run_id), None)
         identifier = self._ticket_for_run(run_id)
         if self.ticket_scope and (not identifier or not self._in_scope(identifier)):
             return False
@@ -4182,11 +4203,10 @@ class Supervisor:
             value = await target.resume(wake)
             if value is None or value is False:
                 reason = target.resume_unavailable_reason(identifier)
-                self.last_resume_error = reason
                 if reason:
+                    self._resume_failures[str(run_id)] = reason
                     self.last_error = f"builder for {identifier} could not resume: {reason}"
                 return False
-            self.last_resume_error = None
             # WorktreeDispatcher returns the builder's terminal payload.  Feed
             # it back through the same result router used for poll-driven
             # wakes so a second blocker is bounded, recorded, and either

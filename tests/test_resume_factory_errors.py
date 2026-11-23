@@ -86,3 +86,73 @@ def test_a_successful_hydrate_clears_a_stale_factory_error(tmp_path: Path) -> No
         assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None
 
     asyncio.run(scenario())
+
+
+def test_retry_does_not_report_a_stale_factory_error_after_the_worktree_is_removed(
+    tmp_path: Path,
+) -> None:
+    """The operator fixed the config, then the worktree went away: say that."""
+
+    async def scenario() -> None:
+        dispatcher, _ = _dispatcher(tmp_path, "terminated")
+        with pytest.raises(RuntimeError, match="cannot be rebuilt"):
+            await dispatcher.retry("SAMPLE-42")
+        dispatcher.runner_factory = lambda wt, wake: object()
+        (tmp_path / "wt" / "SAMPLE-42").rmdir()
+
+        with pytest.raises(RuntimeError) as caught:
+            await dispatcher.retry("SAMPLE-42")
+
+        assert "cannot attach its existing worktree" in str(caught.value)
+        assert REASON not in str(caught.value)
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None
+
+    asyncio.run(scenario())
+
+
+def test_a_resume_that_never_reaches_the_factory_reports_no_reason(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, _ = _dispatcher(tmp_path, "waiting")
+        assert await dispatcher.hydrate("SAMPLE-42") is None
+        wake = Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage", resume="run-1")
+        async with dispatcher._execution_lock("SAMPLE-42"):
+            assert await dispatcher.resume(wake) is None
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None
+
+    asyncio.run(scenario())
+
+
+def test_a_second_answer_for_another_run_does_not_carry_the_first_reason(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
+        enqueue(ledger.connection, "8", "SampleProject", "OTHER-1", "no-such-run", "Use option B")
+
+        assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+        assert await deliver(supervisor, "8", "no-such-run", "Use option B") is False
+
+        assert len(notices) == 2
+        assert REASON in notices[0]
+        assert REASON not in notices[1]
+
+    asyncio.run(scenario())
+
+
+def test_a_long_factory_error_keeps_the_retry_guidance_in_the_notice(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+
+        def factory(wt: Any, wake: Wake) -> Any:
+            raise ValueError("x" * 2000)
+
+        dispatcher.runner_factory = factory
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
+
+        assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+        assert len(notices) == 1 and "Use /retry" in notices[0]
+
+    asyncio.run(scenario())

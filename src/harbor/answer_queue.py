@@ -27,7 +27,8 @@ async def deliver(supervisor,escalation,run_id,instruction):
         resumed = await supervisor.resume_session(run_id,instruction)
         state = 'delivered' if resumed else 'failed'
         if not resumed:
-            reason = getattr(supervisor,'last_resume_error',None)
+            lookup = getattr(supervisor,'resume_failure_reason',None)
+            reason = lookup(run_id) if callable(lookup) else None
             cause = f': {reason}' if reason else ''
             await supervisor._notify_operator(f'answer-failed:{escalation}',f'Answer {escalation} retained, but the builder could not resume{cause}. Use /retry after correcting its custody or state.')
         return resumed
