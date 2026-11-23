@@ -31,8 +31,10 @@ questions in the PR:
 - **Does it still work if they configure nothing?** New capability is opt-in.
   With the new config absent, behaviour is unchanged, and Harbor says so instead
   of guessing. Defaults stay on the safe side: the builder sandbox stays on,
-  `merge_mode` stays `human`, and nothing is auto-merged, auto-installed or
-  auto-escalated.
+  `merge_mode` stays `human`, and nothing is auto-merged, auto-installed, or
+  given more privilege (wider sandbox, network or permissions) without explicit
+  config. Operator escalations for blockers are normal Harbor behaviour and are
+  not affected by this rule.
 - **Which environments does it cover?** State which of these the change was
   run on, and which it was not:
   - macOS and Linux
@@ -51,7 +53,8 @@ questions in the PR:
   variables, or from the tool that already owns them (for example
   `gh auth token`). Never write them into config, MCP config files, the ledger,
   logs, prompts, or PR text. Prefer reusing a credential Harbor already requires
-  (`GITHUB_TOKEN`/`GH_TOKEN`, `LINEAR_API_KEY`) over asking for a new one.
+  (`GITHUB_TOKEN`/`GH_TOKEN` or the variable named by `github_token_env`;
+  `LINEAR_API_KEY`/`HARBOR_LINEAR_API_KEY`) over asking for a new one.
   Document the minimum scopes the user needs.
 - **Does it add a third-party tool?** This covers MCP servers, npm or pip
   packages, and hosted endpoints. Make it opt-in, pin its version, make the
