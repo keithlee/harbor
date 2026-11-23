@@ -1116,8 +1116,14 @@ class UnblockLadder:
             # Human Review is deliberately active: Harbor parks escalations
             # there and delivers the operator's answer to the builder, so a
             # further blocker from that resumed builder must still escalate.
+            # A project's workflow may name further paused/terminal states
+            # (``[states]`` in workflow.toml); those stop the ladder too.
+            workflow = getattr(self, "workflow", None)
+            configured = workflow.config.get("states", {}) if workflow is not None else {}
+            inactive = {"backlog", "paused", "done", "canceled", "cancelled",
+                        *(str(s).casefold() for s in (*configured.get("paused", []), *configured.get("terminal", [])))}
             if (fresh is None or fresh.get("state_type") in {"backlog", "completed", "canceled"}
-                    or str(fresh.get("state", "")).casefold() in {"backlog", "paused", "done", "canceled", "cancelled"}):
+                    or str(fresh.get("state", "")).strip().casefold() in inactive):
                 raise ValueError("blocked ticket is no longer active")
             # Embedded clients may return partial context; absence cannot erase
             # an already observed dependency or PR attachment.
