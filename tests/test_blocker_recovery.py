@@ -294,7 +294,7 @@ def test_committed_protected_path_parks_with_full_context(tmp_path):
     db.close()
 
 
-@pytest.mark.parametrize("gate", ["hold", "shadow", "paused", "foreign", "cancelled", "dependency", "unhealthy", "missing_session", "live_process", "deadline", "ticket_paused", "review_lower", "backlog_lower", "terminal_name"])
+@pytest.mark.parametrize("gate", ["hold", "shadow", "paused", "foreign", "cancelled", "dependency", "unhealthy", "missing_session", "live_process", "deadline", "ticket_paused", "review_lower", "backlog_lower", "terminal_name", "backlog_type"])
 def test_supervisor_recovery_gates(tmp_path, gate):
     import os
     from types import SimpleNamespace
@@ -310,6 +310,7 @@ def test_supervisor_recovery_gates(tmp_path, gate):
     if gate in {"ticket_paused", "review_lower", "backlog_lower", "terminal_name"}:
         ticket["state"] = {"ticket_paused": " Paused ", "review_lower": "human review", "backlog_lower": "backlog", "terminal_name": "CANCELLED"}[gate]
     if gate == "cancelled": ticket["state_type"] = "canceled"
+    if gate == "backlog_type": ticket.update(state="Icebox", state_type="backlog")
     if gate == "dependency": ticket["blocked_by"] = ["MOCK-7"]
     db.replace_tickets("other" if gate == "foreign" else "mock", [ticket], emit_events=False)
     db.connection.execute("INSERT INTO runs(id,ticket,status,terminal_reason,session_id,worktree,pid,deadline_seconds) VALUES (?,?,?,?,?,?,?,?)",
