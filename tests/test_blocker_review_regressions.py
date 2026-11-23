@@ -45,7 +45,7 @@ def test_restricted_decision_authors_are_checked_before_delivery(author):
     assert len(resumes) == (1 if author == {'id':'owner'} else 0)
 
 
-@pytest.mark.parametrize('state,kind', [('Backlog','backlog'),('Human Review','started'),('Done','completed'),('Canceled','canceled')])
+@pytest.mark.parametrize('state,kind', [('Backlog','backlog'),('Paused','started'),('Done','completed'),('Canceled','canceled')])
 def test_fresh_stopped_ticket_cannot_reach_remediation_or_resume(tmp_path,state,kind):
     class Linear:
         async def fetch_blocker_context(self, identifier):
@@ -210,3 +210,60 @@ def test_remote_only_base_allows_cited_wording_resume(tmp_path):
     assert result.resumed and result.answer=='A' and result.reason
     assert len(resumes)==1 and resumes[0][0]=='retained'
     assert 'preserve medium risk' in resumes[0][1]
+
+
+@pytest.mark.parametrize('state', ['In Progress', 'Human Review', 'human review'])
+def test_second_blocker_from_builder_resumed_in_human_review_is_escalated(tmp_path, state):
+    """An operator answer delivered on a Human Review ticket resumes the builder;
+    a second blocker it reports must be escalated and paged, not silently dropped."""
+    from harbor.supervisor import WorktreeDispatcher
+    db = HarborDB(':memory:')
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    db.replace_tickets('mock', [{'identifier': 'MOCK-1', 'title': 'Color', 'state': state}])
+    db.connection.execute('INSERT INTO runs(id,ticket,status,session_id,worktree) VALUES (?,?,?,?,?)',
+                          ('retained', 'MOCK-1', 'blocked', 'native', str(tmp_path)))
+    db.connection.commit()
+    db.record_escalation('MOCK-1', 'retained', 'product_decision', 'Which color?', 2)
+
+    class Linear:
+        def __init__(self):
+            self.comments, self.states = [], []
+        async def fetch_blocker_context(self, identifier):
+            return {'identifier': identifier, 'id': 'linear-1', 'description': 'Pick a color.',
+                    'state': {'name': state, 'type': 'started'}}
+        async def create_comment(self, issue_id, body):
+            self.comments.append((issue_id, body))
+            return {'id': f'comment-{len(self.comments)}'}
+        async def update_issue_state(self, issue_id, name, **kwargs):
+            self.states.append((issue_id, name))
+            return True
+
+    async def mate(prompt, **kwargs):
+        return {'disposition': 'escalate', 'reason': 'A human decision is required.'}
+
+    notices = []
+    linear = Linear()
+    ladder = UnblockLadder(db, linear=linear, first_mate=mate, notifier=notices.append,
+                           repo_path=tmp_path, remediation_executor=lambda command: False)
+
+    class Dispatcher(WorktreeDispatcher):
+        def __init__(self):
+            self.resumed = []
+        async def resume(self, wake):
+            self.resumed.append(wake)
+            # The builder applied the operator's answer, then hit a new blocker.
+            return {'status': 'blocked', 'run_id': 'retained', 'summary': 'Font choice is unspecified',
+                    'blocker': {'kind': 'product_decision', 'question': 'Which font?'}}
+
+    dispatcher = Dispatcher()
+    supervisor = Supervisor(SimpleNamespace(project_name='mock', config=SimpleNamespace()),
+                            db=db, dispatcher=dispatcher, unblock_ladder=ladder)
+    assert asyncio.run(supervisor.resume_session('retained', 'Answer: use blue'))
+    assert len(dispatcher.resumed) == 1
+    assert supervisor.last_error is None, supervisor.last_error
+    assert supervisor.last_unblock is not None and supervisor.last_unblock.rung == 2
+    opened = [row for row in db.escalations() if row['question'] == 'Which font?']
+    assert len(opened) == 1 and opened[0]['rung_resolved'] == 2 and opened[0]['notified']
+    assert len(notices) == 1 and 'Which font?' in notices[0]
+    db.close()

@@ -1113,8 +1113,11 @@ class UnblockLadder:
                 from harbor.project_identity import require_scope
                 await require_scope(self.linear, self.linear_projects, observed.get("project") or {})
             fresh = normalize_issue(observed, hold_all=bool(ticket.get("hold", True)))
+            # Human Review is deliberately active: Harbor parks escalations
+            # there and delivers the operator's answer to the builder, so a
+            # further blocker from that resumed builder must still escalate.
             if (fresh is None or fresh.get("state_type") in {"backlog", "completed", "canceled"}
-                    or str(fresh.get("state", "")).casefold() in {"backlog", "human review", "paused", "done", "canceled", "cancelled"}):
+                    or str(fresh.get("state", "")).casefold() in {"backlog", "paused", "done", "canceled", "cancelled"}):
                 raise ValueError("blocked ticket is no longer active")
             # Embedded clients may return partial context; absence cannot erase
             # an already observed dependency or PR attachment.
