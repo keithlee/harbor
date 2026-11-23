@@ -6,11 +6,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import pytest
+
 from harbor import first_mate_recovery as recovery
+from harbor.clients.linear import LinearClient
 from harbor.config.projects import ProjectConfig
 from harbor.config.workflow import load_workflow
 from harbor.db import HarborDB, apply_phase9_migration
-from harbor.poll.linear_poller import PollResult
+from harbor.poll.linear_poller import LinearPoller, PollResult
 from harbor.runner.base import apply_phase4_migration
 from harbor.supervisor import Supervisor, WorktreeDispatcher
 from harbor.wake import Wake, apply_phase3_migration
@@ -140,10 +144,15 @@ def supervisor_for(tmp_path, db, answer, *, ticket=None):
     return supervisor, mate, linear
 
 
+async def monitor_observed(supervisor):
+    observed = {ticket["identifier"] for ticket in supervisor.db.tickets(supervisor.project)}
+    await supervisor._monitor_blocked(observed)
+
+
 def monitor(supervisor):
     """One monitor pass, then wait for the recoveries it scheduled."""
     async def run():
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         await supervisor._drain_recoveries()
     asyncio.run(run())
 
@@ -368,8 +377,8 @@ def test_recovery_does_not_block_polling(tmp_path):
     supervisor.resume_session = resume_session
 
     async def scenario():
-        await asyncio.wait_for(supervisor._monitor_blocked(), timeout=1)
-        await asyncio.wait_for(supervisor._monitor_blocked(), timeout=1)  # a second poll is not stuck either
+        await asyncio.wait_for(monitor_observed(supervisor), timeout=1)
+        await asyncio.wait_for(monitor_observed(supervisor), timeout=1)  # a second poll is not stuck either
         await settle()
         names = [t.get_name() for t in supervisor._dispatch_tasks.values()]
         assert names == ["harbor-recovery-HAN-86"]
@@ -399,7 +408,7 @@ def test_recovery_task_blocks_duplicate_wake(tmp_path):
     supervisor._deliver_scheduled_wake = deliver
 
     async def scenario():
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         supervisor._schedule_wake(Wake(ticket={"identifier": "HAN-86"}, action="reengage", resume="run-HAN-86"))
         await asyncio.sleep(0)
         assert delivered == []  # never two builders on one ticket
@@ -426,7 +435,7 @@ def test_stalled_live_delivery_is_cancelled_and_replaced(tmp_path):
     async def scenario():
         hung = asyncio.create_task(asyncio.Event().wait(), name="harbor-dispatch-HAN-86")
         supervisor._dispatch_tasks["HAN-86"] = hung
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         await supervisor._drain_recoveries()
         assert hung.cancelled()
         assert replaced == ["HAN-86"] and len(mate.prompts) == 1
@@ -442,7 +451,7 @@ def test_live_delivery_that_is_not_stalled_is_left_alone(tmp_path):
     async def scenario():
         active = asyncio.create_task(asyncio.Event().wait(), name="harbor-dispatch-HAN-86")
         supervisor._dispatch_tasks["HAN-86"] = active
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         assert mate.prompts == [] and not active.cancelled()
         active.cancel()
         await asyncio.gather(active, return_exceptions=True)
@@ -493,7 +502,7 @@ def test_successful_recovery_notifies_after_completion(tmp_path):
     supervisor._notify_operator = notify
 
     async def scenario():
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         await settle()
         assert events == ["builder-start"]  # not announced at scheduling time  # not announced at scheduling time
         gate.set()
@@ -537,7 +546,7 @@ def test_stalled_real_codex_process_is_killed_before_replacement(tmp_path):
         pid = runner.active.pid
         db.connection.execute("UPDATE runs SET last_activity_at=?, started_at=? WHERE id='retained'", (iso(45), iso(60)))
         db.connection.commit()
-        await supervisor._monitor_blocked()
+        await monitor_observed(supervisor)
         await supervisor._drain_recoveries()
         assert delivery.done() and not process_alive(pid)
         row = db.connection.execute("SELECT status, terminal_reason FROM runs WHERE id='retained'").fetchone()
@@ -625,3 +634,73 @@ def test_in_progress_and_human_review_are_still_recovered(tmp_path):
     for name in ("In Progress", "Human Review"):
         prompts, resumed = _monitor_in_state(tmp_path, name)
         assert len(prompts) == 1 and resumed == ["run-HAN-86"], name
+
+
+@pytest.mark.parametrize(
+    ("state", "state_type", "recover"),
+    [
+        ("Icebox", "backlog", False),
+        ("Backlog", "backlog", False),
+        ("Shipped", "completed", False),
+        ("In Progress", "started", True),
+    ],
+)
+def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, recover):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    supervisor.dispatcher.workflow.config["states"] = {"terminal": ["Shipped"]}
+    issue = {
+        "identifier": "HAN-86",
+        "id": "lin-86",
+        "title": "Sample issue",
+        "state": {"name": "In Progress", "type": "started"},
+    }
+
+    def linear_issues(request):
+        variables = json.loads(request.content)["variables"]
+        assert variables["slugs"] == ["demo"]
+        nodes = [issue] if issue["state"]["name"] in variables["states"] else []
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+
+    client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+
+    async def scenario():
+        observed = await supervisor.poller.poll()
+        assert [ticket["identifier"] for ticket in observed.tickets] == ["HAN-86"]
+        issue["state"] = {"name": state, "type": state_type}
+        observed = await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert observed is not None
+        assert [ticket["identifier"] for ticket in observed.tickets] == (["HAN-86"] if recover else [])
+        # An unpolled issue still has its previous observation in SQLite.
+        assert db.tickets("Demo")[0]["state"] == "In Progress"
+
+    try:
+        asyncio.run(scenario())
+        assert resumed == (["run-HAN-86"] if recover else [])
+        assert len(mate.prompts) == len(linear.comments) == int(recover)
+        receipts = db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0]
+        assert receipts == int(recover)
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
+    db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged"})
+    _shelve(db, state="Done", state_type="completed")
+    flag(db, "HAN-86", "cleanup_stuck")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    reconciled = []
+
+    async def reconcile(identifier, *, refresh):
+        reconciled.append((identifier, refresh))
+
+    supervisor._reconcile_completed_merges = reconcile
+    try:
+        asyncio.run(supervisor._monitor_blocked(set()))
+        assert reconciled == [("HAN-86", True)]
+        assert mate.prompts == linear.comments == resumed == []
+    finally:
+        db.close()

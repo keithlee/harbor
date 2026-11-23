@@ -3222,7 +3222,7 @@ class Supervisor:
             from harbor.answer_queue import drain
             drain(self)
             await self._retry_stopped_builders()
-            await self._monitor_blocked()
+            await self._monitor_blocked({self._ticket_key(ticket) for ticket in result.tickets})
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -3974,8 +3974,8 @@ class Supervisor:
                 return str(candidate)
         return ""
 
-    async def _monitor_blocked(self) -> None:
-        """First Mate monitor-and-recover pass over stuck runs and watchdog flags."""
+    async def _monitor_blocked(self, observed_tickets: set[str]) -> None:
+        """Recover stuck runs only when the current Linear poll observed them."""
 
         workflow = getattr(self.dispatcher, "workflow", None)
         ladder = self.unblock_ladder
@@ -4011,6 +4011,10 @@ class Supervisor:
                     self.last_error = f"First Mate cleanup for {case.ticket}: {exc}"
                     await self._notify_operator(f"cleanup-failed:{case.run_id}:{len(case.history)}",
                                                 f"First Mate could not clean up {case.ticket}: {exc}")
+                continue
+            if case.ticket not in observed_tickets:
+                # An issue moved out of the polled states retains its previous
+                # SQLite row. That row cannot authorize recovery.
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
