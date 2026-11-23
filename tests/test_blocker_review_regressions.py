@@ -267,3 +267,78 @@ def test_second_blocker_from_builder_resumed_in_human_review_is_escalated(tmp_pa
     assert len(opened) == 1 and opened[0]['rung_resolved'] == 2 and opened[0]['notified']
     assert len(notices) == 1 and 'Which font?' in notices[0]
     db.close()
+
+
+@pytest.mark.parametrize('state,escalates', [
+    ('On Hold', False), ('on hold', False),   # workflow [states] paused
+    ('Shipped', False), ('SHIPPED', False),   # workflow [states] terminal
+    ('In Progress', True), ('Human Review', True),  # controls: still active
+])
+def test_blocked_final_in_workflow_configured_stopped_state_is_refused(tmp_path, state, escalates):
+    """A blocked final on a ticket the operator moved to a workflow-configured
+    paused or terminal state (Linear type ``started``) must not resume the
+    builder, run remediation, or page the operator."""
+    from harbor.config.workflow import load_workflow
+    from harbor.supervisor import WorktreeDispatcher
+    from workflow_support import config
+    workflow = load_workflow(config(tmp_path / 'project', extra='[states]\npaused=["On Hold"]\nterminal=["Shipped"]\n'))
+    db = HarborDB(':memory:')
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    db.replace_tickets('mock', [{'identifier': 'MOCK-1', 'title': 'Color', 'state': state}])
+    db.connection.execute('INSERT INTO runs(id,ticket,status,session_id,worktree) VALUES (?,?,?,?,?)',
+                          ('retained', 'MOCK-1', 'running', 'native', str(tmp_path)))
+    db.connection.commit()
+
+    class Linear:
+        def __init__(self):
+            self.comments, self.states = [], []
+        async def fetch_blocker_context(self, identifier):
+            return {'identifier': identifier, 'id': 'linear-1', 'description': 'Pick a color.',
+                    'state': {'name': state, 'type': 'started'}}
+        async def create_comment(self, issue_id, body):
+            self.comments.append((issue_id, body))
+            return {'id': f'comment-{len(self.comments)}'}
+        async def update_issue_state(self, issue_id, name, **kwargs):
+            self.states.append((issue_id, name))
+            return True
+
+    calls = []
+    async def mate(prompt, **kwargs):
+        calls.append('first_mate')
+        return {'disposition': 'escalate', 'reason': 'A human decision is required.'}
+    async def resume(run_id, prompt):
+        calls.append('resume')
+        return True
+    def remediate(command):
+        calls.append('remediation')
+        return False
+
+    notices = []
+    linear = Linear()
+    ladder = UnblockLadder(db, linear=linear, first_mate=mate, notifier=notices.append, resumer=resume,
+                           repo_path=tmp_path, remediation_executor=remediate)
+
+    class Dispatcher(WorktreeDispatcher):
+        def __init__(self):
+            self.workflow = workflow
+
+    # Production wiring (``harbor start``) hands the ladder the dispatcher's workflow.
+    ladder.workflow, ladder.workflow_project = workflow, 'mock'
+    supervisor = Supervisor(SimpleNamespace(project_name='mock', config=SimpleNamespace()),
+                            db=db, dispatcher=Dispatcher(), unblock_ladder=ladder)
+    wake = Wake(ticket={'identifier': 'MOCK-1'}, action='reengage', resume='retained')
+    final = {'status': 'blocked', 'run_id': 'retained', 'summary': 'Font choice is unspecified',
+             'blocker': {'kind': 'product_decision', 'question': 'Which font?'}}
+    asyncio.run(supervisor._handle_runner_result(wake, final))
+    opened = [row for row in db.escalations() if row['question'] == 'Which font?']
+    if escalates:
+        assert supervisor.last_error is None, supervisor.last_error
+        assert supervisor.last_unblock is not None and supervisor.last_unblock.rung == 2
+        assert len(opened) == 1 and len(notices) == 1
+    else:
+        assert supervisor.last_error == 'blocked ticket is no longer active'
+        assert supervisor.last_unblock is None
+        assert calls == [] and opened == [] and notices == []
+        assert linear.comments == [] and linear.states == []
+    db.close()
