@@ -22,7 +22,6 @@ from typing import Any, Awaitable, Callable
 
 from harbor.db import HarborDB, apply_phase9_migration
 from harbor.digest import render_digest
-from harbor.wake import delivery_tools_fact, detect_delivery_tools
 from harbor.heartbeat import Heartbeat, HeartbeatEvent
 from harbor.poll.linear_poller import LinearPoller, PollResult
 from harbor.runner.base import (
@@ -149,6 +148,7 @@ class WorktreeDispatcher:
         self.prompt_renderer = prompt_renderer
         self.push_recorder = push_recorder
         self.ticket_scope = normalize_ticket_scope(ticket_scope)
+        self.github_fact = ""
         # Set by Supervisor so a BaseRunner can normalize a final result
         # against Harbor's last read-only PR observation before persisting it.
         self.observed_pr_facts: Callable[[str], Any] | None = None
@@ -295,11 +295,9 @@ class WorktreeDispatcher:
         return self.builder_prompt
 
     def _initial_wake(self, wake: Wake, workflow: Any = None) -> Wake:
-        # Report which delivery tools actually work in the builder's sandbox.
-        # A builder that reaches only for an MCP tool strands an approved
-        # merge, because a non-interactive run refuses any MCP call that wants
-        # approval -- even while plain `gh` is authenticated right there.
-        environment = delivery_tools_fact(detect_delivery_tools())
+        # Tell the builder which GitHub transport it actually has (see
+        # harbor.wake.github_transport_fact); the production dispatcher sets it.
+        environment = self.github_fact
         base = self._launch_prompt(workflow)
         if environment and wake.action == "build":
             base = f"{base}\n\n{environment}" if base else environment

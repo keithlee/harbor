@@ -7,6 +7,8 @@ Work only on the supplied ticket, repository and retained worktree. Linear and G
 On continuation reconcile partial edits, the existing PR and current comments; do not insist the ticket is still Todo.
 Do not create a separate ticket or select another Todo on resume.
 Read the project's AGENTS.md and Pipeline Profile. Never invent install, proof or project settings.
+For GitHub reads and writes use the transport named in your launch prompt ("GitHub transport: ...");
+do not fall back to the `gh` CLI, which cannot reach GitHub from inside the builder sandbox on macOS.
 
 ## Roles and models
 Models come from `config.toml` in this workflow package (mirrored in the policy's `roles`).

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from uuid import UUID
@@ -30,6 +31,23 @@ def claude_read_only(executable: str, model: str, effort: str | None) -> list[st
     return command
 
 
+def github_mcp_config(github_mcp: dict | None) -> dict | None:
+    """The opt-in GitHub MCP server, or None for the default REST transport.
+
+    The header holds a ``${VAR}`` reference that Claude Code expands from its
+    own environment, so the token itself is never written into the command.
+    """
+
+    if not github_mcp:
+        return None
+    url, token_env = str(github_mcp.get("url") or ""), str(github_mcp.get("token_env") or "")
+    if not url.startswith("https://") or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env):
+        raise RunnerError("GitHub MCP needs an https URL and a token environment variable name")
+    return {"mcpServers": {"github": {
+        "type": "http", "url": url, "headers": {"Authorization": f"Bearer ${{{token_env}}}"},
+    }}}
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
@@ -47,6 +65,10 @@ class ClaudeRunner(CodexRunner):
                 "network": {"allowedDomains": ["github.com", "api.github.com", "api.linear.app", "registry.npmjs.org"]},
             },
         }
+        mcp = github_mcp_config(getattr(self, "github_mcp", None))
+        if mcp:
+            # Pre-approve only the GitHub server's tools; dontAsk refuses everything else.
+            settings["permissions"] = {"allow": ["mcp__github"]}
         schema = json.loads(Path(self.schema_path).read_text(encoding="utf-8"))
         # Claude's validator supplies its own draft. Harbor's result schema
         # uses the shared subset of keywords from both drafts.
@@ -59,6 +81,8 @@ class ClaudeRunner(CodexRunner):
             "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill",
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
+        if mcp:
+            command.extend(("--mcp-config", json.dumps(mcp)))
         if resume:
             try:
                 session_id = str(UUID(run_id))
