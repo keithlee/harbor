@@ -2684,6 +2684,8 @@ class Supervisor:
         if hasattr(result, "as_dict") and callable(result.as_dict):
             result = result.as_dict(include_metadata=True)
         if isinstance(result, Mapping):
+            if self._resume_failures:
+                self._resume_failures.pop(self._run_id_for_result(wake, result), None)
             result = await self._reconcile_runner_result(wake, result)
         if self.unblock_ladder is None or result is None:
             # A delivery runner may expose an explicit push receipt even when
@@ -3764,6 +3766,11 @@ class Supervisor:
                         parsed_runs: list[dict[str, Any]] = []
                         for row in rows:
                             item = dict(row)
+                            failure = self.resume_failure_reason(item["id"])
+                            if failure and item["status"] in {"waiting", "parked", "blocked"}:
+                                latest = self._latest_run(item["ticket"])
+                                if latest and latest["id"] == item["id"]:
+                                    item["resume_failure"] = failure
                             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_receipts'").fetchone():
                                 receipt = connection.execute("SELECT attempts,next_retry,last_reason FROM recovery_receipts WHERE run_id IN (?,?) ORDER BY run_id DESC LIMIT 1", (item["id"], "triage:" + item["id"])).fetchone()
                                 if receipt:
@@ -4205,7 +4212,6 @@ class Supervisor:
                 reason = target.resume_unavailable_reason(identifier)
                 if reason:
                     self._resume_failures[str(run_id)] = reason
-                    self.last_error = f"builder for {identifier} could not resume: {reason}"
                 return False
             # WorktreeDispatcher returns the builder's terminal payload.  Feed
             # it back through the same result router used for poll-driven

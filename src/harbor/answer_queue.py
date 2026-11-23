@@ -29,8 +29,12 @@ async def deliver(supervisor,escalation,run_id,instruction):
         if not resumed:
             lookup = getattr(supervisor,'resume_failure_reason',None)
             reason = lookup(run_id) if callable(lookup) else None
-            cause = f': {reason}' if reason else ''
-            await supervisor._notify_operator(f'answer-failed:{escalation}',f'Answer {escalation} retained, but the builder could not resume{cause}. Use /retry after correcting its custody or state.')
+            cause = f": {reason}" if reason else ""
+            await supervisor._notify_operator(
+                f"answer-failed:{escalation}:{run_id}:{reason or ''}",
+                f"Answer {escalation} retained, but the builder could not resume{cause}. "
+                "Use /retry after correcting its custody or state.",
+            )
         return resumed
     except asyncio.CancelledError:
         state = 'stopped'
