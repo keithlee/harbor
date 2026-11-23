@@ -9,9 +9,11 @@ without Harbor learning the skill's name or internals.  Harbor only emits a
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import re
+import secrets
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -48,6 +50,7 @@ _MAX_NOTICE_CHARS = 300
 # A runner-factory reason shown to the operator is capped so the guidance that
 # follows it in a notice is not truncated out of _MAX_NOTICE_CHARS.
 _MAX_RESUME_REASON_CHARS = 160
+_RESUME_FAILURE_KEY = secrets.token_bytes(32)
 # A handoff whose PR Linear has not attached yet is re-checked on later polls
 # and escalated as unverified after this many polls.
 _HANDOFF_OBSERVATION_POLLS = 3
@@ -84,6 +87,13 @@ class Lifecycle(StrEnum):
     RUNNING = "RUNNING"
     PAUSING = "PAUSING"
     PAUSED = "PAUSED"
+
+
+@dataclass(frozen=True)
+class _ResumeFailure:
+    run_id: str
+    reason: str
+    fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -191,7 +201,7 @@ class WorktreeDispatcher:
         self.worktrees: dict[str, Any] = {}
         # Why the runner factory last refused to rebuild a ticket's retained
         # builder (e.g. an invalid model or a missing provider executable).
-        self._resume_errors: dict[str, str] = {}
+        self._resume_errors: dict[str, _ResumeFailure] = {}
         # Serializes the whole lifecycle of one ticket's retained builder.
         # This closes the pre-runs-row window between storing ``runner`` and
         # BaseRunner inserting its ``running`` row in SQLite.
@@ -204,13 +214,17 @@ class WorktreeDispatcher:
     def resume_unavailable_reason(self, identifier: str) -> str | None:
         """Return why the runner factory last refused to rebuild ``identifier``."""
 
-        wanted = str(identifier or "").casefold()
-        return next((v for k, v in self._resume_errors.items() if k.casefold() == wanted), None)
+        failure = self._resume_errors.get(str(identifier or "").casefold())
+        return failure.reason if failure and self._run_is_current(identifier, failure.run_id) else None
+
+    def resume_failure(self, identifier: str, run_id: str) -> _ResumeFailure | None:
+        failure = self._resume_errors.get(identifier.casefold())
+        if failure is not None and failure.run_id == run_id and self._run_is_current(identifier, run_id):
+            return failure
+        return None
 
     def _clear_resume_error(self, identifier: str) -> None:
-        wanted = str(identifier or "").casefold()
-        for key in [k for k in self._resume_errors if k.casefold() == wanted]:
-            del self._resume_errors[key]
+        self._resume_errors.pop(identifier.casefold(), None)
 
     def _in_scope(self, value: Any) -> bool:
         """Check one ticket identifier against this invocation's custody scope."""
@@ -513,7 +527,19 @@ class WorktreeDispatcher:
             "ticket": str(row[4]) if row[4] else identifier,
         }
 
-    async def hydrate(self, identifier: str, *, recover_terminal: bool = False) -> Any:
+    def _run_is_current(self, identifier: str, run_id: str | None) -> bool:
+        if not run_id:
+            return True
+        row = self._persisted_run(identifier)
+        if row is not None and row["id"] != run_id:
+            return False
+        # Lightweight in-memory runners do not always write a ledger row.
+        runner_id = getattr(self.runners.get(identifier), "default_run_id", None)
+        return not runner_id or str(runner_id) == run_id
+
+    async def hydrate(
+        self, identifier: str, *, recover_terminal: bool = False, expected_run_id: str | None = None
+    ) -> Any:
         """Rebuild the retained runner for a ticket after a Harbor restart.
 
         ``self.runners`` is process-local, but the run row, the session id, and
@@ -526,17 +552,19 @@ class WorktreeDispatcher:
         """
 
         identifier = str(identifier or "").strip()
-        # A reason is reported only when THIS attempt failed in the factory.
-        self._clear_resume_error(identifier)
         if not identifier or not self._in_scope(identifier):
             return None
+        row = self._persisted_run(identifier)
+        if expected_run_id and (row is None or row["id"] != expected_run_id):
+            return None
+        # A reason is reported only when this attempt failed in the factory.
+        self._clear_resume_error(identifier)
         existing_key = next(
             (key for key in self.runners if str(key).casefold() == identifier.casefold()),
             None,
         )
         if existing_key is not None:
             return self.runners.get(existing_key)
-        row = self._persisted_run(identifier)
         recoverable = {"waiting", "parked", "blocked"}
         if recover_terminal:
             recoverable.update({"terminated", "orphaned", "failed"})
@@ -566,7 +594,7 @@ class WorktreeDispatcher:
             else:
                 worktree = path
         attached_path = getattr(worktree, "path", worktree)
-        if Path(attached_path).expanduser().resolve() != path.resolve():
+        if Path(attached_path).expanduser().resolve() != path.resolve() or not self._run_is_current(identifier, row["id"]):
             return None
         try:
             runner = await self._factory(worktree, wake)
@@ -574,10 +602,17 @@ class WorktreeDispatcher:
             # A factory that cannot rebuild a handle is not a supervision
             # failure; the resume stays unavailable (fail closed). Keep the
             # factory's reason so the operator can see what to fix.
-            reason = " ".join((str(exc) or type(exc).__name__).split())
+            reason = " ".join(str(exc).split()) or type(exc).__name__
+            # Use the full cause for deduplication without storing it alongside
+            # the operator's bounded display text or in a notification key.
+            fingerprint = hashlib.blake2b(
+                reason.encode("utf-8", errors="surrogatepass"), key=_RESUME_FAILURE_KEY, digest_size=16,
+            ).hexdigest()
             if len(reason) > _MAX_RESUME_REASON_CHARS:
                 reason = reason[: _MAX_RESUME_REASON_CHARS - 1] + "…"
-            self._resume_errors[identifier] = reason
+            self._resume_errors[identifier.casefold()] = _ResumeFailure(row["id"], reason, fingerprint)
+            return None
+        if not self._run_is_current(identifier, row["id"]):
             return None
         self.worktrees[identifier] = worktree
         self.runners[identifier] = runner
@@ -663,6 +698,7 @@ class WorktreeDispatcher:
         identifier = str(identifier or "").strip()
         if not identifier or not self._in_scope(identifier):
             raise ValueError(f"ticket is outside this supervisor's scope: {identifier or '(empty)'}")
+        self._clear_resume_error(identifier)
         row = self._persisted_run(identifier)
         if row is None:
             raise RuntimeError(f"no retained builder exists for {identifier}")
@@ -680,11 +716,11 @@ class WorktreeDispatcher:
         # context. Rebuild its lightweight handle from the durable session so
         # the retry cannot inherit the prior process's terminal flags.
         self.runners.pop(identifier, None)
-        runner = await self.hydrate(identifier, recover_terminal=True)
+        runner = await self.hydrate(identifier, recover_terminal=True, expected_run_id=run_id)
         if runner is None:
-            reason = self.resume_unavailable_reason(identifier)
-            if reason:
-                raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {reason}")
+            failure = self.resume_failure(identifier, run_id)
+            if failure is not None:
+                raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {failure.reason}")
             raise RuntimeError(
                 f"retained builder for {identifier} cannot attach its existing worktree"
             )
@@ -754,10 +790,10 @@ class WorktreeDispatcher:
 
     async def resume(self, wake: Wake) -> Any:
         identifier = self._identifier(wake)
-        # Guard misses below never reach the factory; do not report an old reason.
-        self._clear_resume_error(identifier)
-        if not identifier or not self._in_scope(identifier):
+        if not identifier or not self._in_scope(identifier) or not self._run_is_current(identifier, wake.run_id):
             return None
+        # A current attempt that stops at a guard must not report an older failure.
+        self._clear_resume_error(identifier)
         lock = self._execution_lock(identifier)
         if lock.locked():
             # Do not wait behind another handoff: that would turn a duplicate
@@ -772,7 +808,7 @@ class WorktreeDispatcher:
             if runner is None:
                 # After a restart the in-memory runner is gone but the session is
                 # not.  Try to rebuild the handle from the ledger before giving up.
-                runner = await self.hydrate(identifier)
+                runner = await self.hydrate(identifier, expected_run_id=wake.run_id)
             if runner is None:
                 # Never create a fresh worktree or agent for a resume wake: same
                 # session recovery is fail-closed when the retained runner is gone.
@@ -823,17 +859,20 @@ class WorktreeDispatcher:
                 f"ticket {ticket or '(unknown)'} is outside invocation scope "
                 f"{self.ticket_scope.selector}"
             )
+        run_id = str(run_id) if run_id else None
+        if not self._run_is_current(ticket, run_id):
+            raise PREventError(f"retained builder for {ticket} no longer owns the PR event's run")
         lock = self._execution_lock(ticket)
         if lock.locked():
             raise PREventError(
                 f"builder handoff for {ticket or '(unknown)'} is already active; defer PR event"
             )
         async with lock:
-            if self._run_is_running(ticket, str(run_id) if run_id else None):
+            if self._run_is_running(ticket, run_id):
                 raise PREventError(
                     f"builder run for {ticket or '(unknown)'} is still running; defer PR event"
                 )
-            runner = self.runners.get(ticket) or await self.hydrate(ticket)
+            runner = self.runners.get(ticket) or await self.hydrate(ticket, expected_run_id=run_id)
             if runner is None:
                 raise PREventError(f"no retained builder for PR event ticket {ticket or '(unknown)'}")
             run_id = str(run_id or getattr(runner, "default_run_id", "") or self._stable_run_id(
@@ -1002,8 +1041,6 @@ class Supervisor:
         self.lifecycle = Lifecycle.STOPPED
         self.linear_healthy = False
         self.last_error: str | None = None
-        # Per run id: why its latest resume_session could not rebuild the builder.
-        self._resume_failures: dict[str, str] = {}
         self.last_result: PollResult | None = None
         self._poll_sequence = 0
         self._published_poll = 0
@@ -2684,8 +2721,6 @@ class Supervisor:
         if hasattr(result, "as_dict") and callable(result.as_dict):
             result = result.as_dict(include_metadata=True)
         if isinstance(result, Mapping):
-            if self._resume_failures:
-                self._resume_failures.pop(self._run_id_for_result(wake, result), None)
             result = await self._reconcile_runner_result(wake, result)
         if self.unblock_ladder is None or result is None:
             # A delivery runner may expose an explicit push receipt even when
@@ -3764,13 +3799,15 @@ class Supervisor:
                             "FROM runs ORDER BY COALESCE(started_at, id), id"
                         ).fetchall()
                         parsed_runs: list[dict[str, Any]] = []
+                        dispatcher = self.dispatcher or self.runner
                         for row in rows:
                             item = dict(row)
-                            failure = self.resume_failure_reason(item["id"])
-                            if failure and item["status"] in {"waiting", "parked", "blocked"}:
-                                latest = self._latest_run(item["ticket"])
-                                if latest and latest["id"] == item["id"]:
-                                    item["resume_failure"] = failure
+                            if isinstance(dispatcher, WorktreeDispatcher) and item["status"] in (
+                                {"waiting", "parked", "blocked"} | _STOPPED_RUN_STATUSES
+                            ):
+                                failure = dispatcher.resume_failure(item["ticket"], item["id"])
+                                if failure:
+                                    item["resume_failure"] = failure.reason
                             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_receipts'").fetchone():
                                 receipt = connection.execute("SELECT attempts,next_retry,last_reason FROM recovery_receipts WHERE run_id IN (?,?) ORDER BY run_id DESC LIMIT 1", (item["id"], "triage:" + item["id"])).fetchone()
                                 if receipt:
@@ -4185,15 +4222,21 @@ class Supervisor:
             await self._notify_operator(f"recovery-escalate:{case.run_id}",
                                         f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
-    def resume_failure_reason(self, run_id: str) -> str | None:
-        """Why the latest ``resume_session(run_id)`` could not rebuild its builder."""
+    def resume_failure(self, run_id: str) -> _ResumeFailure | None:
+        """Return the current retained run's rebuild diagnostic, if any."""
 
-        return self._resume_failures.get(str(run_id))
+        dispatcher = self.dispatcher or self.runner
+        if isinstance(dispatcher, WorktreeDispatcher):
+            return dispatcher.resume_failure(self._ticket_for_run(run_id), str(run_id))
+        return None
+
+    def resume_failure_reason(self, run_id: str) -> str | None:
+        failure = self.resume_failure(run_id)
+        return failure.reason if failure else None
 
     async def resume_session(self, run_id: str, prompt: str) -> bool:
         """Resume one persistent builder session, without creating a replacement."""
 
-        self._resume_failures.pop(str(run_id), None)
         identifier = self._ticket_for_run(run_id)
         if self.ticket_scope and (not identifier or not self._in_scope(identifier)):
             return False
@@ -4209,9 +4252,6 @@ class Supervisor:
             )
             value = await target.resume(wake)
             if value is None or value is False:
-                reason = target.resume_unavailable_reason(identifier)
-                if reason:
-                    self._resume_failures[str(run_id)] = reason
                 return False
             # WorktreeDispatcher returns the builder's terminal payload.  Feed
             # it back through the same result router used for poll-driven

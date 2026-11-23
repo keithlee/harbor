@@ -27,11 +27,12 @@ async def deliver(supervisor,escalation,run_id,instruction):
         resumed = await supervisor.resume_session(run_id,instruction)
         state = 'delivered' if resumed else 'failed'
         if not resumed:
-            lookup = getattr(supervisor,'resume_failure_reason',None)
-            reason = lookup(run_id) if callable(lookup) else None
-            cause = f": {reason}" if reason else ""
+            lookup = getattr(supervisor, "resume_failure", None)
+            failure = lookup(run_id) if callable(lookup) else None
+            cause = f": {failure.reason}" if failure else ""
+            fingerprint = failure.fingerprint if failure else ""
             await supervisor._notify_operator(
-                f"answer-failed:{escalation}:{run_id}:{reason or ''}",
+                f"answer-failed:{escalation}:{run_id}:{fingerprint}",
                 f"Answer {escalation} retained, but the builder could not resume{cause}. "
                 "Use /retry after correcting its custody or state.",
             )

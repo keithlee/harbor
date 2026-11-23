@@ -200,7 +200,10 @@ def test_console_shows_the_run_failure_after_a_healthy_poll(tmp_path: Path) -> N
     asyncio.run(scenario())
 
 
-def test_changed_factory_failure_notifies_on_reanswering_same_escalation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shared_prefix", ("", "/long-directory/" * 12))
+def test_changed_factory_failure_notifies_on_reanswering_same_escalation(
+    tmp_path: Path, shared_prefix: str,
+) -> None:
     async def scenario() -> None:
         dispatcher, ledger = _dispatcher(tmp_path, "waiting")
         escalation = ledger.record_escalation("SAMPLE-42", "run-1", "ambiguous_ac", "Which option?", 2)
@@ -211,20 +214,100 @@ def test_changed_factory_failure_notifies_on_reanswering_same_escalation(tmp_pat
         second_reason = "Claude executable is unavailable"
 
         def unavailable_factory(_worktree: Any, _wake: Wake) -> Any:
-            raise ValueError(second_reason)
+            raise ValueError(error)
 
-        for reply in ("Use option A", "Use option B", "Use option B again"):
-            output = await console.handle_command(f"/answer {escalation_id} {reply}")
-            print(output)
+        dispatcher.runner_factory = unavailable_factory
+        counts = []
+        for index, reason in enumerate((REASON, second_reason, second_reason), start=1):
+            error = shared_prefix + reason
+            output = await console.handle_command(f"/answer {escalation_id} Use option {index}")
             assert "same builder resume queued" in output
             await supervisor._dispatch_tasks["SAMPLE-42"]
-            dispatcher.runner_factory = unavailable_factory
+            counts.append(len(notices))
+            print(f"After answer {index}: {counts[-1]} notice(s)")
 
         for notice in notices:
             print(notice)
-        assert len(notices) == 2
+        assert counts == [1, 2, 2]
         assert all("Use /retry" in notice for notice in notices)
-        assert REASON in notices[0] and second_reason in notices[1]
+        if shared_prefix:
+            assert notices[0] == notices[1]
+            assert second_reason not in notices[1]
+        else:
+            assert REASON in notices[0] and second_reason in notices[1]
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+
+def test_retry_failure_stays_visible_in_status_until_a_new_attempt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "terminated")
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher)
+        console = Console(supervisor)
+        await supervisor.poll_once()
+        refusal = await console.handle_command("/retry SAMPLE-42")
+        print(refusal)
+        await supervisor.poll_once()
+
+        for command in ("/status", "/status --full"):
+            status = await console.handle_command(command)
+            print(f"{command} after a healthy poll:\n{status}")
+            assert "Linear healthy" in status and "Linear error:" not in status
+            assert f"Builder resume error for SAMPLE-42 (run run-1): {REASON}" in status
+
+        (tmp_path / "wt" / "SAMPLE-42").rmdir()
+        missing = await console.handle_command("/retry SAMPLE-42")
+        print(missing)
+        assert "cannot attach its existing worktree" in missing
+        assert REASON not in await console.handle_command("/status")
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_answer_for_superseded_run_cannot_rebuild_current_builder(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs(id, ticket, status, session_id, worktree) "
+                "VALUES ('run-2', 'SAMPLE-42', 'waiting', 'session-2', ?)",
+                (str(tmp_path / "wt" / "SAMPLE-42"),),
+            )
+        old = ledger.record_escalation("SAMPLE-42", "run-1", "ambiguous_ac", "Old question?", 2)
+        calls: list[str | None] = []
+        notices: list[str] = []
+        reason = "Current runner executable unavailable"
+
+        def factory(_worktree: Any, wake: Wake) -> Any:
+            calls.append(wake.run_id)
+            raise ValueError(reason)
+
+        dispatcher.runner_factory = factory
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        console = Console(supervisor)
+
+        async def answer(escalation_id: object) -> None:
+            text = await console.handle_command(f"/answer {escalation_id} Use option A")
+            print(text)
+            assert "same builder resume queued" in text
+            await supervisor._dispatch_tasks["SAMPLE-42"]
+            print(f"Factory calls: {calls}")
+            print(notices[-1])
+
+        await answer(old["id"])
+        assert calls == []
+        assert reason not in notices[0]
+        assert supervisor.resume_failure_reason("run-1") is None
+
+        current = ledger.record_escalation("SAMPLE-42", "run-2", "ambiguous_ac", "Current question?", 2)
+        await answer(current["id"])
+        assert calls == ["run-2"]
+        assert reason in notices[1]
+        assert supervisor.resume_failure_reason("run-2") == reason
+        assert supervisor.resume_failure_reason("run-1") is None
         ledger.close()
 
     asyncio.run(scenario())
