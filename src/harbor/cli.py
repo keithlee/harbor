@@ -15,6 +15,7 @@ from typing import Any
 from harbor.clients.github import GitHubClient
 from harbor.clients.linear import LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
+from harbor.wake import github_transport_fact
 from harbor.config.projects import get_project
 from harbor.console import Console
 from harbor.db import HarborDB
@@ -202,6 +203,7 @@ def build_production_dispatcher(
         from harbor.runner.quota import runner_identity
 
         builder_provider = getattr(config, "builder_provider", "codex")
+        github = builder_github(config, workflow, builder_provider)
         claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
         if builder_provider == "claude":
             validate_claude(claude_cli, config.builder_model, config.builder_effort)
@@ -244,6 +246,8 @@ def build_production_dispatcher(
                 deadline_seconds=_deadline_seconds(config),
             )
             runner.workflow_project = config.name
+            runner.github_env = github["env"]
+            runner.github_mcp = github["mcp"] if provider == "claude" else None
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -255,7 +259,54 @@ def build_production_dispatcher(
         prompt_renderer=lambda current: _pipeline_text(config, current),
     )
     dispatcher.workflow = workflow
+    if runner_factory is None:
+        dispatcher.github_fact = github["fact"]
     return dispatcher, manager, factory
+
+
+def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -> dict[str, Any]:
+    """Resolve the builder's GitHub transport: REST helper by default, MCP opt-in.
+
+    Fails closed on a combination Harbor cannot honour: Codex runs
+    non-interactively and refuses any MCP call that wants approval, so the MCP
+    transport is Claude-only.
+    """
+
+    import shlex
+    from harbor.config.workflow import github_settings
+    from harbor.github_rest import rest_base_url, token_env_name
+
+    environ = os.environ if env is None else env
+    settings = github_settings(workflow.config)
+    if settings["transport"] == "mcp" and provider != "claude":
+        raise ValueError("github.transport = \"mcp\" requires builder_provider: claude (Codex refuses MCP calls that need approval)")
+    profile = PipelineProfile.from_project(config)
+    rest_url = rest_base_url(profile.github_api_url)
+    explicit_mcp_url = "mcp_url" in dict((workflow.config or {}).get("github") or {})
+    if settings["transport"] == "mcp" and rest_url != "https://api.github.com" and not explicit_mcp_url:
+        # The default hosted MCP server is GitHub.com only; never send an Enterprise token there.
+        raise ValueError("github.mcp_url is required for GitHub Enterprise Server; the default MCP server serves GitHub.com only")
+    token_env = token_env_name(environ, profile.github_token_env)
+    token_names = " or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
+    repository = str(getattr(config, "github_repository", "") or "")
+    helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
+    child_env = {"HARBOR_GITHUB_API_URL": rest_url}
+    if repository:
+        child_env["HARBOR_GITHUB_REPOSITORY"] = repository
+    if token_env:
+        child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env
+    mcp = {"url": settings["mcp_url"], "token_env": token_env} if settings["transport"] == "mcp" and token_env else None
+    return {
+        "transport": settings["transport"],
+        "mcp_url": settings["mcp_url"],
+        "token_env": token_env,
+        "token_names": token_names,
+        "env": child_env,
+        "mcp": mcp,
+        "fact": github_transport_fact(
+            settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
+        ),
+    }
 
 
 async def _doctor(project_name: str) -> int:
@@ -286,6 +337,19 @@ async def _doctor(project_name: str) -> int:
     print(f"Workflow: {workflow.package} · {workflow.digest}")
     print(f"Models: {workflow.models_path} · controller {controller['model']} · First Mate {workflow.config['first_mate']['model']}")
     print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
+    try:
+        github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"))
+    except ValueError as exc:
+        print(f"GitHub transport: invalid ({exc})")
+        scope_ok = False
+    else:
+        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (python -m harbor.github_rest)"
+        if github["token_env"]:
+            print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
+        else:
+            print(f"GitHub transport: {github['transport']} · {where} · no token: set {github['token_names']}")
+            if getattr(config, "github_repository", ""):
+                scope_ok = False
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
@@ -404,13 +468,26 @@ async def _start(
                 disk_floor_gb=_disk_floor_gb(config),
             custody=db.connection,
             )
-        production_dispatcher, manager, factory = build_production_dispatcher(
-            config, db,
-            worktree_manager=manager,
-            runner_factory=runner_factory,
-            builder_prompt=builder_prompt,
-            ticket_scope=invocation_scope,
-        )
+        try:
+            production_dispatcher, manager, factory = build_production_dispatcher(
+                config, db,
+                worktree_manager=manager,
+                runner_factory=runner_factory,
+                builder_prompt=builder_prompt,
+                ticket_scope=invocation_scope,
+            )
+        except ValueError as exc:
+            # Configuration errors are for the operator, not a traceback.
+            print(f"Harbor: {exc}", file=sys.stderr)
+            close = getattr(client, "close", None)
+            if callable(close):
+                value = close()
+                if asyncio.iscoroutine(value):
+                    await value
+            if github_client is not None and github_client is not client:
+                await github_client.close()
+            db.close()
+            return 2
         # Retain the concrete seams for status and tests without changing the
         # Supervisor API's existing duck-typed injection behavior.
         worktree_manager = manager

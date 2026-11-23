@@ -9,6 +9,12 @@ version = 1
 merge_mode = "human"
 auto_merge_risks = []
 
+[github]
+# How the builder reads and writes GitHub. "rest" (default) uses Harbor's
+# built-in helper with your GITHUB_TOKEN/GH_TOKEN. "mcp" (Claude builders only)
+# adds a GitHub MCP server; set mcp_url for GitHub Enterprise Server.
+transport = "rest"
+
 [recovery]
 # Automatic retries after an unexpected builder exit.
 enabled = true

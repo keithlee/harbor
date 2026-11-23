@@ -783,6 +783,9 @@ class BaseRunner:
                 "PWD": str(self.worktree),
             }
         )
+        # GitHub transport settings for harbor.github_rest (names only; the
+        # token stays in whichever variable the operator already set).
+        env.update(dict(getattr(self, "github_env", None) or {}))
         return env
 
     def _new_context(self, run_id: str | None = None) -> RunContext:

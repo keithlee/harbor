@@ -1,0 +1,173 @@
+[
+  "claude",
+  "--print",
+  "--verbose",
+  "--output-format",
+  "stream-json",
+  "--json-schema",
+  {
+    "additionalProperties": false,
+    "properties": {
+      "blocker": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "product_decision",
+              "env_blocker",
+              "github_transport",
+              "ambiguous_ac",
+              "missing_proof_capability",
+              "conflicting_instruction"
+            ],
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "type": "string"
+          },
+          "recommendation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "question",
+          "options",
+          "recommendation",
+          "evidence"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "next_action": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "outcome": {
+        "enum": [
+          "merged",
+          "pr_open",
+          "parked",
+          "no_pr",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "pr_url": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "status": {
+        "enum": [
+          "completed",
+          "waiting",
+          "blocked",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "summary": {
+        "type": "string"
+      },
+      "waiting_on": {
+        "enum": [
+          "ci",
+          "review",
+          "human",
+          "none",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "status",
+      "outcome",
+      "waiting_on",
+      "pr_url",
+      "summary",
+      "next_action",
+      "blocker"
+    ],
+    "title": "Harbor builder run result",
+    "type": "object"
+  },
+  "--model",
+  "claude-opus-5-5",
+  "--effort",
+  "high",
+  "--permission-mode",
+  "dontAsk",
+  "--tools",
+  "Bash,Read,Glob,Grep,Skill",
+  "--setting-sources",
+  "",
+  "--strict-mcp-config",
+  "--settings",
+  {
+    "permissions": {
+      "allow": [
+        "mcp__github"
+      ]
+    },
+    "sandbox": {
+      "allowUnsandboxedCommands": false,
+      "autoAllowBashIfSandboxed": true,
+      "enabled": true,
+      "failIfUnavailable": true,
+      "filesystem": {
+        "allowWrite": [
+          "<tmp>/state",
+          "<tmp>/repo/.git"
+        ]
+      },
+      "network": {
+        "allowedDomains": [
+          "github.com",
+          "api.github.com",
+          "api.linear.app",
+          "registry.npmjs.org"
+        ]
+      }
+    }
+  },
+  "--mcp-config",
+  {
+    "mcpServers": {
+      "github": {
+        "headers": {
+          "Authorization": "Bearer ${GITHUB_TOKEN}"
+        },
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/"
+      }
+    }
+  }
+]

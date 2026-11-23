@@ -92,6 +92,7 @@ switch models.
 | `[cleanup]` | `after_merge` | worktree cleanup after an observed merge |
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
+| `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -100,6 +101,52 @@ receipts for them, and a human still merges by default.
 
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
+
+### GitHub transport (`[github]`)
+
+The builder needs GitHub to open, update, comment on, check and (when the
+workflow allows) merge its PR. Harbor does not rely on the GitHub CLI for this:
+inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake and
+hangs, while plain HTTPS to the API works. The builder is told to prefer the
+configured transport; where `gh` does work (for example Codex, or Linux) it may
+still use it, and with no token in the environment it is told to try `gh` before
+reporting a blocker. Harbor tells the builder which transport it
+has in the launch prompt.
+
+```toml
+[github]
+transport = "rest"   # default; or "mcp" (Claude builders only)
+# mcp_url = "https://api.githubcopilot.com/mcp/"   # only with transport = "mcp"
+```
+
+**`rest` (default, no extra setup).** The builder runs Harbor's helper,
+`python -m harbor.github_rest`, which calls the GitHub REST API through `curl`.
+Operations: `pr-view`, `pr-create`, `pr-edit`, `pr-comment`, `pr-checks`,
+`pr-merge` (pinned to a head SHA) and `api METHOD /path` for anything else. It
+uses the token you already export for Harbor (`GITHUB_TOKEN` or `GH_TOKEN`),
+targets the project's `github_repository`, and derives the REST base from
+`github_api_url` (`https://host/api/graphql` becomes `https://host/api/v3` on
+GitHub Enterprise Server). The token is passed to `curl` on stdin, so it is never
+on a command line, on disk or in output. Requests only go to that API host.
+
+**`mcp` (opt-in, Claude builders only).** Harbor passes the Claude builder a
+GitHub MCP server and pre-approves only its tools; the Bash sandbox and its
+network allowlist are unchanged. The server runs outside the Bash sandbox. The
+`Authorization` header holds `${GITHUB_TOKEN}` (or whichever variable is set),
+which Claude Code expands, so the token is never written into the command.
+The default endpoint is GitHub's hosted server, which serves GitHub.com only and
+is a dependency on that service; set `mcp_url` to a self-hosted
+`github-mcp-server` to avoid it. On GitHub Enterprise Server `mcp_url` is
+required, so an Enterprise token is never sent to the GitHub.com server. Codex builders
+are refused at startup, because a non-interactive Codex run refuses MCP calls
+that need approval. The REST helper stays available as a fallback.
+
+Token scopes: the builder pushes branches and edits PRs, so a fine-grained token
+needs repository **Contents** and **Pull requests** read/write, plus **Checks**
+and **Commit statuses** read. `harbor doctor` prints the transport and which
+variable the token comes from, and fails when GitHub is configured with no token.
+Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
+GitHub Enterprise Server use the same code path but were not run.
 
 ### Editing mid-run
 

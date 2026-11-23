@@ -19,9 +19,7 @@ import hashlib
 import html
 import json
 import re
-import shutil
 import sqlite3
-import subprocess
 from datetime import datetime, timezone
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
@@ -834,92 +832,61 @@ HOLD_OFF_CONTRACT = (
 )
 
 
-def _gh_auth_status(gh_path: str, env: Mapping[str, str]) -> bool:
-    """Return whether the GitHub CLI accepts its configured credentials."""
-
-    child_env = dict(env)
-    try:
-        result = subprocess.run(
-            [gh_path, "auth", "status", "--hostname", "github.com"],
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
-
-def detect_delivery_tools(env: Mapping[str, str] | None = None) -> dict[str, bool]:
-    """Probe which delivery tools a builder could actually use.
-
-    Read-only: a PATH lookup plus ``gh auth status``.  The CLI can use a
-    credential stored in its config/keychain, so an environment token is not
-    required for builder GitHub mutations.  ``GITHUB_TOKEN``/``GH_TOKEN`` are
-    still passed through unchanged for Harbor's separate GitHub API client.
-    """
-
-    import os
-
-    environ = dict(env if env is not None else os.environ)
-    gh_path = shutil.which("gh")
-    gh_authenticated = gh_path is not None and _gh_auth_status(gh_path, environ)
-    tools: dict[str, bool] = {
-        "git": shutil.which("git") is not None,
-        "gh": gh_authenticated,
-    }
-    if gh_path is not None and not gh_authenticated:
-        tools["gh (auth status failed)"] = False
-    return tools
-
-
-def delivery_tools_fact(tools: Mapping[str, Any] | None = None) -> str:
-    """Report which delivery tools are usable inside the builder's sandbox.
+def github_transport_fact(
+    transport: str = "rest",
+    *,
+    helper: str = "",
+    repository: str = "",
+    token_available: bool = True,
+) -> str:
+    """Tell the builder which GitHub transport this run actually has.
 
     Harbor knows things about the run environment that the builder cannot
-    discover cheaply, and reporting them is the same kind of fact as CI state
-    -- it says what IS, never what to do.
+    discover cheaply; this says what IS, never what to do with the ticket.
 
-    This exists because of a real failure: a builder abandoned an approved
-    merge after an unavailable GitHub transport and an MCP call reported
-    "approval policy is never", while plain ``gh`` was authenticated and
-    working in that very sandbox the whole time. A non-interactive ``codex
-    exec`` refuses any MCP call that wants approval, so an agent that reaches
-    only for MCP strands itself.
+    It replaces a probe that ran ``gh auth status`` *outside* the builder
+    sandbox and then told the builder ``gh`` was available inside it. Inside
+    Claude Code's macOS sandbox ``gh`` cannot complete a TLS handshake, so a
+    builder that trusted that fact hung on every GitHub call (HAN-87). The REST
+    helper goes through ``curl``, which does work there.
     """
 
-    values = dict(tools or {})
-    available = [name for name, ok in sorted(values.items()) if ok]
-    unavailable = [name for name, ok in sorted(values.items()) if not ok]
-    if not available and not unavailable:
+    if not helper:
         return ""
-    parts = []
-    if available:
-        parts.append(f"Available and authenticated in your sandbox: {', '.join(available)}.")
-    if unavailable:
-        parts.append(f"Not usable in this run: {', '.join(unavailable)}.")
-    if values.get("gh"):
-        parts.append(
-            "This run is non-interactive, so any MCP tool that requests approval "
-            "is refused; use the available `gh` CLI for GitHub mutations and do "
-            "not use gh-axi."
+    target = f" for {repository}" if repository else " (pass --repo owner/name)"
+    ops = (
+        "pr-view N; pr-create --head H --base B --title T --body-file F; "
+        "pr-edit N [--title T] [--body-file F]; pr-comment N --body-file F; pr-checks N; "
+        "pr-merge N --sha SHA [--method squash]; api METHOD /path [--input F] for anything else"
+    )
+    rest = f"`{helper} <op>`{target} ({ops}). It prints JSON."
+    if not token_available:
+        return (
+            "GitHub transport: no GitHub token is set in this run's environment, so the REST helper "
+            f"`{helper}` cannot authenticate. If the gh CLI works in your sandbox you may use it; "
+            "if it fails or hangs, report a delivery-transport blocker. Do not use MCP or gh-axi."
         )
-    else:
-        parts.append(
-            "This run is non-interactive, so any MCP tool that requests approval "
-            "is refused; no GitHub mutation transport is available. Do not use MCP "
-            "or gh-axi; report a delivery-transport blocker."
+    common = (
+        "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
+        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual."
+    )
+    if transport == "mcp":
+        return (
+            "GitHub transport: MCP. Use the `github` MCP server tools (mcp__github__*) for GitHub "
+            f"reads and writes; they are pre-approved for this run. If an MCP call fails, use the REST helper {rest} "
+            + common
         )
-    return " ".join(parts)
+    return (
+        f"GitHub transport: REST helper. For every GitHub read and write use {rest} "
+        + common
+        + " This run is non-interactive and has no MCP servers; do not use MCP or gh-axi."
+    )
 
 
 def build_instruction(
     ticket: Mapping[str, Any],
     *,
-    delivery_tools: Mapping[str, Any] | None = None,
+    github_fact: str = "",
 ) -> str:
     identifier = _identifier(ticket)
     title = str(_value(ticket, "title", default="") or "").strip()
@@ -941,9 +908,8 @@ def build_instruction(
         "</untrusted-linear-ticket>",
         HOLD_ON_CONTRACT if held else HOLD_OFF_CONTRACT,
     ]
-    environment = delivery_tools_fact(delivery_tools)
-    if environment:
-        lines.append(environment)
+    if github_fact:
+        lines.append(github_fact)
     lines.append(
         "Before spawning any child agent, editing files, or updating the ticket, "
         "read the supplied ticket constraints and fetch the full current Linear description and comments. "

@@ -26,7 +26,24 @@ SECTIONS = {
     "execution": {"deadline_minutes"},
     "evidence": {"feedback", "ci"},
     "states": {"ready", "paused", "terminal"},
+    "github": {"transport", "mcp_url"},
 }
+GITHUB_TRANSPORTS = {"rest", "mcp"}
+DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
+
+
+def github_settings(data) -> dict:
+    """The builder's GitHub transport. ``rest`` (default) or opt-in ``mcp``."""
+    section = dict((data or {}).get("github") or {})
+    transport = section.get("transport", "rest")
+    if transport not in GITHUB_TRANSPORTS:
+        raise ValueError("github.transport must be \"rest\" or \"mcp\"")
+    url = section.get("mcp_url", DEFAULT_GITHUB_MCP_URL)
+    if not isinstance(url, str) or not url.startswith("https://") or any(c.isspace() for c in url):
+        raise ValueError("github.mcp_url must be an https URL")
+    if "mcp_url" in section and transport != "mcp":
+        raise ValueError("github.mcp_url is only used with transport = \"mcp\"")
+    return {"transport": transport, "mcp_url": url}
 ENTRY_FIELDS = {
     "skills": {"ref", "enabled"},
     "hooks": {"event", "mode", "executor", "command", "protocol", "timeout_seconds", "skill"},
@@ -229,6 +246,7 @@ def load_workflow(path: Path) -> Workflow:
     state_groups = [{s.casefold() for s in data.get("states",{}).get(group,[])} for group in ("ready","paused","terminal")]
     if any(state_groups[i] & state_groups[j] for i in range(3) for j in range(i+1,3)):
         raise ValueError("ready, paused and terminal states must not overlap")
+    github_settings(data)
     deadline = data.get("execution",{}).get("deadline_minutes",90)
     if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or deadline <= 0:
         raise ValueError("deadline must be positive and finite")

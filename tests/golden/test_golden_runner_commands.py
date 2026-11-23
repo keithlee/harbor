@@ -50,6 +50,21 @@ def test_claude_builder_fresh_command(tmp_path: Path, golden) -> None:
     golden.json("argv_claude_builder_fresh.json", argv)
 
 
+def test_claude_builder_with_github_mcp_command(tmp_path: Path, golden) -> None:
+    runner = claude_runner(tmp_path)
+    runner.github_mcp = {"url": "https://api.githubcopilot.com/mcp/", "token_env": "GITHUB_TOKEN"}
+    argv = scrub(runner.command("ignored", run_id="harbor-run-1"), tmp_path)
+    argv = [json.loads(item) if item.startswith("{") else item for item in argv]
+    golden.json("argv_claude_builder_github_mcp.json", argv)
+
+
+def test_github_helper_settings_reach_the_builder_environment(tmp_path: Path) -> None:
+    runner = claude_runner(tmp_path)
+    runner.github_env = {"HARBOR_GITHUB_REPOSITORY": "owner/repo", "HARBOR_GITHUB_TOKEN_ENV": "GITHUB_TOKEN"}
+    env = runner.environment()
+    assert env["HARBOR_GITHUB_REPOSITORY"] == "owner/repo" and env["HARBOR_GITHUB_TOKEN_ENV"] == "GITHUB_TOKEN"
+
+
 def test_claude_builder_resume_uses_the_native_session(tmp_path: Path) -> None:
     argv = claude_runner(tmp_path).command("ignored", run_id=SESSION, resume=True)
     assert argv[-2:] == ["--resume", SESSION]
