@@ -186,6 +186,9 @@ class WorktreeDispatcher:
         self.handoff_gate: Callable[[str], str] | None = None
         self.runners: dict[str, Any] = {}
         self.worktrees: dict[str, Any] = {}
+        # Why the runner factory last refused to rebuild a ticket's retained
+        # builder (e.g. an invalid model or a missing provider executable).
+        self._resume_errors: dict[str, str] = {}
         # Serializes the whole lifecycle of one ticket's retained builder.
         # This closes the pre-runs-row window between storing ``runner`` and
         # BaseRunner inserting its ``running`` row in SQLite.
@@ -194,6 +197,12 @@ class WorktreeDispatcher:
     @staticmethod
     def _identifier(wake: Wake) -> str:
         return str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
+
+    def resume_unavailable_reason(self, identifier: str) -> str | None:
+        """Return why the runner factory last refused to rebuild ``identifier``."""
+
+        wanted = str(identifier or "").casefold()
+        return next((v for k, v in self._resume_errors.items() if k.casefold() == wanted), None)
 
     def _in_scope(self, value: Any) -> bool:
         """Check one ticket identifier against this invocation's custody scope."""
@@ -550,10 +559,13 @@ class WorktreeDispatcher:
             return None
         try:
             runner = await self._factory(worktree, wake)
-        except Exception:
+        except Exception as exc:
             # A factory that cannot rebuild a handle is not a supervision
-            # failure; the resume simply stays unavailable for this poll.
+            # failure; the resume stays unavailable (fail closed). Keep the
+            # factory's reason so the operator can see what to fix.
+            self._resume_errors[identifier] = str(exc) or type(exc).__name__
             return None
+        self._resume_errors.pop(identifier, None)
         self.worktrees[identifier] = worktree
         self.runners[identifier] = runner
         return runner
@@ -657,6 +669,9 @@ class WorktreeDispatcher:
         self.runners.pop(identifier, None)
         runner = await self.hydrate(identifier, recover_terminal=True)
         if runner is None:
+            reason = self.resume_unavailable_reason(identifier)
+            if reason:
+                raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {reason}")
             raise RuntimeError(
                 f"retained builder for {identifier} cannot attach its existing worktree"
             )
@@ -972,6 +987,8 @@ class Supervisor:
         self.lifecycle = Lifecycle.STOPPED
         self.linear_healthy = False
         self.last_error: str | None = None
+        # Why the most recent resume_session could not rebuild its builder.
+        self.last_resume_error: str | None = None
         self.last_result: PollResult | None = None
         self._poll_sequence = 0
         self._published_poll = 0
@@ -4164,7 +4181,12 @@ class Supervisor:
             )
             value = await target.resume(wake)
             if value is None or value is False:
+                reason = target.resume_unavailable_reason(identifier)
+                self.last_resume_error = reason
+                if reason:
+                    self.last_error = f"builder for {identifier} could not resume: {reason}"
                 return False
+            self.last_resume_error = None
             # WorktreeDispatcher returns the builder's terminal payload.  Feed
             # it back through the same result router used for poll-driven
             # wakes so a second blocker is bounded, recorded, and either
