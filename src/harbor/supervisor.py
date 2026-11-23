@@ -3350,7 +3350,7 @@ class Supervisor:
         for ticket in self._fleet_tickets:
             identifier = self._ticket_key(ticket)
             if (self._ticket_project(identifier) != self.project or not self._in_scope(ticket) or not self._owns(ticket) or ticket.get("hold", True)
-                    or ticket.get("state_type") in {"completed", "canceled"}
+                    or ticket.get("state_type") in {"backlog", "completed", "canceled"}
                     or str(ticket.get("state", "")).strip().casefold() in {"backlog", "paused", "done", "completed", "canceled", "cancelled"} or ticket.get("blocked_by")):
                 continue
             workflow = getattr(self.dispatcher, "workflow", None)
