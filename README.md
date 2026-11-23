@@ -117,7 +117,10 @@ while an agent works.
 
 Linear and GitHub API credentials are external-service credentials, not model
 calls. Linear uses `LINEAR_API_KEY` or `HARBOR_LINEAR_API_KEY`; the GitHub
-poller uses `GITHUB_TOKEN` or `GH_TOKEN` when GitHub facts are configured.
+poller uses `GITHUB_TOKEN` or `GH_TOKEN` when GitHub facts are configured. The
+builder uses the same token for its own GitHub work through Harbor's REST
+helper (default) or an opt-in GitHub MCP server; see
+[GitHub transport](docs/configurable-workflows.md#github-transport-github).
 
 For a read-only one-cycle check:
 
