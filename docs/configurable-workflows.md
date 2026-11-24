@@ -233,7 +233,11 @@ addressed by an IP address or a single-label name such as `https://github/`;
 Harbor refuses it instead of guessing, so give the server a DNS name. Codex
 builders are unaffected, since their sandbox does not filter by host, and these
 rules are applied only to Claude builders, including a retained Claude session
-on a project since switched to Codex. A configured DNS name is trusted as-is:
+on a project since switched to Codex. `harbor start` and `harbor doctor` do not
+check such a session, so when it is resumed Harbor prints the same Linear
+warning, and if the GitHub value stops it, a `Harbor: warning: the retained
+Claude builder session for <ticket> cannot resume: ...` line (once per process);
+the session stays unresumed until `github_api_url` is fixed. A configured DNS name is trusted as-is:
 whoever can set `github_api_url` (the registry, `.harbor/pipeline.md` or
 `AGENTS.md` in the main checkout) already decides where the GitHub token is
 sent, so allowing that host gives them nothing new. Verified with unit tests and the production runner factory on macOS

@@ -10,6 +10,7 @@ import shlex
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from harbor.clients.github import GitHubClient
@@ -239,6 +240,14 @@ def build_production_dispatcher(
             if getattr(config, "playwright_browser_image", None):
                 raise ValueError("Claude Code builders require a project-native browser setup")
 
+        warned: set[str] = set()
+
+        def warn_once(message: str) -> None:
+            # The factory runs on every poll that tries to resume; say it once.
+            if message not in warned:
+                warned.add(message)
+                print(f"Harbor: warning: {message}", file=sys.stderr)
+
         def factory(worktree: Any, wake: Any) -> CodexRunner:
             ticket = str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
             path = getattr(worktree, "path", worktree)
@@ -286,7 +295,9 @@ def build_production_dispatcher(
             if provider == "claude":
                 hosts = github["sandbox_hosts"]
                 if hosts is None:  # a retained Claude session on a project now set to Codex
-                    hosts = claude_sandbox_hosts(config, github["env"]["HARBOR_GITHUB_API_URL"])
+                    hosts = resumed_claude_sandbox_hosts(
+                        config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
+                    )
                 runner.sandbox_hosts = hosts
             return runner
     dispatcher = WorktreeDispatcher(
@@ -333,6 +344,35 @@ def claude_sandbox_hosts(config: Any, rest_url: str) -> tuple[str, ...]:
     from harbor.runner.claude import sandbox_hosts
     hosts = (*sandbox_hosts(rest_url, "GitHub API"), *linear_sandbox_hosts(config)[0])
     return tuple(dict.fromkeys(hosts))
+
+
+def resumed_claude_sandbox_hosts(
+    config: Any, rest_url: str, ticket: str, *, warn: Callable[[str], None],
+) -> tuple[str, ...]:
+    """Sandbox hosts for a retained Claude session on a project now set to Codex.
+
+    ``harbor start`` and ``harbor doctor`` only hold a Claude project to the
+    sandbox host rules, so nothing checked them for this session. Report what
+    they would have reported: the Linear warning, and why a GitHub endpoint the
+    allowlist cannot express stops the resume. Still fail closed on the latter;
+    the allowlist is never widened to fit.
+    """
+
+    from harbor.runner.claude import sandbox_hosts
+    linear_hosts, linear_warning = linear_sandbox_hosts(config)
+    if linear_warning:
+        warn(linear_warning)
+    try:
+        github_hosts = sandbox_hosts(rest_url, "GitHub API")
+    except ValueError as exc:
+        reason = (
+            f"the retained Claude builder session for {ticket or '(unknown ticket)'} cannot resume: {exc}. "
+            "Its project is now set to Codex, so harbor doctor and harbor start do not check this; "
+            "set github_api_url to a host name the Claude sandbox can allow"
+        )
+        warn(reason)
+        raise ValueError(reason) from exc
+    return tuple(dict.fromkeys((*github_hosts, *linear_hosts)))
 
 
 def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -> dict[str, Any]:
