@@ -226,6 +226,39 @@ def test_console_status_keeps_latest_fleet_after_overlapping_polls(tmp_path: Pat
     run(scenario())
 
 
+def test_a_poll_publishes_its_github_facts(tmp_path: Path) -> None:
+    """The current poll owns the in-memory PR facts behind /facts and observed_pr_facts."""
+    pr_url = "https://github.com/sample/project/pull/42"
+    ticket = {
+        "id": "linear-42",
+        "identifier": "SAMPLE-42",
+        "title": "Fixture issue",
+        "state": {"name": "In Progress", "type": "started"},
+        "attachments": {"nodes": [{"url": pr_url, "sourceType": "github"}]},
+    }
+    fact = {"ticket": "SAMPLE-42", "number": 42, "url": pr_url, "ci": "green", "threads": [], "mergeable": True}
+
+    def linear(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket]}}})
+
+    async def github(_):
+        return [dict(fact)]
+
+    async def scenario() -> None:
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
+        db = HarborDB(tmp_path / "harbor.db")
+        client = LinearClient(token="test-key", transport=httpx.MockTransport(linear))
+        try:
+            supervisor = Supervisor(LinearPoller(client, config, db=db), db=db, github_poller=github)
+            await supervisor.poll_once()
+            assert [dict(item) for item in supervisor.last_pr_facts] == [fact]
+        finally:
+            await client.close()
+            db.close()
+
+    run(scenario())
+
+
 def test_background_output_is_emitted_under_patch_stdout(tmp_path: Path, monkeypatch) -> None:
     """AC-5: a background event must not corrupt a partially typed line.
 

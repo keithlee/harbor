@@ -3362,8 +3362,7 @@ class Supervisor:
     async def poll_once(self) -> PollResult | None:
         if self.lifecycle in {Lifecycle.PAUSING, Lifecycle.PAUSED}:
             return self.last_result
-        self._poll_sequence += 1
-        poll_sequence = self._poll_sequence
+        poll_sequence = 0
 
         def is_current() -> bool:
             return self._published_poll == poll_sequence
@@ -3377,6 +3376,10 @@ class Supervisor:
         # A console refresh may overlap a background cycle. Publish Linear
         # observations in order while allowing longer downstream work to overlap.
         async with self._linear_poll_lock:
+            # Number polls in the order they fetch Linear, so the newest fetch
+            # is the one that publishes.
+            self._poll_sequence += 1
+            poll_sequence = self._poll_sequence
             # Only flags that existed before this fetch can be judged by its result.
             flags_before = self._latest_flag_id()
             try:
@@ -3412,6 +3415,7 @@ class Supervisor:
             self.github_healthy = github_error is None
             self.github_error = github_error
 
+        self.last_pr_facts = tuple(github_facts)
         grouped = self._github_facts_by_ticket(result.tickets, github_facts)
         self.last_wakes = []
         fleet_tickets: list[dict[str, Any]] = []
