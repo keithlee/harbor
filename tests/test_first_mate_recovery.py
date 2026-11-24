@@ -730,3 +730,100 @@ def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path
         assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
     finally:
         db.close()
+
+
+# ---- #23 relies on a complete poll: absence must mean "left the polled states" ----
+
+def _filler(number):
+    return {"id": f"lin-f{number}", "identifier": f"HAN-{1000 + number}", "title": f"Filler {number}",
+            "state": {"name": "In Progress", "type": "started"}}
+
+
+HAN86_NODE = {"id": "lin-86", "identifier": "HAN-86", "title": "Sample issue",
+              "state": {"name": "In Progress", "type": "started"}}
+
+
+def _paged_linear(pages_for):
+    """Serve Linear's cursor pagination; ``pages_for()`` gives the current pages."""
+
+    def handler(request):
+        pages = pages_for()
+        after = json.loads(request.content)["variables"].get("after")
+        index = 0 if after is None else int(after.removeprefix("cursor-")) + 1
+        page = pages[min(index, len(pages) - 1)]
+        if page == "endless":  # a misbehaving server that never ends pagination
+            nodes, has_next = [], True
+        else:
+            nodes, has_next = page, index + 1 < len(pages)
+        return httpx.Response(200, json={"data": {"issues": {
+            "nodes": nodes, "pageInfo": {"hasNextPage": has_next, "endCursor": f"cursor-{index}"}}}})
+
+    return httpx.MockTransport(handler)
+
+
+def _flagged_supervisor(tmp_path, pages_for):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86", "repeated_answer")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client = LinearClient(token="test-key", transport=_paged_linear(pages_for))
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    return db, client, supervisor, mate, linear, resumed
+
+
+def _seen(db):
+    recovery.initialize(db.connection)  # the monitor may never have run
+    return db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
+
+
+def test_failed_poll_keeps_a_pending_flag_for_the_next_complete_poll(tmp_path):
+    # Page 1 does not contain HAN-86 and the server never ends pagination, so
+    # the client refuses the partial poll. A truncated snapshot must not reach
+    # _monitor_blocked, or #23 would consume HAN-86's flag (never re-emitted).
+    fillers = [_filler(n) for n in range(50)]
+    current = {"pages": [fillers, "endless"]}
+    db, client, supervisor, mate, linear, resumed = _flagged_supervisor(tmp_path, lambda: current["pages"])
+
+    async def scenario():
+        assert await supervisor.poll_once() is None
+        assert supervisor.linear_healthy is False
+        assert "pagination limit" in (supervisor.last_error or "")
+        await supervisor._drain_recoveries()
+        assert _seen(db) == 0  # still pending
+        assert mate.prompts == [] and resumed == []
+        # The next poll completes, with HAN-86 on its second page.
+        current["pages"] = [fillers, [HAN86_NODE]]
+        observed = await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert observed is not None and "HAN-86" in {t["identifier"] for t in observed.tickets}
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == 1 and "repeated_answer" in mate.prompts[0]
+        triggers = db.connection.execute("SELECT ticket, trigger FROM first_mate_recoveries").fetchall()
+        assert [tuple(row) for row in triggers] == [("HAN-86", "watchdog:repeated_answer")]
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_ticket_on_a_later_page_is_observed_and_its_flag_drives_recovery(tmp_path):
+    fillers = [_filler(n) for n in range(50)]
+    db, client, supervisor, mate, linear, resumed = _flagged_supervisor(
+        tmp_path, lambda: [fillers, [HAN86_NODE]])
+
+    async def scenario():
+        observed = await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert observed is not None and len(observed.tickets) == 51
+        assert "HAN-86" in {t["identifier"] for t in observed.tickets}
+
+    try:
+        asyncio.run(scenario())
+        # The flag reached First Mate instead of being consumed as "unpolled".
+        assert len(mate.prompts) == 1 and "repeated_answer" in mate.prompts[0]
+        triggers = db.connection.execute("SELECT ticket, trigger FROM first_mate_recoveries").fetchall()
+        assert [tuple(row) for row in triggers] == [("HAN-86", "watchdog:repeated_answer")]
+    finally:
+        asyncio.run(client.close())
+        db.close()
