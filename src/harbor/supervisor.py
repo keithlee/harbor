@@ -3178,17 +3178,21 @@ class Supervisor:
         # GitHub is optional in Phase 1.  When present it is strictly
         # query-only: the poller is injected and Harbor calls no mutation API.
         github_facts: list[Mapping[str, Any]] = []
+        github_error: str | None = None
         if self.github_poller is not None:
             try:
                 github_facts = await self._call_github(result.tickets)
             except Exception as exc:
-                self.github_healthy = False
-                self.github_error = str(exc)
-            else:
-                self.github_healthy = True
-                self.github_error = None
+                github_error = str(exc)
 
-        self.last_pr_facts = tuple(github_facts)
+        # The GitHub read can finish after a newer Linear poll, even when
+        # both polls returned the same Linear snapshot hash.
+        if result is self.last_result:
+            self.last_pr_facts = tuple(github_facts)
+            if self.github_poller is not None:
+                self.github_healthy = github_error is None
+                self.github_error = github_error
+
         grouped = self._github_facts_by_ticket(result.tickets, github_facts)
         self.last_wakes = []
         fleet_tickets: list[dict[str, Any]] = []
@@ -3248,7 +3252,9 @@ class Supervisor:
             wake = self.decider.decide(ticket, facts) if self.decider is not None and not quota_wait else None
             if wake is not None:
                 await self._emit_wake(wake)
-        self._fleet_tickets = tuple(fleet_tickets)
+        # PR-event processing or dispatch may have let a newer poll finish.
+        if result is self.last_result:
+            self._fleet_tickets = tuple(fleet_tickets)
         if not self.shadow:
             await self._retry_pending_handoffs()
             from harbor.answer_queue import drain
