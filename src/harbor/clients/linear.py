@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
 
@@ -27,15 +27,24 @@ query HarborIssues($slugs: [String!]!, $states: [String!]!, $after: String) {
 }
 """
 
-# The poll follows Linear's cursor pagination so no matching ticket is ever
-# invisible to dispatch or First Mate recovery.  The bound (40 pages of 50,
-# i.e. 2000 issues) only stops a runaway or misbehaving server; reaching it is
-# an error, never a silently truncated snapshot.
+# Every Linear connection Harbor reads (the issue poll, the project list used
+# to resolve the configured scope, and a team's workflow states) follows
+# Linear's cursor pagination, so no ticket, project or state is ever invisible
+# because it sorted past the first page.  The bound (40 pages of 50, i.e. 2000
+# nodes) only stops a runaway or misbehaving server; reaching it is an error,
+# never a silently truncated result.
 LINEAR_POLL_MAX_PAGES = 40
 
 HEALTH_QUERY = "query HarborHealth { viewer { id } }"
 
-LINEAR_PROJECTS_QUERY = "query HarborProjects { projects(first: 50) { nodes { id name slugId } } }"
+LINEAR_PROJECTS_QUERY = """
+query HarborProjects($after: String) {
+  projects(first: 50, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id name slugId }
+  }
+}
+"""
 
 LINEAR_ISSUE_STATUS_QUERY = """
 query HarborIssueStatus($id: String!) {
@@ -52,10 +61,16 @@ query HarborIssueStatus($id: String!) {
 # config and the plan both speak in names ("Blocked", "Human Review"), so the
 # client resolves a name to its id once and caches it.
 LINEAR_STATES_QUERY = """
-query HarborStates($issueId: String!) {
+query HarborStates($issueId: String!, $after: String) {
   issue(id: $issueId) {
     id
-    team { id name states(first: 50) { nodes { id name type } } }
+    team {
+      id name
+      states(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id name type }
+      }
+    }
   }
 }
 """
@@ -247,15 +262,9 @@ class LinearClient:
         variables: dict[str, Any] = {"slugs": list(slugs), "states": list(states)}
         collected: dict[str, dict[str, Any]] = {}
         unkeyed: list[dict[str, Any]] = []
-        cursors: set[str] = set()
-        for _ in range(LINEAR_POLL_MAX_PAGES):
-            data = await self._post(LINEAR_QUERY, variables)
-            issues = data.get("issues", {})
-            if not isinstance(issues, dict):
-                raise LinearClientError("Linear issues response was malformed")
-            nodes = issues.get("nodes", [])
-            if not isinstance(nodes, list):
-                raise LinearClientError("Linear issues response was malformed")
+        async for nodes in self._paged_nodes(
+            LINEAR_QUERY, variables, lambda data: data.get("issues", {}), what="issue", partial="poll"
+        ):
             for node in nodes:
                 if not isinstance(node, dict):
                     continue
@@ -265,22 +274,55 @@ class LinearClient:
                 else:
                     # A page boundary can repeat an issue; keep one copy.
                     collected[str(key)] = node
-            info = issues.get("pageInfo") or {}
+        # Page order depends on Linear's cursor boundaries; the snapshot hash
+        # must not, so return a canonical order.
+        result = [*collected.values(), *unkeyed]
+        result.sort(key=lambda node: (str(node.get("identifier", "")), str(node.get("id", ""))))
+        return result
+
+    async def _paged_nodes(
+        self,
+        query: str,
+        variables: Mapping[str, Any],
+        connection: Callable[[dict[str, Any]], Any],
+        *,
+        what: str,
+        partial: str,
+    ) -> AsyncIterator[list[Any]]:
+        """Yield each page's ``nodes`` of one Linear connection, following cursors.
+
+        ``connection`` picks the connection object out of a response's data.
+        The query must take ``$after`` (omitted on the first page; GraphQL
+        treats it as null) and select ``pageInfo { hasNextPage endCursor }``.
+        A malformed page, a missing/repeated cursor, or more than
+        ``LINEAR_POLL_MAX_PAGES`` pages raises: callers never see a partial
+        list presented as complete.
+        """
+
+        variables = dict(variables)
+        variables.pop("after", None)
+        cursors: set[str] = set()
+        for _ in range(LINEAR_POLL_MAX_PAGES):
+            data = await self._post(query, variables)
+            page = connection(data)
+            if not isinstance(page, dict):
+                raise LinearClientError(f"Linear {what} response was malformed")
+            nodes = page.get("nodes", [])
+            if not isinstance(nodes, list):
+                raise LinearClientError(f"Linear {what} response was malformed")
+            yield nodes
+            info = page.get("pageInfo") or {}
             if not isinstance(info, dict):
-                raise LinearClientError("Linear issues pageInfo was malformed")
+                raise LinearClientError(f"Linear {what} pageInfo was malformed")
             if not info.get("hasNextPage"):
-                # Page order depends on Linear's cursor boundaries; the
-                # snapshot hash must not, so return a canonical order.
-                result = [*collected.values(), *unkeyed]
-                result.sort(key=lambda node: (str(node.get("identifier", "")), str(node.get("id", ""))))
-                return result
+                return
             after = info.get("endCursor")
             if not after or not isinstance(after, str) or after in cursors:
-                raise LinearClientError("incomplete Linear issue pagination; refusing a partial poll")
+                raise LinearClientError(f"incomplete Linear {what} pagination; refusing a partial {partial}")
             cursors.add(after)
             variables["after"] = after
         raise LinearClientError(
-            f"Linear poll exceeds pagination limit of {LINEAR_POLL_MAX_PAGES} pages; refusing a partial poll"
+            f"Linear {partial} exceeds pagination limit of {LINEAR_POLL_MAX_PAGES} pages; refusing a partial {partial}"
         )
 
     async def poll(
@@ -350,19 +392,38 @@ class LinearClient:
         return result
 
     async def list_projects(self) -> list[dict[str, Any]]:
-        """List visible Linear projects, for doctor's scope validation."""
+        """List every visible Linear project.
 
-        data = await self._post(LINEAR_PROJECTS_QUERY)
-        nodes = ((data.get("projects") or {}).get("nodes")) or []
-        return [dict(node) for node in nodes if isinstance(node, Mapping)]
+        Used to resolve a configured URL-form slug, by doctor's scope
+        validation, and by the ticket-scope check, so it must be complete:
+        a project past the first page is still a configured project.
+        """
+
+        projects: list[dict[str, Any]] = []
+        async for nodes in self._paged_nodes(
+            LINEAR_PROJECTS_QUERY,
+            {},
+            lambda data: data.get("projects") or {},
+            what="project",
+            partial="project list",
+        ):
+            projects.extend(dict(node) for node in nodes if isinstance(node, Mapping))
+        return projects
 
     async def _cache_team_states(self, issue_id: str) -> None:
         """Load names and terminal types for the issue's owning Linear team."""
 
-        data = await self._post(LINEAR_STATES_QUERY, {"issueId": str(issue_id)})
-        issue = data.get("issue") or {}
-        team = issue.get("team") or {}
-        nodes = ((team.get("states") or {}).get("nodes")) or []
+        # Read every page before touching the cache, so a failed lookup never
+        # leaves a partial view of the team's workflow behind.
+        nodes: list[Any] = []
+        async for page in self._paged_nodes(
+            LINEAR_STATES_QUERY,
+            {"issueId": str(issue_id)},
+            lambda data: ((data.get("issue") or {}).get("team") or {}).get("states") or {},
+            what="workflow state",
+            partial="workflow state lookup",
+        ):
+            nodes.extend(page)
         for node in nodes:
             if not isinstance(node, Mapping):
                 continue
