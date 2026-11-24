@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
+DEFAULT_LINEAR_API_URL = "https://api.linear.app/graphql"
+
 
 LINEAR_QUERY = """
 query HarborIssues($slugs: [String!]!, $states: [String!]!, $after: String) {
@@ -122,7 +124,7 @@ class LinearClient:
         self,
         token: str | None = None,
         *,
-        endpoint: str = "https://api.linear.app/graphql",
+        endpoint: str = DEFAULT_LINEAR_API_URL,
         timeout: float = 15.0,
         transport: httpx.AsyncBaseTransport | None = None,
         http_client: httpx.AsyncClient | None = None,

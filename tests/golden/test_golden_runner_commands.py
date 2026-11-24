@@ -65,6 +65,17 @@ def test_github_helper_settings_reach_the_builder_environment(tmp_path: Path) ->
     assert env["HARBOR_GITHUB_REPOSITORY"] == "owner/repo" and env["HARBOR_GITHUB_TOKEN_ENV"] == "GITHUB_TOKEN"
 
 
+def test_claude_builder_sandbox_adds_configured_hosts_and_refuses_wildcards(tmp_path: Path) -> None:
+    runner = claude_runner(tmp_path)
+    runner.sandbox_hosts = ("ghe.example.test", "github.com")
+    argv = runner.command("x", run_id="r")
+    allowed = json.loads(argv[argv.index("--settings") + 1])["sandbox"]["network"]["allowedDomains"]
+    assert allowed == ["github.com", "api.github.com", "api.linear.app", "registry.npmjs.org", "ghe.example.test"]
+    runner.sandbox_hosts = ("*.example.test",)
+    with pytest.raises(RunnerError, match="sandbox host"):
+        runner.command("x", run_id="r")
+
+
 def test_claude_builder_resume_uses_the_native_session(tmp_path: Path) -> None:
     argv = claude_runner(tmp_path).command("ignored", run_id=SESSION, resume=True)
     assert argv[-2:] == ["--resume", SESSION]

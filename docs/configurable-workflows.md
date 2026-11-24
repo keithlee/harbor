@@ -209,6 +209,38 @@ variable the token comes from, and fails when GitHub is configured with no token
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 
+**Claude builder sandbox network.** A Claude builder's Bash commands (the REST
+helper, `git push`, `curl`) can reach only an allowlist of hosts:
+`github.com`, `api.github.com`, `api.linear.app` and `registry.npmjs.org`, plus
+the hosts your project configures. Harbor adds the host of `github_api_url`
+(on GitHub Enterprise Server, `https://ghe.example.com/api/graphql` adds
+`ghe.example.com`, which serves both the API and git), the git host of an
+`api.<host>` endpoint (`api.acme.ghe.com` also adds `acme.ghe.com`), and the
+host of `linear_api_url`. Only the host of an `https` URL is used; a path, port,
+wildcard, user name, IP address (including numeric forms such as
+`0x7f.0x0.0x0.0x1`, or any host whose last label is a decimal or `0x` number) or
+whitespace is never added. A malformed GitHub value stops `harbor start` and
+fails `harbor doctor` instead of widening the sandbox. A `linear_api_url` the
+allowlist cannot express (for example a local `http://127.0.0.1:8080/graphql`
+stub) is left out with a warning from `harbor start` and a
+`Linear sandbox access: not added (...)` line in `harbor doctor`; Harbor itself
+still reaches it, but builder Bash commands cannot. A GitHub.com project gets exactly the default list. `harbor doctor`
+prints the list as `Builder sandbox network:` for Claude builders; it shows
+what the sandbox allows, not that the host answers. A git remote on a host
+other than the API host (for example SSH through a separate hostname) is not
+added. A Claude builder therefore cannot use a GitHub Enterprise Server that is
+addressed by an IP address or a single-label name such as `https://github/`;
+Harbor refuses it instead of guessing, so give the server a DNS name. Codex
+builders are unaffected, since their sandbox does not filter by host, and these
+rules are applied only to Claude builders, including a retained Claude session
+on a project since switched to Codex. A configured DNS name is trusted as-is:
+whoever can set `github_api_url` (the registry, `.harbor/pipeline.md` or
+`AGENTS.md` in the main checkout) already decides where the GitHub token is
+sent, so allowing that host gives them nothing new. Verified with unit tests and the production runner factory on macOS
+(generated `--settings` for GitHub.com and a GitHub Enterprise Server config);
+not run against a real GitHub Enterprise Server, a custom Linear endpoint, or
+on Linux.
+
 ### Editing mid-run
 
 Editing `.harbor/workflow/` while a ticket is in flight never blocks it. The

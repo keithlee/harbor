@@ -63,13 +63,64 @@ def attribution_off() -> bool:
     raise ValueError(f"{ATTRIBUTION_ENV} must be 'off', 'on', or unset; got {value!r}")
 
 
+DEFAULT_SANDBOX_DOMAINS = ("github.com", "api.github.com", "api.linear.app", "registry.npmjs.org")
+_HOST_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+# At least two labels, and a top-level label with a letter, so IP literals are refused.
+_HOST = re.compile(rf"(?:{_HOST_LABEL}\.)+(?=[0-9-]*[a-z]){_HOST_LABEL}")
+# A last label that is a number makes the whole host an IPv4 address to URL
+# parsers and inet_aton: decimal, or hex such as 0x7f.0x0.0x0.0x1 (127.0.0.1).
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
+
+
+def _domain(host: str) -> str:
+    if not _HOST.fullmatch(host) or _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
+        raise ValueError(f"not a plain host name: {host!r}")
+    return host
+
+
+def sandbox_hosts(url: str, label: str = "GitHub API", *, git_host: bool = True) -> tuple[str, ...]:
+    """Hosts the builder's Bash sandbox must reach for one configured endpoint.
+
+    Only the host of an ``https`` URL is taken: never a path, wildcard, user
+    info or IP literal. With ``git_host``, ``api.<host>`` also yields ``<host>``, where GitHub
+    serves git (``api.github.com`` -> ``github.com``, GHE.com likewise); GitHub
+    Enterprise Server serves its API and git from one host. Anything malformed
+    raises, so a bad value fails closed instead of widening the allowlist.
+    """
+
+    text = str(url or "")
+    match = re.fullmatch(r"https://([^/?#\s@\[\]]+?)(?::[0-9]{1,5})?(?:[/?#][^\s]*)?", text)
+    if not match:
+        raise ValueError(f"the {label} URL must be an https URL with a plain host name")
+    try:
+        host = _domain(match.group(1).lower())
+    except ValueError as exc:
+        raise ValueError(f"the {label} URL must be an https URL with a plain host name") from exc
+    hosts = [host]
+    if git_host and host.startswith("api.") and host.count(".") >= 2:
+        hosts.append(host[len("api."):])
+    return tuple(hosts)
+
+
+def sandbox_domains(*extra: str) -> list[str]:
+    """Harbor's default allowlist plus the project's configured hosts, deduplicated."""
+
+    return list(dict.fromkeys((*DEFAULT_SANDBOX_DOMAINS, *(_domain(host) for host in extra))))
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
     provider = "claude"
+    # Extra hosts derived from the project's configured endpoints (see sandbox_hosts).
+    sandbox_hosts: tuple[str, ...] = ()
 
     def command(self, instruction: str, *, run_id: str, resume: bool = False) -> list[str]:
         del instruction
+        try:
+            domains = sandbox_domains(*self.sandbox_hosts)
+        except ValueError as exc:
+            raise RunnerError(f"refusing a builder sandbox host: {exc}") from exc
         settings = {
             "sandbox": {
                 "enabled": True,
@@ -77,7 +128,7 @@ class ClaudeRunner(CodexRunner):
                 "allowUnsandboxedCommands": False,
                 "autoAllowBashIfSandboxed": True,
                 "filesystem": {"allowWrite": list(self.writable_roots)},
-                "network": {"allowedDomains": ["github.com", "api.github.com", "api.linear.app", "registry.npmjs.org"]},
+                "network": {"allowedDomains": domains},
             },
         }
         mcp = github_mcp_config(getattr(self, "github_mcp", None))
