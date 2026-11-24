@@ -10,8 +10,10 @@ import httpx
 
 
 LINEAR_QUERY = """
-query HarborIssues($slugs: [String!]!, $states: [String!]!) {
-  issues(filter: {project: {slugId: {in: $slugs}}, state: {name: {in: $states}}}, first: 50) {
+query HarborIssues($slugs: [String!]!, $states: [String!]!, $after: String) {
+  issues(filter: {project: {slugId: {in: $slugs}}, state: {name: {in: $states}}},
+         first: 50, after: $after, orderBy: createdAt) {
+    pageInfo { hasNextPage endCursor }
     nodes {
       id identifier title description url updatedAt branchName
       state { name type }
@@ -22,6 +24,12 @@ query HarborIssues($slugs: [String!]!, $states: [String!]!) {
   }
 }
 """
+
+# The poll follows Linear's cursor pagination so no matching ticket is ever
+# invisible to dispatch or First Mate recovery.  The bound (40 pages of 50,
+# i.e. 2000 issues) only stops a runaway or misbehaving server; reaching it is
+# an error, never a silently truncated snapshot.
+LINEAR_POLL_MAX_PAGES = 40
 
 HEALTH_QUERY = "query HarborHealth { viewer { id } }"
 
@@ -223,7 +231,8 @@ class LinearClient:
 
         ``project_slug`` accepts a single slug or a sequence, so adding a
         project is a config edit rather than a code change.  It stays one
-        GraphQL request regardless of how many projects are included.
+        GraphQL query per page regardless of how many projects are included;
+        every page is followed (see ``LINEAR_POLL_MAX_PAGES``).
         """
 
         slugs = project_slugs(project_slug)
@@ -232,15 +241,45 @@ class LinearClient:
             slugs = resolve(slugs, await self.list_projects())
         if not states or not slugs:
             return []
-        data = await self._post(
-            LINEAR_QUERY,
-            {"slugs": list(slugs), "states": list(states)},
+        # ``after`` is omitted on the first page (GraphQL treats it as null).
+        variables: dict[str, Any] = {"slugs": list(slugs), "states": list(states)}
+        collected: dict[str, dict[str, Any]] = {}
+        unkeyed: list[dict[str, Any]] = []
+        cursors: set[str] = set()
+        for _ in range(LINEAR_POLL_MAX_PAGES):
+            data = await self._post(LINEAR_QUERY, variables)
+            issues = data.get("issues", {})
+            if not isinstance(issues, dict):
+                raise LinearClientError("Linear issues response was malformed")
+            nodes = issues.get("nodes", [])
+            if not isinstance(nodes, list):
+                raise LinearClientError("Linear issues response was malformed")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                key = node.get("id")
+                if key is None:
+                    unkeyed.append(node)
+                else:
+                    # A page boundary can repeat an issue; keep one copy.
+                    collected[str(key)] = node
+            info = issues.get("pageInfo") or {}
+            if not isinstance(info, dict):
+                raise LinearClientError("Linear issues pageInfo was malformed")
+            if not info.get("hasNextPage"):
+                # Page order depends on Linear's cursor boundaries; the
+                # snapshot hash must not, so return a canonical order.
+                result = [*collected.values(), *unkeyed]
+                result.sort(key=lambda node: (str(node.get("identifier", "")), str(node.get("id", ""))))
+                return result
+            after = info.get("endCursor")
+            if not after or not isinstance(after, str) or after in cursors:
+                raise LinearClientError("incomplete Linear issue pagination; refusing a partial poll")
+            cursors.add(after)
+            variables["after"] = after
+        raise LinearClientError(
+            f"Linear poll exceeds pagination limit of {LINEAR_POLL_MAX_PAGES} pages; refusing a partial poll"
         )
-        issues = data.get("issues", {})
-        nodes = issues.get("nodes", []) if isinstance(issues, dict) else []
-        if not isinstance(nodes, list):
-            raise LinearClientError("Linear issues response was malformed")
-        return [node for node in nodes if isinstance(node, dict)]
 
     async def poll(
         self,
@@ -431,4 +470,4 @@ class LinearClient:
     progress = update_progress
 
 
-__all__ = ["HEALTH_QUERY", "LINEAR_QUERY", "LinearClient", "LinearClientError", "project_slugs", "resolve_token"]
+__all__ = ["HEALTH_QUERY", "LINEAR_POLL_MAX_PAGES", "LINEAR_QUERY", "LinearClient", "LinearClientError", "project_slugs", "resolve_token"]
