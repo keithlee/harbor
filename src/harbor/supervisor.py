@@ -4057,7 +4057,11 @@ class Supervisor:
                 continue
             if case.ticket not in observed_tickets:
                 # An issue moved out of the polled states retains its previous
-                # SQLite row. That row cannot authorize recovery.
+                # SQLite row. That row cannot authorize recovery. A watchdog
+                # flag is a point-in-time observation, so consume it here
+                # (as find_cases does for shelved tickets); otherwise it
+                # would trigger recovery days later when the ticket returns.
+                recovery.mark_flag(connection, case.flag_id)
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))

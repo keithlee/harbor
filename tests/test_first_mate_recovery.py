@@ -704,3 +704,29 @@ def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
         assert mate.prompts == linear.comments == resumed == []
     finally:
         db.close()
+
+
+def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path):
+    # The watchdog flags HAN-86, then the operator moves it to a backlog-type
+    # state before the next poll. SQLite still holds its old active state, so
+    # find_cases keeps the flag; the poll no longer observes the ticket.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+
+    async def scenario():
+        await supervisor._monitor_blocked(set())  # unpolled pass
+        await supervisor._drain_recoveries()
+        seen = db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
+        assert seen == 1  # the stale flag is consumed, not left pending
+        # Days later the ticket returns to In Progress and is polled again.
+        await supervisor._monitor_blocked({"HAN-86"})
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert mate.prompts == [] and linear.comments == [] and resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    finally:
+        db.close()
