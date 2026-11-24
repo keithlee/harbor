@@ -224,7 +224,8 @@ class WorktreeDispatcher:
         return failure.reason if failure and self._run_is_current(identifier, failure.run_id) else None
 
     def resume_failure(self, identifier: str, run_id: str) -> _ResumeFailure | None:
-        failure = self._resume_errors.get(identifier.casefold())
+        # getattr: duck-typed subclasses that skip __init__ have no stored errors.
+        failure = getattr(self, "_resume_errors", {}).get(identifier.casefold())
         if failure is not None and failure.run_id == run_id and self._run_is_current(identifier, run_id):
             return failure
         return None
@@ -798,8 +799,9 @@ class WorktreeDispatcher:
         identifier = self._identifier(wake)
         if not identifier or not self._in_scope(identifier) or not self._run_is_current(identifier, wake.run_id):
             return None
-        # A current attempt that stops at a guard must not report an older failure.
-        self._clear_resume_error(identifier)
+        # A wake turned away by a guard below is not a new attempt, so it keeps
+        # any stored factory error visible; hydrate() clears it when an attempt
+        # actually reaches the factory.
         lock = self._execution_lock(identifier)
         if lock.locked():
             # Do not wait behind another handoff: that would turn a duplicate
@@ -1148,6 +1150,9 @@ class Supervisor:
         # Process-local keys of operator notifications already sent, so a
         # per-poll retry of the same failure pages the operator once.
         self._operator_notices: set[str] = set()
+        # Per run id: the factory failure that the latest resume_session attempt
+        # itself hit, so a wake turned away at a guard cites no stale cause.
+        self._attempt_resume_failures: dict[str, _ResumeFailure] = {}
         # Handoffs reported before Linear attached their PR, keyed by ticket.
         self._pending_handoffs: dict[str, dict[str, Any]] = {}
         # Ledger handoffs (run id + finish time) already checked by this
@@ -4242,12 +4247,18 @@ class Supervisor:
                                         f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
     def resume_failure(self, run_id: str) -> _ResumeFailure | None:
-        """Return the current retained run's rebuild diagnostic, if any."""
+        """Return the factory failure the latest ``resume_session(run_id)`` hit.
 
+        Only a failure produced by that attempt is returned; /status reads the
+        dispatcher's standing diagnostic instead.
+        """
+
+        failure = self._attempt_resume_failures.get(str(run_id))
         dispatcher = self.dispatcher or self.runner
-        if isinstance(dispatcher, WorktreeDispatcher):
-            return dispatcher.resume_failure(self._ticket_for_run(run_id), str(run_id))
-        return None
+        if failure is None or not isinstance(dispatcher, WorktreeDispatcher):
+            return None
+        # Still the current diagnostic for the run that still owns its ticket.
+        return failure if dispatcher.resume_failure(self._ticket_for_run(run_id), str(run_id)) is failure else None
 
     def resume_failure_reason(self, run_id: str) -> str | None:
         failure = self.resume_failure(run_id)
@@ -4269,8 +4280,15 @@ class Supervisor:
                 resume=str(run_id),
                 instruction=prompt,
             )
+            self._attempt_resume_failures.pop(str(run_id), None)
+            prior = target.resume_failure(identifier, str(run_id))
             value = await target.resume(wake)
             if value is None or value is False:
+                failure = target.resume_failure(identifier, str(run_id))
+                if failure is not None and failure is not prior:
+                    # Each factory failure is a new record, so identity proves
+                    # this attempt (not an earlier one) reached the factory.
+                    self._attempt_resume_failures[str(run_id)] = failure
                 return False
             # WorktreeDispatcher returns the builder's terminal payload.  Feed
             # it back through the same result router used for poll-driven

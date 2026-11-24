@@ -114,14 +114,37 @@ def test_retry_does_not_report_a_stale_factory_error_after_the_worktree_is_remov
     asyncio.run(scenario())
 
 
-def test_a_resume_that_never_reaches_the_factory_reports_no_reason(tmp_path: Path) -> None:
+def test_a_resume_that_never_reaches_the_factory_keeps_the_diagnostic_but_reports_no_reason(
+    tmp_path: Path,
+) -> None:
+    """A wake turned away at a guard is not a new attempt.
+
+    The stored factory error stays visible in /status until an attempt actually
+    reaches the factory, but the turned-away answer must not cite it as its cause.
+    """
+
     async def scenario() -> None:
-        dispatcher, _ = _dispatcher(tmp_path, "waiting")
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        console = Console(supervisor)
+        await supervisor.poll_once()
         assert await dispatcher.hydrate("SAMPLE-42") is None
         wake = Wake(ticket={"identifier": "SAMPLE-42"}, action="reengage", resume="run-1")
+        enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
         async with dispatcher._execution_lock("SAMPLE-42"):
+            # A poll-driven reengage and an answer, both turned away at the lock.
             assert await dispatcher.resume(wake) is None
-        assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None
+            assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+
+        print(notices)
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        status = await console.handle_command("/status")
+        print(status)
+        assert f"Builder resume error for SAMPLE-42 (run run-1): {REASON}" in status
+        assert len(notices) == 1 and REASON not in notices[0]
+        assert supervisor.resume_failure_reason("run-1") is None
+        ledger.close()
 
     asyncio.run(scenario())
 
