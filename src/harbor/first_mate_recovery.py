@@ -82,6 +82,7 @@ class Case:
     history: list = field(default_factory=list)
     detail: str = ""
     flag_id: int | None = None
+    flag_ids: list = field(default_factory=list)  # every pending watchdog flag folded into this case
 
     @property
     def attempts(self) -> int:
@@ -218,6 +219,7 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
                                           history(connection, run[0]))
         case.detail = "; ".join(filter(None, [case.detail, str(flag.get("detail") or flag.get("kind") or "")]))
         case.flag_id = event_id
+        case.flag_ids.append(event_id)
         cases[run[0]] = case
     ready = []
     for case in cases.values():
@@ -340,7 +342,18 @@ def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
             (case.project, case.ticket, case.run_id, case.trigger, decision["action"], decision.get("instruction"),
              decision.get("reason"), case.session_id if decision["action"] == "fresh_session" else None, time.time()),
         )
-    mark_flag(connection, case.flag_id)
+    for event_id in case.flag_ids or [case.flag_id]:
+        mark_flag(connection, event_id)
+
+
+def latest_flag_id(connection) -> int | None:
+    """The newest watchdog flag id now, or ``None`` when it cannot be read."""
+
+    try:
+        row = connection.execute("SELECT MAX(id) FROM events WHERE event_type = 'watchdog.flag'").fetchone()
+    except Exception:
+        return None
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def comment(case: Case, decision: Mapping[str, Any]) -> str:
