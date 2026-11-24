@@ -1089,6 +1089,7 @@ class Supervisor:
         self.last_result: PollResult | None = None
         self._poll_sequence = 0
         self._published_poll = 0
+        self._linear_poll_lock = asyncio.Lock()
         self.github_poller = github_poller or github
         self.github_healthy: bool | None = None
         self.github_error: str | None = None
@@ -1165,7 +1166,7 @@ class Supervisor:
         self._background_dispatch = False
         self._dispatch_tasks: dict[str, asyncio.Task[Any]] = {}
         self._dispatch_wakes: dict[str, Wake] = {}
-        # Tickets with a First Mate recovery task in flight (one at a time).
+        # Tickets with First Mate triage or recovery in flight (one at a time).
         self._recovery_tickets: set[str] = set()
         self._started_build_tickets: set[str] = set()
         # A process-local marker for a merge receipt obtained from an
@@ -3321,25 +3322,28 @@ class Supervisor:
         # on every live cycle instead of requiring a supervisor restart.
         if not self.shadow:
             await self._reconcile_completed_merges()
-        # Only flags that existed before this fetch can be judged by its result.
-        flags_before = self._latest_flag_id()
-        try:
-            result = await self.poller.poll()
-        except Exception as exc:  # keep the console alive through a transient API error
-            if poll_sequence > self._published_poll:
-                self._published_poll = poll_sequence
-                self.linear_healthy = False
-                self.last_error = str(exc)
-            return None
-        if poll_sequence < self._published_poll:
-            return result
-        # Use request order, not the Linear snapshot hash: successive Linear
-        # responses can be identical while GitHub's head, CI or feedback moves.
-        self._published_poll = poll_sequence
-        self.linear_healthy = True
-        self.last_error = None
-        self.last_result = result
-        self._last_activity_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # A console refresh may overlap a background cycle. Publish Linear
+        # observations in order while allowing longer downstream work to overlap.
+        async with self._linear_poll_lock:
+            # Only flags that existed before this fetch can be judged by its result.
+            flags_before = self._latest_flag_id()
+            try:
+                result = await self.poller.poll()
+            except Exception as exc:  # keep the console alive through a transient API error
+                if poll_sequence > self._published_poll:
+                    self._published_poll = poll_sequence
+                    self.linear_healthy = False
+                    self.last_error = str(exc)
+                return None
+            if poll_sequence < self._published_poll:
+                return result
+            # Use request order, not the Linear snapshot hash: successive Linear
+            # responses can be identical while GitHub's head, CI or feedback moves.
+            self._published_poll = poll_sequence
+            self.linear_healthy = True
+            self.last_error = None
+            self.last_result = result
+            self._last_activity_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # GitHub is optional in Phase 1.  When present it is strictly
         # query-only: the poller is injected and Harbor calls no mutation API.
@@ -3434,8 +3438,7 @@ class Supervisor:
             await self._retry_stopped_builders()
             if not is_current():
                 return result  # a newer poll published while this one awaited
-            await self._monitor_blocked({self._ticket_key(ticket) for ticket in result.tickets},
-                                        flags_before=flags_before)
+            await self._monitor_blocked(result, flags_before=flags_before)
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -4197,7 +4200,15 @@ class Supervisor:
         from harbor import first_mate_recovery as recovery
         return recovery.latest_flag_id(connection)
 
-    async def _monitor_blocked(self, observed_tickets: set[str], *, flags_before: int | None = None) -> None:
+    def _is_current_linear_observation(self, observation: PollResult) -> bool:
+        return (
+            self.linear_healthy
+            and not self._dispatch_suspended
+            and self.last_result is not None
+            and self.last_result.snapshot_hash == observation.snapshot_hash
+        )
+
+    async def _monitor_blocked(self, observation: PollResult, *, flags_before: int | None = None) -> None:
         """Recover stuck runs only when the current Linear poll observed them.
 
         ``flags_before`` is the newest watchdog flag id read before that poll's
@@ -4208,7 +4219,9 @@ class Supervisor:
         ladder = self.unblock_ladder
         mate = getattr(ladder, "first_mate", None) if ladder is not None else None
         connection = getattr(self.db, "connection", None) if self.db is not None else None
-        if workflow is None or mate is None or connection is None or self._dispatch_suspended:
+        if workflow is None or mate is None or connection is None:
+            return
+        if not self._is_current_linear_observation(observation):
             return
         from harbor import first_mate_recovery as recovery
         from harbor.first_mate import FirstMateError, FirstMateQuotaError
@@ -4222,7 +4235,10 @@ class Supervisor:
         except Exception as exc:
             self.last_error = f"First Mate monitor: {exc}"
             return
+        observed_tickets = {self._ticket_key(ticket) for ticket in observation.tickets}
         for case in cases:
+            if not self._is_current_linear_observation(observation):
+                return
             if not self._in_scope(case.ticket):
                 continue  # --ticket scope: no triage, comments or receipts for other tickets
             if case.ticket in self._recovery_tickets:
@@ -4252,23 +4268,29 @@ class Supervisor:
                     if flags_before is not None and event_id <= flags_before:
                         recovery.mark_flag(connection, event_id)
                 continue
+            self._recovery_tickets.add(case.ticket)
             try:
-                proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
-            except FirstMateQuotaError as exc:
-                # The only case that backs off exponentially (see backoff_seconds).
-                proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
-            except FirstMateError as exc:
-                proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
-            decision = recovery.validate(proposal, case, settings)
-            recovery.record(connection, case, decision)
-            if decision["action"] == "wait":
-                continue
-            await self._post_recovery_comment(case, decision)
-            # Never await the builder here: recovery runs as a tracked
-            # background task so polling and other tickets keep moving.
-            self._schedule_recovery(case, decision)
+                try:
+                    proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
+                except FirstMateQuotaError as exc:
+                    # The only case that backs off exponentially (see backoff_seconds).
+                    proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
+                except FirstMateError as exc:
+                    proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
+                if not self._is_current_linear_observation(observation):
+                    return
+                decision = recovery.validate(proposal, case, settings)
+                recovery.record(connection, case, decision)
+                if decision["action"] == "wait":
+                    continue
+                await self._post_recovery_comment(case, decision)
+            finally:
+                self._recovery_tickets.discard(case.ticket)
+            if self._is_current_linear_observation(observation):
+                # Recovery runs as a tracked task so polling can continue.
+                self._schedule_recovery(case, decision, observation)
 
-    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any], observation: PollResult) -> None:
         from harbor import first_mate_recovery as recovery
         connection = getattr(self.db, "connection", None)
         self._recovery_tickets.add(case.ticket)
@@ -4278,11 +4300,15 @@ class Supervisor:
 
         async def run() -> None:
             try:
+                if not self._is_current_linear_observation(observation):
+                    return
                 if previous is not None and not previous.done():
                     # A stalled live delivery: cancel it through the normal
                     # path (kills the process group, records the stop) first.
                     previous.cancel()
                     await asyncio.gather(previous, return_exceptions=True)
+                    if not self._is_current_linear_observation(observation):
+                        return
                 await self._apply_recovery(case, decision)
             except Exception as exc:
                 if connection is not None:

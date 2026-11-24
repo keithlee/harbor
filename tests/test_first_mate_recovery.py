@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -144,9 +145,13 @@ def supervisor_for(tmp_path, db, answer, *, ticket=None):
     return supervisor, mate, linear
 
 
-async def monitor_observed(supervisor):
-    observed = {ticket["identifier"] for ticket in supervisor.db.tickets(supervisor.project)}
-    await supervisor._monitor_blocked(observed)
+async def monitor_observed(supervisor, tickets=None, *, flags_before=None):
+    if tickets is None:
+        tickets = supervisor.db.tickets(supervisor.project)
+    observation = PollResult(tuple(tickets), "snapshot", True, ())
+    supervisor.last_result = observation
+    supervisor.linear_healthy = True
+    await supervisor._monitor_blocked(observation, flags_before=flags_before)
 
 
 def monitor(supervisor):
@@ -636,19 +641,7 @@ def test_in_progress_and_human_review_are_still_recovered(tmp_path):
         assert len(prompts) == 1 and resumed == ["run-HAN-86"], name
 
 
-@pytest.mark.parametrize(
-    ("state", "state_type", "recover"),
-    [
-        ("Icebox", "backlog", False),
-        ("Backlog", "backlog", False),
-        ("Shipped", "completed", False),
-        ("In Progress", "started", True),
-    ],
-)
-def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, recover):
-    db = ledger(tmp_path, final=ENV_BLOCKED)
-    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
-    supervisor.dispatcher.workflow.config["states"] = {"terminal": ["Shipped"]}
+def _linear_observation(supervisor, db, *, poll_states=Poller.config.poll_states):
     issue = {
         "identifier": "HAN-86",
         "id": "lin-86",
@@ -663,7 +656,24 @@ def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, 
         return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
-    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    supervisor.poller = LinearPoller(client, replace(Poller.config, poll_states=poll_states), db=db)
+    return client, issue
+
+
+@pytest.mark.parametrize(
+    ("state", "state_type", "recover"),
+    [
+        ("Icebox", "backlog", False),
+        ("Backlog", "backlog", False),
+        ("Shipped", "completed", False),
+        ("In Progress", "started", True),
+    ],
+)
+def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, recover):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    supervisor.dispatcher.workflow.config["states"] = {"terminal": ["Shipped"]}
+    client, issue = _linear_observation(supervisor, db)
 
     async def scenario():
         observed = await supervisor.poller.poll()
@@ -687,6 +697,140 @@ def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, 
         db.close()
 
 
+@pytest.mark.parametrize("blocked_on", ["github", "triage"])
+def test_first_mate_cannot_recover_from_an_older_overlapping_poll(tmp_path, blocked_on):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        older_waiting, release_older = asyncio.Event(), asyncio.Event()
+
+        async def github(tickets):
+            if tickets:
+                older_waiting.set()
+                await release_older.wait()
+            return []
+
+        original_triage = mate.triage
+
+        async def triage(prompt):
+            proposal = await original_triage(prompt)
+            older_waiting.set()
+            await release_older.wait()
+            return proposal
+
+        if blocked_on == "github":
+            supervisor.github_poller = github
+        else:
+            mate.triage = triage
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(older_waiting.wait(), timeout=2)
+            issue["state"] = {"name": "Icebox", "type": "backlog"}
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets == ()
+            assert db.tickets("Demo")[0]["state"] == "In Progress"
+        finally:
+            release_older.set()
+            previous = await asyncio.wait_for(older, timeout=2)
+        assert [ticket["identifier"] for ticket in previous.tickets] == ["HAN-86"]
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == int(blocked_on == "triage")
+        assert linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_first_mate_rechecks_state_after_a_failed_snapshot_write(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db, poll_states=(*Poller.config.poll_states, "Icebox"))
+
+    async def scenario():
+        previous = await supervisor.poller.poll()
+        db.connection.execute("""
+            CREATE TEMP TRIGGER fail_icebox_write BEFORE UPDATE OF state ON tickets
+            WHEN NEW.state = 'Icebox' BEGIN SELECT RAISE(ABORT, 'temporary failure'); END
+        """)
+        issue["state"] = {"name": "Icebox", "type": "backlog"}
+        assert await supervisor.poll_once() is None
+        assert supervisor.linear_healthy is False
+        digest_after_failure = db.snapshot_hash("Demo")
+        db.connection.execute("DROP TRIGGER fail_icebox_write")
+        latest = await supervisor.refresh()
+        await supervisor._drain_recoveries()
+        assert latest.tickets[0]["state"] == "Icebox"
+        assert mate.prompts == linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+        assert digest_after_failure == previous.snapshot_hash
+        assert latest.changed and db.snapshot_hash("Demo") == latest.snapshot_hash
+        assert db.tickets("Demo")[0]["state_type"] == "backlog"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_linear_observations_publish_in_request_order(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        first_response, release_response, release_github = (asyncio.Event() for _ in range(3))
+        refresh_started = asyncio.Event()
+        fetch_issues = client.fetch_issues
+
+        async def fetch(*args):
+            nodes = await fetch_issues(*args)
+            if nodes:
+                first_response.set()
+                await release_response.wait()
+            return nodes
+
+        async def github(tickets):
+            if tickets:
+                await release_github.wait()
+            return []
+
+        async def refresh():
+            refresh_started.set()
+            return await supervisor.refresh()
+
+        client.fetch_issues = fetch
+        supervisor.github_poller = github
+        older = asyncio.create_task(supervisor.poll_once())
+        await asyncio.wait_for(first_response.wait(), timeout=2)
+        issue["state"] = {"name": "Icebox", "type": "backlog"}
+        newer = asyncio.create_task(refresh())
+        await asyncio.wait_for(refresh_started.wait(), timeout=2)
+        release_response.set()
+        try:
+            latest = await asyncio.wait_for(newer, timeout=2)
+            assert latest.tickets == ()
+        finally:
+            release_github.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+        assert supervisor.last_result is latest
+        assert db.snapshot_hash("Demo") == latest.snapshot_hash
+        assert mate.prompts == linear.comments == resumed == []
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
 def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
     db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged"})
     _shelve(db, state="Done", state_type="completed")
@@ -699,7 +843,7 @@ def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
 
     supervisor._reconcile_completed_merges = reconcile
     try:
-        asyncio.run(supervisor._monitor_blocked(set()))
+        asyncio.run(monitor_observed(supervisor, ()))
         assert reconciled == [("HAN-86", True)]
         assert mate.prompts == linear.comments == resumed == []
     finally:
@@ -717,12 +861,12 @@ def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path
 
     async def scenario():
         cutoff = recovery.latest_flag_id(db.connection)
-        await supervisor._monitor_blocked(set(), flags_before=cutoff)  # unpolled pass
+        await monitor_observed(supervisor, (), flags_before=cutoff)  # unpolled pass
         await supervisor._drain_recoveries()
         seen = db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
         assert seen == 1  # the stale flag is consumed, not left pending
         # Days later the ticket returns to In Progress and is polled again.
-        await supervisor._monitor_blocked({"HAN-86"})
+        await monitor_observed(supervisor)
         await supervisor._drain_recoveries()
 
     try:
@@ -949,7 +1093,7 @@ def test_superseded_poll_does_not_run_the_monitor(tmp_path):
     original_retry = supervisor._retry_stopped_builders
 
     async def monitor(observed, *args, **kwargs):
-        monitored.append(sorted(observed))
+        monitored.append(sorted(supervisor._ticket_key(ticket) for ticket in observed.tickets))
         return await original_monitor(observed, *args, **kwargs)
 
     async def retry_then_overtake():
