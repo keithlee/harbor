@@ -1022,7 +1022,9 @@ def test_first_mate_does_not_charge_a_recovery_abandoned_during_the_comment(tmp_
 @pytest.mark.parametrize(
     ("action", "change"),
     [("resume", "icebox"), ("retry", "icebox"), ("fresh_session", "icebox"),
-     ("fresh_session", "paused_policy"), ("fresh_session", "paused_browser_policy"),
+     ("resume", "paused_policy"), ("retry", "paused_policy"), ("fresh_session", "paused_policy"),
+     ("resume", "paused_browser_policy"), ("retry", "paused_browser_policy"),
+     ("fresh_session", "paused_browser_policy"),
      ("fresh_session", "title")],
 )
 def test_first_mate_authorizes_actual_codex_spawn_after_async_preparation(tmp_path, monkeypatch, action, change):
@@ -1163,6 +1165,34 @@ def test_first_mate_rechecks_authorization_before_model_fallback(tmp_path, shelv
     finally:
         asyncio.run(client.close())
         db.close()
+
+
+@pytest.mark.parametrize("state_type", [" Backlog", "BACKLOG", "Completed ", " canceled"])
+def test_launch_recheck_and_find_cases_agree_on_an_unnormalized_stopped_state_type(tmp_path, state_type):
+    """The launch-time recheck and ``find_cases`` share ``ticket_states.is_stopped``.
+
+    A separate, unnormalized stopped check would call " Backlog" eligible at
+    launch while ``find_cases`` (which normalizes) calls it stopped.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+
+    def observe():
+        supervisor.last_result = PollResult(tuple(db.tickets("Demo")), "snapshot", True, ())
+        supervisor.linear_healthy = True
+
+    _shelve(db, state="In Progress", state_type="started")
+    [case] = recovery.find_cases(db.connection, "Demo", SETTINGS)
+    observe()
+    assert supervisor._first_mate_can_recover(case) is True
+
+    _shelve(db, state="Icebox", state_type=state_type)
+    observe()
+    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []
+    assert supervisor._first_mate_can_recover(case) is False
+    assert supervisor._first_mate_can_recover(case, reload_policy=True) is False
+    assert supervisor._first_mate_can_recover(case, reload_policy=True, attempted=True) is False
+    db.close()
 
 
 def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
