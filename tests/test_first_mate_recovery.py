@@ -890,7 +890,7 @@ def test_first_mate_rechecks_eligibility_after_runner_hydration(tmp_path, action
         assert recovery.history(db.connection, "run-HAN-86") == []
         row = supervisor.dispatcher._persisted_run("HAN-86")
         assert (row["status"], row["session_id"]) == (status, "native-1")
-        assert not db.queue_has_idem("HAN-86@retry@run-HAN-86")
+        assert not db.queue_has_idem("HAN-86@retry@run-HAN-86", live_only=False)
 
     try:
         asyncio.run(scenario())
@@ -1016,7 +1016,7 @@ def test_first_mate_authorizes_actual_codex_spawn_after_async_preparation(tmp_pa
         if change != "title":
             row = supervisor.dispatcher._persisted_run("HAN-86")
             assert (row["status"], row["session_id"]) == (status, "native-1")
-            assert not db.queue_has_idem("HAN-86@retry@run-HAN-86")
+            assert not db.queue_has_idem("HAN-86@retry@run-HAN-86", live_only=False)
 
     try:
         asyncio.run(scenario())
