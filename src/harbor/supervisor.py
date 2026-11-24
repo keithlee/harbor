@@ -3412,7 +3412,6 @@ class Supervisor:
             self.github_healthy = github_error is None
             self.github_error = github_error
 
-        self.last_pr_facts = tuple(github_facts)
         grouped = self._github_facts_by_ticket(result.tickets, github_facts)
         self.last_wakes = []
         fleet_tickets: list[dict[str, Any]] = []
