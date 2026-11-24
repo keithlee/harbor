@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from harbor.clients.github import GitHubClient, build_pull_requests_query
@@ -231,6 +231,7 @@ class GitHubPoller:
         *,
         owner: str | None = None,
         repo: str | None = None,
+        is_current: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         # A direct sequence of PR URLs/numbers is accepted as a convenience,
         # while the normal path is a Linear ticket mapping with attachments.
@@ -257,6 +258,8 @@ class GitHubPoller:
             raise ValueError("GitHub owner and repository are required")
         numbers = tuple(number for number, _ in attached)
         response = await self._fetch(owner, repo, numbers)
+        if is_current is not None and not is_current():
+            return []
         repository = response.get("repository") if isinstance(response, Mapping) else None
         if repository is None and isinstance(response, Mapping):
             data = response.get("data")
@@ -277,6 +280,10 @@ class GitHubPoller:
                 by_number[number] = node
         result: list[dict[str, Any]] = []
         for number, ticket in attached:
+            # A newer observer may finish while an async event processor is
+            # recording the previous PR. Skip the rest of the stale batch.
+            if is_current is not None and not is_current():
+                return []
             if number not in by_number:
                 continue
             node = dict(by_number[number])
