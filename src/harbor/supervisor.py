@@ -120,6 +120,10 @@ class _ResumeFailure:
     fingerprint: str
 
 
+class _RecoverySuperseded(Exception):
+    """A prepared First Mate action lost its authorization before launch."""
+
+
 @dataclass(frozen=True)
 class SupervisorStatus:
     project: str
@@ -599,6 +603,17 @@ class WorktreeDispatcher:
         if row is None or row.get("status") not in recoverable:
             return None
         identifier = str(row.get("ticket") or identifier)
+        prepared = await self._prepare_retained_runner(identifier, row)
+        if prepared is None:
+            return None
+        worktree, runner = prepared
+        self.worktrees[identifier] = worktree
+        self.runners[identifier] = runner
+        return runner
+
+    async def _prepare_retained_runner(self, identifier: str, row: Mapping[str, Any]) -> tuple[Any, Any] | None:
+        """Attach and construct a runner without replacing the retained handle."""
+
         worktree_path = row.get("worktree")
         if not worktree_path:
             return None
@@ -646,11 +661,12 @@ class WorktreeDispatcher:
             return None
         if not self._run_is_current(identifier, row["id"]):
             return None
-        self.worktrees[identifier] = worktree
-        self.runners[identifier] = runner
-        return runner
+        return (worktree, runner) if runner is not None else None
 
-    async def fresh_session(self, identifier: str, instruction: str, *, switch: Any | None = None) -> Any:
+    async def fresh_session(
+        self, identifier: str, instruction: str, *, switch: Any | None = None,
+        before_launch: Callable[[], None] | None = None,
+    ) -> Any:
         """Start a NEW builder session for a stuck ticket in its retained worktree.
 
         First Mate recovery and the quota provider fallback call this. The
@@ -677,6 +693,22 @@ class WorktreeDispatcher:
         connection = getattr(self.db, "connection", None)
         # A provider switch that cannot build its runner must leave the run waiting for the reset.
         restore = _switch_snapshot(connection, row["id"]) if switch is not None and connection is not None else None
+        if switch is not None and connection is not None:
+            from harbor.runner.quota import rebind_runner_identity
+            rebind_runner_identity(connection, row["id"], switch.provider, switch.model, switch.effort or "")
+        try:
+            prepared = await self._prepare_retained_runner(identifier, row)
+            if prepared is None:
+                raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
+            worktree, runner = prepared
+            prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
+            if before_launch is not None:
+                before_launch()
+        except BaseException:
+            if restore is not None:
+                restore()
+            raise
+        # Keep the retained session available until its replacement is ready.
         if connection is not None:
             with connection:
                 connection.execute(
@@ -684,28 +716,13 @@ class WorktreeDispatcher:
                     (row["id"],),
                 )
             if switch is not None:
-                from harbor.runner.quota import rebind_runner_identity
-                rebind_runner_identity(connection, row["id"], switch.provider, switch.model, switch.effort or "")
                 try:
                     with connection:
                         connection.execute("DELETE FROM quota_recovery WHERE run_id=?", (row["id"],))
                 except sqlite3.OperationalError:
                     pass  # no quota table: nothing was waiting
-        self.runners.pop(identifier, None)
-        try:
-            runner = await self.hydrate(identifier, recover_terminal=True)
-        except BaseException:
-            if restore is not None:
-                restore()
-            raise
-        if runner is None:
-            if restore is not None:
-                restore()
-            raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
-        # The old conversation is gone: the new session needs the full launch
-        # prompt (delivery skill, policy incl. merge authority, runtime
-        # invocation) before First Mate's hand-off.
-        prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
+        self.worktrees[identifier] = worktree
+        self.runners[identifier] = runner
         wake = Wake(
             ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
             action="reengage",
@@ -717,7 +734,10 @@ class WorktreeDispatcher:
         await self._record_push_result(wake, result)
         return result
 
-    async def retry(self, identifier: str, instruction: str | None = None) -> Any:
+    async def retry(
+        self, identifier: str, instruction: str | None = None, *,
+        before_launch: Callable[[], None] | None = None,
+    ) -> Any:
         """Explicitly resume a terminated/orphaned run in its retained session.
 
         Explicit operators and the bounded recovery scheduler share this
@@ -770,29 +790,28 @@ class WorktreeDispatcher:
         if callable(has_idem) and has_idem(retry_key, live_only=True):
             raise RuntimeError(f"a retry is already active for {identifier}")
 
-        transition = getattr(self.db, "transition_ticket_queue", None) if self.db is not None else None
-        if callable(transition):
-            transition(
-                identifier,
-                "stopped",
-                error="superseded by explicit same-session retry",
-            )
-        enqueue = getattr(self.db, "enqueue", None) if self.db is not None else None
-        if callable(enqueue):
-            queued = enqueue(
-                identifier,
-                "reengage",
-                retry_key,
-                {
-                    "instruction": retry_instruction,
-                    "ticket": {"identifier": identifier},
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "reason": "operator-retry",
-                },
-            )
-            if not queued:
-                raise RuntimeError(f"a retry is already active for {identifier}")
+        def prepare_retry() -> None:
+            if before_launch is not None:
+                before_launch()
+            transition = getattr(self.db, "transition_ticket_queue", None)
+            if callable(transition):
+                transition(identifier, "stopped", error="superseded by explicit same-session retry")
+            enqueue = getattr(self.db, "enqueue", None)
+            if callable(enqueue):
+                queued = enqueue(
+                    identifier,
+                    "reengage",
+                    retry_key,
+                    {
+                        "instruction": retry_instruction,
+                        "ticket": {"identifier": identifier},
+                        "run_id": run_id,
+                        "session_id": session_id,
+                        "reason": "operator-retry",
+                    },
+                )
+                if not queued:
+                    raise RuntimeError(f"a retry is already active for {identifier}")
 
         wake = Wake(
             ticket={"identifier": identifier, "builder_run_id": run_id, "run_id": run_id},
@@ -803,8 +822,15 @@ class WorktreeDispatcher:
             reason="operator-retry",
         )
         transition_queue = getattr(self.db, "transition_queue", None) if self.db is not None else None
+        if before_launch is None:
+            prepare_retry()
         try:
-            result = await self.resume(wake)
+            if before_launch is None:
+                result = await self.resume(wake)
+            else:
+                result = await self.resume(wake, before_launch=prepare_retry)
+        except _RecoverySuperseded:
+            raise
         except Exception:
             if callable(transition_queue):
                 transition_queue(
@@ -823,7 +849,7 @@ class WorktreeDispatcher:
             raise RuntimeError(f"same-session retry could not start for {identifier}")
         return result
 
-    async def resume(self, wake: Wake) -> Any:
+    async def resume(self, wake: Wake, *, before_launch: Callable[[], None] | None = None) -> Any:
         identifier = self._identifier(wake)
         if not identifier or not self._in_scope(identifier) or not self._run_is_current(identifier, wake.run_id):
             return None
@@ -865,6 +891,8 @@ class WorktreeDispatcher:
                 workflow = self.workflow = workflow.reload()
                 bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             wake = replace(wake, instruction=self._with_handoff_gate(identifier, wake.instruction))
+            if before_launch is not None:
+                before_launch()
             result = await self._runner_call(runner, wake, resume=True)
             await self._record_push_result(wake, result)
             return result
@@ -4200,13 +4228,21 @@ class Supervisor:
         from harbor import first_mate_recovery as recovery
         return recovery.latest_flag_id(connection)
 
-    def _is_current_linear_observation(self, observation: PollResult) -> bool:
-        return (
-            self.linear_healthy
-            and not self._dispatch_suspended
-            and self.last_result is not None
-            and self.last_result.snapshot_hash == observation.snapshot_hash
-        )
+    def _first_mate_can_recover(self, case: Any, states: Mapping[str, Any]) -> bool:
+        from harbor.ticket_states import is_stopped
+
+        if not self.linear_healthy or self._dispatch_suspended or self.last_result is None:
+            return False
+        ticket = next((item for item in self.last_result.tickets if self._ticket_key(item) == case.ticket), None)
+        if (ticket is None or ticket.get("hold")
+                or is_stopped(ticket.get("state"), ticket.get("state_type"), states)):
+            return False
+        run = self._latest_run(case.ticket)
+        if run is None or run["id"] != case.run_id or (run.get("session_id") or "") != case.session_id:
+            return False
+        status = str(run.get("status") or "").casefold()
+        # Replacing a stalled delivery first terminates the old process.
+        return status == case.status or (case.status == "running" and status == "terminated")
 
     async def _monitor_blocked(self, observation: PollResult, *, flags_before: int | None = None) -> None:
         """Recover stuck runs only when the current Linear poll observed them.
@@ -4221,7 +4257,7 @@ class Supervisor:
         connection = getattr(self.db, "connection", None) if self.db is not None else None
         if workflow is None or mate is None or connection is None:
             return
-        if not self._is_current_linear_observation(observation):
+        if not self.linear_healthy or self._dispatch_suspended:
             return
         from harbor import first_mate_recovery as recovery
         from harbor.first_mate import FirstMateError, FirstMateQuotaError
@@ -4237,7 +4273,7 @@ class Supervisor:
             return
         observed_tickets = {self._ticket_key(ticket) for ticket in observation.tickets}
         for case in cases:
-            if not self._is_current_linear_observation(observation):
+            if not self.linear_healthy or self._dispatch_suspended:
                 return
             if not self._in_scope(case.ticket):
                 continue  # --ticket scope: no triage, comments or receipts for other tickets
@@ -4268,6 +4304,8 @@ class Supervisor:
                     if flags_before is not None and event_id <= flags_before:
                         recovery.mark_flag(connection, event_id)
                 continue
+            if not self._first_mate_can_recover(case, states):
+                continue  # held, shelved, closed or superseded since the poll
             self._recovery_tickets.add(case.ticket)
             try:
                 try:
@@ -4277,20 +4315,20 @@ class Supervisor:
                     proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
                 except FirstMateError as exc:
                     proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
-                if not self._is_current_linear_observation(observation):
-                    return
+                if not self._first_mate_can_recover(case, states):
+                    continue
                 decision = recovery.validate(proposal, case, settings)
-                recovery.record(connection, case, decision)
                 if decision["action"] == "wait":
+                    recovery.record(connection, case, decision)
                     continue
                 await self._post_recovery_comment(case, decision)
             finally:
                 self._recovery_tickets.discard(case.ticket)
-            if self._is_current_linear_observation(observation):
+            if self._first_mate_can_recover(case, states):
                 # Recovery runs as a tracked task so polling can continue.
-                self._schedule_recovery(case, decision, observation)
+                self._schedule_recovery(case, decision, states)
 
-    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any], observation: PollResult) -> None:
+    def _schedule_recovery(self, case: Any, decision: Mapping[str, Any], states: Mapping[str, Any]) -> None:
         from harbor import first_mate_recovery as recovery
         connection = getattr(self.db, "connection", None)
         self._recovery_tickets.add(case.ticket)
@@ -4299,18 +4337,31 @@ class Supervisor:
         previous = self._dispatch_tasks.get(case.ticket)
 
         async def run() -> None:
+            attempted = False
+
+            def before_launch() -> None:
+                nonlocal attempted
+                if not self._first_mate_can_recover(case, states):
+                    raise _RecoverySuperseded
+                recovery.record(connection, case, decision)
+                attempted = True
+
             try:
-                if not self._is_current_linear_observation(observation):
+                if not self._first_mate_can_recover(case, states):
                     return
                 if previous is not None and not previous.done():
                     # A stalled live delivery: cancel it through the normal
                     # path (kills the process group, records the stop) first.
                     previous.cancel()
                     await asyncio.gather(previous, return_exceptions=True)
-                    if not self._is_current_linear_observation(observation):
+                    if not self._first_mate_can_recover(case, states):
                         return
-                await self._apply_recovery(case, decision)
+                await self._apply_recovery(case, decision, before_launch=before_launch)
+            except _RecoverySuperseded:
+                return
             except Exception as exc:
+                if not attempted and not self._first_mate_can_recover(case, states):
+                    return
                 if connection is not None:
                     recovery.record(connection, case, {"action": "escalate", "instruction": "",
                                                        "reason": f"{decision['action']} failed: {exc}"})
@@ -4344,24 +4395,27 @@ class Supervisor:
         except Exception as exc:  # a comment failure never stops recovery
             self.last_error = f"First Mate comment: {exc}"
 
-    async def _apply_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
+    async def _apply_recovery(self, case: Any, decision: Mapping[str, Any], *, before_launch: Callable[[], None]) -> None:
         from harbor import first_mate_recovery as recovery
         action, instruction = decision["action"], decision.get("instruction") or ""
         if action == "resume":
-            if not await self.resume_session(case.run_id, instruction):
+            if not await self.resume_session(case.run_id, instruction, before_launch=before_launch):
                 raise RuntimeError("retained builder session is not available to resume")
         elif action == "retry":
-            result = await self.dispatcher.retry(case.ticket, instruction)
+            result = await self.dispatcher.retry(case.ticket, instruction, before_launch=before_launch)
             run_id = str((result.get("run_id") if isinstance(result, Mapping) else getattr(result, "run_id", "")) or case.run_id)
             wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": run_id, "run_id": run_id},
                         action="reengage", resume=run_id, reason="first-mate-retry")
             await self._handle_runner_result(wake, result)
         elif action == "fresh_session":
-            result = await self.dispatcher.fresh_session(case.ticket, recovery.fresh_session_instruction(case, instruction))
+            result = await self.dispatcher.fresh_session(
+                case.ticket, recovery.fresh_session_instruction(case, instruction), before_launch=before_launch,
+            )
             wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": case.run_id, "run_id": case.run_id},
                         action="reengage", resume=case.run_id, reason="first-mate-fresh-session")
             await self._handle_runner_result(wake, result)
         elif action == "escalate":
+            before_launch()
             await self._notify_operator(f"recovery-escalate:{case.run_id}",
                                         f"First Mate needs a human for {case.ticket} ({case.trigger}): {decision['reason']}")
 
@@ -4383,7 +4437,7 @@ class Supervisor:
         failure = self.resume_failure(run_id)
         return failure.reason if failure else None
 
-    async def resume_session(self, run_id: str, prompt: str) -> bool:
+    async def resume_session(self, run_id: str, prompt: str, *, before_launch: Callable[[], None] | None = None) -> bool:
         """Resume one persistent builder session, without creating a replacement."""
 
         identifier = self._ticket_for_run(run_id)
@@ -4401,7 +4455,10 @@ class Supervisor:
             )
             self._attempt_resume_failures.pop(str(run_id), None)
             prior = target.resume_failure(identifier, str(run_id))
-            value = await target.resume(wake)
+            if before_launch is None:
+                value = await target.resume(wake)
+            else:
+                value = await target.resume(wake, before_launch=before_launch)
             if value is None or value is False:
                 failure = target.resume_failure(identifier, str(run_id))
                 if failure is not None and failure is not prior:
@@ -4417,6 +4474,8 @@ class Supervisor:
             return True
         method = getattr(target, "resume_session", None) if target is not None else None
         if callable(method):
+            if before_launch is not None:
+                before_launch()
             value = method(run_id, prompt)
             value = await value if inspect.isawaitable(value) else value
             return value is not False
@@ -4425,6 +4484,8 @@ class Supervisor:
         method = getattr(target, "resume", None) or getattr(target, "resume_run", None)
         if not callable(method):
             return False
+        if before_launch is not None:
+            before_launch()
         try:
             value = method(run_id, prompt)
         except TypeError:
