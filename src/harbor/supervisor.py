@@ -973,6 +973,8 @@ class Supervisor:
         self.linear_healthy = False
         self.last_error: str | None = None
         self.last_result: PollResult | None = None
+        self._poll_sequence = 0
+        self._published_poll = 0
         self.github_poller = github_poller or github
         self.github_healthy: bool | None = None
         self.github_error: str | None = None
@@ -1305,7 +1307,12 @@ class Supervisor:
             result[identifier] = aggregate
         return result
 
-    async def _call_github(self, tickets: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    async def _call_github(
+        self,
+        tickets: Iterable[Mapping[str, Any]],
+        *,
+        is_current: Callable[[], bool] | None = None,
+    ) -> list[Mapping[str, Any]]:
         poller = self.github_poller
         if poller is None:
             return []
@@ -1314,6 +1321,7 @@ class Supervisor:
             method = poller
         if method is None:
             raise TypeError("GitHub poller must expose poll")
+        kwargs: dict[str, Any] = {}
         try:
             signature = inspect.signature(method)
             positional = [
@@ -1321,9 +1329,14 @@ class Supervisor:
                 for parameter in signature.parameters.values()
                 if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
             ]
+            guard = signature.parameters.get("is_current")
+            if is_current is not None and guard is not None and guard.kind in (
+                inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ):
+                kwargs["is_current"] = is_current
         except (TypeError, ValueError):
             positional = [object()]
-        value = method(tickets) if positional else method()
+        value = method(tickets, **kwargs) if positional else method(**kwargs)
         value = await value if inspect.isawaitable(value) else value
         if isinstance(value, Mapping):
             values = value.get("facts", value.get("prs", value.values()))
@@ -3054,7 +3067,13 @@ class Supervisor:
             return False
         return bool(row and row[0])
 
-    async def _process_pr_events(self, ticket: Mapping[str, Any], facts: Mapping[str, Any]) -> None:
+    async def _process_pr_events(
+        self,
+        ticket: Mapping[str, Any],
+        facts: Mapping[str, Any],
+        *,
+        is_current: Callable[[], bool] | None = None,
+    ) -> None:
         """Offer newly observed and durable PR events to the retained builder."""
 
         processor = self.pr_event_processor
@@ -3083,6 +3102,8 @@ class Supervisor:
             # comment or running the risk turn reaches the unblock ladder.
             target = _ResultRoutingTarget(self, processor, target)
         for row in self._pr_rows(facts):
+            if is_current is not None and not is_current():
+                return
             row_url = self._normalized_pr_url(row)
             if not row_url or row_url not in attached_urls:
                 continue
@@ -3126,6 +3147,12 @@ class Supervisor:
     async def poll_once(self) -> PollResult | None:
         if self.lifecycle in {Lifecycle.PAUSING, Lifecycle.PAUSED}:
             return self.last_result
+        self._poll_sequence += 1
+        poll_sequence = self._poll_sequence
+
+        def is_current() -> bool:
+            return self._published_poll == poll_sequence
+
         # A builder may merge and move Linear to Done before GitHub's read
         # model reports the merge to Harbor.  Done tickets are intentionally
         # absent from the normal Linear poll, so retry exact-PR reconciliation
@@ -3135,9 +3162,16 @@ class Supervisor:
         try:
             result = await self.poller.poll()
         except Exception as exc:  # keep the console alive through a transient API error
-            self.linear_healthy = False
-            self.last_error = str(exc)
+            if poll_sequence > self._published_poll:
+                self._published_poll = poll_sequence
+                self.linear_healthy = False
+                self.last_error = str(exc)
             return None
+        if poll_sequence < self._published_poll:
+            return result
+        # Use request order, not the Linear snapshot hash: successive Linear
+        # responses can be identical while GitHub's head, CI or feedback moves.
+        self._published_poll = poll_sequence
         self.linear_healthy = True
         self.last_error = None
         self.last_result = result
@@ -3146,21 +3180,25 @@ class Supervisor:
         # GitHub is optional in Phase 1.  When present it is strictly
         # query-only: the poller is injected and Harbor calls no mutation API.
         github_facts: list[Mapping[str, Any]] = []
+        github_error: str | None = None
         if self.github_poller is not None:
             try:
-                github_facts = await self._call_github(result.tickets)
+                github_facts = await self._call_github(result.tickets, is_current=is_current)
             except Exception as exc:
-                self.github_healthy = False
-                self.github_error = str(exc)
-            else:
-                self.github_healthy = True
-                self.github_error = None
+                github_error = str(exc)
+        if not is_current():
+            return result
+        if self.github_poller is not None:
+            self.github_healthy = github_error is None
+            self.github_error = github_error
 
         self.last_pr_facts = tuple(github_facts)
         grouped = self._github_facts_by_ticket(result.tickets, github_facts)
         self.last_wakes = []
         fleet_tickets: list[dict[str, Any]] = []
         for raw_ticket in result.tickets:
+            if not is_current():
+                return result
             ticket = self._enrich_ticket(raw_ticket)
             identifier = self._ticket_key(ticket)
             facts = grouped.get(identifier, {})
@@ -3191,9 +3229,11 @@ class Supervisor:
                 continue
             if facts:
                 try:
-                    await self._process_pr_events(ticket, facts)
+                    await self._process_pr_events(ticket, facts, is_current=is_current)
                 except PREventDeliveryExhausted as exc:
                     # The event stays parked until an explicit /retry re-arms it.
+                    if not is_current():
+                        return result
                     self.last_error = str(exc)
                     ticket_id = exc.ticket or self._ticket_key(ticket)
                     await self._notify_operator(
@@ -3206,7 +3246,11 @@ class Supervisor:
                     # retained builder or malformed response therefore stays
                     # pending for a later poll, while a transient review
                     # problem cannot take down Linear/GitHub supervision.
+                    if not is_current():
+                        return result
                     self.last_error = str(exc)
+                if not is_current():
+                    return result
                 if self._owns(ticket):
                     handoff = self._ticket_handoff(ticket, facts)
                     if handoff:
@@ -3216,6 +3260,8 @@ class Supervisor:
             wake = self.decider.decide(ticket, facts) if self.decider is not None and not quota_wait else None
             if wake is not None:
                 await self._emit_wake(wake)
+        if not is_current():
+            return result
         self._fleet_tickets = tuple(fleet_tickets)
         if not self.shadow:
             await self._retry_pending_handoffs()

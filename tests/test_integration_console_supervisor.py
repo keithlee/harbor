@@ -6,20 +6,135 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from harbor.clients.linear import LinearClient
 from harbor.config.pipeline import PipelineConfig, load_projects, parse_projects_markdown
 from harbor.config.projects import ProjectConfig, get_project
 from harbor.console import Console
 from harbor.db import HarborDB
 from harbor.first_mate import FirstMate
 from harbor.heartbeat import Heartbeat
-from harbor.poll.linear_poller import PollResult
+from harbor.poll.github_poller import GitHubPoller
+from harbor.poll.linear_poller import LinearPoller, PollResult
+from harbor.pr_events import PREventProcessor
 from harbor.runner.base import apply_phase4_migration
 from harbor.supervisor import Lifecycle, Supervisor, WorktreeDispatcher
-from harbor.wake import apply_phase3_migration
+from harbor.wake import Wake, apply_phase3_migration
 
 
 def run(value: Any) -> Any:
     return asyncio.run(value)
+
+
+@pytest.mark.parametrize("shelve", [False, True], ids=["new-head", "shelved"])
+def test_overlapping_github_polls_keep_the_latest_pr_observation(tmp_path: Path, shelve: bool) -> None:
+    pr_url = "https://github.com/example/project/pull/42"
+    ticket = {
+        "id": "linear-42",
+        "identifier": "SAMPLE-42",
+        "title": "Fixture issue",
+        "state": {"name": "In Progress", "type": "started"},
+        "attachments": {"nodes": [{"url": pr_url, "sourceType": "github"}]},
+    }
+
+    def linear(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket]}}})
+
+    async def scenario() -> None:
+        older_waiting = asyncio.Event()
+        release_older = asyncio.Event()
+        offered_heads: list[str] = []
+        resumed: list[str] = []
+
+        class GitHub:
+            calls = 0
+
+            async def pull_requests(self, owner, repo, numbers):
+                self.calls += 1
+                if self.calls == 1:
+                    older_waiting.set()
+                    await release_older.wait()
+                    head, conclusion = "old-head", "FAILURE"
+                else:
+                    head, conclusion = "new-head", "SUCCESS"
+                return {42: {
+                    "number": 42,
+                    "url": pr_url,
+                    "headRefOid": head,
+                    "state": "OPEN",
+                    "statusCheckRollup": {"contexts": {"nodes": [{"name": "tests", "conclusion": conclusion}]}},
+                    "issue": {"comments": {"nodes": [{
+                        "id": f"comment-{head}",
+                        "body": f"Feedback on {head}",
+                        "author": {"login": "reviewer", "__typename": "User"},
+                    }]}},
+                }}
+
+        async def builder(event: dict[str, Any]) -> dict[str, str]:
+            offered_heads.append(event["head_sha"])
+            return {"status": "waiting", "summary": "feedback delivered"}
+
+        class Runner:
+            async def resume(self, wake: Wake) -> dict[str, str]:
+                if isinstance(wake, Wake) and wake.idem_key:
+                    resumed.append(wake.idem_key)
+                return {"status": "waiting", "waiting_on": "ci", "summary": "CI read"}
+
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path, hold_all=False)
+        db = HarborDB(tmp_path / "harbor.db")
+        client = LinearClient(token="test-key", transport=httpx.MockTransport(linear))
+        try:
+            apply_phase3_migration(db)
+            apply_phase4_migration(db)
+            poller = LinearPoller(client, config, db=db)
+            baseline = await poller.poll()
+            db.connection.execute("UPDATE tickets SET owned = 1 WHERE identifier = 'SAMPLE-42'")
+            db.connection.execute(
+                "INSERT INTO runs(id, ticket, status, waiting_on, session_id) VALUES (?, ?, ?, ?, ?)",
+                ("run-42", "SAMPLE-42", "waiting", "ci" if shelve else "human", "session-42"),
+            )
+            db.connection.commit()
+            events = PREventProcessor(db, project=config.name, builder=builder)
+            github = GitHubPoller(GitHub(), owner="example", repo="project", required_checks=["tests"], event_processor=events)
+            supervisor = Supervisor(poller, db=db, github_poller=github, runner=Runner() if shelve else None)
+            older = asyncio.create_task(supervisor.poll_once())
+            try:
+                await asyncio.wait_for(older_waiting.wait(), timeout=2)
+                if shelve:
+                    ticket["state"] = {"name": "Icebox", "type": "backlog"}
+                newer = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            finally:
+                release_older.set()
+                previous = await asyncio.wait_for(older, timeout=2)
+
+            assert previous.snapshot_hash == baseline.snapshot_hash
+            pr = db.connection.execute("SELECT head_sha, ci_state FROM prs").fetchone()
+            pr = tuple(pr) if pr is not None else None
+            state = db.connection.execute("SELECT head_sha FROM github_pr_states").fetchone()
+            pr_event_head = state[0] if state is not None else None
+            rework = db.connection.execute("SELECT bot_rework_rounds FROM tickets").fetchone()[0]
+            event_heads = {event["head_sha"] for event in events.events()}
+            queued = [row[0] for row in db.connection.execute("SELECT idem_key FROM work_queue")]
+            print({"pr": pr, "pr_event_head": pr_event_head, "rework": rework,
+                   "event_heads": sorted(event_heads), "offered_heads": offered_heads,
+                   "queued": queued, "resumed": resumed})
+            if shelve:
+                assert newer.tickets == ()
+                assert not queued and not resumed
+                assert pr is None and pr_event_head is None and not event_heads
+            else:
+                assert newer.snapshot_hash == previous.snapshot_hash
+                assert pr == ("new-head", "green")
+                assert pr_event_head == "new-head"
+                assert event_heads == {"new-head"}
+                assert offered_heads and set(offered_heads) == {"new-head"}
+            assert rework == 0
+        finally:
+            await client.close()
+            db.close()
+
+    run(scenario())
 
 
 class FakePoller:
