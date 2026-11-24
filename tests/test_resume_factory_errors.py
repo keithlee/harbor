@@ -404,3 +404,34 @@ def test_a_pr_event_for_a_superseded_run_is_retired_not_retried_forever(tmp_path
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_answer_on_a_terminal_run_after_a_failed_retry_keeps_the_factory_cause(
+    tmp_path: Path,
+) -> None:
+    """An answer cannot hydrate a terminated run, so it is not a new attempt."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "terminated")
+        escalation = ledger.record_escalation("SAMPLE-42", "run-1", "ambiguous_ac", "Which option?", 2)
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        console = Console(supervisor)
+        await supervisor.poll_once()
+        refusal = await console.handle_command("/retry SAMPLE-42")
+        print(refusal)
+        assert REASON in refusal
+
+        enqueue(ledger.connection, str(escalation["id"]), "SampleProject", "SAMPLE-42", "run-1", "Use option A")
+        assert await deliver(supervisor, str(escalation["id"]), "run-1", "Use option A") is False
+
+        status = await console.handle_command("/status")
+        print(status)
+        print(notices)
+        assert f"Builder resume error for SAMPLE-42 (run run-1): {REASON}" in status
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        # The answer never reached the factory, so it cites no cause of its own.
+        assert notices and REASON not in notices[-1]
+        ledger.close()
+
+    asyncio.run(scenario())

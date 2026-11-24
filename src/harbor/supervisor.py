@@ -564,13 +564,16 @@ class WorktreeDispatcher:
         row = self._persisted_run(identifier)
         if expected_run_id and (row is None or row["id"] != expected_run_id):
             return None
-        # A reason is reported only when this attempt failed in the factory.
-        self._clear_resume_error(identifier)
+        # A stored factory reason is cleared only once it stops being the cause:
+        # a live handle exists, the worktree is gone, or this attempt reaches
+        # the factory.  An early return (e.g. a terminal row hydrated without
+        # recover_terminal) is not an attempt and keeps the diagnostic.
         existing_key = next(
             (key for key in self.runners if str(key).casefold() == identifier.casefold()),
             None,
         )
         if existing_key is not None:
+            self._clear_resume_error(identifier)
             return self.runners.get(existing_key)
         recoverable = {"waiting", "parked", "blocked"}
         if recover_terminal:
@@ -585,6 +588,8 @@ class WorktreeDispatcher:
         if not path.is_dir():
             # The worktree was removed (merged, or cleaned up by hand).  There
             # is nothing to resume into; fail closed rather than rebuild it.
+            # The missing worktree, not an older factory error, is now the cause.
+            self._clear_resume_error(identifier)
             return None
         wake = Wake(
             ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
@@ -603,6 +608,8 @@ class WorktreeDispatcher:
         attached_path = getattr(worktree, "path", worktree)
         if Path(attached_path).expanduser().resolve() != path.resolve() or not self._run_is_current(identifier, row["id"]):
             return None
+        # This attempt reaches the factory: its outcome replaces any old reason.
+        self._clear_resume_error(identifier)
         try:
             runner = await self._factory(worktree, wake)
         except Exception as exc:
