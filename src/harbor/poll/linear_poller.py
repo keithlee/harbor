@@ -41,6 +41,9 @@ def _blocked_by(node: Mapping[str, Any]) -> list[str]:
 def normalize_issue(node: Mapping[str, Any], *, hold_all: bool = True) -> dict[str, Any] | None:
     """Convert one GraphQL issue node into Harbor's stable ticket shape."""
 
+    identifier = node.get("identifier")
+    if not isinstance(identifier, str) or not identifier.strip():
+        return None
     state = node.get("state")
     state_name = state.get("name") if isinstance(state, Mapping) else state
     if not state_name:
@@ -65,7 +68,7 @@ def normalize_issue(node: Mapping[str, Any], *, hold_all: bool = True) -> dict[s
         if item.get("id")
     ]
     return {
-        "identifier": str(node.get("identifier", "")),
+        "identifier": identifier,
         "id": node.get("id"),
         "title": str(node.get("title", "")),
         "description": str(node.get("description") or ""),
@@ -111,9 +114,12 @@ class LinearPoller:
         self.tracker = SnapshotTracker(db.snapshot_hash(self.project_name) if db else None)
         self.last_result: PollResult | None = None
 
-    def _normalize(self, raw: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    def _normalize(
+        self, raw: Iterable[dict[str, Any]],
+    ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         allowed = {state for state in self.config.poll_states if state.casefold() != "backlog"}
         normalized: list[dict[str, Any]] = []
+        accepted: list[dict[str, Any]] = []
         prior: dict[str, Mapping[str, Any]] = {}
         if self.db is not None:
             # ``owned``/``hold`` are local custody flags.  Expose the durable
@@ -136,14 +142,16 @@ class LinearPoller:
             if str(state_name) not in allowed:
                 continue
             ticket = normalize_issue(node, hold_all=self.config.hold_all)
-            if ticket and ticket["identifier"]:
-                previous = prior.get(ticket["identifier"])
-                if previous is not None:
-                    ticket["owned"] = bool(previous.get("owned", ticket.get("owned", False)))
-                    ticket["hold"] = bool(previous.get("hold", ticket.get("hold", self.config.hold_all)))
-                normalized.append(ticket)
+            if ticket is None:
+                continue
+            previous = prior.get(ticket["identifier"])
+            if previous is not None:
+                ticket["owned"] = bool(previous.get("owned", ticket.get("owned", False)))
+                ticket["hold"] = bool(previous.get("hold", ticket.get("hold", self.config.hold_all)))
+            normalized.append(ticket)
+            accepted.append(node)
         normalized.sort(key=lambda item: item["identifier"])
-        return tuple(normalized)
+        return tuple(normalized), tuple(accepted)
 
     async def poll(self) -> PollResult:
         requested_states = tuple(
@@ -167,18 +175,9 @@ class LinearPoller:
             issues = data.get("issues", {}) if isinstance(data, Mapping) else {}
             raw_nodes = issues.get("nodes", []) if isinstance(issues, Mapping) else []
         raw = tuple(dict(node) for node in raw_nodes if isinstance(node, Mapping))
-        # Hash the filtered, normalized observation.  Server-side Backlog leaks
-        # therefore cannot create an event or make an idle cycle look changed.
-        tickets = self._normalize(raw)
-        allowed_states = {state for state in self.config.poll_states if state.casefold() != "backlog"}
-        filtered_raw = tuple(
-            node
-            for node in raw
-            if (
-                (node.get("state", {}).get("name") if isinstance(node.get("state"), Mapping) else node.get("state"))
-                in allowed_states
-            )
-        )
+        # Hash only nodes that produced a ticket. Out-of-scope states and
+        # malformed identifiers cannot make an idle cycle look changed.
+        tickets, filtered_raw = self._normalize(raw)
         payload: dict[str, Any] = {"tickets": list(filtered_raw)}
         digest = snapshot_hash(payload)
         changed = digest != self.tracker.previous_hash

@@ -76,6 +76,41 @@ def test_poller_sends_only_configured_states_and_excludes_backlog(tmp_path: Path
     assert "updatedAt body user { id name }" in calls[0]["query"]
 
 
+def test_malformed_identifiers_do_not_create_tickets_or_events(tmp_path: Path) -> None:
+    valid = issue("SAMPLE-42", "Todo")
+    missing = issue("SAMPLE-14", "Todo")
+    del missing["identifier"]
+    nodes = [
+        valid,
+        missing,
+        {**issue("SAMPLE-15", "Todo"), "identifier": None},
+        {**issue("SAMPLE-16", "Todo"), "identifier": ""},
+        {**issue("SAMPLE-17", "Todo"), "identifier": "  "},
+        {**issue("SAMPLE-18", "Todo"), "identifier": 18},
+    ]
+    db = HarborDB(tmp_path / "harbor.db")
+    client = LinearClient(token="test-key", transport=fake_transport(nodes, []))
+    poller = LinearPoller(client, config(tmp_path), db=db)
+
+    async def scenario() -> None:
+        try:
+            first = await poller.poll()
+            assert [ticket["identifier"] for ticket in first.tickets] == ["SAMPLE-42"]
+            assert [ticket["identifier"] for ticket in db.tickets("SampleProject")] == ["SAMPLE-42"]
+            assert db.event_count("SampleProject") == 1
+
+            nodes[:] = [valid]
+            second = await poller.poll()
+            assert second.snapshot_hash == first.snapshot_hash
+            assert second.events == ()
+            assert db.event_count("SampleProject") == 1
+        finally:
+            await client.close()
+            db.close()
+
+    run(scenario())
+
+
 def test_unchanged_snapshot_creates_no_second_events_row(tmp_path: Path) -> None:
     nodes = [issue("SAMPLE-42", "Todo")]
     calls: list[dict] = []
