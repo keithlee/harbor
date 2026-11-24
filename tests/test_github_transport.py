@@ -418,6 +418,77 @@ def test_a_resumed_claude_session_refuses_an_ip_literal_ghes(tmp_path: Path, mon
         db.close()
 
 
+def test_a_resumed_claude_session_reports_why_it_cannot_resume(tmp_path: Path, monkeypatch, capsys) -> None:
+    # The project is now Codex, so start and doctor never checked the Claude
+    # host rules. The resume must still fail closed, but say why, once.
+    from harbor.runner.quota import bind_runner_identity
+    from harbor.wake import Wake
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch, IP_GHES, provider="codex")
+    try:
+        assert capsys.readouterr().err == ""
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        wake = Wake(ticket={"identifier": "SAMPLE-1"}, action="reengage", resume="harbor-run-1")
+        for _ in range(2):  # every poll retries the resume
+            with pytest.raises(ValueError, match="SAMPLE-1 cannot resume.*GitHub API URL"):
+                factory(tmp_path, wake)
+        err = capsys.readouterr().err
+        assert err.count("Harbor: warning: the retained Claude builder session for SAMPLE-1 cannot resume") == 1
+        assert "set github_api_url" in err
+    finally:
+        db.close()
+
+
+def test_a_resumed_claude_builder_that_cannot_hydrate_is_not_silent(tmp_path: Path, monkeypatch, capsys) -> None:
+    import asyncio
+    from harbor.runner.quota import bind_runner_identity
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (dispatcher, _, _), db = claude_production(tmp_path, monkeypatch, IP_GHES, provider="codex")
+    try:
+        worktree = tmp_path / "wt" / "SAMPLE-1"
+        worktree.mkdir(parents=True)
+        dispatcher.worktree_manager = SimpleNamespace()  # attach the retained path as-is
+        from harbor.runner.base import apply_phase4_migration
+        from harbor.wake import apply_phase3_migration
+        apply_phase3_migration(db)
+        apply_phase4_migration(db)
+        with db.connection:
+            db.connection.execute(
+                "INSERT INTO tickets(identifier, project, title, state, owned, observed_at) "
+                "VALUES ('SAMPLE-1', 'SampleProject', 'Sample', 'In Progress', 1, '2026-01-01T00:00:00Z')"
+            )
+            db.connection.execute(
+                "INSERT INTO runs(id, ticket, worktree, status, started_at) "
+                "VALUES ('harbor-run-1', 'SAMPLE-1', ?, 'waiting', '2026-01-01T00:00:00Z')",
+                (str(worktree),),
+            )
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        assert asyncio.run(dispatcher.hydrate("SAMPLE-1")) is None  # still fail closed
+        assert "retained Claude builder session for SAMPLE-1 cannot resume" in capsys.readouterr().err
+    finally:
+        db.close()
+
+
+def test_a_resumed_claude_session_warns_about_an_unexpressible_linear_url(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    from harbor.runner.quota import bind_runner_identity
+    from harbor.wake import Wake
+    monkeypatch.setenv("HARBOR_CODEX_EXECUTABLE", "/bin/echo")
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch, provider="codex", linear_api_url=LOCAL_LINEAR_STUB)
+    try:
+        assert capsys.readouterr().err == ""  # a Codex project is not held to the Claude rules at start
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        wake = Wake(ticket={"identifier": "SAMPLE-1"}, action="reengage", resume="harbor-run-1")
+        runner = factory(tmp_path, wake)
+        factory(tmp_path, wake)
+        assert sandbox_domains(runner.command("x", run_id="harbor-run-1")) == GITHUB_COM_DOMAINS  # not widened
+        err = capsys.readouterr().err
+        assert err.count("Harbor: warning: the Linear API URL must be an https URL") == 1
+    finally:
+        db.close()
+
+
 def test_a_github_com_project_keeps_the_default_sandbox_allowlist(tmp_path: Path, monkeypatch) -> None:
     assert production_claude_domains(tmp_path, monkeypatch) == GITHUB_COM_DOMAINS
 
