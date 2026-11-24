@@ -311,3 +311,73 @@ def test_answer_for_superseded_run_cannot_rebuild_current_builder(tmp_path: Path
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_a_pr_event_for_a_superseded_run_is_retired_not_retried_forever(tmp_path: Path) -> None:
+    """A PR event bound to run-1 cannot be handed to run-2, and must not loop.
+
+    The custody guard refuses the stale event; the processor must then retire it
+    (offered, not replied, so the current run still sees the unreplied gap) and
+    tell the operator once, instead of re-offering it on every poll.
+    """
+
+    from harbor.pr_events import PREventProcessor
+    from harbor.supervisor import _ResultRoutingTarget
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        resumed: list[str] = []
+
+        class CurrentRunner:
+            default_run_id = "run-2"
+
+            async def resume(self, run_id: str, prompt: str) -> dict[str, str]:
+                resumed.append(run_id)
+                return {"run_id": run_id, "status": "waiting", "summary": "ok"}
+
+        dispatcher.runner_factory = lambda _wt, _wake: CurrentRunner()
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        processor = PREventProcessor(ledger, project="SampleProject")
+        url = "https://github.com/acme/demo/pull/7"
+        ticket = {"identifier": "SAMPLE-42", "pr_urls": [url]}
+        facts = {
+            "number": 7, "url": url, "createdAt": "2026-09-02T10:00:00Z", "headRefOid": "a" * 40,
+            "state": "OPEN", "ci": {"state": "green"},
+            "comments": [{"id": "c-1", "body": "Please fix the timeout.", "surface": "issue",
+                          "author": "reviewer", "created_at": "2026-09-02T10:01:00Z"}],
+        }
+        run_1 = {"id": "run-1", "status": "waiting"}
+        observed = processor.observe(ticket, facts, run=run_1)
+        assert observed and all(event["run_id"] == "run-1" for event in observed)
+
+        # The ticket is redispatched: run-2 now owns it.
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs(id, ticket, status, session_id, worktree) "
+                "VALUES ('run-2', 'SAMPLE-42', 'waiting', 'session-2', ?)",
+                (str(tmp_path / "wt" / "SAMPLE-42"),),
+            )
+        run_2 = {"id": "run-2", "status": "waiting"}
+        target = _ResultRoutingTarget(supervisor, processor, dispatcher)
+
+        outcomes = []
+        for _poll in range(3):
+            outcomes.append(await processor.process(ticket, facts, run=run_2, builder=target))
+        print(f"Poll outcomes: {outcomes}")
+        print(f"Notices: {notices}")
+
+        assert resumed == [], "a run-1 event must never be handed to run-2's session"
+        retired = [event for event in outcomes[0] if event.get("superseded")]
+        assert {event["event_key"] for event in retired} == {event["event_key"] for event in observed}
+        assert outcomes[1:] == [[], []], "a retired event must not be re-offered on later polls"
+        # Retired as offered-not-replied: the comment is still an unreplied gap.
+        assert all(processor._event_flags(event["event_key"]) == (True, False) for event in observed)
+        comment_keys = {e["event_key"] for e in observed if e["event_type"] == "NEW_COMMENT_VERSION"}
+        pending = {item["event_key"] for item in processor.events(pending_only=True, ticket="SAMPLE-42")}
+        assert comment_keys and comment_keys <= pending
+        assert len(notices) == len(observed)
+        assert all("superseded" in notice and "run-1" in notice for notice in notices)
+        ledger.close()
+
+    asyncio.run(scenario())

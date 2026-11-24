@@ -85,6 +85,14 @@ class PREventDeliveryExhausted(PREventError):
         super().__init__(f"builder failed {attempts} times handling a PR event for {ticket or '(unknown ticket)'}")
 
 
+class PREventSuperseded(PREventError):
+    """The PR event's run no longer owns its ticket; it can never be delivered.
+
+    Unlike a transient refusal (a live process, an active handoff), this one is
+    permanent, so the processor retires the event instead of re-offering it.
+    """
+
+
 def _connection(db: Any) -> sqlite3.Connection | None:
     if isinstance(db, sqlite3.Connection):
         return db
@@ -1683,6 +1691,15 @@ class PREventProcessor:
                     # Unknown local events are not silently marked as delivered;
                     # this keeps future event types fail-closed.
                     raise PREventError(f"unsupported PR event type: {event.event_type}")
+            except PREventSuperseded as exc:
+                # The run that observed this event was replaced, so the event
+                # can never reach its session.  Retire it as offered-not-replied:
+                # it stops being re-offered every poll (and from blocking the
+                # events queued behind it), while the unreplied comment stays a
+                # handoff gap for the run that now owns the ticket.
+                logger.warning("retiring PR event %s: %s", event.event_key, exc)
+                self._mark_offered(event.event_key, replied=False)
+                delivered.append({**event.as_dict(), "superseded": True, "reason": str(exc)})
             finally:
                 await self._end_delivery(event.event_key)
         return delivered
@@ -1828,6 +1845,7 @@ __all__ = [
     "PREventDeliveryExhausted",
     "PREventError",
     "PREventProcessor",
+    "PREventSuperseded",
     "PrEventProcessor",
     "PRFeedbackProcessor",
     "PR_CREATED",

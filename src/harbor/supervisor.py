@@ -42,7 +42,13 @@ from harbor.wake import (
     record_push,
     ticket_scope as normalize_ticket_scope,
 )
-from harbor.pr_events import PREventDeliveryExhausted, PREventError, handoff_gate_text, has_handoff_gaps
+from harbor.pr_events import (
+    PREventDeliveryExhausted,
+    PREventError,
+    PREventSuperseded,
+    handoff_gate_text,
+    has_handoff_gaps,
+)
 
 # Terminal runner states that stop a builder until an operator ``/retry``.
 _STOPPED_RUN_STATUSES = frozenset({"failed", "terminated", "orphaned"})
@@ -861,7 +867,10 @@ class WorktreeDispatcher:
             )
         run_id = str(run_id) if run_id else None
         if not self._run_is_current(ticket, run_id):
-            raise PREventError(f"retained builder for {ticket} no longer owns the PR event's run")
+            raise PREventSuperseded(
+                f"PR event for {ticket} belongs to superseded run {run_id}; "
+                "the retained builder no longer owns it"
+            )
         lock = self._execution_lock(ticket)
         if lock.locked():
             raise PREventError(
@@ -980,7 +989,17 @@ class _ResultRoutingTarget:
         self.target = target
 
     async def handle_pr_event(self, event: Mapping[str, Any]) -> Any:
-        result = await self.processor.deliver(self.target, event)
+        try:
+            result = await self.processor.deliver(self.target, event)
+        except PREventSuperseded as exc:
+            # The processor retires the event; tell the operator once per event.
+            ticket = str(event.get("ticket") or "(unknown)")
+            await self.supervisor._notify_operator(
+                f"pr-event-superseded:{event.get('event_key') or event.get('key')}",
+                f"{ticket}: retired a PR event for superseded run {event.get('run_id')}; "
+                "its unreplied comment remains a handoff gap for the current builder.",
+            )
+            raise
         await self.supervisor.route_pr_event_result(event, result)
         return result
 
