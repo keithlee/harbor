@@ -217,9 +217,14 @@ the hosts your project configures. Harbor adds the host of `github_api_url`
 `ghe.example.com`, which serves both the API and git), the git host of an
 `api.<host>` endpoint (`api.acme.ghe.com` also adds `acme.ghe.com`), and the
 host of `linear_api_url`. Only the host of an `https` URL is used; a path, port,
-wildcard, user name, IP address or whitespace is never added, and a malformed
-value stops `harbor start` and fails `harbor doctor` instead of widening the
-sandbox. A GitHub.com project gets exactly the default list. `harbor doctor`
+wildcard, user name, IP address (including numeric forms such as
+`0x7f.0x0.0x0.0x1`, or any host whose last label is a decimal or `0x` number) or
+whitespace is never added. A malformed GitHub value stops `harbor start` and
+fails `harbor doctor` instead of widening the sandbox. A `linear_api_url` the
+allowlist cannot express (for example a local `http://127.0.0.1:8080/graphql`
+stub) is left out with a warning from `harbor start` and a
+`Linear sandbox access: not added (...)` line in `harbor doctor`; Harbor itself
+still reaches it, but builder Bash commands cannot. A GitHub.com project gets exactly the default list. `harbor doctor`
 prints the list as `Builder sandbox network:` for Claude builders; it shows
 what the sandbox allows, not that the host answers. A git remote on a host
 other than the API host (for example SSH through a separate hostname) is not

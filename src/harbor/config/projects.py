@@ -6,6 +6,7 @@ opaque string to the supervisor; Phase 1 only needs the scope and polling settin
 
 from __future__ import annotations
 
+from harbor.clients.linear import DEFAULT_LINEAR_API_URL
 from harbor.recovery import BlockerPolicy
 
 import os
@@ -192,7 +193,7 @@ class ProjectConfig:
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     pipeline_path: Path | None = None
     registry_path: Path | None = None
-    linear_api_url: str = "https://api.linear.app/graphql"
+    linear_api_url: str = DEFAULT_LINEAR_API_URL
     poll_states: tuple[str, ...] = POLL_STATES
     dispatch_states: tuple[str, ...] = DISPATCH_STATES
     poll_interval_seconds: float = 60.0

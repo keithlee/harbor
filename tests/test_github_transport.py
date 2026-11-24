@@ -451,6 +451,12 @@ def test_an_api_host_also_allows_its_git_host() -> None:
     "https://-bad.example.test/graphql",
     "https://[::1]/graphql",
     "https://10.0.0.1/api/graphql",
+    # Numeric forms URL parsers and inet_aton read as IPv4 (all 127.0.0.1).
+    "https://0x7f.0x0.0x0.0x1/api/graphql",
+    "https://127.0.0.0x1/api/graphql",
+    "https://0177.0.0.0x01/api/graphql",
+    "https://example.0x10/api/graphql",
+    "https://example.0x/api/graphql",
     "ghe.example.test",
     "",
 ])
@@ -460,12 +466,53 @@ def test_a_malformed_endpoint_fails_closed_instead_of_widening_the_sandbox(url: 
         sandbox_hosts(url)
 
 
+@pytest.mark.parametrize(("url", "host"), [
+    ("https://xn--bcher-kva.example/api/graphql", "xn--bcher-kva.example"),
+    ("https://0x7f.example.test/api/graphql", "0x7f.example.test"),
+    ("https://ghe.0xfoo/api/graphql", "ghe.0xfoo"),
+    ("https://10.0.0.5.example.test/api/graphql", "10.0.0.5.example.test"),
+])
+def test_names_that_only_look_numeric_are_still_host_names(url: str, host: str) -> None:
+    from harbor.runner.claude import sandbox_hosts
+    assert sandbox_hosts(url) == (host,)
+
+
+LOCAL_LINEAR_STUB = "http://127.0.0.1:8080/graphql"
+
+
+def test_a_local_linear_stub_does_not_stop_a_claude_project(tmp_path: Path, monkeypatch, capsys) -> None:
+    # LinearClient accepts http, and a Claude project on a local Linear stub ran
+    # before the sandbox allowlist existed. Skip that host; never widen to fit it.
+    domains = production_claude_domains(tmp_path, monkeypatch, linear_api_url=LOCAL_LINEAR_STUB)
+    assert domains == GITHUB_COM_DOMAINS
+    assert "Harbor: warning: the Linear API URL must be an https URL" in capsys.readouterr().err
+
+
+def test_a_linear_url_the_sandbox_cannot_express_is_reported_not_raised(tmp_path: Path) -> None:
+    config = project(tmp_path)
+    config.linear_api_url = LOCAL_LINEAR_STUB
+    github = builder_github(config, workflow(), "claude", env={"GITHUB_TOKEN": TOKEN})
+    assert github["sandbox_hosts"] == ("api.github.com", "github.com")
+    assert "Linear API URL" in github["linear_sandbox_warning"]
+
+
+def test_the_default_linear_endpoint_has_one_source() -> None:
+    from harbor.cli import claude_sandbox_hosts
+    from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient
+    from harbor.config.projects import ProjectConfig
+    assert ProjectConfig(name="SampleProject", linear_project_slug="sample").linear_api_url is DEFAULT_LINEAR_API_URL
+    assert LinearClient(token="x").endpoint is DEFAULT_LINEAR_API_URL
+    assert claude_sandbox_hosts(SimpleNamespace(linear_api_url=""), "https://api.github.com") == (
+        "api.github.com", "github.com", "api.linear.app")
+
+
 def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(ValueError, match="GitHub API URL"):
         claude_production(tmp_path, monkeypatch, "github_api_url: https://*.example.test/api/graphql")
 
 
-def run_doctor(tmp_path: Path, provider: str, github_api_url: str):
+def run_doctor(tmp_path: Path, provider: str, github_api_url: str,
+               linear_api_url: str = "https://linear.invalid/graphql"):
     import os
     import subprocess
     import sys
@@ -477,7 +524,7 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str):
     materialize(repo, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
-                        f"builder_provider: {provider}\nlinear_api_url: https://linear.invalid/graphql\n"
+                        f"builder_provider: {provider}\nlinear_api_url: {linear_api_url}\n"
                         f"github_api_url: {github_api_url}\n")
     projects = tmp_path / "projects.md"
     projects.write_text(
@@ -511,3 +558,12 @@ def test_doctor_reports_an_ip_literal_ghes_invalid_for_a_claude_builder(tmp_path
     result = run_doctor(tmp_path, "claude", "https://10.0.0.5/api/graphql")
     assert "GitHub transport: invalid (the GitHub API URL must be" in result.stdout, result.stdout
     assert result.returncode == 1
+
+
+def test_doctor_labels_a_linear_url_problem_as_linear_not_github(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "claude", "https://ghe.example.test/api/graphql", LOCAL_LINEAR_STUB)
+    assert "GitHub transport: invalid" not in result.stdout, result.stdout
+    assert "GitHub transport: rest" in result.stdout, result.stdout
+    assert "Linear sandbox access: not added (the Linear API URL must be an https URL" in result.stdout, result.stdout
+    assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
+            "ghe.example.test\n") in result.stdout, result.stdout

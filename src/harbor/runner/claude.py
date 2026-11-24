@@ -67,10 +67,13 @@ DEFAULT_SANDBOX_DOMAINS = ("github.com", "api.github.com", "api.linear.app", "re
 _HOST_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
 # At least two labels, and a top-level label with a letter, so IP literals are refused.
 _HOST = re.compile(rf"(?:{_HOST_LABEL}\.)+(?=[0-9-]*[a-z]){_HOST_LABEL}")
+# A last label that is a number makes the whole host an IPv4 address to URL
+# parsers and inet_aton: decimal, or hex such as 0x7f.0x0.0x0.0x1 (127.0.0.1).
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")
 
 
 def _domain(host: str) -> str:
-    if not _HOST.fullmatch(host):
+    if not _HOST.fullmatch(host) or _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
         raise ValueError(f"not a plain host name: {host!r}")
     return host
 

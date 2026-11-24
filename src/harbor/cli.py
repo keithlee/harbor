@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from harbor.clients.github import GitHubClient
-from harbor.clients.linear import LinearClient, LinearClientError
+from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
 from harbor.config.projects import get_project
@@ -231,6 +231,8 @@ def build_production_dispatcher(
 
         builder_provider = getattr(config, "builder_provider", "codex")
         github = builder_github(config, workflow, builder_provider)
+        if github["linear_sandbox_warning"]:
+            print(f"Harbor: warning: {github['linear_sandbox_warning']}", file=sys.stderr)
         claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
         if builder_provider == "claude":
             validate_claude(claude_cli, config.builder_model, config.builder_effort)
@@ -302,19 +304,34 @@ def build_production_dispatcher(
     return dispatcher, manager, factory
 
 
+def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
+    """The configured Linear host for a Claude builder's sandbox, or why it is left out.
+
+    Harbor itself talks to Linear outside the sandbox, and ``LinearClient``
+    accepts any endpoint (for example a local ``http://127.0.0.1`` stub), so a
+    Linear URL the sandbox allowlist cannot express is skipped with a warning
+    instead of failing the project. It is never widened to fit.
+    """
+
+    from harbor.runner.claude import sandbox_hosts
+    url = str(getattr(config, "linear_api_url", "") or DEFAULT_LINEAR_API_URL)
+    try:
+        return sandbox_hosts(url, "Linear API", git_host=False), None
+    except ValueError as exc:
+        return (), f"{exc}; the Claude builder sandbox does not allow it, so builder Bash commands cannot reach Linear"
+
+
 def claude_sandbox_hosts(config: Any, rest_url: str) -> tuple[str, ...]:
     """Hosts a Claude builder's Bash sandbox must reach beyond Harbor's defaults.
 
     The configured GitHub API and git host, and the configured Linear endpoint.
-    A malformed value raises, so the builder never launches unable to push.
+    A malformed GitHub value raises, so the builder never launches unable to
+    push; a Linear value the allowlist cannot express is skipped (see
+    ``linear_sandbox_hosts``).
     """
 
     from harbor.runner.claude import sandbox_hosts
-    hosts = (
-        *sandbox_hosts(rest_url, "GitHub API"),
-        *sandbox_hosts(str(getattr(config, "linear_api_url", "") or "https://api.linear.app/graphql"),
-                       "Linear API", git_host=False),
-    )
+    hosts = (*sandbox_hosts(rest_url, "GitHub API"), *linear_sandbox_hosts(config)[0])
     return tuple(dict.fromkeys(hosts))
 
 
@@ -354,6 +371,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     # to its host rules here (start and doctor fail closed). A resumed Claude
     # session on a project now set to Codex computes them in the factory.
     hosts = claude_sandbox_hosts(config, rest_url) if provider == "claude" else None
+    linear_warning = linear_sandbox_hosts(config)[1] if provider == "claude" else None
     return {
         "transport": settings["transport"],
         "mcp_url": settings["mcp_url"],
@@ -362,6 +380,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "env": child_env,
         "mcp": mcp,
         "sandbox_hosts": hosts,
+        "linear_sandbox_warning": linear_warning,
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
         ),
@@ -412,6 +431,8 @@ async def _doctor(project_name: str) -> int:
         if github["sandbox_hosts"] is not None:
             from harbor.runner.claude import sandbox_domains
             print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
+        if github["linear_sandbox_warning"]:
+            print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
@@ -824,7 +845,7 @@ async def _linear_write(
         except ValueError as exc:
             print(f"Harbor: {exc}", file=sys.stderr)
             return 2
-    client = LinearClient(endpoint=endpoint or "https://api.linear.app/graphql")
+    client = LinearClient(endpoint=endpoint or DEFAULT_LINEAR_API_URL)
     try:
         if not client.token:
             print(
