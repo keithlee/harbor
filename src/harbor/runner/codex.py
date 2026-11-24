@@ -205,7 +205,7 @@ class CodexRunner(BaseRunner):
             env[ENDPOINT_ENV] = self._playwright_endpoint
         return env
 
-    async def _execute(self, context, instruction, *, resume):
+    async def _execute(self, context, instruction, *, resume, before_spawn: Callable[[], None] | None = None):
         runtime = nullcontext(("", ""))
         if self.playwright_browser_image:
             runtime = browser_endpoint(
@@ -228,11 +228,17 @@ class CodexRunner(BaseRunner):
                         "Continue work that does not require browser proof and report "
                         "this blocker if browser proof is required."
                     )
+                if before_spawn is not None:
+                    return await self._execute_with_model_fallback(
+                        context, instruction, resume=resume, before_spawn=before_spawn,
+                    )
                 return await self._execute_with_model_fallback(context, instruction, resume=resume)
             finally:
                 self._playwright_endpoint = ""
 
-    async def _execute_with_model_fallback(self, context, instruction, *, resume):
+    async def _execute_with_model_fallback(
+        self, context, instruction, *, resume, before_spawn: Callable[[], None] | None = None,
+    ):
         from harbor.model_policy import selected_model, record_fallback
         connection = _db_connection(self.db)
         project = getattr(self, "workflow_project", "")
@@ -242,15 +248,30 @@ class CodexRunner(BaseRunner):
         else:
             self.model = self.primary_model
         chain = (self.primary_model, *self.fallback_models)
-        while True:
-            result = await super()._execute(context, instruction, resume=resume)
-            if result.status != "failed" or not self._fallback_available(context):
-                return result
+        next_model = None
+
+        def prepare_spawn() -> None:
+            nonlocal next_model
+            if before_spawn is not None:
+                before_spawn()
+            if next_model is None:
+                return
             rejected = self.model
-            self.model = chain[chain.index(self.model) + 1]
+            self.model = next_model
+            next_model = None
             if connection is not None:
                 record_fallback(connection, project, self.ticket, context.run_id,
                                 self.primary_model, rejected, self.model)
+
+        while True:
+            if before_spawn is None:
+                prepare_spawn()
+                result = await super()._execute(context, instruction, resume=resume)
+            else:
+                result = await super()._execute(context, instruction, resume=resume, before_spawn=prepare_spawn)
+            if result.status != "failed" or not self._fallback_available(context):
+                return result
+            next_model = chain[chain.index(self.model) + 1]
             resume = True  # Retain the native session, logical run, worktree and budget.
 
     def _stored_session_id(self, run_id: str) -> str | None:
@@ -266,14 +287,18 @@ class CodexRunner(BaseRunner):
         row = connection.execute("SELECT session_id FROM runs WHERE id = ?", (run_id,)).fetchone()
         return str(row[0]) if row and row[0] else None
 
-    async def resume_run(self, run_id: str, instruction: str) -> RunResult:
+    async def resume_run(self, run_id: str, instruction: str, *, before_spawn: Callable[[], None] | None = None) -> RunResult:
         context = self.contexts.get(run_id)
         if context is None:
             context = self._new_context(run_id)
         context.session_id = self._stored_session_id(run_id) or context.session_id or run_id
+        if before_spawn is not None:
+            return await self._execute(context, instruction, resume=True, before_spawn=before_spawn)
         return await self._execute(context, instruction, resume=True)
 
-    async def resume(self, run_id: str, instruction: str) -> RunResult:
+    async def resume(self, run_id: str, instruction: str, *, before_spawn: Callable[[], None] | None = None) -> RunResult:
+        if before_spawn is not None:
+            return await self.resume_run(run_id, instruction, before_spawn=before_spawn)
         return await self.resume_run(run_id, instruction)
 
     continue_run = resume_run

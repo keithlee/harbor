@@ -1,7 +1,9 @@
 """First Mate monitor-and-recover, including a replay of the HAN-86 deadlock."""
 import asyncio
 import json
+import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -935,6 +937,152 @@ def test_first_mate_preserves_fresh_session_attempt_when_title_changes(tmp_path)
         assert launches == ["run-HAN-86"]
         assert len(mate.prompts) == len(linear.comments) == 1
         assert [item["action"] for item in recovery.history(db.connection, "run-HAN-86")] == ["fresh_session"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "change"),
+    [("resume", "icebox"), ("retry", "icebox"), ("fresh_session", "icebox"),
+     ("fresh_session", "paused_policy"), ("fresh_session", "paused_browser_policy"),
+     ("fresh_session", "title")],
+)
+def test_first_mate_authorizes_actual_codex_spawn_after_async_preparation(tmp_path, monkeypatch, action, change):
+    from harbor.runner.codex import CodexRunner
+
+    status = "failed" if action == "retry" else "blocked"
+    db = ledger(tmp_path, status=status, final=ENV_BLOCKED)
+    decision = {"action": action, "instruction": "continue", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = tmp_path / "launched"
+    executable = tmp_path / "record-codex"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(launches)!r}).write_text('launched')\n"
+        "sys.stdin.read()\n"
+    )
+    executable.chmod(0o755)
+
+    async def scenario():
+        preparing, release_preparation = asyncio.Event(), asyncio.Event()
+
+        @asynccontextmanager
+        async def runtime(image, *, lifetime_seconds):
+            if change != "paused_policy":
+                preparing.set()
+                await release_preparation.wait()
+            yield "ws://127.0.0.1:3000/test", ""
+
+        async def factory(worktree, wake):
+            if change == "paused_policy":
+                preparing.set()
+                await release_preparation.wait()
+            return CodexRunner(
+                worktree, db=db, ticket="HAN-86", run_id=wake.run_id,
+                executable=str(executable), playwright_browser_image=f"example/browser@sha256:{'a' * 64}",
+            )
+
+        monkeypatch.setattr("harbor.runner.codex.browser_endpoint", runtime)
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            await asyncio.wait_for(preparing.wait(), timeout=2)
+            if change == "icebox":
+                issue["state"] = {"name": "Icebox", "type": "backlog"}
+            elif change in {"paused_policy", "paused_browser_policy"}:
+                workflow = supervisor.dispatcher.workflow.package / "workflow.toml"
+                workflow.write_text(workflow.read_text() + '\n[states]\npaused = ["In Progress"]\n')
+            else:
+                issue["title"] = "Renamed during browser preparation"
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert len(latest.tickets) == int(change != "icebox")
+            early_attempts = recovery.history(db.connection, "run-HAN-86")
+        finally:
+            release_preparation.set()
+            await supervisor._drain_recoveries()
+
+        assert launches.exists() == (change == "title")
+        assert early_attempts == []
+        assert len(mate.prompts) == len(linear.comments) == 1
+        actions = [item["action"] for item in recovery.history(db.connection, "run-HAN-86")]
+        assert actions == (["fresh_session"] if change == "title" else [])
+        if change != "title":
+            row = supervisor.dispatcher._persisted_run("HAN-86")
+            assert (row["status"], row["session_id"]) == (status, "native-1")
+            assert not db.queue_has_idem("HAN-86@retry@run-HAN-86")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("shelved", [True, False])
+def test_first_mate_rechecks_authorization_before_model_fallback(tmp_path, shelved):
+    from harbor.runner.codex import CodexRunner
+    from test_model_fallback import provider_error
+
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "resume", "instruction": "continue", "reason": "stuck"}
+    supervisor, _, _ = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    release = tmp_path / "release"
+    launches = tmp_path / "models"
+    executable = tmp_path / "record-codex"
+    rejection = {"type": "error", "message": json.dumps(provider_error())}
+    final = {"type": "result", "result": {"status": "waiting", "outcome": "no_pr", "waiting_on": "human",
+                                         "summary": "fallback worked", "next_action": "wait", "pr_url": None, "blocker": None}}
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "model = sys.argv[sys.argv.index('-m') + 1]\n"
+        "sys.stdin.read()\n"
+        f"with Path({str(launches)!r}).open('a') as stream:\n"
+        "    stream.write(model + '\\n')\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'native-1'}), flush=True)\n"
+        "if model == 'primary':\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        f"    print(json.dumps({rejection!r}), flush=True)\n"
+        "    raise SystemExit(1)\n"
+        f"print(json.dumps({final!r}), flush=True)\n"
+    )
+    executable.chmod(0o755)
+
+    def factory(worktree, wake):
+        return CodexRunner(worktree, db=db, ticket="HAN-86", model="primary", fallback_models=["fallback"],
+                           executable=str(executable), run_id=wake.run_id)
+
+    async def scenario():
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            async with asyncio.timeout(3):
+                while not launches.exists():
+                    await asyncio.sleep(0.01)
+            if shelved:
+                issue["state"] = {"name": "Icebox", "type": "backlog"}
+            else:
+                issue["title"] = "Renamed during primary builder process"
+            latest = await supervisor.refresh()
+            assert len(latest.tickets) == int(not shelved)
+        finally:
+            release.touch()
+            await supervisor._drain_recoveries()
+        assert launches.read_text().splitlines() == (["primary"] if shelved else ["primary", "fallback"])
+        attempts = recovery.history(db.connection, "run-HAN-86")
+        assert [item["action"] for item in attempts] == ["resume"]
+        fallback_receipts = db.connection.execute("SELECT COUNT(*) FROM workflow_receipts WHERE kind='model_fallback'").fetchone()[0]
+        assert fallback_receipts == int(not shelved)
 
     try:
         asyncio.run(scenario())
