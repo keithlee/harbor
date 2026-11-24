@@ -1,6 +1,8 @@
 """Durable operator-answer delivery receipts, with no detached subprocesses."""
 import asyncio
 
+from harbor.ticket_states import is_stopped, workflow_states
+
 
 def initialize(db):
     db.execute("CREATE TABLE IF NOT EXISTS answer_queue (escalation TEXT PRIMARY KEY, project TEXT, ticket TEXT, run_id TEXT, instruction TEXT, status TEXT)")
@@ -57,12 +59,10 @@ def drain(supervisor):
         run = supervisor._latest_run(row[2]) or {}
         if not ticket or not supervisor._in_scope(ticket) or ticket.get('hold') or ticket.get('blocked_by'):
             continue
-        workflow = getattr(getattr(supervisor,'dispatcher',None),'workflow',None)
-        states = workflow.config.get('states',{}) if workflow else {}
-        # Human Review is deliberately not inactive: Harbor parks product-decision
+        # Human Review is deliberately not stopped: Harbor parks product-decision
         # escalations there, so an operator answer must still reach the builder.
-        inactive = {'paused','backlog',*(str(s).casefold() for s in states.get('paused',[])),*(str(s).casefold() for s in states.get('terminal',[]))}
-        if run.get('id') != row[3] or ticket.get('state_type') in {'completed','canceled','backlog'} or str(ticket.get('state','')).casefold() in inactive:
+        states = workflow_states(getattr(supervisor,'dispatcher',None))
+        if run.get('id') != row[3] or is_stopped(ticket.get('state'),ticket.get('state_type'),states):
             continue
         if str(run.get('terminal_reason','')).startswith('operator'):
             with db:
