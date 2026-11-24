@@ -193,7 +193,9 @@ def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
     supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
     resumed = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         resumed.append((run_id, prompt))
         return True
 
@@ -374,7 +376,9 @@ def test_recovery_does_not_block_polling(tmp_path):
     never = asyncio.Event()
     calls = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         calls.append(run_id)
         await never.wait()  # a builder that never returns
         return True
@@ -402,7 +406,9 @@ def test_recovery_task_blocks_duplicate_wake(tmp_path):
     never = asyncio.Event()
     delivered = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         await never.wait()
         return True
 
@@ -431,7 +437,9 @@ def test_stalled_live_delivery_is_cancelled_and_replaced(tmp_path):
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
     replaced = []
 
-    async def fresh_session(identifier, instruction):
+    async def fresh_session(identifier, instruction, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         replaced.append(identifier)
         return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "run-HAN-86"}
 
@@ -470,7 +478,9 @@ def test_recovery_failure_escalates_and_frees_the_ticket(tmp_path):
     supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"})
     notices = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         raise RuntimeError("session gone")
 
     async def notify(key, message):
@@ -493,7 +503,9 @@ def test_successful_recovery_notifies_after_completion(tmp_path):
     events = []
     gate = asyncio.Event()
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         events.append("builder-start")
         await gate.wait()
         events.append("builder-done")
@@ -534,7 +546,9 @@ def test_stalled_real_codex_process_is_killed_before_replacement(tmp_path):
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
     replaced = []
 
-    async def fresh_session(identifier, instruction):
+    async def fresh_session(identifier, instruction, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         replaced.append(identifier)
         return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "retained"}
 
@@ -573,7 +587,9 @@ def _recording_supervisor(tmp_path, db):
     supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
     resumed = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         resumed.append(run_id)
         return True
 
@@ -823,6 +839,102 @@ def test_linear_observations_publish_in_request_order(tmp_path):
         assert supervisor.last_result is latest
         assert db.snapshot_hash("Demo") == latest.snapshot_hash
         assert mate.prompts == linear.comments == resumed == []
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("action", ["resume", "retry", "fresh_session"])
+def test_first_mate_rechecks_eligibility_after_runner_hydration(tmp_path, action):
+    status = "failed" if action == "retry" else "blocked"
+    db = ledger(tmp_path, status=status, final=ENV_BLOCKED)
+    decision = {"action": action, "instruction": "continue", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = []
+
+    class Runner:
+        async def resume(self, run_id, instruction):
+            launches.append(("resume", run_id))
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+        async def start(self, instruction, *, run_id=None):
+            launches.append(("start", run_id))
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        hydrating, release_hydration = asyncio.Event(), asyncio.Event()
+
+        async def factory(worktree, wake):
+            hydrating.set()
+            await release_hydration.wait()
+            return Runner()
+
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            await asyncio.wait_for(hydrating.wait(), timeout=2)
+            issue["state"] = {"name": "Icebox", "type": "backlog"}
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets == ()
+        finally:
+            release_hydration.set()
+            await supervisor._drain_recoveries()
+        assert not launches
+        assert len(mate.prompts) == len(linear.comments) == 1
+        assert recovery.history(db.connection, "run-HAN-86") == []
+        row = supervisor.dispatcher._persisted_run("HAN-86")
+        assert (row["status"], row["session_id"]) == (status, "native-1")
+        assert not db.queue_has_idem("HAN-86@retry@run-HAN-86")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_first_mate_preserves_fresh_session_attempt_when_title_changes(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "fresh_session", "instruction": "start over", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = []
+
+    class Runner:
+        async def start(self, instruction, *, run_id=None):
+            launches.append(run_id)
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        posting, release_comment = asyncio.Event(), asyncio.Event()
+        create_comment = linear.create_comment
+
+        async def comment(issue_id, body):
+            posting.set()
+            await release_comment.wait()
+            return await create_comment(issue_id, body)
+
+        supervisor.dispatcher.runner_factory = lambda worktree, wake: Runner()
+        linear.create_comment = comment
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(posting.wait(), timeout=2)
+            issue["title"] = "Renamed while the comment was pending"
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets[0]["state"] == "In Progress"
+            queued_actions = recovery.history(db.connection, "run-HAN-86")
+        finally:
+            release_comment.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+        assert queued_actions == []
+        assert launches == ["run-HAN-86"]
+        assert len(mate.prompts) == len(linear.comments) == 1
+        assert [item["action"] for item in recovery.history(db.connection, "run-HAN-86")] == ["fresh_session"]
 
     try:
         asyncio.run(scenario())

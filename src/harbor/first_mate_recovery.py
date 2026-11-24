@@ -26,7 +26,6 @@ from typing import Any, Iterable, Mapping
 # stays active: Harbor parks escalations there and resumes from it.
 STOPPED_STATE_TYPES = {"backlog", "completed", "canceled"}
 STOPPED_STATE_NAMES = {"backlog", "paused", "done", "completed", "canceled", "cancelled"}
-
 ACTIONS = ("resume", "retry", "fresh_session", "wait", "escalate")
 # Kinds a recovery must never answer: those need cited authority or a human.
 HUMAN_KINDS = {"product_decision", "design_decision", "new_product_decision", "ambiguous_ac", "conflicting_instruction"}
@@ -147,6 +146,14 @@ def backoff_seconds(settings: Mapping[str, Any], recent: list[dict]) -> float:
     return base * (1, 1, 3, 6)[min(streak, 3)]
 
 
+def stopped_state_names(configured: Iterable[str]) -> set[str]:
+    return STOPPED_STATE_NAMES | {str(state).strip().casefold() for state in configured}
+
+
+def ticket_stopped(held: Any, state: Any, state_type: Any, names: set[str]) -> bool:
+    return bool(held) or state_type in STOPPED_STATE_TYPES or str(state or "").strip().casefold() in names
+
+
 def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: float | None = None,
                in_scope=None, stopped_states: Iterable[str] = ()) -> list[Case]:
     """Runs First Mate should look at now (respecting the per-run recheck delay).
@@ -156,10 +163,7 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     """
     initialize(connection)
     now = time.time() if now is None else now
-    stopped_names = STOPPED_STATE_NAMES | {str(s).strip().casefold() for s in stopped_states}
-
-    def stopped(hold: Any, state: Any, state_type: Any) -> bool:
-        return bool(hold) or state_type in STOPPED_STATE_TYPES or str(state or "").strip().casefold() in stopped_names
+    stopped_names = stopped_state_names(stopped_states)
     recheck = float(settings.get("recheck_minutes", 10)) * 60
     stall = float(settings.get("stall_minutes", 30)) * 60
     rows = connection.execute(
@@ -173,7 +177,7 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     cases: dict[str, Case] = {}
     for row in rows:
         run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold, state_type, state = row
-        if stopped(hold, state, state_type):
+        if ticket_stopped(hold, state, state_type, stopped_names):
             continue
         status = str(status or "").casefold()
         final = _final(final_json)
@@ -207,7 +211,7 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue
         # Same eligibility as ledger cases: never restart a held, shelved or
         # closed ticket. Cleaning up a merged (Done) ticket is the one exception.
-        if stopped(run[6], run[8], run[7]) and flag.get("kind") != "cleanup_stuck":
+        if ticket_stopped(run[6], run[8], run[7], stopped_names) and flag.get("kind") != "cleanup_stuck":
             mark_flag(connection, event_id)
             continue
         final = _final(run[2])
