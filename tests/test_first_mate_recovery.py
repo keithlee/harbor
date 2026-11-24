@@ -945,6 +945,80 @@ def test_first_mate_preserves_fresh_session_attempt_when_title_changes(tmp_path)
         db.close()
 
 
+@pytest.mark.parametrize("change", ["unrelated_ticket", "recovering_ticket_shelved"])
+def test_first_mate_does_not_charge_a_recovery_abandoned_during_the_comment(tmp_path, change):
+    """A newer poll while the recovery comment is posting must not consume budget.
+
+    An unrelated ticket changing leaves the recovering ticket eligible, so the
+    fresh session still runs and is recorded once.  When the recovering ticket
+    itself is shelved, nothing runs, and nothing is recorded: the run keeps its
+    whole recovery budget, including its single fresh-session allowance.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "fresh_session", "instruction": "start over", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    recovering = {"identifier": "HAN-86", "id": "lin-86", "title": "Sample issue",
+                  "state": {"name": "In Progress", "type": "started"}}
+    unrelated = {"identifier": "HAN-99", "id": "lin-99", "title": "Unrelated issue",
+                 "state": {"name": "Human Review", "type": "started"}}
+
+    def linear_issues(request):
+        states = json.loads(request.content)["variables"]["states"]
+        nodes = [issue for issue in (recovering, unrelated) if issue["state"]["name"] in states]
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+
+    client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    launches = []
+
+    class Runner:
+        async def start(self, instruction, *, run_id=None):
+            launches.append(run_id)
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        posting, release_comment = asyncio.Event(), asyncio.Event()
+        create_comment = linear.create_comment
+
+        async def comment(issue_id, body):
+            posting.set()
+            await release_comment.wait()
+            return await create_comment(issue_id, body)
+
+        supervisor.dispatcher.runner_factory = lambda worktree, wake: Runner()
+        linear.create_comment = comment
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(posting.wait(), timeout=2)
+            if change == "unrelated_ticket":
+                unrelated["title"] = "Renamed while the comment was pending"
+            else:
+                recovering["state"] = {"name": "Icebox", "type": "backlog"}
+            previous_hash = supervisor.last_result.snapshot_hash
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.snapshot_hash != previous_hash
+        finally:
+            release_comment.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == len(linear.comments) == 1
+        charged = [item["action"] for item in recovery.history(db.connection, "run-HAN-86")]
+        if change == "unrelated_ticket":
+            assert launches == ["run-HAN-86"]
+            assert charged == ["fresh_session"]
+        else:
+            assert launches == []
+            # No receipt: the unexecuted fresh session spent neither the
+            # recovery budget nor the run's single fresh-session allowance.
+            assert charged == []
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("action", "change"),
     [("resume", "icebox"), ("retry", "icebox"), ("fresh_session", "icebox"),
