@@ -19,7 +19,13 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
+
+# A shelved or closed ticket is never recovered, matching the answer queue,
+# the unblock ladder and the supervisor's stopped-builder retry. Human Review
+# stays active: Harbor parks escalations there and resumes from it.
+STOPPED_STATE_TYPES = {"backlog", "completed", "canceled"}
+STOPPED_STATE_NAMES = {"backlog", "paused", "done", "completed", "canceled", "cancelled"}
 
 ACTIONS = ("resume", "retry", "fresh_session", "wait", "escalate")
 # Kinds a recovery must never answer: those need cited authority or a human.
@@ -142,15 +148,23 @@ def backoff_seconds(settings: Mapping[str, Any], recent: list[dict]) -> float:
 
 
 def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: float | None = None,
-               in_scope=None) -> list[Case]:
-    """Runs First Mate should look at now (respecting the per-run recheck delay)."""
+               in_scope=None, stopped_states: Iterable[str] = ()) -> list[Case]:
+    """Runs First Mate should look at now (respecting the per-run recheck delay).
+
+    ``stopped_states`` names the workflow's extra paused/terminal states
+    (``[states]`` in workflow.toml); tickets in them are skipped too.
+    """
     initialize(connection)
     now = time.time() if now is None else now
+    stopped_names = STOPPED_STATE_NAMES | {str(s).strip().casefold() for s in stopped_states}
+
+    def stopped(hold: Any, state: Any, state_type: Any) -> bool:
+        return bool(hold) or state_type in STOPPED_STATE_TYPES or str(state or "").strip().casefold() in stopped_names
     recheck = float(settings.get("recheck_minutes", 10)) * 60
     stall = float(settings.get("stall_minutes", 30)) * 60
     rows = connection.execute(
         """SELECT r.id, r.ticket, r.status, r.final_json, r.session_id, r.finished_at, r.last_activity_at,
-                  r.started_at, t.linear_id, t.title, t.hold, t.state_type
+                  r.started_at, t.linear_id, t.title, t.hold, t.state_type, t.state
            FROM runs r JOIN tickets t ON t.identifier = r.ticket
            WHERE t.project = ? AND r.id = (SELECT r2.id FROM runs r2 WHERE r2.ticket = r.ticket
                  ORDER BY COALESCE(r2.finished_at, r2.started_at, r2.id) DESC, r2.id DESC LIMIT 1)""",
@@ -158,8 +172,8 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     ).fetchall()
     cases: dict[str, Case] = {}
     for row in rows:
-        run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold, state_type = row
-        if hold or state_type in {"completed", "canceled"}:
+        run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold, state_type, state = row
+        if stopped(hold, state, state_type):
             continue
         status = str(status or "").casefold()
         final = _final(final_json)
@@ -184,16 +198,16 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue  # leave the flag for the supervisor that owns this ticket
         flag = _final(payload)
         run = connection.execute(
-            "SELECT r.id, r.status, r.final_json, r.session_id, t.linear_id, t.title, t.hold, t.state_type "
+            "SELECT r.id, r.status, r.final_json, r.session_id, t.linear_id, t.title, t.hold, t.state_type, t.state "
             "FROM runs r JOIN tickets t ON t.identifier=r.ticket "
             "WHERE r.ticket=? ORDER BY COALESCE(r.finished_at, r.started_at, r.id) DESC LIMIT 1", (ticket,)
         ).fetchone()
         if run is None:
             mark_flag(connection, event_id)
             continue
-        # Same eligibility as ledger cases: never restart a held or closed
-        # ticket. Cleaning up a merged (Done) ticket is the one exception.
-        if (run[6] or run[7] in {"completed", "canceled"}) and flag.get("kind") != "cleanup_stuck":
+        # Same eligibility as ledger cases: never restart a held, shelved or
+        # closed ticket. Cleaning up a merged (Done) ticket is the one exception.
+        if stopped(run[6], run[8], run[7]) and flag.get("kind") != "cleanup_stuck":
             mark_flag(connection, event_id)
             continue
         final = _final(run[2])
