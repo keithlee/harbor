@@ -182,9 +182,9 @@ class LinearPoller:
         payload: dict[str, Any] = {"tickets": list(filtered_raw)}
         digest = snapshot_hash(payload)
         changed = digest != self.tracker.previous_hash
-        self.tracker.previous_hash = digest
         if changed and self.db:
             self.db.record_observation(self.project_name, digest, payload, tickets)
+        self.tracker.previous_hash = digest
         result = PollResult(tickets=tickets, snapshot_hash=digest, changed=changed, raw=raw)
         self.last_result = result
         return result
