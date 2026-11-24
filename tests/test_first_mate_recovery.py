@@ -1195,6 +1195,68 @@ def test_launch_recheck_and_find_cases_agree_on_an_unnormalized_stopped_state_ty
     db.close()
 
 
+@pytest.mark.parametrize("edited", ["before_pass", "during_triage"])
+def test_first_mate_does_not_comment_after_policy_pauses_the_state(tmp_path, edited):
+    """An operator pausing In Progress in workflow.toml stops triage comments, not just the launch."""
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    _shelve(db, state="In Progress", state_type="started")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    workflow = supervisor.dispatcher.workflow.package / "workflow.toml"
+
+    def pause_in_progress():
+        workflow.write_text(workflow.read_text() + '\n[states]\npaused = ["In Progress"]\n')
+
+    if edited == "before_pass":
+        pause_in_progress()
+    else:
+        triage = mate.triage
+
+        async def triage_then_pause(prompt):
+            answer = await triage(prompt)
+            pause_in_progress()
+            return answer
+
+        mate.triage = triage_then_pause
+    monitor(supervisor)
+    assert len(mate.prompts) == int(edited == "during_triage")
+    assert linear.comments == resumed == []
+    assert recovery.history(db.connection, "run-HAN-86") == []
+    db.close()
+
+
+@pytest.mark.parametrize("shelved", [True, False])
+def test_operator_is_told_when_a_failed_attempt_loses_its_fallback(tmp_path, shelved):
+    """A primary run that failed, then lost authorization before its fallback, is not dropped silently."""
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    _shelve(db, state="In Progress", state_type="started")
+    supervisor, mate, linear, _ = _recording_supervisor(tmp_path, db)
+    notices = []
+
+    async def notify(key, message):
+        notices.append((key, message))
+        return True
+
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        before_launch()  # primary attempt is committed
+        if shelved:
+            _shelve(db, state="Icebox", state_type="backlog")
+            supervisor.last_result = PollResult(tuple(db.tickets("Demo")), "snapshot", True, ())
+        before_launch()  # model fallback re-checks authorization
+        return True
+
+    supervisor._notify_operator = notify
+    supervisor.resume_session = resume_session
+    monitor(supervisor)
+    assert [item["action"] for item in recovery.history(db.connection, "run-HAN-86")] == ["resume"]
+    keys = [key.split(":")[0] for key, _ in notices]
+    if shelved:
+        assert keys == ["recovery-superseded"]
+        assert "HAN-86" in notices[0][1] and "fallback" in notices[0][1]
+    else:
+        assert keys == ["recovery"]
+    db.close()
+
+
 def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
     db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged"})
     _shelve(db, state="Done", state_type="completed")

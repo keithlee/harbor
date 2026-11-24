@@ -4301,8 +4301,11 @@ class Supervisor:
         from harbor.first_mate import FirstMateError, FirstMateQuotaError
         from harbor.ticket_states import configured_stopped_names
 
-        settings = workflow.config.get("first_mate", {})
         try:
+            # Triage and the Linear comment follow the operator's current
+            # policy, not the copy loaded when the last builder launched.
+            workflow = self.dispatcher.workflow = workflow.reload()
+            settings = workflow.config.get("first_mate", {})
             states = workflow.config.get("states", {})
             cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope,
                                         stopped_states=configured_stopped_names(states))
@@ -4353,7 +4356,12 @@ class Supervisor:
                     proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
                 except FirstMateError as exc:
                     proposal = {"action": "wait", "reason": f"First Mate unavailable: {exc}"}
-                if not self._first_mate_can_recover(case):
+                try:
+                    # The policy may have changed while First Mate deliberated.
+                    if not self._first_mate_can_recover(case, reload_policy=True):
+                        continue
+                except Exception as exc:  # an unreadable workflow authorizes nothing
+                    self.last_error = f"First Mate monitor: {exc}"
                     continue
                 decision = recovery.validate(proposal, case, settings)
                 if decision["action"] == "wait":
@@ -4397,6 +4405,13 @@ class Supervisor:
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
             except _RecoverySuperseded:
+                if attempted:
+                    # The committed attempt failed and its model fallback was
+                    # refused; nothing else reports that outcome.
+                    await self._notify_operator(
+                        f"recovery-superseded:{case.run_id}:{len(case.history)}",
+                        f"First Mate {decision['action']} {case.ticket} failed and its model fallback was not "
+                        "started: the ticket is no longer eligible for recovery (held, shelved, closed or superseded).")
                 return
             except Exception as exc:
                 if not attempted and not self._first_mate_can_recover(case):
