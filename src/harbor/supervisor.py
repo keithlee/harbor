@@ -95,6 +95,24 @@ class Lifecycle(StrEnum):
     PAUSED = "PAUSED"
 
 
+def _describe_superseded_pr_events(kinds: Iterable[str]) -> str:
+    """Name retired PR events by kind, e.g. ``the PR's risk-analysis request and 2 review comments``."""
+
+    kinds = list(kinds)
+    comments = kinds.count("NEW_COMMENT_VERSION")
+    parts = []
+    if "PR_CREATED" in kinds:
+        parts.append("the PR's risk-analysis request")
+    if "RISK_INVALIDATED" in kinds:
+        parts.append("a risk re-analysis request")
+    if comments:
+        parts.append(f"{comments} review comment{'s' if comments != 1 else ''}")
+    other = len([k for k in kinds if k not in {"PR_CREATED", "RISK_INVALIDATED", "NEW_COMMENT_VERSION"}])
+    if other:
+        parts.append(f"{other} other PR event{'s' if other != 1 else ''}")
+    return " and ".join(parts) if parts else "PR events"
+
+
 @dataclass(frozen=True)
 class _ResumeFailure:
     run_id: str
@@ -1000,14 +1018,10 @@ class _ResultRoutingTarget:
     async def handle_pr_event(self, event: Mapping[str, Any]) -> Any:
         try:
             result = await self.processor.deliver(self.target, event)
-        except PREventSuperseded as exc:
-            # The processor retires the event; tell the operator once per event.
-            ticket = str(event.get("ticket") or "(unknown)")
-            await self.supervisor._notify_operator(
-                f"pr-event-superseded:{event.get('event_key') or event.get('key')}",
-                f"{ticket}: retired a PR event for superseded run {event.get('run_id')}; "
-                "its unreplied comment remains a handoff gap for the current builder.",
-            )
+        except PREventSuperseded:
+            # The processor retires the event; the supervisor reports every
+            # event retired for one superseded run in a single notice.
+            self.supervisor._note_superseded_pr_event(event)
             raise
         await self.supervisor.route_pr_event_result(event, result)
         return result
@@ -1160,6 +1174,8 @@ class Supervisor:
         # Per run id: the factory failure that the latest resume_session attempt
         # itself hit, so a wake turned away at a guard cites no stale cause.
         self._attempt_resume_failures: dict[str, _ResumeFailure] = {}
+        # PR event types retired this poll, per (ticket, superseded run id).
+        self._superseded_pr_events: dict[tuple[str, str], list[str]] = {}
         # Handoffs reported before Linear attached their PR, keyed by ticket.
         self._pending_handoffs: dict[str, dict[str, Any]] = {}
         # Ledger handoffs (run id + finish time) already checked by this
@@ -3167,6 +3183,24 @@ class Supervisor:
             return False
         return bool(row and row[0])
 
+    def _note_superseded_pr_event(self, event: Mapping[str, Any]) -> None:
+        key = (str(event.get("ticket") or "(unknown)"), str(event.get("run_id") or "(unknown)"))
+        self._superseded_pr_events.setdefault(key, []).append(
+            str(event.get("event_type") or event.get("type") or "")
+        )
+
+    async def _notify_superseded_pr_events(self) -> None:
+        """Send one notice per superseded run whose PR events were retired."""
+
+        pending, self._superseded_pr_events = self._superseded_pr_events, {}
+        for (ticket, run_id), kinds in pending.items():
+            await self._notify_operator(
+                f"pr-event-superseded:{ticket}:{run_id}",
+                f"{ticket}: retired {_describe_superseded_pr_events(kinds)} observed for superseded run "
+                f"{run_id}; they were not handed to the current builder, which sees "
+                "the open work as handoff gaps.",
+            )
+
     async def _process_pr_events(
         self,
         ticket: Mapping[str, Any],
@@ -3176,6 +3210,18 @@ class Supervisor:
     ) -> None:
         """Offer newly observed and durable PR events to the retained builder."""
 
+        try:
+            await self._offer_pr_events(ticket, facts, is_current=is_current)
+        finally:
+            await self._notify_superseded_pr_events()
+
+    async def _offer_pr_events(
+        self,
+        ticket: Mapping[str, Any],
+        facts: Mapping[str, Any],
+        *,
+        is_current: Callable[[], bool] | None = None,
+    ) -> None:
         processor = self.pr_event_processor
         if not self._in_scope(ticket) or processor is None or not facts or self.shadow:
             return

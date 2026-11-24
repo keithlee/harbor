@@ -387,6 +387,8 @@ def test_a_pr_event_for_a_superseded_run_is_retired_not_retried_forever(tmp_path
         outcomes = []
         for _poll in range(3):
             outcomes.append(await processor.process(ticket, facts, run=run_2, builder=target))
+            # Supervisor._process_pr_events flushes the retirement notice after each offer.
+            await supervisor._notify_superseded_pr_events()
         print(f"Poll outcomes: {outcomes}")
         print(f"Notices: {notices}")
 
@@ -399,8 +401,42 @@ def test_a_pr_event_for_a_superseded_run_is_retired_not_retried_forever(tmp_path
         comment_keys = {e["event_key"] for e in observed if e["event_type"] == "NEW_COMMENT_VERSION"}
         pending = {item["event_key"] for item in processor.events(pending_only=True, ticket="SAMPLE-42")}
         assert comment_keys and comment_keys <= pending
-        assert len(notices) == len(observed)
-        assert all("superseded" in notice and "run-1" in notice for notice in notices)
+        assert notices == [
+            "SAMPLE-42: retired the PR's risk-analysis request and 1 review comment observed for "
+            "superseded run run-1; they were not handed to the current builder, which sees the "
+            "open work as handoff gaps."
+        ]
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_superseded_pr_event_notice_matches_the_event_kind_and_pages_once_per_run(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+
+        supervisor._note_superseded_pr_event({"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "PR_CREATED"})
+        await supervisor._notify_superseded_pr_events()
+        for index in range(3):
+            supervisor._note_superseded_pr_event(
+                {"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "NEW_COMMENT_VERSION", "key": str(index)}
+            )
+        await supervisor._notify_superseded_pr_events()
+        for index in range(3):
+            supervisor._note_superseded_pr_event(
+                {"ticket": "SAMPLE-42", "run_id": "run-7", "event_type": "NEW_COMMENT_VERSION", "key": str(index)}
+            )
+        await supervisor._notify_superseded_pr_events()
+
+        print(notices)
+        assert len(notices) == 2, "one page per superseded run, not one per event"
+        assert "risk-analysis request" in notices[0] and "comment" not in notices[0]
+        assert "run-7" in notices[1] and "3 review comments" in notices[1]
+        assert "risk" not in notices[1]
         ledger.close()
 
     asyncio.run(scenario())
