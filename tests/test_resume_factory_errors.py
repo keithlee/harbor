@@ -180,7 +180,10 @@ def test_a_long_factory_error_keeps_the_retry_guidance_in_the_notice(tmp_path: P
         enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
 
         assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+        print(notices)
         assert len(notices) == 1 and "Use /retry" in notices[0]
+        # The cause itself is shown, capped so the guidance after it survives.
+        assert "could not resume: " + "x" * 100 in notices[0]
 
     asyncio.run(scenario())
 
