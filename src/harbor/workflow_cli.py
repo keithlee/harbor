@@ -50,7 +50,10 @@ async def fresh_context(config, db, ticket_id, run, event):
         fact = matches[0]
         states = load_workflow(Path(config.workflow_path)).config.get("states",{})
         inactive = {"paused","human review","backlog",*(str(s).casefold() for s in states.get("paused",[])),*(str(s).casefold() for s in states.get("terminal",[]))}
-        inactive_merge = event == "pre_merge" and str(ticket.get("state","")).casefold() in inactive
+        inactive_merge = event == "pre_merge" and (
+            ticket["state_type"] in {"backlog", "completed"}
+            or str(ticket.get("state", "")).casefold() in inactive
+        )
         from harbor.linear_feedback import pending
         linear_feedback = pending(raw)
         from harbor.risk_evidence import observed_floor, retain_floor
@@ -58,7 +61,7 @@ async def fresh_context(config, db, ticket_id, run, event):
         risk = retain_floor(db.connection,config.name,ticket_id,run["id"],observed_floor(raw,{}))
         return {"project":config.name,"ticket":ticket_id,"run_id":run["id"],"head_sha":fact.get("head_sha"),
                 "event":event,"fresh":True,"terminal":ticket["state_type"] == "completed",
-                "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled" or (event == "pre_merge" and ticket["state_type"] == "completed")),
+                "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled"),
                 "facts":fact,"gaps":processor.handoff_gaps(ticket,fact["url"],head_sha=fact.get("head_sha")),
                 "linear_feedback":linear_feedback,"feedback_digest":feedback_digest,"risk":risk}
     finally:
