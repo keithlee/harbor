@@ -21,11 +21,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-# A shelved or closed ticket is never recovered, matching the answer queue,
-# the unblock ladder and the supervisor's stopped-builder retry. Human Review
-# stays active: Harbor parks escalations there and resumes from it.
-STOPPED_STATE_TYPES = {"backlog", "completed", "canceled"}
-STOPPED_STATE_NAMES = {"backlog", "paused", "done", "completed", "canceled", "cancelled"}
+from harbor.ticket_states import is_stopped
+
+# A shelved or closed ticket is never recovered: ``is_stopped`` is shared with
+# the answer queue, the unblock ladder and the supervisor's stopped-builder
+# retry. Human Review stays active: Harbor parks escalations there and resumes
+# from it.
 
 ACTIONS = ("resume", "retry", "fresh_session", "wait", "escalate")
 # Kinds a recovery must never answer: those need cited authority or a human.
@@ -156,10 +157,10 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     """
     initialize(connection)
     now = time.time() if now is None else now
-    stopped_names = STOPPED_STATE_NAMES | {str(s).strip().casefold() for s in stopped_states}
+    workflow_states = {"paused": tuple(stopped_states)}
 
     def stopped(hold: Any, state: Any, state_type: Any) -> bool:
-        return bool(hold) or state_type in STOPPED_STATE_TYPES or str(state or "").strip().casefold() in stopped_names
+        return bool(hold) or is_stopped(state, state_type, workflow_states)
     recheck = float(settings.get("recheck_minutes", 10)) * 60
     stall = float(settings.get("stall_minutes", 30)) * 60
     rows = connection.execute(

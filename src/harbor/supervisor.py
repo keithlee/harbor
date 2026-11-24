@@ -3383,6 +3383,7 @@ class Supervisor:
         )
         from harbor.runner.quota import USAGE_LIMIT, legacy_codex_quota
         from harbor.runner.base import process_alive, process_group_alive
+        from harbor.ticket_states import is_stopped, workflow_states
         import time
         if (self.shadow or self.read_only or self._dispatch_suspended or self._stop.is_set()
                 or self.lifecycle not in {Lifecycle.RUNNING, Lifecycle.STARTING}
@@ -3396,14 +3397,9 @@ class Supervisor:
         for ticket in self._fleet_tickets:
             identifier = self._ticket_key(ticket)
             if (self._ticket_project(identifier) != self.project or not self._in_scope(ticket) or not self._owns(ticket) or ticket.get("hold", True)
-                    or ticket.get("state_type") in {"backlog", "completed", "canceled"}
-                    or str(ticket.get("state", "")).strip().casefold() in {"backlog", "paused", "done", "completed", "canceled", "cancelled"} or ticket.get("blocked_by")):
+                    or is_stopped(ticket.get("state"), ticket.get("state_type"), workflow_states(self.dispatcher))
+                    or ticket.get("blocked_by")):
                 continue
-            workflow = getattr(self.dispatcher, "workflow", None)
-            if workflow:
-                stopped = workflow.config.get("states", {})
-                if str(ticket.get("state", "")).strip().casefold() in {str(s).casefold() for s in (*stopped.get("paused", []), *stopped.get("terminal", []))}:
-                    continue
             task = self._dispatch_tasks.get(identifier)
             if task is not None and not task.done():
                 continue
@@ -4031,12 +4027,13 @@ class Supervisor:
             return
         from harbor import first_mate_recovery as recovery
         from harbor.first_mate import FirstMateError, FirstMateQuotaError
+        from harbor.ticket_states import configured_stopped_names
 
         settings = workflow.config.get("first_mate", {})
         try:
             states = workflow.config.get("states", {})
             cases = recovery.find_cases(connection, self.project, settings, in_scope=self._in_scope,
-                                        stopped_states=(*states.get("paused", []), *states.get("terminal", [])))
+                                        stopped_states=configured_stopped_names(states))
         except Exception as exc:
             self.last_error = f"First Mate monitor: {exc}"
             return
