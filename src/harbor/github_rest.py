@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 DEFAULT_REST_URL = "https://api.github.com"
 TOKEN_FALLBACKS = ("GITHUB_TOKEN", "GH_TOKEN")
@@ -49,6 +50,22 @@ def rest_base_url(graphql_url: str | None) -> str:
         return url[: -len("/graphql")] + "/v3"
     if url.endswith("/graphql"):
         return url[: -len("/graphql")]
+    return url
+
+
+def require_https_api_url(graphql_url: str | None) -> str:
+    """Return the GraphQL endpoint if Harbor may send a GitHub token to it.
+
+    The same rule ``rest_base_url`` applies to the builder: https only, plus a
+    host. Callers check this before building a GitHub client, so a plain-http
+    or scheme-less endpoint fails closed without sending a request.
+    """
+
+    url = (graphql_url or "").strip()
+    if not url.startswith("https://"):
+        raise ValueError("the GitHub API URL must use https")
+    if not urlsplit(url).hostname:
+        raise ValueError("the GitHub API URL must name a host")
     return url
 
 
