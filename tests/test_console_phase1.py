@@ -164,7 +164,7 @@ def test_console_status_keeps_latest_fleet_after_overlapping_polls(tmp_path: Pat
     def linear(_: httpx.Request) -> httpx.Response:
         if linear_unavailable:
             raise httpx.ConnectError("Linear temporarily unavailable")
-        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket]}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     async def scenario() -> None:
         nonlocal linear_unavailable
@@ -239,7 +239,7 @@ def test_a_poll_publishes_its_github_facts(tmp_path: Path) -> None:
     fact = {"ticket": "SAMPLE-42", "number": 42, "url": pr_url, "ci": "green", "threads": [], "mergeable": True}
 
     def linear(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket]}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     async def github(_):
         return [dict(fact)]

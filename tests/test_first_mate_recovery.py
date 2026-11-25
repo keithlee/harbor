@@ -965,7 +965,7 @@ def test_first_mate_does_not_charge_a_recovery_abandoned_during_the_comment(tmp_
     def linear_issues(request):
         states = json.loads(request.content)["variables"]["states"]
         nodes = [issue for issue in (recovering, unrelated) if issue["state"]["name"] in states]
-        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
     supervisor.poller = LinearPoller(client, Poller.config, db=db)
