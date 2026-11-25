@@ -196,6 +196,7 @@ def test_fresh_paginated_linear_ac_unblocks_without_human(tmp_path):
         return httpx.Response(200, json={"data":{"issue":{
             "id":"uuid", "identifier":"MOCK-2", "description":"The button color must be blue.",
             "state":{"name":"In Progress","type":"started"},
+            **{field:{"nodes":[],"pageInfo":{"hasNextPage":False}} for field in ("labels","attachments","inverseRelations")},
             "comments":{"nodes":[{"id":str(after), "body":"Use the approved blue button color.","user":{"id":"owner"}}],
                         "pageInfo":{"hasNextPage":after is None,"endCursor":"cursor-2"}}
         }}})

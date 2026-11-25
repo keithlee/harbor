@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 
+from harbor.clients.linear import LinearClientError
 from harbor.recovery import BlockerPolicy
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -177,6 +178,40 @@ def _paths(value: Any) -> list[str]:
 
 def _normalise_paths(value: Any) -> tuple[str, ...]:
     return tuple(item.replace("\\", "/").lstrip("./") for item in _paths(value))
+
+
+class BlockerContextUnavailable(LinearClientError):
+    """Harbor could not read or verify a blocked ticket's fresh Linear context.
+
+    Raised only from the pre-triage reads in ``UnblockLadder.handle`` (the
+    blocker-context fetch and the project-scope check), before any model call
+    or Linear write, so replaying triage after it is safe.  A
+    ``LinearClientError`` raised later (a comment or state write) is not this
+    type: triage already ran and must not be replayed.
+    """
+
+
+_TRIAGE_RAN_ATTR = "_harbor_triage_ran"
+
+
+def triage_ran(exc: BaseException) -> bool:
+    """Whether ``UnblockLadder.handle`` had begun triage when ``exc`` was raised.
+
+    Triage counts as run once the ladder has durably recorded a decision
+    (see ``UnblockLadder._decide``); every Linear write, resume and notice
+    follows that record.  An error or cancellation before it -- in the
+    pre-triage reads, remediation, First Mate or a workflow validator --
+    leaves the blocked run untriaged, so its retry is kept.
+    """
+
+    return bool(getattr(exc, _TRIAGE_RAN_ATTR, False))
+
+
+class TicketNotUnblockable(ValueError):
+    """The fresh ticket state rules out unblocking (stopped or still dependent).
+
+    An expected outcome, not a failure: callers record it without paging.
+    """
 
 
 @dataclass(frozen=True)
@@ -1104,14 +1139,58 @@ class UnblockLadder:
         *,
         blocker: Mapping[str, Any] | None = None,
     ) -> UnblockResult:
+        progress: dict[str, bool] = {}
+        try:
+            return await self._handle(ticket, run, final, blocker=blocker, progress=progress)
+        except BaseException as exc:
+            # BaseException too: a replay cancelled after First Mate decided
+            # (e.g. while its comment write is in flight) must read as triaged,
+            # or the caller would keep the retry and repeat the decision.
+            if progress.get("triage"):
+                try:
+                    setattr(exc, _TRIAGE_RAN_ATTR, True)
+                except AttributeError:
+                    pass  # an exception type without a __dict__ reads as untriaged
+            raise
+
+    def _decide(self, progress: dict[str, bool], *args: Any, **kwargs: Any) -> Any:
+        """Record a triage decision and mark the run as triaged.
+
+        The mark follows the first durable decision: the ladder row for a
+        deterministic adapter, a remediation fix, a GitHub-transport
+        escalation, a rung-1 resolution or a rung-2 escalation.  Every Linear
+        write, resume and notice in ``_handle`` comes after one of these, so a
+        failure or cancellation before it (inside First Mate, remediation or
+        a workflow validator) leaves the run untriaged and its retry kept.
+        """
+
+        escalation = self._record(*args, **kwargs)
+        progress["triage"] = True
+        return escalation
+
+    async def _handle(
+        self,
+        ticket: Mapping[str, Any],
+        run: Mapping[str, Any],
+        final: Mapping[str, Any] | None,
+        *,
+        blocker: Mapping[str, Any] | None,
+        progress: dict[str, bool],
+    ) -> UnblockResult:
         final = final or {}
         fetch = getattr(self.linear, "fetch_blocker_context", None)
         if callable(fetch):
             from harbor.poll.linear_poller import normalize_issue
-            observed = await fetch(_identifier(ticket))
-            if self.linear_projects:
-                from harbor.project_identity import require_scope
-                await require_scope(self.linear, self.linear_projects, observed.get("project") or {})
+            try:
+                observed = await fetch(_identifier(ticket))
+                if self.linear_projects:
+                    from harbor.project_identity import require_scope
+                    await require_scope(self.linear, self.linear_projects, observed.get("project") or {})
+            except BlockerContextUnavailable:
+                raise
+            except LinearClientError as exc:
+                # Classified by origin: nothing has been decided or written yet.
+                raise BlockerContextUnavailable(str(exc)) from exc
             fresh = normalize_issue(observed, hold_all=bool(ticket.get("hold", True)))
             # Human Review is deliberately active: Harbor parks escalations
             # there and delivers the operator's answer to the builder, so a
@@ -1120,7 +1199,7 @@ class UnblockLadder:
             # (``[states]`` in workflow.toml); those stop the ladder too.
             from harbor.ticket_states import is_stopped, workflow_states
             if fresh is None or is_stopped(fresh.get("state"), fresh.get("state_type"), workflow_states(self)):
-                raise ValueError("blocked ticket is no longer active")
+                raise TicketNotUnblockable("blocked ticket is no longer active")
             # Embedded clients may return partial context; absence cannot erase
             # an already observed dependency or PR attachment.
             for external, normalized in (("inverseRelations", "blocked_by"), ("attachments", "pr_urls")):
@@ -1128,7 +1207,7 @@ class UnblockLadder:
                     fresh.pop(normalized, None)
             ticket = {**ticket, **fresh}
         if ticket.get("blocked_by"):
-            raise ValueError("blocked ticket has unresolved dependencies")
+            raise TicketNotUnblockable("blocked ticket has unresolved dependencies")
         blocker_value = dict(blocker or _blocker(final))
         ticket_id = _identifier(ticket)
         run_id = _run_id(run)
@@ -1166,7 +1245,7 @@ class UnblockLadder:
         )
         if adapter is not None:
             answer, citation, reason = adapter
-            escalation = self._record(ticket_id, run_id, kind, question, 0, citation=citation, answer=answer, status="resume_pending", reason=reason)
+            escalation = self._decide(progress, ticket_id, run_id, kind, question, 0, citation=citation, answer=answer, status="resume_pending", reason=reason)
             resumed, command = await self._resume(
                 ticket_id, run_id, answer=answer, citation=citation, reason=reason,
                 next_action=str(final.get("next_action") or ""),
@@ -1185,7 +1264,7 @@ class UnblockLadder:
             self._record(ticket_id, run_id, kind, question, 0, status="resume_pending", reason="deterministic remediation did not clear the blocker")
         if remediation.fixed:
             citation = f"deterministic:{remediation.plan.kind if remediation.plan else kind}"
-            escalation = self._record(ticket_id, run_id, kind, question or remediation.plan.reason, 0, citation=citation, answer=remediation.plan.reason if remediation.plan else "", status="resume_pending")
+            escalation = self._decide(progress, ticket_id, run_id, kind, question or remediation.plan.reason, 0, citation=citation, answer=remediation.plan.reason if remediation.plan else "", status="resume_pending")
             answer = remediation.plan.reason if remediation.plan else "deterministic remediation completed"
             resumed, command = await self._resume(ticket_id, run_id, answer=answer, citation=citation,
                                                  reason="deterministic remediation completed",
@@ -1215,7 +1294,7 @@ class UnblockLadder:
                 "GitHub CLI authentication is unavailable. Run `gh auth login --hostname github.com` "
                 "in the environment that starts Harbor before retrying this builder session."
             )
-            escalation = self._record(ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
+            escalation = self._decide(progress, ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
             escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
             label = f" (escalation #{escalation_id})" if escalation_id is not None else ""
             notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication{label}: {reason}")
@@ -1276,7 +1355,8 @@ class UnblockLadder:
             if any(receipt["blocking"] for receipt in receipts):
                 triage_result = TriageResult("escalate",reason="configured decision validator blocked resolution")
         if triage_result.resolved and triage_result.citation.strip() and triage_result.answer.strip():
-            escalation = self._record(
+            escalation = self._decide(
+                progress,
                 ticket_id,
                 run_id,
                 kind,
@@ -1331,8 +1411,8 @@ class UnblockLadder:
         # Record before any external write or notification: the row's id is
         # what the operator answers, and a failed notifier must never leave an
         # unanswerable park behind.
-        escalation = self._record(
-            ticket_id, run_id, kind, question, 2, status="open", reason=reason, searched=searched,
+        escalation = self._decide(
+            progress, ticket_id, run_id, kind, question, 2, status="open", reason=reason, searched=searched,
         )
         escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
         label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"

@@ -115,6 +115,7 @@ def test_blocker_context_fetches_dependency_and_pr_facts(incomplete):
         assert 'inverseRelations(first: 100)' in payload['query']
         assert 'attachments(first: 100)' in payload['query']
         issue = {'identifier':'MOCK-1','comments':{'nodes':[],'pageInfo':{'hasNextPage':False}},
+                 'labels':{'nodes':[],'pageInfo':{'hasNextPage':False}},
                  'attachments':{'nodes':[{'url':'https://github.com/mock/repo/pull/1','sourceType':'github'}],'pageInfo':{'hasNextPage':incomplete == 'attachments'}},
                  'inverseRelations':{'nodes':[{'type':'blocks','issue':{'identifier':'MOCK-2','state':{'type':'started'}}}],'pageInfo':{'hasNextPage':incomplete == 'inverseRelations'}}}
         return httpx.Response(200,json={'data':{'issue':issue}})

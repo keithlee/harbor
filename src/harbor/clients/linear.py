@@ -204,6 +204,19 @@ class LinearClient:
             }
           }
         }"""
+        def connection(issue: dict[str, Any], field: str) -> tuple[list[Any], dict[str, Any]]:
+            # Completeness must be proven, not assumed: a connection or
+            # pageInfo that Linear omitted cannot show the first page was the
+            # whole set, so a blocking relation, PR link or risk label past it
+            # would be invisible.  Fail closed instead.
+            page = issue.get(field)
+            nodes = page.get("nodes") if isinstance(page, dict) else None
+            info = page.get("pageInfo") if isinstance(page, dict) else None
+            if (not isinstance(nodes, list) or not isinstance(info, dict)
+                    or not isinstance(info.get("hasNextPage"), bool)):
+                raise LinearClientError(f"malformed blocker {field}; refusing unprovable context")
+            return nodes, info
+
         comments: list[dict[str, Any]] = []
         after = None
         cursors: set[str] = set()
@@ -213,12 +226,11 @@ class LinearClient:
             if not isinstance(issue, dict) or issue.get("identifier") != identifier:
                 raise LinearClientError("cannot verify blocked ticket identity")
             for field in ("attachments", "inverseRelations", "labels"):
-                if issue.get(field, {}).get("pageInfo", {}).get("hasNextPage"):
+                if connection(issue, field)[1]["hasNextPage"]:
                     raise LinearClientError(f"incomplete blocker {field}; refusing partial context")
-            page = issue.get("comments", {})
-            comments.extend(page.get("nodes", []))
-            info = page.get("pageInfo", {})
-            if not info.get("hasNextPage"):
+            nodes, info = connection(issue, "comments")
+            comments.extend(nodes)
+            if not info["hasNextPage"]:
                 issue["comments"] = {"nodes": comments}
                 return issue
             after = info.get("endCursor")
