@@ -233,7 +233,7 @@ def build_production_dispatcher(
         builder_provider = getattr(config, "builder_provider", "codex")
         github = builder_github(config, workflow, builder_provider)
         if github["linear_sandbox_warning"]:
-            print(f"Harbor: warning: {github['linear_sandbox_warning']}", file=sys.stderr)
+            print(f"Harbor: warning: {github['linear_sandbox_warning']}; {LINEAR_URL_RESTART}", file=sys.stderr)
         claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
         if builder_provider == "claude":
             validate_claude(claude_cli, config.builder_model, config.builder_effort)
@@ -315,6 +315,18 @@ def build_production_dispatcher(
     return dispatcher, manager, factory
 
 
+# The sandbox hosts are resolved once, when ``harbor start`` builds the
+# dispatcher; only the workflow package is reloaded per poll. Said only by a
+# running process's warnings, never by ``harbor doctor``.
+LINEAR_URL_RESTART = (
+    "if you change linear_api_url (or api_url), restart Harbor; a running harbor start keeps the value it started with"
+)
+GITHUB_URL_RESTART = (
+    "set github_api_url (or github_graphql_url / github_endpoint) to a host name the Claude sandbox can allow, "
+    "then restart Harbor; a running harbor start keeps the value it started with"
+)
+
+
 def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
     """The configured Linear host for a Claude builder's sandbox, or why it is left out.
 
@@ -361,14 +373,14 @@ def resumed_claude_sandbox_hosts(
     from harbor.runner.claude import sandbox_hosts
     linear_hosts, linear_warning = linear_sandbox_hosts(config)
     if linear_warning:
-        warn(linear_warning)
+        warn(f"{linear_warning}; {LINEAR_URL_RESTART}")
     try:
         github_hosts = sandbox_hosts(rest_url, "GitHub API")
     except ValueError as exc:
         reason = (
             f"the retained Claude builder session for {ticket or '(unknown ticket)'} cannot resume: {exc}. "
             "Its project is now set to Codex, so harbor doctor and harbor start do not check this; "
-            "set github_api_url to a host name the Claude sandbox can allow"
+            f"{GITHUB_URL_RESTART}"
         )
         warn(reason)
         raise ValueError(reason) from exc
