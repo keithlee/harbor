@@ -510,6 +510,17 @@ class ProjectDefinition:
     repo_path: Path
     pipeline_path: Path | None = None
     values: Mapping[str, Any] = field(default_factory=dict)
+    # The identity columns as written (``name``/``project``/``id``,
+    # ``repo_path``/``repo``/``repository``/``path``, ``pipeline_path``/``pipeline``).
+    identity_columns: Mapping[str, str] = field(default_factory=dict)
+
+
+# Identity columns by what they set, in the order Harbor takes the first non-empty one.
+REGISTRY_IDENTITY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "name": ("name", "project", "id"),
+    "repo_path": ("repo_path", "repo", "repository", "path"),
+    "pipeline_path": ("pipeline_path", "pipeline"),
+}
 
 
 def _project_rows(text: str) -> list[dict[str, str]]:
@@ -578,21 +589,26 @@ def parse_projects_markdown(text: str, *, source: str | Path | None = None) -> t
     base = Path(source).expanduser().resolve().parent if source else Path.cwd()
     result: list[ProjectDefinition] = []
     for row in _project_rows(text):
-        name = row.get("name") or row.get("project") or row.get("id")
-        repo = row.get("repo_path") or row.get("repo") or row.get("repository") or row.get("path")
+        first = {
+            target: next((row[column] for column in columns if row.get(column)), "")
+            for target, columns in REGISTRY_IDENTITY_COLUMNS.items()
+        }
+        name, repo = first["name"], first["repo_path"]
         if not name or not repo:
             continue
         repo_path = Path(os.path.expandvars(repo)).expanduser()
         if not repo_path.is_absolute():
             repo_path = (base / repo_path).resolve()
-        pipeline_value = row.get("pipeline_path") or row.get("pipeline")
+        pipeline_value = first["pipeline_path"]
         pipeline_path: Path | None = None
         if pipeline_value:
             pipeline_path = Path(os.path.expandvars(pipeline_value)).expanduser()
             if not pipeline_path.is_absolute():
                 pipeline_path = (base / pipeline_path).resolve()
-        values = {key: value for key, value in row.items() if key not in {"name", "project", "id", "repo_path", "repo", "repository", "path", "pipeline", "pipeline_path"}}
-        result.append(ProjectDefinition(str(name), repo_path, pipeline_path, values))
+        identity = {column for columns in REGISTRY_IDENTITY_COLUMNS.values() for column in columns}
+        values = {key: value for key, value in row.items() if key not in identity}
+        written = {key: value for key, value in row.items() if key in identity}
+        result.append(ProjectDefinition(str(name), repo_path, pipeline_path, values, written))
     return tuple(result)
 
 

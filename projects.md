@@ -41,11 +41,25 @@ silently. A column is reported when:
 - `.harbor/workflow` always replaces it: `builder_model`, `firstmate_model`,
   `builder_fallback_models`, `firstmate_fallback_models` and `workflow_path`;
 - the value Harbor resolved is not the cell's value, for example
-  `builder_effort` when `.harbor/workflow` sets `reasoning_effort`.
+  `builder_effort` when `.harbor/workflow` sets `reasoning_effort`;
+- another spelling of the same setting wins, so this one is skipped: an alias
+  next to its column (`heartbeat_interval` beside `heartbeat_seconds`, or
+  `slug` beside a `linear_project_slug` column, even an empty one), or a second
+  identity column such as `repo`, `repository` or `pipeline` beside
+  `repo_path`/`pipeline_path` (for the GitHub repository, use
+  `github_repository`);
+- the cell is empty and Harbor uses that empty value instead of the
+  pipeline's value or the default. Today this happens for most columns: for
+  example, an empty `base_branch` resolves to an empty branch and an empty
+  `hold` resolves to hold off. The endpoint and GitHub columns
+  (`linear_api_url`, `github_api_url`, `github_repository`, `required_checks`,
+  `bot_rework_cap` and their aliases) ignore an empty cell, and so do
+  `linear_project_slug` and `linear_team`. Fill in an empty cell or remove the
+  column.
 
 `harbor doctor` prints a `Registry:` line for each one. `harbor start`,
 `harbor facts` and `harbor status` print a warning once on stderr (so `--json`
 output on stdout is unchanged). Each names the project, the column and the
 registry file, with a hint when one applies: the registry column you probably
-meant, or where the setting belongs. An empty cell sets nothing and is not
-reported. The warnings do not change doctor's exit status.
+meant, or where the setting belongs. The warnings do not change doctor's exit
+status.

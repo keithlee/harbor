@@ -530,8 +530,15 @@ def unknown_registry_keys(values: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _registry_column(setting: str, values: Mapping[str, object]) -> str:
-    """The column the operator wrote for *setting* (the setting or an alias)."""
+    """The column ``get_project`` reads for *setting* (the setting or an alias).
 
+    A scope alias is read only when the setting's own column is absent (an
+    empty own column still wins); endpoint and GitHub columns take the first
+    non-empty one of (setting, *aliases).
+    """
+
+    if setting in REGISTRY_SCOPE_ALIASES:
+        return next((column for column in (setting, *REGISTRY_SCOPE_ALIASES[setting]) if column in values), setting)
     aliases = next((table[setting] for table in REGISTRY_ALIAS_TABLES if setting in table), ())
     for column in (setting, *aliases):
         if str(values.get(column) or "").strip():
@@ -588,35 +595,88 @@ def _workflow_settings(config: "ProjectConfig") -> frozenset[str]:
     return frozenset(owned)
 
 
-def registry_values_not_used(
-    config: "ProjectConfig", settings: Mapping[str, object], values: Mapping[str, object]
-) -> tuple[tuple[str, str, str], ...]:
-    """Registry settings whose value is not the one Harbor resolved.
+def _pipeline_only(config: "ProjectConfig") -> "ProjectConfig | None":
+    """*config*'s project resolved from its pipeline alone, without the registry."""
 
-    *settings* are the registry settings ``get_project`` passed on and
-    *values* the raw columns.  Each result is ``(column, registry value,
-    reason)``.  An empty cell is not reported: it sets nothing.
+    if config.pipeline_path is None:
+        return None
+    try:
+        return ProjectConfig.from_pipeline(
+            config.name, Path(config.pipeline_path), repo_path=config.repo_path,
+            linear_project_slug=config.linear_project_slug, linear_team=config.linear_team,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def registry_values_not_used(
+    config: "ProjectConfig",
+    settings: Mapping[str, object],
+    values: Mapping[str, object],
+    identity: Mapping[str, object] | None = None,
+) -> tuple[tuple[str, str, str], ...]:
+    """Registry cells whose value is not the one Harbor resolved.
+
+    *settings* are the registry settings ``get_project`` passed on, *values*
+    the raw setting columns and *identity* the raw identity columns.  Each
+    result is ``(column, registry value, reason)``.  Reported:
+
+    - a workflow-owned column (``.harbor/workflow`` always replaces it);
+    - a column whose value differs from the value Harbor resolved;
+    - a column Harbor skips because another spelling of the same setting
+      wins (an alias, or a second identity column such as ``repository``);
+    - an empty cell whose empty value Harbor resolves although the pipeline
+      (or its default) sets a non-empty one.  Once resolution ignores empty
+      cells, Harbor resolves the pipeline value and this stops firing.
     """
 
+    from harbor.config.pipeline import REGISTRY_IDENTITY_COLUMNS
     from harbor.config.workflow import MIGRATION_HINT
 
     workflow = _workflow_settings(config)
     result: list[tuple[str, str, str]] = []
+    pipeline_only: list["ProjectConfig | None"] = []
+
+    def filled(column: str, table: Mapping[str, object]) -> str:
+        return str(table.get(column) or "").strip()
+
+    for target, columns in REGISTRY_IDENTITY_COLUMNS.items():
+        written = identity or {}
+        winner = next((column for column in columns if filled(column, written)), None)
+        for column in columns:
+            if winner and column != winner and filled(column, written) and filled(column, written) != filled(winner, written):
+                reason = f"Harbor ignores it: it reads `{winner}` (`{filled(winner, written)}`)"
+                if column == "repository":
+                    reason += "; for the GitHub repository, use `github_repository`"
+                result.append((column, filled(column, written), reason))
+
     for setting in settings:
         if setting == "repo_path":
             continue
         column = _registry_column(setting, values)
         if column not in values:
             continue  # derived by get_project (``hold_all`` from ``hold``), not written by the operator
+        used = getattr(config, setting, None)
+        aliases = next((table[setting] for table in REGISTRY_ALIAS_TABLES if setting in table), ())
+        for other in (setting, *aliases):
+            if other != column and filled(other, values) and not _registry_value_used(filled(other, values), used):
+                reads = f"`{column}`" + (", which is empty" if not filled(column, values) else "")
+                result.append((other, filled(other, values), f"Harbor ignores it: it reads {reads}, and uses `{_shown(used)}`"))
         # Compare the cell the operator wrote, not get_project's parsed copy
         # (``required_checks`` is a tuple and ``bot_rework_cap`` an int there).
         raw = values[column]
         if not str(raw).strip():
+            if not pipeline_only:
+                pipeline_only.append(_pipeline_only(config))
+            fallback = getattr(pipeline_only[0], setting, None) if pipeline_only[0] is not None else None
+            if not used and fallback and fallback != used:
+                empty = "the empty value" + (f" (`{_shown(used)}`)" if _shown(used) else "")
+                result.append((column, "", f"Harbor uses {empty} instead of `{_shown(fallback)}` from the pipeline "
+                               "or its default; fill in the cell or remove the column"))
             continue
         if setting in WORKFLOW_OWNED_KEYS:
             result.append((column, str(raw), f"Harbor ignores it: `{setting}` comes from .harbor/workflow; {MIGRATION_HINT}"))
             continue
-        used = getattr(config, setting, None)
         if _registry_value_used(raw, used):
             continue
         reason = f"Harbor uses `{_shown(used)}`"
@@ -641,7 +701,11 @@ def _registry_key_hint(key: str, pipeline: Path | None) -> str:
     }
     canonical = {alias: setting for setting, aliases in pipeline_aliases.items() for alias in aliases}
     # Columns worth suggesting: ones whose registry value Harbor actually uses.
-    columns = (REGISTRY_SETTING_KEYS | REGISTRY_ALIAS_KEYS) - WORKFLOW_OWNED_KEYS - set(RETIRED_KEYS) - {"repo_path"}
+    # ``poll_states``/``dispatch_states`` are left out while a registry list is
+    # still split into characters (a separate fix).
+    columns = (REGISTRY_SETTING_KEYS | REGISTRY_ALIAS_KEYS) - WORKFLOW_OWNED_KEYS - set(RETIRED_KEYS) - {
+        "repo_path", "poll_states", "dispatch_states",
+    }
     if canonical.get(key) in columns:
         return f" The registry column is `{canonical[key]}`."
     pipeline_keys = set(canonical) - set(RETIRED_KEYS)
@@ -666,7 +730,8 @@ def registry_key_warnings(config: "ProjectConfig") -> tuple[str, ...]:
         for key in config.registry_unknown_keys
     )
     unused = tuple(
-        f"{config.name} sets `{column}` to `{raw}`{where}, but {reason}."
+        (f"{config.name} sets `{column}` to `{raw}`{where}" if raw else f"{config.name} leaves `{column}` empty{where}")
+        + f", but {reason}."
         for column, raw, reason in config.registry_unused_values
     )
     return unknown + unused
@@ -762,7 +827,9 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                 registry_unknown_keys=unknown_registry_keys(definition.values),
             )
             return replace(
-                config, registry_unused_values=registry_values_not_used(config, overrides, definition.values)
+                config, registry_unused_values=registry_values_not_used(
+                    config, overrides, definition.values, definition.identity_columns
+                )
             )
 
     if registry_loaded:

@@ -10,6 +10,7 @@ ignored before it was added to the registry (#33).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -352,3 +353,135 @@ def test_github_registry_columns_and_aliases_are_not_reported(
     profile = PipelineProfile.from_project(config)
     if "repo" in "".join(registry.values()):
         assert profile.repository == "owner/repo"
+
+
+# ------------------------------------------------ empty cells (round 3)
+#
+# Today an empty registry cell can win over the pipeline (an empty
+# base_branch resolves to "", an empty hold to false). Report it while that
+# is so; once resolution ignores empty cells the check must stop firing.
+
+
+def plain(tmp_path: Path, monkeypatch, registry: dict[str, str], pipeline_extra: str = "") -> tuple[str, ...]:
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(write_project(tmp_path, registry, pipeline_extra)))
+    return tuple(w.replace(f" in {tmp_path / 'projects.md'}", "") for w in registry_key_warnings(get_project("SampleProject")))
+
+
+@pytest.mark.parametrize("column, pipeline_extra, fallback", [
+    ("base_branch", "base_branch: dev\n", "dev"),
+    ("poll_interval_seconds", "poll_interval_seconds: 45\n", "45.0"),
+    ("hold", "", "true"),
+])
+def test_an_empty_cell_that_wins_over_the_pipeline_is_reported(
+    tmp_path: Path, monkeypatch, column: str, pipeline_extra: str, fallback: str
+) -> None:
+    warnings = plain(tmp_path, monkeypatch, {column: ""}, pipeline_extra)
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith(f"SampleProject leaves `{column}` empty, but Harbor uses the empty value")
+    assert warnings[0].endswith(f"instead of `{fallback}` from the pipeline or its default; "
+                                "fill in the cell or remove the column.")
+
+
+@pytest.mark.parametrize("registry, pipeline_extra", [
+    ({"github_repository": ""}, "github_repository: owner/repo\n"),   # #38 ignores an empty GitHub cell
+    ({"required_checks": "", "bot_rework_cap": ""}, "required_checks: [CI]\n"),
+    ({"linear_api_url": "", "api_url": ""}, ""),                     # endpoint cells are ignored when empty
+    ({"linear_project_slug": "", "linear_team": ""}, ""),            # from_pipeline ignores an empty slug/team
+    ({"skill": ""}, ""),                                              # empty in the pipeline too
+])
+def test_an_empty_cell_that_resolution_ignores_is_not_reported(
+    tmp_path: Path, monkeypatch, registry: dict[str, str], pipeline_extra: str
+) -> None:
+    assert plain(tmp_path, monkeypatch, registry, pipeline_extra) == ()
+
+
+def test_the_empty_cell_report_stops_once_resolution_ignores_empty_cells(tmp_path: Path, monkeypatch) -> None:
+    from harbor.config.projects import registry_values_not_used
+
+    # The config an empty-cell-ignoring loader would produce: the pipeline's value.
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(write_project(tmp_path, {}, "base_branch: dev\n")))
+    config = get_project("SampleProject")
+    assert config.base_branch == "dev"
+    assert registry_values_not_used(config, {"base_branch": ""}, {"base_branch": ""}) == ()
+
+
+# -------------------------------- spellings that lose to another (round 3)
+
+
+def test_an_alias_behind_an_empty_scope_column_is_reported(tmp_path: Path, monkeypatch) -> None:
+    assert plain(tmp_path, monkeypatch, {"linear_project_slug": "", "slug": "reg-slug"}) == (
+        "SampleProject sets `slug` to `reg-slug`, but Harbor ignores it: it reads `linear_project_slug`, "
+        "which is empty, and uses `sample`.",
+    )
+
+
+@pytest.mark.parametrize("registry, expected", [
+    ({"heartbeat_seconds": "30", "heartbeat_interval": "99"},
+     "SampleProject sets `heartbeat_interval` to `99`, but Harbor ignores it: it reads `heartbeat_seconds`, and uses `30`."),
+    ({"linear_api_url": "https://a.example.test/graphql", "api_url": "https://b.example.test/graphql"},
+     "SampleProject sets `api_url` to `https://b.example.test/graphql`, but Harbor ignores it: it reads "
+     "`linear_api_url`, and uses `https://a.example.test/graphql`."),
+    ({"github_repository": "owner/repo", "github_repo": "owner/other"},
+     "SampleProject sets `github_repo` to `owner/other`, but Harbor ignores it: it reads `github_repository`, "
+     "and uses `owner/repo`."),
+])
+def test_a_second_spelling_of_a_set_column_is_reported(tmp_path: Path, monkeypatch, registry, expected) -> None:
+    assert plain(tmp_path, monkeypatch, registry) == (expected,)
+
+
+def test_matching_spellings_are_not_reported(tmp_path: Path, monkeypatch) -> None:
+    assert plain(tmp_path, monkeypatch, {"heartbeat_seconds": "30", "heartbeat_interval": "30"}) == ()
+
+
+def test_identity_columns_behind_repo_path_and_pipeline_path_are_reported(tmp_path: Path, monkeypatch) -> None:
+    warnings = plain(tmp_path, monkeypatch, {"repository": "owner/repo", "repo": "/elsewhere", "pipeline": "/x.md"})
+    assert warnings == (
+        f"SampleProject sets `repo` to `/elsewhere`, but Harbor ignores it: it reads `repo_path` (`{tmp_path / 'repo'}`).",
+        f"SampleProject sets `repository` to `owner/repo`, but Harbor ignores it: it reads `repo_path` "
+        f"(`{tmp_path / 'repo'}`); for the GitHub repository, use `github_repository`.",
+        f"SampleProject sets `pipeline` to `/x.md`, but Harbor ignores it: it reads `pipeline_path` "
+        f"(`{tmp_path / 'pipeline.md'}`).",
+    )
+
+
+# ------------------------------------------------------- hints (round 3)
+
+
+def test_hints_name_ci_required_checks_but_not_the_state_lists(tmp_path: Path, monkeypatch) -> None:
+    warnings = plain(tmp_path, monkeypatch, {"ci_required_check": "x", "poll_state": "y", "dispatch_state": "z"})
+    assert warnings[0] == ("SampleProject sets unknown column `ci_required_check`; Harbor ignores it. "
+                           "Did you mean `ci_required_checks`?")
+    assert not any("Did you mean `poll_states`?" in w or "Did you mean `dispatch_states`?" in w for w in warnings)
+
+
+# ----------------------------------------------------------- harbor facts
+
+
+class FactsLinearClient:
+    def __init__(self, *, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    async def fetch_issues(self, projects: tuple[str, ...], states: tuple[str, ...]) -> list[dict[str, Any]]:
+        return []
+
+    async def close(self) -> None:
+        return None
+
+
+def run_facts(tmp_path: Path, monkeypatch, capsys, registry: dict[str, str]) -> tuple[int, str, str]:
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(write_project(tmp_path, registry)))
+    monkeypatch.setattr(cli, "_db_path", lambda: tmp_path / "harbor.db")
+    monkeypatch.setattr(cli, "LinearClient", FactsLinearClient)
+    code = asyncio.run(cli._facts("SampleProject", as_json=True))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_facts_warns_on_stderr_and_leaves_stdout_and_exit_code_alone(tmp_path: Path, monkeypatch, capsys) -> None:
+    clean_code, clean_out, clean_err = run_facts(tmp_path / "clean", monkeypatch, capsys, {})
+    code, out, err = run_facts(tmp_path / "flagged", monkeypatch, capsys, UNKNOWN)
+    assert "warning" not in clean_err
+    assert err.count("Harbor: warning: SampleProject sets unknown column `github_api_ur1`") == 1, err
+    assert out == clean_out
+    assert json.loads(out) == []
+    assert code == clean_code
