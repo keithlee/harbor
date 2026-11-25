@@ -1014,9 +1014,17 @@ class BaseRunner:
         self._queue_transition(context, "running")
         _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
         if process.stdin is not None:
-            process.stdin.write(instruction.encode("utf-8"))
-            await process.stdin.drain()
-            process.stdin.close()
+            try:
+                process.stdin.write(instruction.encode("utf-8"))
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # The builder exited, or closed its stdin, before taking the
+                # prompt.  That is the builder's failure, not Harbor's: its
+                # output and exit status are still read below and recorded
+                # as this run's result.
+                pass
+            finally:
+                process.stdin.close()
 
         drain_task = asyncio.create_task(self._drain(context), name=f"harbor-stream-{context.run_id}")
         deadline_task = asyncio.create_task(self._deadline_watch(context), name=f"harbor-deadline-{context.run_id}")
