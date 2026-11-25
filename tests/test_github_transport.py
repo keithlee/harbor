@@ -434,10 +434,11 @@ def test_a_resumed_claude_session_reports_why_it_cannot_resume(tmp_path: Path, m
                 factory(tmp_path, wake)
         err = capsys.readouterr().err
         assert err.count("Harbor: warning: the retained Claude builder session for SAMPLE-1 cannot resume") == 1
-        assert "set github_api_url" in err
         # The URL is read once when harbor start builds the dispatcher, and the
-        # warning is not repeated, so it must say a restart is needed.
-        assert "Restart Harbor after fixing github_api_url" in err
+        # warning is not repeated, so it must say a restart is needed, and name
+        # the aliases an operator may have used instead of github_api_url.
+        assert ("set github_api_url (or github_graphql_url / github_endpoint) to a host name the Claude "
+                "sandbox can allow, then restart Harbor") in err
     finally:
         db.close()
 
@@ -488,7 +489,7 @@ def test_a_resumed_claude_session_warns_about_an_unexpressible_linear_url(
         assert sandbox_domains(runner.command("x", run_id="harbor-run-1")) == GITHUB_COM_DOMAINS  # not widened
         err = capsys.readouterr().err
         assert err.count("Harbor: warning: the Linear API URL must be an https URL") == 1
-        assert "Restart Harbor after fixing linear_api_url" in err
+        assert "if you change linear_api_url (or api_url), restart Harbor" in err
     finally:
         db.close()
 
@@ -560,7 +561,9 @@ def test_a_local_linear_stub_does_not_stop_a_claude_project(tmp_path: Path, monk
     # before the sandbox allowlist existed. Skip that host; never widen to fit it.
     domains = production_claude_domains(tmp_path, monkeypatch, linear_api_url=LOCAL_LINEAR_STUB)
     assert domains == GITHUB_COM_DOMAINS
-    assert "Harbor: warning: the Linear API URL must be an https URL" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Harbor: warning: the Linear API URL must be an https URL" in err
+    assert "if you change linear_api_url (or api_url), restart Harbor" in err  # harbor start's warning
 
 
 def test_a_linear_url_the_sandbox_cannot_express_is_reported_not_raised(tmp_path: Path) -> None:
@@ -640,5 +643,7 @@ def test_doctor_labels_a_linear_url_problem_as_linear_not_github(tmp_path: Path)
     assert "GitHub transport: invalid" not in result.stdout, result.stdout
     assert "GitHub transport: rest" in result.stdout, result.stdout
     assert "Linear sandbox access: not added (the Linear API URL must be an https URL" in result.stdout, result.stdout
+    # doctor is not a running process, and a local stub is a supported setup.
+    assert "restart harbor" not in (result.stdout + result.stderr).lower(), result.stdout + result.stderr
     assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
             "ghe.example.test\n") in result.stdout, result.stdout

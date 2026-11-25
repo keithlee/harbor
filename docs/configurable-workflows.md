@@ -238,11 +238,14 @@ check such a session, so when it is resumed Harbor prints the same Linear
 warning, and if the GitHub value stops it, a `Harbor: warning: the retained
 Claude builder session for <ticket> cannot resume: ...` line (once per process);
 the session stays unresumed until `github_api_url` is fixed and Harbor is
-restarted. Harbor reads `github_api_url` and `linear_api_url` for the sandbox
-once, when `harbor start` builds its dispatcher (only the workflow package is
-reloaded per poll), so after fixing either one restart Harbor: a running
-`harbor start` keeps the old value and, having warned once, prints nothing
-more. Both the GitHub and the Linear warning say so. A configured DNS name is trusted as-is:
+restarted. Harbor reads the GitHub URL (`github_api_url`, or its aliases
+`github_graphql_url` and `github_endpoint`) and the Linear URL
+(`linear_api_url`, or `api_url`) for the sandbox once, when `harbor start`
+builds its dispatcher (only the workflow package is reloaded per poll). If you
+change either one, restart Harbor: a running `harbor start` keeps the old value
+and, having warned once, prints nothing more. The warnings from `harbor start`
+and from a resumed session say so; `harbor doctor`, which reads the current
+value each run, does not. A deliberate local Linear stub needs no change. A configured DNS name is trusted as-is:
 whoever can set `github_api_url` (the registry, `.harbor/pipeline.md` or
 `AGENTS.md` in the main checkout) already decides where the GitHub token is
 sent, so allowing that host gives them nothing new. Verified with unit tests and the production runner factory on macOS
