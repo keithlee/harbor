@@ -120,7 +120,7 @@ else:
             "id":"uuid-1", "identifier":"MOCK-1", "title":"Recover a partial edit",
             "description":"Preserve partial.txt and finish the change.", "state":{"name":"In Progress", "type":"started"},
             "comments":{"nodes":[]}, "inverseRelations":{"nodes":[]}, "attachments":{"nodes":[]}
-        }]}}})
+        }], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     async def scenario():
         db = HarborDB(tmp_path / "ledger.sqlite")

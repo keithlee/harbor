@@ -39,7 +39,7 @@ def test_overlapping_github_polls_keep_the_latest_pr_observation(tmp_path: Path,
     }
 
     def linear(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket]}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     async def scenario() -> None:
         older_waiting = asyncio.Event()

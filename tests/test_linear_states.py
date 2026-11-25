@@ -32,7 +32,7 @@ def transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
                     {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"},
                     {"id": BLOCKED, "name": "Blocked", "type": "started"},
                     {"id": RELEASED, "name": "Released", "type": "completed"},
-                ]}}}}})
+                ], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}})
         return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {
             "id": "u", "identifier": "SAMPLE-32", "state": {"id": HUMAN_REVIEW, "name": "Human Review", "type": "started"}}}}})
 

@@ -660,7 +660,7 @@ def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, 
         variables = json.loads(request.content)["variables"]
         assert variables["slugs"] == ["demo"]
         nodes = [issue] if issue["state"]["name"] in variables["states"] else []
-        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
     supervisor.poller = LinearPoller(client, Poller.config, db=db)

@@ -32,7 +32,7 @@ def fake_transport(nodes: list[dict], calls: list[dict]) -> httpx.MockTransport:
         payload = json.loads(request.content)
         calls.append(payload)
         assert "issues(filter:" in payload["query"]
-        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     return httpx.MockTransport(handler)
 

@@ -33,7 +33,7 @@ def _issue(title: str = "A ticket", updated_at: str = "2026-09-03T20:00:00Z") ->
 
 def _console(tmp_path: Path, nodes: list[dict]) -> tuple[Console, Supervisor, HarborDB, LinearClient]:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(
         name="SampleProject",

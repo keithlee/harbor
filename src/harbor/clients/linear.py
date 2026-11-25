@@ -118,6 +118,22 @@ def project_slugs(value: str | Sequence[str] | None) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _team_states_connection(data: dict[str, Any]) -> Any:
+    """Pick ``issue.team.states`` out of a states response.
+
+    A null or missing link anywhere on the path returns ``None`` so the
+    pager reports the response as malformed, the same as the poll does for a
+    null ``issues``, instead of reading it as an empty last page.
+    """
+
+    node: Any = data
+    for key in ("issue", "team", "states"):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
 class LinearClientError(RuntimeError):
     """A network, HTTP, or GraphQL failure."""
 
@@ -268,7 +284,12 @@ class LinearClient:
         collected: dict[str, dict[str, Any]] = {}
         unkeyed: list[dict[str, Any]] = []
         async for nodes in self._paged_nodes(
-            LINEAR_QUERY, variables, lambda data: data.get("issues", {}), what="issue", partial="poll"
+            LINEAR_QUERY,
+            variables,
+            lambda data: data.get("issues"),
+            what="issue",
+            partial="poll",
+            response="issues",
         ):
             for node in nodes:
                 if not isinstance(node, dict):
@@ -293,17 +314,22 @@ class LinearClient:
         *,
         what: str,
         partial: str,
+        response: str | None = None,
     ) -> AsyncIterator[list[Any]]:
         """Yield each page's ``nodes`` of one Linear connection, following cursors.
 
         ``connection`` picks the connection object out of a response's data.
         The query must take ``$after`` (omitted on the first page; GraphQL
         treats it as null) and select ``pageInfo { hasNextPage endCursor }``.
-        A malformed page, a missing/repeated cursor, or more than
-        ``LINEAR_POLL_MAX_PAGES`` pages raises: callers never see a partial
-        list presented as complete.
+        A malformed page (a missing/null connection, or a ``pageInfo`` or
+        ``hasNextPage`` that is absent or not the expected type), a
+        missing/repeated cursor, or more than ``LINEAR_POLL_MAX_PAGES`` pages
+        raises: callers never see a partial list presented as complete.
+        ``response`` names the connection in the malformed-response errors
+        (defaults to ``what``).
         """
 
+        label = response or what
         variables = dict(variables)
         variables.pop("after", None)
         cursors: set[str] = set()
@@ -311,15 +337,18 @@ class LinearClient:
             data = await self._post(query, variables)
             page = connection(data)
             if not isinstance(page, dict):
-                raise LinearClientError(f"Linear {what} response was malformed")
+                raise LinearClientError(f"Linear {label} response was malformed")
             nodes = page.get("nodes", [])
             if not isinstance(nodes, list):
-                raise LinearClientError(f"Linear {what} response was malformed")
+                raise LinearClientError(f"Linear {label} response was malformed")
+            # The query selects pageInfo, so an absent or non-boolean
+            # hasNextPage is a malformed page, not a last page: treating it
+            # as the end would silently truncate the list to this page.
+            info = page.get("pageInfo")
+            if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+                raise LinearClientError(f"Linear {label} pageInfo was malformed")
             yield nodes
-            info = page.get("pageInfo") or {}
-            if not isinstance(info, dict):
-                raise LinearClientError(f"Linear {what} pageInfo was malformed")
-            if not info.get("hasNextPage"):
+            if not info["hasNextPage"]:
                 return
             after = info.get("endCursor")
             if not after or not isinstance(after, str) or after in cursors:
@@ -408,7 +437,7 @@ class LinearClient:
         async for nodes in self._paged_nodes(
             LINEAR_PROJECTS_QUERY,
             {},
-            lambda data: data.get("projects") or {},
+            lambda data: data.get("projects"),
             what="project",
             partial="project list",
         ):
@@ -427,10 +456,14 @@ class LinearClient:
         teams: set[str] = set()
 
         def team_states(data: dict[str, Any]) -> Any:
-            team = (data.get("issue") or {}).get("team") or {}
-            if team.get("id"):
-                teams.add(str(team["id"]))
-            return team.get("states") or {}
+            # A null or missing issue/team/states yields None, which the
+            # pager reports as malformed before anything is cached.
+            states = _team_states_connection(data)
+            if isinstance(states, dict):
+                team_id = data["issue"]["team"].get("id")
+                if team_id:
+                    teams.add(str(team_id))
+            return states
 
         nodes: list[Any] = []
         async for page in self._paged_nodes(

@@ -132,7 +132,7 @@ def test_shadow_full_poll_cycle_would_wake_but_performs_no_delivery_or_mutation(
 
     async def scenario() -> dict[str, Any]:
         linear_wire = RecordingGraphQL(
-            {"data": {"issues": {"nodes": [_linear_issue()]}}}
+            {"data": {"issues": {"nodes": [_linear_issue()], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
         )
         github_wire = RecordingGraphQL(
             {
