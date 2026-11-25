@@ -419,7 +419,9 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         raise ValueError("github.mcp_url is required for GitHub Enterprise Server; the default MCP server serves GitHub.com only")
     token_env = token_env_name(environ, profile.github_token_env)
     token_names = " or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
-    repository = str(getattr(config, "github_repository", "") or "")
+    # The same resolved repository the GitHub poller reads, so the builder
+    # never acts on a different repository than Harbor observes.
+    repository = profile.repository if profile.repository_owner else ""
     helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
     child_env = {"HARBOR_GITHUB_API_URL": rest_url}
     if repository:
@@ -441,6 +443,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "mcp": mcp,
         "sandbox_hosts": hosts,
         "linear_sandbox_warning": linear_warning,
+        "repository": repository,
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
         ),
@@ -486,7 +489,7 @@ async def _doctor(project_name: str) -> int:
             print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
         else:
             print(f"GitHub transport: {github['transport']} · {where} · no token: set {github['token_names']}")
-            if getattr(config, "github_repository", ""):
+            if github["repository"]:
                 scope_ok = False
         if github["sandbox_hosts"] is not None:
             from harbor.runner.claude import sandbox_domains

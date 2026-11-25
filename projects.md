@@ -16,3 +16,11 @@ these endpoint columns, a non-empty cell wins over the same setting in the
 project's pipeline, and an empty cell is ignored: Harbor uses the pipeline's
 value, then the default (`https://api.linear.app/graphql` or
 `https://api.github.com/graphql`).
+
+The GitHub columns `github_repository` (alias `github_repo`), `required_checks`
+(alias `ci_required_checks`, a list such as `[CI, "Lint, typecheck"]`) and
+`bot_rework_cap` follow the same rule: a non-empty cell wins over the pipeline,
+an empty cell is ignored, and then the pipeline's value or the default applies.
+Every consumer (the builder's `HARBOR_GITHUB_REPOSITORY`, the GitHub poller,
+PR-event processing, `harbor workflow check` and `harbor doctor`) reads the
+resolved value, so they always name the same repository and checks.

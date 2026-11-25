@@ -28,6 +28,7 @@ from .pipeline import (
     DEFAULT_SKILL,
     DEFAULT_WORKTREE_ROOT,
     PipelineConfig,
+    _int as _pipeline_int,
     load_projects,
     parse_pipeline_markdown as parse_pipeline_settings,
 )
@@ -412,6 +413,36 @@ class ProjectConfig:
         return cls.from_pipeline(name, Path(path), **overrides)
 
 
+def _resolve_registry_github(overrides: dict[str, object]) -> None:
+    """Normalize the registry's GitHub columns in place.
+
+    Precedence for ``github_repository``, ``required_checks`` and
+    ``bot_rework_cap`` is registry -> pipeline -> default, the same as the
+    endpoint columns: a non-empty registry cell wins, and an empty cell is
+    dropped so it never blanks the pipeline's value.  Registry cells are raw
+    strings, so they are parsed the way the pipeline parses them; otherwise
+    ``[CI, tests]`` would become a tuple of characters.
+    """
+
+    for key, aliases in (
+        ("github_repository", ("github_repository", "github_repo")),
+        ("required_checks", ("required_checks", "ci_required_checks")),
+        ("bot_rework_cap", ("bot_rework_cap",)),
+    ):
+        value = next(
+            (overrides[alias] for alias in aliases if str(overrides.get(alias) or "").strip()),
+            None,
+        )
+        if value is None:
+            overrides.pop(key, None)
+        elif key == "required_checks":
+            overrides[key] = _split_list(value)  # type: ignore[arg-type]
+        elif key == "bot_rework_cap":
+            overrides[key] = _pipeline_int(value, DEFAULT_BOT_REWORK_CAP)
+        else:
+            overrides[key] = str(value).strip()
+
+
 def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
     """Resolve a named project, optionally from a local config root."""
 
@@ -489,6 +520,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                         break
                 else:
                     overrides.pop(key, None)
+            _resolve_registry_github(overrides)
             if "hold" in overrides and "hold_all" not in overrides:
                 overrides["hold_all"] = _as_bool(str(overrides["hold"]), True)
             overrides["repo_path"] = definition.repo_path

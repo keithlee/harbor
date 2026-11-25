@@ -198,6 +198,12 @@ Harbor uses `https://api.github.com/graphql`. A registry value goes through the
 same checks as a pipeline value, so a malformed one stops `harbor start` and
 fails `harbor doctor` for a Claude builder.
 
+`github_repository`, `required_checks` and `bot_rework_cap` use the same
+precedence: registry, then `.harbor/pipeline.md`, then the default, with an
+empty registry column ignored. The repository the REST helper targets
+(`HARBOR_GITHUB_REPOSITORY`) is the one Harbor's GitHub poller reads, in
+`harbor start`, `harbor poll`, `harbor doctor` and `harbor workflow check`.
+
 **`mcp` (opt-in, Claude builders only).** Harbor passes the Claude builder a
 GitHub MCP server and pre-approves only its tools; the Bash sandbox and its
 network allowlist are unchanged. The server runs outside the Bash sandbox. The

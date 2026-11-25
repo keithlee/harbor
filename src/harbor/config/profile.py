@@ -251,14 +251,7 @@ class PipelineProfile:
             if hasattr(project, name):
                 defaults[name] = getattr(project, name)
         profile = cls._from_project_files(project, path, defaults)
-        # A GitHub endpoint set in the project registry is explicit and wins
-        # over the pipeline file, as ``linear_api_url`` does; otherwise an
-        # Enterprise host set only in the registry would be replaced by the
-        # GitHub.com default without a word.
-        registry_url = str(getattr(project, "github_api_url", "") or "").strip()
-        if registry_url and registry_url != profile.github_api_url:
-            profile = replace(profile, github_api_url=registry_url)
-        return profile
+        return _apply_project_values(profile, project)
 
     @classmethod
     def _from_project_files(
@@ -272,6 +265,43 @@ class PipelineProfile:
                 if candidate.is_file():
                     return cls.from_markdown(candidate.read_text(encoding="utf-8"), defaults=defaults)
         return cls.from_markdown("", defaults=defaults)
+
+
+def _apply_project_values(profile: PipelineProfile, project: object) -> PipelineProfile:
+    """Let the project's resolved GitHub settings win over the pipeline parse.
+
+    A ``ProjectConfig`` already holds registry -> pipeline -> default for
+    ``github_repository``, ``required_checks``, ``bot_rework_cap`` and
+    ``github_api_url`` (an empty registry cell is ignored).  Re-reading the
+    pipeline file here must not undo that: the builder environment, the
+    supervisor's wake decider and the GitHub poller all have to see the same
+    repository, checks and cap.  A project value that is empty (or absent on
+    a duck-typed fake) leaves the pipeline file's value in place.
+    """
+
+    changes: dict[str, object] = {}
+    repository = str(getattr(project, "github_repository", "") or "").strip()
+    if repository:
+        owner, name = _repository_parts(repository)
+        if name:
+            changes["repository_owner"] = owner
+            changes["repository_name"] = name
+    checks = _split_list(getattr(project, "required_checks", None))  # type: ignore[arg-type]
+    if checks:
+        changes["required_checks"] = checks
+    if hasattr(project, "bot_rework_cap"):
+        try:
+            changes["bot_rework_cap"] = max(0, int(getattr(project, "bot_rework_cap")))
+        except (TypeError, ValueError):
+            pass
+    # A GitHub endpoint set in the project registry is explicit and wins over
+    # the pipeline file, as ``linear_api_url`` does; otherwise an Enterprise
+    # host set only in the registry would be replaced by the GitHub.com
+    # default without a word.
+    url = str(getattr(project, "github_api_url", "") or "").strip()
+    if url:
+        changes["github_api_url"] = url
+    return replace(profile, **changes) if changes else profile  # type: ignore[arg-type]
 
 
 def parse_pipeline_profile(
