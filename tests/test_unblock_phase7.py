@@ -401,7 +401,7 @@ def test_linear_progress_primitives_write_comment_and_nonterminal_state_only():
             return httpx.Response(200, json={"data": {"issue": {"id": "linear-42", "team": {
                 "id": "t", "name": "HAN", "states": {"nodes": [
                     {"id": "6876f9e0-76aa-4dac-ac4f-fabeceb1d54f", "name": "Blocked", "type": "started"},
-                ]}}}}})
+                ], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}})
         return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {"state": {"name": "Blocked"}}}}})
 
     async def exercise():

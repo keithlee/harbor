@@ -19,7 +19,7 @@ def run(coro):
 
 def test_console_lifecycle_commands_work_without_agents(tmp_path: Path) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     db = HarborDB(tmp_path / "harbor.db")
@@ -44,7 +44,7 @@ def test_console_lifecycle_commands_work_without_agents(tmp_path: Path) -> None:
 
 def test_console_banner_reports_live_and_shadow_mode(tmp_path: Path) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
@@ -64,7 +64,7 @@ def test_console_banner_reports_live_and_shadow_mode(tmp_path: Path) -> None:
 
 def test_retry_command_uses_the_supervisors_explicit_recovery_path(tmp_path: Path) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
@@ -93,7 +93,7 @@ def test_free_form_input_is_not_dispatched_in_phase_one(tmp_path: Path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
@@ -130,7 +130,7 @@ def test_status_renders_observed_tickets_and_never_backlog(tmp_path: Path) -> No
     ]
 
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     client = LinearClient(transport=httpx.MockTransport(handler))
@@ -176,7 +176,7 @@ def test_background_output_is_emitted_under_patch_stdout(tmp_path: Path, monkeyp
     monkeypatch.setattr(console_module, "patch_stdout", lambda *, raw=False: Patch(raw))
 
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
     db = HarborDB(tmp_path / "harbor.db")
