@@ -191,3 +191,125 @@ def test_dedupe_depends_on_the_receipt_ledger_surviving() -> None:
         assert len(posts) == 2, "this documents the failure mode, it is not desired behavior"
 
     asyncio.run(scenario())
+
+
+# Two Linear teams with the same workflow-state names but distinct ids.  Each
+# team owns its states, so "Blocked" for a TEAMB issue must resolve to TEAMB's
+# id even after TEAMA's states are already cached.
+TEAM_A_BLOCKED = "aaaaaaaa-0000-4000-8000-00000000000b"
+TEAM_A_REVIEW = "aaaaaaaa-0000-4000-8000-000000000001"
+TEAM_A_RELEASED = "aaaaaaaa-0000-4000-8000-00000000000d"
+TEAM_B_BLOCKED = "bbbbbbbb-0000-4000-8000-00000000000b"
+TEAM_B_REVIEW = "bbbbbbbb-0000-4000-8000-000000000001"
+TEAM_B_RELEASED = "bbbbbbbb-0000-4000-8000-00000000000d"
+
+
+def two_team_transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
+    teams = {
+        "A": ("team-a", [
+            {"id": TEAM_A_BLOCKED, "name": "Blocked", "type": "started"},
+            {"id": TEAM_A_REVIEW, "name": "Human Review", "type": "started"},
+            {"id": TEAM_A_RELEASED, "name": "Released", "type": "completed"},
+        ]),
+        "B": ("team-b", [
+            {"id": TEAM_B_BLOCKED, "name": "Blocked", "type": "started"},
+            {"id": TEAM_B_REVIEW, "name": "Human Review", "type": "started"},
+            {"id": TEAM_B_RELEASED, "name": "Released", "type": "completed"},
+        ]),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        issue = body["variables"]["issueId"]
+        team_id, nodes = teams[issue.split("-")[0][-1]]
+        if "HarborStates" in body["query"]:
+            return httpx.Response(200, json={"data": {"issue": {"id": issue, "team": {
+                "id": team_id, "name": team_id, "states": {"nodes": nodes}}}}})
+        state_id = body["variables"]["stateId"]
+        if state_id not in {node["id"] for node in nodes}:
+            # Linear refuses a state that belongs to another team.
+            return httpx.Response(200, json={"errors": [{"message": "Argument Validation Error"}]})
+        return httpx.Response(200, json={"data": {"issueUpdate": {"success": True, "issue": {
+            "id": issue, "identifier": issue, "state": {"id": state_id, "name": "Blocked", "type": "started"}}}}})
+
+    return httpx.MockTransport(handler)
+
+
+def test_a_state_name_resolves_against_the_issues_own_team_after_another_teams_cache_is_warm() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=two_team_transport(calls))
+        try:
+            await client.update_issue_state("TEAMA-1", "Blocked")
+            await client.update_issue_state("TEAMB-7", "Blocked")
+        finally:
+            await client.close()
+        mutations = [c["variables"]["stateId"] for c in calls if "HarborProgress" in c["query"]]
+        assert mutations == [TEAM_A_BLOCKED, TEAM_B_BLOCKED], "each issue must get its own team's state id"
+
+    asyncio.run(scenario())
+
+
+def test_another_teams_state_id_is_never_validated_from_the_cache() -> None:
+    """A UUID that belongs to team A is not a workflow state of a team-B issue."""
+
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=two_team_transport(calls))
+        try:
+            await client.update_issue_state("TEAMA-1", "Blocked")
+            with pytest.raises(LinearClientError, match="no Linear workflow state id"):
+                await client.update_issue_state("TEAMB-7", TEAM_A_BLOCKED)
+        finally:
+            await client.close()
+        assert [c["variables"]["stateId"] for c in calls if "HarborProgress" in c["query"]] == [TEAM_A_BLOCKED]
+
+    asyncio.run(scenario())
+
+
+def test_a_terminal_label_is_refused_per_team_after_another_teams_cache_is_warm() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=two_team_transport(calls))
+        try:
+            await client.update_issue_state("TEAMA-1", "Blocked")
+            with pytest.raises(ValueError, match="terminal"):
+                await client.update_issue_state("TEAMB-7", "Released")
+        finally:
+            await client.close()
+        assert sum("HarborProgress" in c["query"] for c in calls) == 1
+
+    asyncio.run(scenario())
+
+
+def test_one_lookup_serves_every_state_of_the_same_issue() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=two_team_transport(calls))
+        try:
+            await client.update_issue_state("TEAMB-7", "Human Review")
+            await client.update_issue_state("TEAMB-7", "Blocked")
+            await client.update_issue_state("TEAMA-1", "Blocked")
+            await client.update_issue_state("TEAMA-1", "Human Review")
+        finally:
+            await client.close()
+        assert sum("HarborStates" in c["query"] for c in calls) == 2, "one lookup per issue's team"
+
+    asyncio.run(scenario())
+
+
+def test_an_unknown_name_for_a_new_issue_costs_one_lookup_and_fails_closed() -> None:
+    async def scenario() -> None:
+        calls: list[dict[str, Any]] = []
+        client = LinearClient(token="k", transport=two_team_transport(calls))
+        try:
+            await client.update_issue_state("TEAMA-1", "Blocked")
+            with pytest.raises(LinearClientError, match="no Linear workflow state named"):
+                await client.update_issue_state("TEAMB-7", "Not A State")
+        finally:
+            await client.close()
+        assert sum("HarborStates" in c["query"] for c in calls) == 2
+        assert sum("HarborProgress" in c["query"] for c in calls) == 1
+
+    asyncio.run(scenario())

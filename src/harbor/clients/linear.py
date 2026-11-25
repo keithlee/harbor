@@ -146,8 +146,13 @@ class LinearClient:
     ) -> None:
         self.endpoint = endpoint
         self.token = resolve_token(token)
-        self._state_ids: dict[str, str] = {}
-        self._state_types: dict[str, str] = {}
+        # Workflow states belong to a Linear team, and different teams reuse
+        # the same names ("Blocked", "Human Review") with distinct ids.  Both
+        # maps are therefore scoped by team, and an issue is only looked up in
+        # the team its own state query reported.
+        self._issue_teams: dict[str, str] = {}
+        self._state_ids: dict[str, dict[str, str]] = {}
+        self._state_types: dict[str, dict[str, str]] = {}
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=timeout, transport=transport)
 
@@ -410,20 +415,39 @@ class LinearClient:
             projects.extend(dict(node) for node in nodes if isinstance(node, Mapping))
         return projects
 
-    async def _cache_team_states(self, issue_id: str) -> None:
-        """Load names and terminal types for the issue's owning Linear team."""
+    async def _cache_team_states(self, issue_id: str) -> str:
+        """Load names and terminal types for the issue's owning Linear team.
+
+        Returns the cache scope (the team id) the issue's states live under.
+        """
 
         # Read every page before touching the cache, so a failed lookup never
         # leaves a partial view of the team's workflow behind.
+        issue = str(issue_id)
+        teams: set[str] = set()
+
+        def team_states(data: dict[str, Any]) -> Any:
+            team = (data.get("issue") or {}).get("team") or {}
+            if team.get("id"):
+                teams.add(str(team["id"]))
+            return team.get("states") or {}
+
         nodes: list[Any] = []
         async for page in self._paged_nodes(
             LINEAR_STATES_QUERY,
-            {"issueId": str(issue_id)},
-            lambda data: ((data.get("issue") or {}).get("team") or {}).get("states") or {},
+            {"issueId": issue},
+            team_states,
             what="workflow state",
             partial="workflow state lookup",
         ):
             nodes.extend(page)
+        if len(teams) > 1:
+            raise LinearClientError(f"Linear workflow state pages for issue {issue} named more than one team")
+        # Without a team id the states can only be trusted for this one issue,
+        # so they are never shared with another issue's lookup.
+        scope = next(iter(teams)) if teams else f"issue:{issue}"
+        state_ids: dict[str, str] = {}
+        state_types: dict[str, str] = {}
         for node in nodes:
             if not isinstance(node, Mapping):
                 continue
@@ -431,8 +455,20 @@ class LinearClient:
             identifier = node.get("id")
             if label and identifier:
                 state_id = str(identifier)
-                self._state_ids[label.casefold()] = state_id
-                self._state_types[state_id] = str(node.get("type", "")).strip().casefold()
+                state_ids[label.casefold()] = state_id
+                state_types[state_id] = str(node.get("type", "")).strip().casefold()
+        self._state_ids[scope] = state_ids
+        self._state_types[scope] = state_types
+        self._issue_teams[issue] = scope
+        return scope
+
+    async def _team_scope(self, issue_id: str) -> tuple[str, bool]:
+        """Return the issue's cache scope and whether it was loaded just now."""
+
+        scope = self._issue_teams.get(str(issue_id))
+        if scope is not None:
+            return scope, False
+        return await self._cache_team_states(issue_id), True
 
     async def resolve_state_id(self, issue_id: str, name: str) -> str | None:
         """Resolve a workflow state name to its id for the issue's team."""
@@ -440,20 +476,23 @@ class LinearClient:
         wanted = str(name).strip().casefold()
         if not wanted:
             return None
-        cached = self._state_ids.get(wanted)
-        if cached is not None:
+        scope, fresh = await self._team_scope(issue_id)
+        cached = self._state_ids.get(scope, {}).get(wanted)
+        if cached is not None or fresh:
             return cached
-        await self._cache_team_states(issue_id)
-        return self._state_ids.get(wanted)
+        # A state added to the team since the cached lookup: refresh once.
+        scope = await self._cache_team_states(issue_id)
+        return self._state_ids.get(scope, {}).get(wanted)
 
     async def _resolve_state_type(self, issue_id: str, state_id: str) -> str | None:
         """Return the authoritative workflow type for a state id, if visible."""
 
-        cached = self._state_types.get(state_id)
-        if cached is not None:
+        scope, fresh = await self._team_scope(issue_id)
+        cached = self._state_types.get(scope, {}).get(state_id)
+        if cached is not None or fresh:
             return cached
-        await self._cache_team_states(issue_id)
-        return self._state_types.get(state_id)
+        scope = await self._cache_team_states(issue_id)
+        return self._state_types.get(scope, {}).get(state_id)
 
     async def update_issue_state(self, issue_id: str, state_id: str) -> dict[str, Any]:
         """Set a non-terminal Linear state by id/name.
