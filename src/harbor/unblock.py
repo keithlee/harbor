@@ -179,6 +179,13 @@ def _normalise_paths(value: Any) -> tuple[str, ...]:
     return tuple(item.replace("\\", "/").lstrip("./") for item in _paths(value))
 
 
+class TicketNotUnblockable(ValueError):
+    """The fresh ticket state rules out unblocking (stopped or still dependent).
+
+    An expected outcome, not a failure: callers record it without paging.
+    """
+
+
 @dataclass(frozen=True)
 class AuthoritySource:
     label: str
@@ -1120,7 +1127,7 @@ class UnblockLadder:
             # (``[states]`` in workflow.toml); those stop the ladder too.
             from harbor.ticket_states import is_stopped, workflow_states
             if fresh is None or is_stopped(fresh.get("state"), fresh.get("state_type"), workflow_states(self)):
-                raise ValueError("blocked ticket is no longer active")
+                raise TicketNotUnblockable("blocked ticket is no longer active")
             # Embedded clients may return partial context; absence cannot erase
             # an already observed dependency or PR attachment.
             for external, normalized in (("inverseRelations", "blocked_by"), ("attachments", "pr_urls")):
@@ -1128,7 +1135,7 @@ class UnblockLadder:
                     fresh.pop(normalized, None)
             ticket = {**ticket, **fresh}
         if ticket.get("blocked_by"):
-            raise ValueError("blocked ticket has unresolved dependencies")
+            raise TicketNotUnblockable("blocked ticket has unresolved dependencies")
         blocker_value = dict(blocker or _blocker(final))
         ticket_id = _identifier(ticket)
         run_id = _run_id(run)

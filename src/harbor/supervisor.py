@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -57,6 +58,9 @@ _MAX_NOTICE_CHARS = 300
 # follows it in a notice is not truncated out of _MAX_NOTICE_CHARS.
 _MAX_RESUME_REASON_CHARS = 160
 _RESUME_FAILURE_KEY = secrets.token_bytes(32)
+_LOG = logging.getLogger(__name__)
+# Receipt reason for a blocked run whose Linear blocker context was unprovable.
+_LINEAR_CONTEXT_REASON = "Linear blocker context unavailable"
 # A handoff whose PR Linear has not attached yet is re-checked on later polls
 # and escalated as unverified after this many polls.
 _HANDOFF_OBSERVATION_POLLS = 3
@@ -2925,7 +2929,7 @@ class Supervisor:
         except Exception as exc:
             from harbor.clients.linear import LinearClientError
             from harbor.first_mate import FirstMateError, FirstMateQuotaError
-            from harbor.recovery import defer_quota, recovery_schema
+            from harbor.recovery import defer_quota
             import time
             # Only a failed model invocation, or a Linear blocker context that
             # could not be read or proven complete, gets an automatic triage
@@ -2934,16 +2938,37 @@ class Supervisor:
             connection = getattr(self.db, "connection", None)
             if isinstance(exc, FirstMateQuotaError) and connection is not None and run_id:
                 defer_quota(connection, "triage:" + run_id, exc.provider, exc.reset, time.time())
-            elif isinstance(exc, (FirstMateError, LinearClientError)) and connection is not None and run_id and self.blocker_policy.retry_delays:
-                reason = "Linear blocker context unavailable" if isinstance(exc, LinearClientError) else "First Mate invocation failed"
-                recovery_schema(connection)
-                with connection:
-                    connection.execute("INSERT OR IGNORE INTO recovery_receipts(run_id,next_retry,last_reason) VALUES (?,?,?)", ("triage:" + run_id, time.time() + self.blocker_policy.retry_delays[0], reason))
+            elif isinstance(exc, (FirstMateError, LinearClientError)) and run_id:
+                self._schedule_triage_retry(
+                    run_id, _LINEAR_CONTEXT_REASON if isinstance(exc, LinearClientError) else "First Mate invocation failed"
+                )
             # A malformed blocked final must not stop source polling.  The
             # literal error remains visible in /status for operator action.
             self.last_error = str(exc)
             if isinstance(exc, LinearClientError):
                 await self._notify_blocker_context_failure(self._ticket_key(wake.ticket), run_id, exc)
+
+    def _schedule_triage_retry(self, run_id: str, reason: str) -> None:
+        """Queue a bounded triage replay of a blocked run (see _retry_stopped_builders).
+
+        The receipt's ``last_reason`` always holds the latest real cause:
+        ``claim_retry`` rewrites it with the synthetic ``unexpected_exit`` on
+        each replay, so a failed replay writes the cause back.
+        """
+
+        import time
+        from harbor.recovery import recovery_schema
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not self.blocker_policy.retry_delays:
+            return
+        recovery_schema(connection)
+        with connection:
+            connection.execute(
+                "INSERT INTO recovery_receipts(run_id,next_retry,last_reason) VALUES (?,?,?) "
+                "ON CONFLICT(run_id) DO UPDATE SET last_reason=excluded.last_reason",
+                ("triage:" + run_id, time.time() + self.blocker_policy.retry_delays[0], reason),
+            )
 
     async def _notify_blocker_context_failure(self, identifier: str, run_id: Any, exc: Exception) -> None:
         """Tell the operator, once per run and error, that triage could not start."""
@@ -3744,12 +3769,17 @@ class Supervisor:
                 if not claim_quota_retry(connection, row["id"], time.time(), triage=triage_quota):
                     continue
             elif not claim_retry(connection, retry_row, self.blocker_policy, time.time()):
-                receipt = connection.execute("SELECT attempts,notified FROM recovery_receipts WHERE run_id=?", (retry_row["id"],)).fetchone()
+                receipt = connection.execute("SELECT attempts,notified,last_reason FROM recovery_receipts WHERE run_id=?", (retry_row["id"],)).fetchone()
                 if receipt and receipt[0] >= len(self.blocker_policy.retry_delays) and not receipt[1]:
-                    next_step = "Triage could not finish (First Mate or the Linear blocker context failed); inspect the failure and answer the blocker." if triage_retry else f"Inspect the retained session; /retry {identifier} is an explicit override."
+                    linear_cause = triage_retry and receipt[2] == _LINEAR_CONTEXT_REASON
+                    next_step = ("Harbor could not verify the ticket's Linear blocker context; check the ticket in Linear and answer the blocker." if linear_cause
+                                 else "First Mate could not finish triage; inspect its failure and answer the blocker." if triage_retry
+                                 else f"Inspect the retained session; /retry {identifier} is an explicit override.")
                     notified = await self._notify_operator(f"recovery-exhausted:{retry_row['id']}", f"{identifier}: automatic recovery exhausted after {receipt[0]} attempts. {next_step}")
                     if triage_retry:
-                        self.db.record_escalation(identifier, row["id"], "env_blocker", "First Mate retries exhausted; how should this blocker be resolved?", 2, status="open", reason=next_step)
+                        question = ("Linear blocker context retries exhausted; how should this blocker be resolved?" if linear_cause
+                                    else "First Mate retries exhausted; how should this blocker be resolved?")
+                        self.db.record_escalation(identifier, row["id"], "env_blocker", question, 2, status="open", reason=next_step)
                     if notified:
                         with connection:
                             connection.execute("UPDATE recovery_receipts SET notified=1 WHERE run_id=?", (retry_row["id"],))
@@ -3879,11 +3909,27 @@ class Supervisor:
                 value = ladder.handle(tickets[identifier], run, final)
                 self.last_unblock = await value if inspect.isawaitable(value) else value
             except Exception as exc:
-                # One ticket's failure (for example an unprovable Linear
-                # blocker context) must not stop start() from reaching
+                # One ticket's failure must not stop start() from reaching
                 # RUNNING and polling every other ticket.
-                self.last_error = str(exc)
-                await self._notify_blocker_context_failure(identifier, run.get("id"), exc)
+                from harbor.clients.linear import LinearClientError
+                from harbor.unblock import TicketNotUnblockable
+                self.last_error = f"{identifier}: {exc}"
+                run_id = str(run.get("id") or "")
+                if isinstance(exc, LinearClientError):
+                    if run_id:
+                        self._schedule_triage_retry(run_id, _LINEAR_CONTEXT_REASON)
+                    await self._notify_blocker_context_failure(identifier, run_id, exc)
+                elif isinstance(exc, TicketNotUnblockable):
+                    # Expected: the ticket was stopped or still has a blocking
+                    # dependency.  Recorded, not paged on every restart.
+                    _LOG.info("startup blocker retry skipped for %s: %s", identifier, exc)
+                else:
+                    _LOG.exception("startup blocker retry failed for %s", identifier)
+                    await self._notify_operator(
+                        f"startup-blocker-retry:{identifier}:{run_id}:{type(exc).__name__}:{exc}",
+                        f"{identifier}: could not retry deterministic blocker for run {run_id or 'unknown'}: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
                 continue
             retried.append(identifier)
         return retried

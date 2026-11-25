@@ -270,3 +270,204 @@ def test_blocked_final_with_unprovable_context_notifies_once_and_schedules_bound
         "SELECT attempts,last_reason FROM recovery_receipts WHERE run_id='triage:logical'").fetchone()
     assert receipt is not None and receipt[0] == 0 and "Linear" in receipt[1]
     db.close()
+
+
+def _startup_scenario(tmp_path, ladder_factory, notifier):
+    """Run ``start()`` with two retained blocked runs carrying a deterministic blocker."""
+    from harbor.poll.linear_poller import PollResult
+
+    class Poller:
+        project_name = "mock"
+        config = SimpleNamespace()
+
+        def __init__(self):
+            self.calls = 0
+
+        async def poll(self):
+            self.calls += 1
+            return PollResult((), f"snapshot-{self.calls}", False, ())
+
+    async def scenario():
+        db = HarborDB(tmp_path / "ledger.sqlite")
+        apply_phase3_migration(db)
+        apply_phase4_migration(db)
+        db.replace_tickets("mock", [
+            {"identifier": "MOCK-1", "title": "One", "state": "Blocked", "owned": True, "hold": False},
+            {"identifier": "MOCK-2", "title": "Two", "state": "Blocked", "owned": True, "hold": False},
+        ])
+        final = json.dumps({"status": "blocked", "blocker": {
+            "kind": "env_blocker", "question": "Linear connector requires approval"}})
+        for run_id, ticket, finished in (("run-1", "MOCK-1", "2026-09-05T02:00:00+00:00"),
+                                         ("run-2", "MOCK-2", "2026-09-05T01:00:00+00:00")):
+            db.connection.execute(
+                "INSERT INTO runs(id,ticket,role,status,final_json,finished_at) VALUES (?,?,'builder','blocked',?,?)",
+                (run_id, ticket, final, finished))
+        db.connection.commit()
+        ladder, cleanup = ladder_factory(db)
+        poller = Poller()
+        supervisor = Supervisor(poller, db=db, unblock_ladder=ladder, notifier=notifier)
+        try:
+            await supervisor.start()
+            state = supervisor.lifecycle
+            receipts = db.connection.execute(
+                "SELECT run_id,last_reason FROM recovery_receipts ORDER BY run_id").fetchall() \
+                if db.connection.execute("SELECT 1 FROM sqlite_master WHERE name='recovery_receipts'").fetchone() else []
+        finally:
+            await supervisor.stop()
+            await cleanup()
+            db.close()
+        return state, poller.calls, [tuple(row) for row in receipts]
+
+    return asyncio.run(scenario())
+
+
+def test_startup_does_not_report_a_stopped_ticket_as_a_linear_failure(tmp_path):
+    """A complete context for a Canceled ticket is an expected outcome, not a Linear fault."""
+    from harbor.supervisor import Lifecycle
+
+    canceled = complete_issue()
+    canceled["state"] = {"name": "Canceled", "type": "canceled"}
+    good = complete_issue()
+    good["identifier"] = "MOCK-2"
+    queries, resumes = [], []
+
+    async def resumer(run_id, prompt):
+        resumes.append(run_id)
+        return True
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("deterministic blocker reached First Mate or remediation")
+
+    def factory(db):
+        linear = per_ticket_linear({"MOCK-1": canceled, "MOCK-2": good}, queries)
+        return (UnblockLadder(db, linear=linear, first_mate=forbidden, resumer=resumer,
+                              remediation_executor=forbidden), linear.close)
+
+    notifier = Notifier()
+    state, polls, receipts = _startup_scenario(tmp_path, factory, notifier)
+    assert state == Lifecycle.RUNNING and polls >= 1
+    assert resumes == ["run-2"]
+    assert all("Linear blocker context" not in message for message in notifier.messages), notifier.messages
+    assert notifier.messages == []  # expected outcome: recorded, not paged on every restart
+    assert receipts == []
+
+
+def test_startup_reports_a_non_linear_error_accurately_and_logs_it(tmp_path, caplog):
+    import logging
+    from harbor.supervisor import Lifecycle
+
+    handled = []
+
+    class Ladder:
+        def can_retry_deterministically(self, ticket, run_row, final):
+            return True
+
+        async def handle(self, ticket, run_row, final):
+            if ticket["identifier"] == "MOCK-1":
+                raise TypeError("unexpected keyword 'x'")
+            handled.append(ticket["identifier"])
+            return "resumed"
+
+    async def nothing():
+        return None
+
+    notifier = Notifier()
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        state, polls, receipts = _startup_scenario(tmp_path, lambda db: (Ladder(), nothing), notifier)
+    assert state == Lifecycle.RUNNING and polls >= 1
+    assert handled == ["MOCK-2"]
+    assert len(notifier.messages) == 1, notifier.messages
+    message = notifier.messages[0]
+    assert "MOCK-1" in message and "could not retry deterministic blocker" in message and "TypeError" in message
+    assert "Linear" not in message
+    assert any(record.exc_info and record.exc_info[0] is TypeError for record in caplog.records)
+    assert receipts == []
+
+
+def test_startup_linear_failure_schedules_bounded_triage_retry(tmp_path):
+    bad = mutate(complete_issue(), "labels", "null pageInfo")
+    good = complete_issue()
+    good["identifier"] = "MOCK-2"
+    queries = []
+
+    async def resumer(run_id, prompt):
+        return True
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("deterministic blocker reached First Mate or remediation")
+
+    def factory(db):
+        linear = per_ticket_linear({"MOCK-1": bad, "MOCK-2": good}, queries)
+        return (UnblockLadder(db, linear=linear, first_mate=forbidden, resumer=resumer,
+                              remediation_executor=forbidden), linear.close)
+
+    notifier = Notifier()
+    _, _, receipts = _startup_scenario(tmp_path, factory, notifier)
+    assert receipts == [("triage:run-1", "Linear blocker context unavailable")]
+    assert len(notifier.messages) == 1 and "Linear blocker context" in notifier.messages[0]
+
+
+def test_linear_context_triage_retry_is_bounded_and_escalates_with_its_cause(tmp_path):
+    """Replay through _retry_stopped_builders until exhaustion with retry_delays (0, 0)."""
+    from harbor.recovery import BlockerPolicy
+    from harbor.runner.base import apply_phase9_migration
+    from harbor.supervisor import Lifecycle
+
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    apply_phase9_migration(db)
+    ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "Color", "state": "In Progress",
+              "owned": True, "hold": False}
+    final = {"status": "blocked", "summary": "Need a color", "run_id": "run-1",
+             "blocker": {"kind": "product_decision", "question": "What button color?"}}
+    db.replace_tickets("mock", [ticket], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,session_id,deadline_seconds,final_json) VALUES (?,?,?,?,?,?,?)",
+        ("run-1", "MOCK-1", "blocked", str(tmp_path), "session-1", 60, json.dumps(final)))
+    db.connection.commit()
+    queries = []
+    linear = per_ticket_linear({"MOCK-1": mutate(complete_issue(), "inverseRelations", "missing pageInfo")}, queries)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("unprovable blocker context reached a model, resume or remediation")
+
+    class Dispatcher:
+        async def retry(self, *args):
+            raise AssertionError("builder must not be retried while its blocker is untriaged")
+
+    notifier = Notifier()
+    poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=BlockerPolicy((0, 0))))
+    supervisor = Supervisor(poller, db=db, dispatcher=Dispatcher(), notifier=notifier)
+    supervisor.unblock_ladder = UnblockLadder(db, linear=linear, first_mate=forbidden, resumer=forbidden,
+                                              remediation_executor=forbidden, repo_path=tmp_path)
+    supervisor.lifecycle = Lifecycle.RUNNING
+    supervisor.linear_healthy = True
+    supervisor._fleet_tickets = (ticket,)
+    wake = Wake(ticket=ticket, action="reengage", resume="run-1")
+
+    async def scenario():
+        try:
+            await supervisor._handle_runner_result(wake, final)
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                await supervisor._retry_stopped_builders()
+                await asyncio.gather(*list(supervisor._dispatch_tasks.values()))
+        finally:
+            await linear.close()
+
+    asyncio.run(scenario())
+    fetches = [query for query in queries if "HarborBlocker" in query]
+    assert len(fetches) == 3  # the original triage plus two bounded replays
+    assert all("mutation" not in query for query in queries)
+    context = [m for m in notifier.messages if "blocker context could not be verified" in m]
+    exhausted = [m for m in notifier.messages if "automatic recovery exhausted" in m]
+    assert len(context) == 1 and len(exhausted) == 1, notifier.messages
+    assert "Linear blocker context" in exhausted[0]
+    escalations = [row for row in db.escalations() if row["status"] == "open"]
+    assert len(escalations) == 1
+    assert escalations[0]["question"] == "Linear blocker context retries exhausted; how should this blocker be resolved?"
+    assert db.connection.execute(
+        "SELECT last_reason FROM recovery_receipts WHERE run_id='triage:run-1'").fetchone()[0] == \
+        "Linear blocker context unavailable"
+    db.close()
