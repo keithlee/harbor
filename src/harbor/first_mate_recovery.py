@@ -347,10 +347,16 @@ def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
 
 
 def latest_flag_id(connection) -> int | None:
-    """The newest watchdog flag id now, or ``None`` when it cannot be read."""
+    """The newest event id now, or ``None`` when it cannot be read.
+
+    Any flag committed before this read has an id at or below it, and any flag
+    written later has a higher one, so the newest id of any event is a valid
+    cutoff. It reads straight from the rowid instead of scanning every event
+    for the newest ``watchdog.flag`` on each poll.
+    """
 
     try:
-        row = connection.execute("SELECT MAX(id) FROM events WHERE event_type = 'watchdog.flag'").fetchone()
+        row = connection.execute("SELECT MAX(id) FROM events").fetchone()
     except Exception:
         return None
     return int(row[0]) if row and row[0] is not None else 0

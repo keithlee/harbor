@@ -733,6 +733,26 @@ def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path
         db.close()
 
 
+def test_flag_cutoff_is_the_newest_event_of_any_kind(tmp_path):
+    # The cutoff must not scan the ledger for the newest watchdog flag: a poll
+    # reads it every cycle and the events table only grows. The newest id of
+    # any event is an equally valid cutoff, read straight from the rowid.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    try:
+        flag(db, "HAN-86")
+        db.connection.execute(
+            "INSERT INTO events(project, identifier, event_type, payload_json, at) "
+            "VALUES ('SampleProject', 'HAN-86', 'ticket.observed', '{}', '2026-01-01T00:00:00+00:00')"
+        )
+        newest = db.connection.execute("SELECT MAX(id) FROM events").fetchone()[0]
+        assert recovery.latest_flag_id(db.connection) == newest
+        plan = " ".join(str(row) for row in db.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT MAX(id) FROM events").fetchall())
+        assert "SCAN" not in plan
+    finally:
+        db.close()
+
+
 # ---- #23 relies on a complete poll: absence must mean "left the polled states" ----
 
 def _filler(number):
