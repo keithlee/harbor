@@ -222,3 +222,46 @@ def test_empty_registry_cells_leave_every_pipeline_value_alone(tmp_path, monkeyp
     baseline = _settings(_project(tmp_path / "a", monkeypatch, {}, pipeline=PIPELINE))
     blank = _settings(_project(tmp_path / "b", monkeypatch, {column: "" for column in TYPED_COLUMNS}, pipeline=PIPELINE))
     assert blank == baseline
+
+
+# -- hold: ``shadow_hold`` is a hold alias, as in the pipeline parser ---------
+
+
+def test_a_registry_shadow_hold_true_holds_over_a_released_pipeline(tmp_path, monkeypatch) -> None:
+    config = _project(tmp_path, monkeypatch, {"shadow_hold": "true"}, pipeline="hold: false")
+    assert config.hold is True
+    assert config.hold_all is True
+
+
+def test_a_registry_shadow_hold_false_releases_a_pipeline_hold(tmp_path, monkeypatch) -> None:
+    config = _project(tmp_path, monkeypatch, {"shadow_hold": "false"}, pipeline="hold: true")
+    assert config.hold is False
+    assert config.hold_all is False
+
+
+def test_an_empty_registry_shadow_hold_cell_keeps_the_pipeline_value(tmp_path, monkeypatch) -> None:
+    assert _project(tmp_path, monkeypatch, {"shadow_hold": ""}, pipeline="hold: true").hold is True
+    monkeypatch.delenv("HARBOR_PROJECTS_FILE")
+    other = tmp_path / "released"
+    other.mkdir()
+    assert _project(other, monkeypatch, {"shadow_hold": ""}, pipeline="hold: false").hold is False
+
+
+@pytest.mark.parametrize("column", ["hold", "hold_all"])
+def test_registry_hold_and_hold_all_win_over_registry_shadow_hold(tmp_path, monkeypatch, column) -> None:
+    # Pipeline alias order: hold > hold_all > shadow_hold.
+    config = _project(tmp_path, monkeypatch, {column: "false", "shadow_hold": "true"}, pipeline="hold: true")
+    assert config.hold is False
+
+
+def test_registry_shadow_hold_applies_when_hold_cells_are_empty(tmp_path, monkeypatch) -> None:
+    config = _project(
+        tmp_path, monkeypatch, {"hold": "", "hold_all": "", "shadow_hold": "true"}, pipeline="hold: false"
+    )
+    assert config.hold is True
+
+
+@pytest.mark.parametrize("text", ["maybe", "ture", "2"])
+def test_an_unrecognized_registry_shadow_hold_fails_closed(tmp_path, monkeypatch, text) -> None:
+    with pytest.raises(ValueError, match=rf"SampleProject: registry shadow_hold must be true or false .*, got '{text}'"):
+        _project(tmp_path, monkeypatch, {"shadow_hold": text}, pipeline="hold: false")
