@@ -2929,25 +2929,50 @@ class Supervisor:
             # Triage completed: nothing is left to replay.
             self._clear_triage_retry(run_id)
         except Exception as exc:
-            from harbor.first_mate import FirstMateError, FirstMateQuotaError
-            from harbor.recovery import defer_quota
-            import time
-            # Only a failed model invocation gets an automatic triage retry
-            # here; an unreadable blocker context is handled (and retried) by
-            # _report_unblock_failure.  Explicit task cancellation is a
-            # BaseException and bypasses this.
-            connection = getattr(self.db, "connection", None)
-            if isinstance(exc, FirstMateQuotaError) and connection is not None and run_id:
-                defer_quota(connection, "triage:" + run_id, exc.provider, exc.reset, time.time())
-            elif isinstance(exc, FirstMateError) and run_id:
-                self._schedule_triage_retry(run_id, "First Mate invocation failed")
             # A malformed blocked final must not stop source polling.  The
             # literal error remains visible in /status for operator action.
             self.last_error = str(exc)
-            if not isinstance(exc, FirstMateError):
+            if not self._retry_first_mate_failure(run_id, exc):
                 await self._report_unblock_failure(
                     self._ticket_key(wake.ticket), run_id, exc, action="handle the blocked result"
                 )
+        except BaseException as exc:
+            self._end_cancelled_triage(run_id, exc)
+            raise
+
+    def _retry_first_mate_failure(self, run_id: Any, exc: BaseException) -> bool:
+        """Give a failed First Mate invocation its automatic triage retry.
+
+        A usage limit defers until the provider resets; any other First Mate
+        failure schedules the bounded ``triage:`` replay.  Returns whether
+        ``exc`` was a First Mate failure.
+        """
+
+        from harbor.first_mate import FirstMateError, FirstMateQuotaError
+        from harbor.recovery import defer_quota
+        import time
+
+        if not isinstance(exc, FirstMateError):
+            return False
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if isinstance(exc, FirstMateQuotaError):
+            if connection is not None and run_id:
+                try:
+                    defer_quota(connection, "triage:" + str(run_id), exc.provider, exc.reset, time.time())
+                except sqlite3.OperationalError as error:
+                    _LOG.error("could not defer triage for run %s", run_id, exc_info=error)
+                    self.last_error = f"triage quota deferral failed: {error}"
+        elif run_id:
+            self._schedule_triage_retry(str(run_id), "First Mate invocation failed")
+        return True
+
+    def _end_cancelled_triage(self, run_id: Any, exc: BaseException) -> None:
+        """A cancellation after triage's decision ends the replay; one before it keeps it."""
+
+        from harbor.unblock import triage_ran
+
+        if triage_ran(exc):
+            self._clear_triage_retry(run_id)
 
     async def _report_unblock_failure(self, identifier: str, run_id: Any, exc: Exception, *, action: str) -> None:
         """Log, notify and keep or end the triage retry for a failed unblock.
@@ -3014,13 +3039,19 @@ class Supervisor:
                 f"{identifier}: could not {action} for run {run_text or 'unknown'}: {type(exc).__name__}: {exc}",
             )
 
-    def _receipt_write(self, sql: str, params: tuple[Any, ...]) -> None:
-        """Run one write on recovery_receipts; a missing table means nothing was scheduled."""
+    def _receipt_write(self, sql: str, params: tuple[Any, ...], *, create: bool = False) -> None:
+        """Run one write on recovery_receipts; a missing table means nothing was scheduled.
+
+        ``create`` makes the table first (for a write that adds a receipt).
+        """
 
         connection = getattr(self.db, "connection", None) if self.db is not None else None
         if connection is None:
             return
         try:
+            if create:
+                from harbor.recovery import recovery_schema
+                recovery_schema(connection)
             with connection:
                 connection.execute(sql, params)
         except sqlite3.OperationalError as exc:
@@ -3028,7 +3059,7 @@ class Supervisor:
                 return
             # A locked or broken ledger must not silently leave (or drop) a
             # receipt that decides whether triage is replayed.
-            _LOG.error("could not update triage retry receipt %s", params[-1], exc_info=exc)
+            _LOG.error("could not update triage retry receipt (%s)", sql.split()[0], exc_info=exc)
             self.last_error = f"triage retry receipt update failed: {exc}"
 
     def _triage_retry_pending(self, run_id: Any) -> bool:
@@ -3039,8 +3070,14 @@ class Supervisor:
             return connection.execute(
                 "SELECT 1 FROM recovery_receipts WHERE run_id=?", ("triage:" + str(run_id),)
             ).fetchone() is not None
-        except sqlite3.OperationalError:
-            return False  # no recovery_receipts table yet
+        except sqlite3.OperationalError as exc:
+            if str(exc).startswith("no such table"):
+                return False  # nothing has been scheduled yet
+            # Fail safe: an unreadable ledger must not let startup replay a
+            # triage that the poll may already own.
+            _LOG.error("could not read triage retry receipt for run %s", run_id, exc_info=exc)
+            self.last_error = f"triage retry receipt read failed: {exc}"
+            return True
 
     def _clear_triage_retry(self, run_id: Any) -> None:
         """End a pending ``triage:<run>`` replay once triage has run.
@@ -3079,18 +3116,15 @@ class Supervisor:
         """
 
         import time
-        from harbor.recovery import recovery_schema
 
-        connection = getattr(self.db, "connection", None) if self.db is not None else None
-        if connection is None or not self.blocker_policy.retry_delays:
+        if not run_id or not self.blocker_policy.retry_delays:
             return
-        recovery_schema(connection)
-        with connection:
-            connection.execute(
-                "INSERT INTO recovery_receipts(run_id,next_retry,last_reason) VALUES (?,?,?) "
-                "ON CONFLICT(run_id) DO UPDATE SET last_reason=excluded.last_reason",
-                ("triage:" + run_id, time.time() + self.blocker_policy.retry_delays[0], reason),
-            )
+        self._receipt_write(
+            "INSERT INTO recovery_receipts(run_id,next_retry,last_reason) VALUES (?,?,?) "
+            "ON CONFLICT(run_id) DO UPDATE SET last_reason=excluded.last_reason",
+            ("triage:" + run_id, time.time() + self.blocker_policy.retry_delays[0], reason),
+            create=True,
+        )
 
     async def _cleanup_merged_worktree(self, wake: Wake, result: Mapping[str, Any]) -> None:
         """Remove a ticket's worktree once Harbor has verified its merge.
@@ -4036,10 +4070,14 @@ class Supervisor:
                 # One ticket's failure must not stop start() from reaching
                 # RUNNING and polling every other ticket.
                 self.last_error = f"{identifier}: {exc}"
-                await self._report_unblock_failure(
-                    identifier, run.get("id"), exc, action="retry deterministic blocker"
-                )
+                if not self._retry_first_mate_failure(run.get("id"), exc):
+                    await self._report_unblock_failure(
+                        identifier, run.get("id"), exc, action="retry deterministic blocker"
+                    )
                 continue
+            except BaseException as exc:
+                self._end_cancelled_triage(run.get("id"), exc)
+                raise
             retried.append(identifier)
         return retried
 

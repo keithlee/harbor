@@ -1143,7 +1143,10 @@ class UnblockLadder:
         progress: dict[str, bool] = {}
         try:
             return await self._handle(ticket, run, final, blocker=blocker, progress=progress)
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException too: a replay cancelled after First Mate decided
+            # (e.g. while its comment write is in flight) must read as triaged,
+            # or the caller would keep the retry and repeat the decision.
             if progress.get("triage"):
                 try:
                     setattr(exc, _TRIAGE_RAN_ATTR, True)

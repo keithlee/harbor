@@ -1049,3 +1049,267 @@ def test_startup_skips_a_run_whose_triage_retry_is_pending(tmp_path):
     _startup_scenario(tmp_path, factory, notifier)
     assert handled == ["run-2"]
     assert notifier.messages == []
+
+
+class _Harness:
+    """A supervisor, a real ladder and LinearClient over MockTransport, one blocked run.
+
+    ``fm`` is "ok", "fail" or "quota"; ``hang`` names a request ("comment" or
+    "fetch") that blocks until cancelled, so a replay can be cancelled at a
+    chosen point.
+    """
+
+    def __init__(self, tmp_path, *, blocker=None, ladder_policy=None, prior_rung0=False):
+        from harbor.recovery import BlockerPolicy
+        from harbor.runner.base import apply_phase9_migration
+
+        self.tmp_path = tmp_path
+        self.fm = "ok"
+        self.hang = None
+        self.hanging = None
+        self.fetches = 0
+        self.mutations = []
+        self.prompts = []
+        self.notifier = Notifier()
+        self.ladder_policy = ladder_policy
+        self.db = HarborDB(tmp_path / "ledger.sqlite")
+        apply_phase3_migration(self.db)
+        apply_phase4_migration(self.db)
+        apply_phase9_migration(self.db)
+        self.ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "Color", "state": "In Progress",
+                       "owned": True, "hold": False}
+        self.final = {"status": "blocked", "summary": "Need a color", "run_id": "run-1",
+                      "blocker": blocker or {"kind": "product_decision", "question": "What button color?"}}
+        self.db.replace_tickets("mock", [self.ticket], emit_events=False)
+        self.db.connection.execute(
+            "INSERT INTO runs(id,ticket,role,status,worktree,session_id,deadline_seconds,final_json,finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("run-1", "MOCK-1", "builder", "blocked", str(tmp_path), "session-1", 60, json.dumps(self.final),
+             "2026-09-05T02:00:00+00:00"))
+        self.db.connection.commit()
+        if prior_rung0:
+            self.db.record_escalation("MOCK-1", "run-0", "env_blocker", "old", 0, status="superseded")
+        self.policy = BlockerPolicy((0, 0))
+        self.build()
+
+    def build(self):
+        from harbor.first_mate import FirstMateError, FirstMateQuotaError
+        from harbor.supervisor import Lifecycle
+
+        async def handler(request):
+            query = json.loads(request.content)["query"]
+            if "mutation" in query:
+                self.mutations.append("HarborComment" if "HarborComment" in query else "other")
+                if "HarborComment" in query and self.hang == "comment":
+                    self.hanging = asyncio.Event()
+                    await self.hanging.wait()
+                if "HarborComment" in query:
+                    return httpx.Response(200, json={"data": {"commentCreate": {"success": True, "comment": {
+                        "id": f"c{len(self.mutations)}", "body": "", "createdAt": "2026-09-05T00:00:00Z"}}}})
+                return httpx.Response(200, json={"data": {"issueUpdate": {"success": True}}})
+            if "HarborStates" in query:
+                return httpx.Response(200, json={"data": {"issue": {"id": "uuid-1", "team": {"id": "t1", "name": "T", "states": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"id": "s1", "name": "Blocked", "type": "started"},
+                              {"id": "s2", "name": "Human Review", "type": "started"}]}}}}})
+            self.fetches += 1
+            if self.hang == "fetch":
+                self.hanging = asyncio.Event()
+                await self.hanging.wait()
+            issue = complete_issue()
+            issue["description"] = "The button color must be blue."
+            issue["state"] = {"name": "In Progress", "type": "started"}
+            return httpx.Response(200, json={"data": {"issue": issue}})
+
+        self.linear = LinearClient(token="mock", transport=httpx.MockTransport(handler))
+
+        async def mate(prompt, **kwargs):
+            self.prompts.append(prompt)
+            if self.fm == "fail":
+                raise FirstMateError("First Mate was killed")
+            if self.fm == "quota":
+                raise FirstMateQuotaError(None)
+            return {"disposition": "resolve", "answer": "Use blue", "citation": "ticket:MOCK-1:1", "reason": "AC says blue."}
+
+        async def resume(run_id, prompt):
+            return True
+
+        class Dispatcher:
+            async def retry(self, *args):
+                raise AssertionError("builder must not be retried")
+
+        poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=self.policy))
+        self.supervisor = Supervisor(poller, db=self.db, dispatcher=Dispatcher(), notifier=self.notifier)
+        kwargs = {"policy": self.ladder_policy} if self.ladder_policy is not None else {}
+        self.supervisor.unblock_ladder = UnblockLadder(self.db, linear=self.linear, first_mate=mate, resumer=resume,
+                                                       repo_path=self.tmp_path, protected_paths=(), **kwargs)
+        self.supervisor.lifecycle = Lifecycle.RUNNING
+        self.supervisor.linear_healthy = True
+        self.supervisor._fleet_tickets = (self.ticket,)
+
+    async def blocked_final(self):
+        await self.supervisor._handle_runner_result(Wake(ticket=self.ticket, action="reengage", resume="run-1"), self.final)
+
+    async def poll(self, *, cancel=False):
+        await asyncio.sleep(0.01)
+        await self.supervisor._retry_stopped_builders()
+        tasks = list(self.supervisor._dispatch_tasks.values())
+        if cancel and tasks:
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if self.hanging is not None:
+                    break
+            assert self.hanging is not None, "the replay never reached the hanging request"
+            for task in tasks:
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def restart(self):
+        await self.linear.close()
+        self.hang = None
+        self.hanging = None
+        self.build()
+        await self.supervisor._retry_deterministic_blockers()
+
+    def receipts(self):
+        return [tuple(row) for row in self.db.connection.execute(
+            "SELECT run_id,attempts,last_reason FROM recovery_receipts")]
+
+    def comments(self):
+        return self.mutations.count("HarborComment")
+
+
+def test_replay_cancelled_after_first_mate_decided_is_not_replayed_after_restart(tmp_path):
+    """Review finding 1 (``fm_fail_cancel_restart``): a cancellation after the decision ends the retry."""
+    h = _Harness(tmp_path)
+
+    async def scenario():
+        try:
+            h.fm = "fail"
+            await h.blocked_final()
+            assert h.receipts()[0][0] == "triage:run-1"
+            h.fm, h.hang = "ok", "comment"
+            await h.poll(cancel=True)  # First Mate decided; the comment write is cancelled in flight
+            assert h.receipts() == []
+            await h.restart()
+            for _ in range(4):
+                await h.poll()
+        finally:
+            await h.linear.close()
+
+    asyncio.run(scenario())
+    assert len(h.prompts) == 2  # the failed call and the cancelled replay's decision; never a third
+    assert h.comments() == 1  # only the cancelled write; no repeat
+    h.db.close()
+
+
+def test_replay_cancelled_before_the_decision_keeps_the_retry(tmp_path):
+    h = _Harness(tmp_path)
+
+    async def scenario():
+        try:
+            h.fm = "fail"
+            await h.blocked_final()
+            h.fm, h.hang = "ok", "fetch"
+            await h.poll(cancel=True)  # cancelled while reading the blocker context
+            kept = h.receipts()
+            h.hang = None
+            for _ in range(3):
+                await h.poll()
+            return kept
+        finally:
+            await h.linear.close()
+
+    kept = asyncio.run(scenario())
+    assert [row[0] for row in kept] == ["triage:run-1"]
+    assert len(h.prompts) == 2  # the failed call, then one triage after the cancelled read
+    assert h.comments() == 1
+    assert h.receipts() == []
+    h.db.close()
+
+
+_PROTECTED_DETERMINISTIC = {"kind": "env_blocker", "question": "Linear connector requires approval",
+                            "touched_paths": ["src/harbor/clients/linear.py"]}
+
+
+def test_startup_first_mate_failure_gets_the_triage_retry(tmp_path):
+    """Review finding 2 (``startup_det_protected_fm_fail``)."""
+    from harbor.recovery import BlockerPolicy
+
+    h = _Harness(tmp_path, blocker=_PROTECTED_DETERMINISTIC,
+                 ladder_policy=BlockerPolicy((0, 0), unblock_attempts=1), prior_rung0=True)
+
+    async def scenario():
+        try:
+            h.fm = "fail"
+            await h.restart()
+            receipts = h.receipts()
+            h.fm = "ok"
+            for _ in range(4):
+                await h.poll()
+            return receipts
+        finally:
+            await h.linear.close()
+
+    receipts = asyncio.run(scenario())
+    assert receipts == [("triage:run-1", 0, "First Mate invocation failed")]
+    assert not [m for m in h.notifier.messages if "after triage" in m], h.notifier.messages
+    assert len(h.prompts) == 2  # the failed startup call, then one triage replayed by the poll
+    assert h.comments() == 1
+    assert h.receipts() == []
+    h.db.close()
+
+
+def test_startup_first_mate_quota_is_deferred(tmp_path):
+    """Review finding 2 (``startup_det_protected_fm_quota``)."""
+    from harbor.recovery import BlockerPolicy
+
+    h = _Harness(tmp_path, blocker=_PROTECTED_DETERMINISTIC,
+                 ladder_policy=BlockerPolicy((0, 0), unblock_attempts=1), prior_rung0=True)
+
+    async def scenario():
+        try:
+            h.fm = "quota"
+            await h.restart()
+        finally:
+            await h.linear.close()
+
+    asyncio.run(scenario())
+    assert [row[0] for row in h.db.connection.execute("SELECT run_id FROM quota_recovery")] == ["triage:run-1"]
+    assert not [m for m in h.notifier.messages if "after triage" in m], h.notifier.messages
+    h.db.close()
+
+
+class _Locked:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, *args):
+        import sqlite3
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_scheduling_a_retry_on_a_locked_ledger_does_not_raise(caplog):
+    """Review finding 3: the startup handler must not let a ledger error escape start()."""
+    import logging
+
+    supervisor = Supervisor(SimpleNamespace(project_name="mock", config=SimpleNamespace()))
+    supervisor.db = SimpleNamespace(connection=_Locked())
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        supervisor._schedule_triage_retry("run-1", "Linear blocker context unavailable")
+    assert "database is locked" in (supervisor.last_error or "")
+    assert any(record.exc_info for record in caplog.records)
+
+
+def test_pending_check_on_a_locked_ledger_fails_safe(caplog):
+    """Review finding 3: an unreadable ledger reads as pending, so startup does not replay triage."""
+    import logging
+
+    supervisor = Supervisor(SimpleNamespace(project_name="mock", config=SimpleNamespace()))
+    supervisor.db = SimpleNamespace(connection=_Locked())
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        assert supervisor._triage_retry_pending("run-1") is True
+    assert any(record.exc_info for record in caplog.records)
