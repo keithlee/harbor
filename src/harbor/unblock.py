@@ -197,12 +197,11 @@ _TRIAGE_RAN_ATTR = "_harbor_triage_ran"
 def triage_ran(exc: BaseException) -> bool:
     """Whether ``UnblockLadder.handle`` had begun triage when ``exc`` was raised.
 
-    "Triage" starts once every pre-decision read and check has passed (fresh
-    Linear context, scope, state, dependencies and changed-path inspection)
-    and the ladder moves on to a decision: a deterministic adapter,
-    remediation, First Mate, or an escalation.  An error raised before that
-    point leaves the blocked run untriaged; one raised after it means a
-    decision may already have been recorded or written.
+    Triage counts as run once the ladder has durably recorded a decision
+    (see ``UnblockLadder._decide``); every Linear write, resume and notice
+    follows that record.  An error or cancellation before it -- in the
+    pre-triage reads, remediation, First Mate or a workflow validator --
+    leaves the blocked run untriaged, so its retry is kept.
     """
 
     return bool(getattr(exc, _TRIAGE_RAN_ATTR, False))
@@ -1154,6 +1153,21 @@ class UnblockLadder:
                     pass  # an exception type without a __dict__ reads as untriaged
             raise
 
+    def _decide(self, progress: dict[str, bool], *args: Any, **kwargs: Any) -> Any:
+        """Record a triage decision and mark the run as triaged.
+
+        The mark follows the first durable decision: the ladder row for a
+        deterministic adapter, a remediation fix, a GitHub-transport
+        escalation, a rung-1 resolution or a rung-2 escalation.  Every Linear
+        write, resume and notice in ``_handle`` comes after one of these, so a
+        failure or cancellation before it (inside First Mate, remediation or
+        a workflow validator) leaves the run untriaged and its retry kept.
+        """
+
+        escalation = self._record(*args, **kwargs)
+        progress["triage"] = True
+        return escalation
+
     async def _handle(
         self,
         ticket: Mapping[str, Any],
@@ -1229,12 +1243,9 @@ class UnblockLadder:
             if not protected and self._prior_rung_zero(ticket_id, kind) < self.policy.unblock_attempts
             else None
         )
-        # Every pre-decision read and check has passed; from here on the
-        # ladder decides (adapter, remediation, First Mate, escalation).
-        progress["triage"] = True
         if adapter is not None:
             answer, citation, reason = adapter
-            escalation = self._record(ticket_id, run_id, kind, question, 0, citation=citation, answer=answer, status="resume_pending", reason=reason)
+            escalation = self._decide(progress, ticket_id, run_id, kind, question, 0, citation=citation, answer=answer, status="resume_pending", reason=reason)
             resumed, command = await self._resume(
                 ticket_id, run_id, answer=answer, citation=citation, reason=reason,
                 next_action=str(final.get("next_action") or ""),
@@ -1253,7 +1264,7 @@ class UnblockLadder:
             self._record(ticket_id, run_id, kind, question, 0, status="resume_pending", reason="deterministic remediation did not clear the blocker")
         if remediation.fixed:
             citation = f"deterministic:{remediation.plan.kind if remediation.plan else kind}"
-            escalation = self._record(ticket_id, run_id, kind, question or remediation.plan.reason, 0, citation=citation, answer=remediation.plan.reason if remediation.plan else "", status="resume_pending")
+            escalation = self._decide(progress, ticket_id, run_id, kind, question or remediation.plan.reason, 0, citation=citation, answer=remediation.plan.reason if remediation.plan else "", status="resume_pending")
             answer = remediation.plan.reason if remediation.plan else "deterministic remediation completed"
             resumed, command = await self._resume(ticket_id, run_id, answer=answer, citation=citation,
                                                  reason="deterministic remediation completed",
@@ -1283,7 +1294,7 @@ class UnblockLadder:
                 "GitHub CLI authentication is unavailable. Run `gh auth login --hostname github.com` "
                 "in the environment that starts Harbor before retrying this builder session."
             )
-            escalation = self._record(ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
+            escalation = self._decide(progress, ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
             escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
             label = f" (escalation #{escalation_id})" if escalation_id is not None else ""
             notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication{label}: {reason}")
@@ -1344,7 +1355,8 @@ class UnblockLadder:
             if any(receipt["blocking"] for receipt in receipts):
                 triage_result = TriageResult("escalate",reason="configured decision validator blocked resolution")
         if triage_result.resolved and triage_result.citation.strip() and triage_result.answer.strip():
-            escalation = self._record(
+            escalation = self._decide(
+                progress,
                 ticket_id,
                 run_id,
                 kind,
@@ -1399,8 +1411,8 @@ class UnblockLadder:
         # Record before any external write or notification: the row's id is
         # what the operator answers, and a failed notifier must never leave an
         # unanswerable park behind.
-        escalation = self._record(
-            ticket_id, run_id, kind, question, 2, status="open", reason=reason, searched=searched,
+        escalation = self._decide(
+            progress, ticket_id, run_id, kind, question, 2, status="open", reason=reason, searched=searched,
         )
         escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
         label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"

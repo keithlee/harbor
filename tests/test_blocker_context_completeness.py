@@ -1065,6 +1065,8 @@ class _Harness:
 
         self.tmp_path = tmp_path
         self.fm = "ok"
+        self.remedy = "ok"  # ok | fail | hang: the remediation executor's outcome
+        self.remedies = 0
         self.hang = None
         self.hanging = None
         self.fetches = 0
@@ -1123,8 +1125,18 @@ class _Harness:
 
         self.linear = LinearClient(token="mock", transport=httpx.MockTransport(handler))
 
+        async def executor(command):
+            self.remedies += 1
+            if self.remedy == "hang":
+                self.hanging = asyncio.Event()
+                await self.hanging.wait()
+            return self.remedy == "ok"
+
         async def mate(prompt, **kwargs):
             self.prompts.append(prompt)
+            if self.hang == "first_mate":
+                self.hanging = asyncio.Event()
+                await self.hanging.wait()
             if self.fm == "fail":
                 raise FirstMateError("First Mate was killed")
             if self.fm == "quota":
@@ -1142,7 +1154,8 @@ class _Harness:
         self.supervisor = Supervisor(poller, db=self.db, dispatcher=Dispatcher(), notifier=self.notifier)
         kwargs = {"policy": self.ladder_policy} if self.ladder_policy is not None else {}
         self.supervisor.unblock_ladder = UnblockLadder(self.db, linear=self.linear, first_mate=mate, resumer=resume,
-                                                       repo_path=self.tmp_path, protected_paths=(), **kwargs)
+                                                       repo_path=self.tmp_path, protected_paths=(),
+                                                       remediation_executor=executor, **kwargs)
         self.supervisor.lifecycle = Lifecycle.RUNNING
         self.supervisor.linear_healthy = True
         self.supervisor._fleet_tickets = (self.ticket,)
@@ -1313,3 +1326,60 @@ def test_pending_check_on_a_locked_ledger_fails_safe(caplog):
     with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
         assert supervisor._triage_retry_pending("run-1") is True
     assert any(record.exc_info for record in caplog.records)
+
+
+def test_replay_cancelled_inside_first_mate_keeps_the_retry_and_is_retriaged(tmp_path):
+    """Review round 8: a cancellation while First Mate is deciding has no durable effect."""
+    h = _Harness(tmp_path)
+
+    async def scenario():
+        try:
+            h.fm = "fail"
+            await h.blocked_final()
+            h.fm, h.hang = "ok", "first_mate"
+            await h.poll(cancel=True)  # /exit while First Mate is thinking
+            kept = h.receipts()
+            await h.restart()
+            for _ in range(4):
+                await h.poll()
+            return kept
+        finally:
+            await h.linear.close()
+
+    kept = asyncio.run(scenario())
+    assert [row[0] for row in kept] == ["triage:run-1"]
+    assert len(h.prompts) == 3  # failed, cancelled mid-decision, then the triage that completes
+    assert h.comments() == 1
+    assert h.receipts() == []
+    assert [(row["status"], row["rung_resolved"]) for row in h.db.escalations()] == [("resume_pending", 1)]
+    h.db.close()
+
+
+def test_replay_cancelled_inside_remediation_keeps_the_retry_and_is_retriaged(tmp_path):
+    """Review round 8: a cancellation while a remediation command runs has no durable decision."""
+    h = _Harness(tmp_path, blocker={"kind": "env_blocker", "question": "Error: Cannot find module 'left-pad'"})
+
+    async def scenario():
+        try:
+            h.remedy, h.fm = "fail", "fail"  # remediation fails, then First Mate fails: a retry is queued
+            await h.blocked_final()
+            first = h.receipts()
+            h.remedy, h.fm = "hang", "ok"
+            await h.poll(cancel=True)  # /exit while the remediation command runs
+            kept = h.receipts()
+            h.remedy = "ok"
+            await h.restart()
+            for _ in range(4):
+                await h.poll()
+            return first, kept
+        finally:
+            await h.linear.close()
+
+    first, kept = asyncio.run(scenario())
+    assert [row[0] for row in first] == ["triage:run-1"]
+    assert [row[0] for row in kept] == ["triage:run-1"]
+    assert h.remedies == 3  # failed, cancelled, then the remediation that fixes it
+    assert h.receipts() == []
+    statuses = [(row["status"], row["rung_resolved"], row["citation"]) for row in h.db.escalations()]
+    assert ("resume_pending", 0, "deterministic:missing_module") in statuses, statuses
+    h.db.close()
