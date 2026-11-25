@@ -3390,10 +3390,10 @@ class Supervisor:
                     self.linear_healthy = False
                     self.last_error = str(exc)
                 return None
-            if poll_sequence < self._published_poll:
-                return result
-            # Use request order, not the Linear snapshot hash: successive Linear
-            # responses can be identical while GitHub's head, CI or feedback moves.
+            # Numbering inside the lock makes this fetch the newest yet, so it
+            # always publishes. Use request order, not the Linear snapshot hash:
+            # successive Linear responses can be identical while GitHub's head,
+            # CI or feedback moves.
             self._published_poll = poll_sequence
             self.linear_healthy = True
             self.last_error = None
