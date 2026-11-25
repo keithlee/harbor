@@ -193,6 +193,11 @@ class ProjectConfig:
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     pipeline_path: Path | None = None
     registry_path: Path | None = None
+    # GitHub settings (``github_repository``, ``required_checks``,
+    # ``bot_rework_cap``) that a non-empty registry cell set.  Only these win
+    # over the pipeline file in ``PipelineProfile.from_project``; a value that
+    # came from the pipeline or a default leaves the profile's own parse alone.
+    registry_github_keys: frozenset[str] = frozenset()
     linear_api_url: str = DEFAULT_LINEAR_API_URL
     # GitHub GraphQL endpoint set in the project registry (``github_api_url``,
     # or its aliases ``github_graphql_url`` / ``github_endpoint``).  Empty
@@ -412,6 +417,46 @@ class ProjectConfig:
         return cls.from_pipeline(name, Path(path), **overrides)
 
 
+def _resolve_registry_github(name: str, overrides: dict[str, object]) -> frozenset[str]:
+    """Normalize the registry's GitHub columns in place; return the keys set.
+
+    Precedence for ``github_repository``, ``required_checks`` and
+    ``bot_rework_cap`` is registry -> pipeline -> default, the same as the
+    endpoint columns: a non-empty registry cell wins, and an empty cell is
+    dropped so it never blanks the pipeline's value.  Registry cells are raw
+    strings, so they are parsed here; otherwise ``[CI, tests]`` would become
+    a tuple of characters.  A ``bot_rework_cap`` that is not a non-negative
+    integer fails closed rather than silently replacing the pipeline's cap.
+    """
+
+    present: set[str] = set()
+    for key, aliases in (
+        ("github_repository", ("github_repository", "github_repo")),
+        ("required_checks", ("required_checks", "ci_required_checks")),
+        ("bot_rework_cap", ("bot_rework_cap", "bot_rework_rounds")),
+    ):
+        value = next(
+            (overrides[alias] for alias in aliases if str(overrides.get(alias) or "").strip()),
+            None,
+        )
+        if value is None:
+            overrides.pop(key, None)
+            continue
+        present.add(key)
+        if key == "required_checks":
+            overrides[key] = _split_list(value)  # type: ignore[arg-type]
+        elif key == "bot_rework_cap":
+            text = str(value).strip()
+            if not text.isdigit():
+                raise ValueError(
+                    f"Harbor project {name}: registry bot_rework_cap must be a non-negative integer, got {text!r}"
+                )
+            overrides[key] = int(text)
+        else:
+            overrides[key] = str(value).strip()
+    return frozenset(present)
+
+
 def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
     """Resolve a named project, optionally from a local config root."""
 
@@ -489,6 +534,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                         break
                 else:
                     overrides.pop(key, None)
+            registry_github_keys = _resolve_registry_github(definition.name, overrides)
             if "hold" in overrides and "hold_all" not in overrides:
                 overrides["hold_all"] = _as_bool(str(overrides["hold"]), True)
             overrides["repo_path"] = definition.repo_path
@@ -535,7 +581,11 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     f"Harbor project {definition.name} is missing its live pipeline: expected {expected}; "
                     "refusing to fall back to AGENTS.md"
                 )
-            return replace(ProjectConfig.from_pipeline(definition.name, pipeline, **overrides), registry_path=registry_path)
+            return replace(
+                ProjectConfig.from_pipeline(definition.name, pipeline, **overrides),
+                registry_path=registry_path,
+                registry_github_keys=registry_github_keys,
+            )
 
     if registry_loaded:
         raise ValueError(f"unknown Harbor project: {name}")

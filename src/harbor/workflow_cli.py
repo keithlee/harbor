@@ -49,8 +49,11 @@ async def fresh_context(config, db, ticket_id, run, event):
         ticket = normalize_issue(raw, hold_all=retained.get("hold", True))
         if not ticket:
             raise ValueError("ticket state unavailable")
-        processor = PREventProcessor(db, project=config.name, profile=config)
-        poller = GitHubPoller(github, profile=config, db=db, project=config.name, event_processor=processor)
+        # The same resolved profile the GitHub client uses (and `harbor poll`
+        # and `harbor start` use), so the workflow check reads the same
+        # repository and required checks.
+        processor = PREventProcessor(db, project=config.name, profile=profile)
+        poller = GitHubPoller(github, profile=profile, db=db, project=config.name, event_processor=processor)
         facts = await poller.poll([ticket])
         matches = [f for f in facts if f.get("url") == run.get("pr_url")] if run.get("pr_url") else facts
         if len(matches) != 1:
