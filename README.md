@@ -103,6 +103,28 @@ facts, worktree root, and SQLite custody. `linear_projects` widens one named
 project's Linear scope; it is not a way to combine unrelated repositories or
 workflows. Run one Harbor process per named repository.
 
+The table is one of three registry forms. Each project may instead be a
+heading section, or an entry in a YAML-style list (for example inside a fenced
+`yaml` code block). In the list form every field must be indented deeper than
+its entry's `-`; only scalar `key: value` fields are read, so this is not a
+full YAML parser.
+
+```md
+## SampleProject
+repo_path: ~/Projects/SampleProject
+pipeline_path: ~/Pipelines/sample-project.md
+linear_project_slug: sample-project-abc123
+linear_team: SAMPLE
+```
+
+```yaml
+- name: SampleProject
+  repo_path: ~/Projects/SampleProject
+  pipeline_path: ~/Pipelines/sample-project.md
+  linear_project_slug: sample-project-abc123
+  linear_team: SAMPLE
+```
+
 ## Verify and start
 
 From the Harbor checkout:

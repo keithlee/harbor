@@ -32,3 +32,7 @@ PR-event processing, `harbor workflow check` and `harbor doctor` all read that
 resolved value. The supervisor's bot-rework decision reads `bot_rework_cap`
 from the project configuration, which applies the same precedence and accepts
 the same spellings.
+
+Instead of the table, a registry may describe each project as a heading
+section or as a YAML-style list; see "Manual multi-project setup" in `README.md` for
+both forms. Keep this file free of entries.
