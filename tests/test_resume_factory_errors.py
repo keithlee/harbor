@@ -713,3 +713,148 @@ def test_overlapping_flushes_send_one_superseded_notice(tmp_path: Path) -> None:
         ledger.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_first", [False, True], ids=["fail-after-success", "fail-before-success"])
+def test_overlapping_retries_leave_no_stale_cause_once_a_builder_is_live(
+    tmp_path: Path, failure_first: bool
+) -> None:
+    """Two retries share the factory; the one that fails must not outlive the one that resumed."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "terminated")
+        resumed: list[str] = []
+
+        class Runner:
+            default_run_id = "run-1"
+
+            async def resume(self, run_id: str, prompt: str) -> dict[str, str]:
+                resumed.append(run_id)
+                return {"run_id": run_id, "status": "waiting", "summary": "ok"}
+
+        gates = {"fail": asyncio.Event(), "succeed": asyncio.Event()}
+        outcomes = iter(["fail", "succeed"])
+
+        async def factory(_wt: Any, _wake: Wake) -> Any:
+            outcome = next(outcomes)
+            await gates[outcome].wait()
+            if outcome == "fail":
+                raise ValueError("transient: provider CLI busy")
+            return Runner()
+
+        dispatcher.runner_factory = factory
+        retry_a = asyncio.create_task(dispatcher.retry("SAMPLE-42"))
+        await asyncio.sleep(0)
+        retry_b = asyncio.create_task(dispatcher.retry("SAMPLE-42"))
+        await asyncio.sleep(0)
+        order = ("fail", "succeed") if failure_first else ("succeed", "fail")
+        for name in order:
+            gates[name].set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+        results = await asyncio.gather(retry_a, retry_b, return_exceptions=True)
+        print(f"Retry outcomes: {results}")
+        print(f"Stored cause: {dispatcher.resume_unavailable_reason('SAMPLE-42')!r}")
+
+        assert resumed == ["run-1"], "exactly one retry resumes the builder"
+        assert isinstance(results[0], RuntimeError)
+        assert dispatcher.runners.get("SAMPLE-42") is not None, "retry B left a live builder"
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None, (
+            "a live builder must not be reported as unresumable"
+        )
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_superseded_notice_is_sent_on_the_next_flush(tmp_path: Path) -> None:
+    """stop() cancelling the poll task mid-send must not drop the retirement notice."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        sent: list[str] = []
+        hang = asyncio.Event()
+
+        async def notifier(text: str) -> None:
+            if not hang.is_set():
+                await asyncio.Event().wait()  # never returns: cancelled by stop()
+            sent.append(text)
+
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notifier)
+        supervisor._note_superseded_pr_event({"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "PR_CREATED"})
+        supervisor._note_superseded_pr_event(
+            {"ticket": "SAMPLE-43", "run_id": "run-9", "event_type": "NEW_COMMENT_VERSION"}
+        )
+        flush = asyncio.create_task(supervisor._notify_superseded_pr_events())
+        await asyncio.sleep(0)
+        flush.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await flush
+
+        hang.set()
+        await supervisor._notify_superseded_pr_events()
+        print(sent)
+        assert len(sent) == 2
+        assert "SAMPLE-42" in sent[0] and "risk-analysis request" in sent[0]
+        assert "SAMPLE-43" in sent[1] and "1 review comment" in sent[1]
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_overlapping_flush_then_failed_send_reports_every_retired_event(tmp_path: Path) -> None:
+    """A retried notice counts the events noted by an overlapping flush, not only the first."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        sent: list[str] = []
+        release = asyncio.Event()
+        failures = [RuntimeError("notifier offline")]
+
+        async def notifier(text: str) -> None:
+            await release.wait()
+            if failures:
+                raise failures.pop()
+            sent.append(text)
+
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notifier)
+        comment = {"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "NEW_COMMENT_VERSION"}
+        supervisor._note_superseded_pr_event(comment)
+        first = asyncio.create_task(supervisor._notify_superseded_pr_events())
+        await asyncio.sleep(0)
+        supervisor._note_superseded_pr_event(comment)
+        supervisor._note_superseded_pr_event(comment)
+        second = asyncio.create_task(supervisor._notify_superseded_pr_events())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        assert sent == []
+
+        await supervisor._notify_superseded_pr_events()
+        print(sent)
+        assert len(sent) == 1 and "3 review comments" in sent[0]
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_single_retired_event_notice_uses_singular_wording(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        supervisor._note_superseded_pr_event({"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "PR_CREATED"})
+        supervisor._note_superseded_pr_event(
+            {"ticket": "SAMPLE-43", "run_id": "run-9", "event_type": "NEW_COMMENT_VERSION"}
+        )
+        supervisor._note_superseded_pr_event(
+            {"ticket": "SAMPLE-43", "run_id": "run-9", "event_type": "NEW_COMMENT_VERSION"}
+        )
+        await supervisor._notify_superseded_pr_events()
+        print(notices)
+        assert "; it was not handed to the current builder" in notices[0]
+        assert "they were" not in notices[0]
+        assert "; they were not handed to the current builder" in notices[1]
+        ledger.close()
+
+    asyncio.run(scenario())

@@ -255,6 +255,9 @@ class WorktreeDispatcher:
     def _clear_resume_error(self, identifier: str) -> None:
         self._resume_errors.pop(identifier.casefold(), None)
 
+    def _live_runner_key(self, identifier: str) -> str | None:
+        return next((key for key in self.runners if str(key).casefold() == identifier.casefold()), None)
+
     def _in_scope(self, value: Any) -> bool:
         """Check one ticket identifier against this invocation's custody scope."""
 
@@ -599,10 +602,7 @@ class WorktreeDispatcher:
         # a live handle exists, the worktree is gone, or this attempt reaches
         # the factory.  An early return (e.g. a terminal row hydrated without
         # recover_terminal) is not an attempt and keeps the diagnostic.
-        existing_key = next(
-            (key for key in self.runners if str(key).casefold() == identifier.casefold()),
-            None,
-        )
+        existing_key = self._live_runner_key(identifier)
         if existing_key is not None:
             self._clear_resume_error(identifier)
             return self.runners.get(existing_key)
@@ -666,8 +666,16 @@ class WorktreeDispatcher:
             ).hexdigest()
             if len(reason) > _MAX_RESUME_REASON_CHARS:
                 reason = reason[: _MAX_RESUME_REASON_CHARS - 1] + "…"
-            self._resume_errors[identifier.casefold()] = _ResumeFailure(row["id"], reason, fingerprint)
+            # Hydrate runs outside the execution lock, so an overlapping
+            # attempt (operator /retry beside the recovery scheduler) may have
+            # installed a live builder while this factory call was failing.
+            # A live builder is resumable: this cause no longer describes it.
+            if self._live_runner_key(identifier) is None:
+                self._resume_errors[identifier.casefold()] = _ResumeFailure(row["id"], reason, fingerprint)
             return None
+        # The factory can rebuild this builder: a cause stored by an
+        # overlapping attempt that failed while this call was in flight is stale.
+        self._clear_resume_error(identifier)
         if not self._run_is_current(identifier, row["id"]):
             return None
         return (worktree, runner) if runner is not None else None
@@ -796,6 +804,9 @@ class WorktreeDispatcher:
             # Each factory failure is a new record: cite only one this retry produced.
             if failure is not None and failure is not prior:
                 raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {failure.reason}")
+            if self._live_runner_key(identifier) is not None:
+                # An overlapping retry rebuilt and resumed the builder first.
+                raise RuntimeError(f"a retry is already active for {identifier}")
             raise RuntimeError(
                 f"retained builder for {identifier} cannot attach its existing worktree"
             )
@@ -1232,6 +1243,9 @@ class Supervisor:
         self._attempt_resume_failures: dict[str, _ResumeFailure] = {}
         # PR event types retired this poll, per (ticket, superseded run id).
         self._superseded_pr_events: dict[tuple[str, str], list[str]] = {}
+        # Superseded-run notices whose send is in flight, so an overlapping
+        # flush leaves their queued entry to the send that owns it.
+        self._superseded_pr_sends: set[tuple[str, str]] = set()
         # Handoffs reported before Linear attached their PR, keyed by ticket.
         self._pending_handoffs: dict[str, dict[str, Any]] = {}
         # Ledger handoffs (run id + finish time) already checked by this
@@ -3253,22 +3267,37 @@ class Supervisor:
         )
 
     async def _notify_superseded_pr_events(self) -> None:
-        """Send one notice per superseded run whose PR events were retired."""
+        """Send one notice per superseded run whose PR events were retired.
 
-        pending, self._superseded_pr_events = self._superseded_pr_events, {}
-        for (ticket, run_id), kinds in pending.items():
+        The events are already retired and never re-offered, so an entry stays
+        queued until its notice is delivered: a failed or cancelled send is
+        retried on the next flush with every kind noted meanwhile.
+        """
+
+        pending = self._superseded_pr_events
+        for key in list(pending):
+            # An overlapping flush already owns this entry's send; kinds noted
+            # meanwhile join its entry and stay queued if that send fails.
+            if key in self._superseded_pr_sends:
+                continue
+            kinds = list(pending.get(key) or ())
+            ticket, run_id = key
             notice_key = f"pr-event-superseded:{ticket}:{run_id}"
-            sent = await self._notify_operator(
-                notice_key,
-                f"{ticket}: retired {_describe_superseded_pr_events(kinds)} observed for superseded run "
-                f"{run_id}; they were not handed to the current builder, which sees "
-                "the open work as handoff gaps.",
-            )
+            pronoun = "it was" if len(kinds) == 1 else "they were"
+            self._superseded_pr_sends.add(key)
+            try:
+                sent = await self._notify_operator(
+                    notice_key,
+                    f"{ticket}: retired {_describe_superseded_pr_events(kinds)} observed for superseded run "
+                    f"{run_id}; {pronoun} not handed to the current builder, which sees "
+                    "the open work as handoff gaps.",
+                )
+            finally:
+                self._superseded_pr_sends.discard(key)
             deliverable = self.notifier is not None and not self.shadow and not self.read_only
-            if not sent and deliverable and notice_key not in self._operator_notices:
-                # The events are already retired and never re-offered, so a
-                # failed send is retried after the next PR-event offer.
-                self._superseded_pr_events.setdefault((ticket, run_id), []).extend(kinds)
+            if sent or not deliverable or notice_key in self._operator_notices:
+                # Delivered, undeliverable, or already delivered earlier.
+                pending.pop(key, None)
 
     async def _process_pr_events(
         self,
