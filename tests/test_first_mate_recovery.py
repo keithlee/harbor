@@ -1303,6 +1303,28 @@ def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path
         db.close()
 
 
+def test_observed_but_ineligible_ticket_keeps_its_watchdog_flag(tmp_path):
+    # Only an unpolled ticket's flags are consumed. A ticket the poll did
+    # observe, but that the launch recheck refuses (held in the latest
+    # observation), keeps its flag for a later pass.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    held = [{**ticket, "hold": True} for ticket in db.tickets("Demo")]
+
+    async def scenario():
+        await monitor_observed(supervisor, held, flags_before=recovery.latest_flag_id(db.connection))
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert mate.prompts == linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_flag_cutoff_is_the_newest_event_of_any_kind(tmp_path):
     # The cutoff must not scan the ledger for the newest watchdog flag: a poll
     # reads it every cycle and the events table only grows. The newest id of
