@@ -797,6 +797,47 @@ def test_first_mate_rechecks_state_after_a_failed_snapshot_write(tmp_path):
         db.close()
 
 
+def test_poll_numbering_follows_linear_fetch_order_not_poll_entry(tmp_path):
+    """A poll that stalls before its Linear fetch still publishes the newer data it fetches.
+
+    Poll A enters first and stalls in merge reconciliation. Poll B fetches and
+    publishes. A then fetches newer Linear data; numbering polls on entry
+    (before the lock) would mark A older than B and discard its fresher fetch.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        a_stalled, release_a = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def reconcile(*args, **kwargs):
+            calls.append(len(calls))
+            if len(calls) == 1:  # poll A
+                a_stalled.set()
+                await release_a.wait()
+
+        supervisor._reconcile_completed_merges = reconcile
+        poll_a = asyncio.create_task(supervisor.poll_once())
+        await asyncio.wait_for(a_stalled.wait(), timeout=2)
+        poll_b = await asyncio.wait_for(supervisor.poll_once(), timeout=2)  # B publishes first
+        assert [ticket["identifier"] for ticket in poll_b.tickets] == ["HAN-86"]
+        issue["state"] = {"name": "Icebox", "type": "backlog"}  # newer Linear data
+        release_a.set()
+        latest = await asyncio.wait_for(poll_a, timeout=2)
+        await supervisor._drain_recoveries()
+        assert latest.tickets == ()
+        assert supervisor.last_result is latest  # A's newer fetch is the published one
+        assert db.snapshot_hash("Demo") == latest.snapshot_hash
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
 def test_linear_observations_publish_in_request_order(tmp_path):
     db = ledger(tmp_path, final=ENV_BLOCKED)
     supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
