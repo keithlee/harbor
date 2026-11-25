@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -250,6 +250,20 @@ class PipelineProfile:
         ):
             if hasattr(project, name):
                 defaults[name] = getattr(project, name)
+        profile = cls._from_project_files(project, path, defaults)
+        # A GitHub endpoint set in the project registry is explicit and wins
+        # over the pipeline file, as ``linear_api_url`` does; otherwise an
+        # Enterprise host set only in the registry would be replaced by the
+        # GitHub.com default without a word.
+        registry_url = str(getattr(project, "github_api_url", "") or "").strip()
+        if registry_url and registry_url != profile.github_api_url:
+            profile = replace(profile, github_api_url=registry_url)
+        return profile
+
+    @classmethod
+    def _from_project_files(
+        cls, project: object, path: object, defaults: Mapping[str, object]
+    ) -> "PipelineProfile":
         if path and Path(path).is_file():
             return cls.from_markdown(Path(path).read_text(encoding="utf-8"), defaults=defaults)
         repo_path = getattr(project, "repo_path", None)

@@ -194,6 +194,12 @@ class ProjectConfig:
     pipeline_path: Path | None = None
     registry_path: Path | None = None
     linear_api_url: str = DEFAULT_LINEAR_API_URL
+    # GitHub GraphQL endpoint set in the project registry (``github_api_url``,
+    # or its aliases ``github_graphql_url`` / ``github_endpoint``).  Empty
+    # means the registry does not set it, so ``PipelineProfile.from_project``
+    # reads the pipeline file and then the GitHub.com default.  When set, it
+    # wins over the pipeline file, like ``linear_api_url``.
+    github_api_url: str = ""
     poll_states: tuple[str, ...] = POLL_STATES
     dispatch_states: tuple[str, ...] = DISPATCH_STATES
     poll_interval_seconds: float = 60.0
@@ -469,6 +475,16 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     if alias in overrides:
                         overrides[key] = overrides[alias]
                         break
+            # The registry may name the GitHub endpoint under the same keys a
+            # pipeline file accepts; take the first one with a value so an empty
+            # column never hides a filled-in alias.
+            for alias in ("github_api_url", "github_graphql_url", "github_endpoint"):
+                github_url = str(overrides.get(alias) or "").strip()
+                if github_url:
+                    overrides["github_api_url"] = github_url
+                    break
+            else:
+                overrides.pop("github_api_url", None)
             if "hold" in overrides and "hold_all" not in overrides:
                 overrides["hold_all"] = _as_bool(str(overrides["hold"]), True)
             overrides["repo_path"] = definition.repo_path
@@ -481,6 +497,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     "linear_projects",
                     "linear_team",
                     "linear_api_url",
+                    "github_api_url",
                     "poll_interval_seconds",
                     "heartbeat_seconds",
                     "poll_states",

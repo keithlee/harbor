@@ -589,8 +589,8 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
         claude_production(tmp_path, monkeypatch, "github_api_url: https://*.example.test/api/graphql")
 
 
-def run_doctor(tmp_path: Path, provider: str, github_api_url: str,
-               linear_api_url: str = "https://linear.invalid/graphql"):
+def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
+               linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None):
     import os
     import subprocess
     import sys
@@ -603,12 +603,15 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str,
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
                         f"builder_provider: {provider}\nlinear_api_url: {linear_api_url}\n"
-                        f"github_api_url: {github_api_url}\n")
+                        + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else ""))
+    extra = registry or {}
     projects = tmp_path / "projects.md"
     projects.write_text(
-        "| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository |\n"
-        "| --- | --- | --- | --- | --- | --- |\n"
-        f"| SampleProject | {repo} | {pipeline} | sample | SAMPLE | owner/repo |\n"
+        "| name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository |"
+        + "".join(f" {key} |" for key in extra) + "\n"
+        + "| --- | --- | --- | --- | --- | --- |" + " --- |" * len(extra) + "\n"
+        + f"| SampleProject | {repo} | {pipeline} | sample | SAMPLE | owner/repo |"
+        + "".join(f" {value} |" for value in extra.values()) + "\n"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
@@ -647,3 +650,91 @@ def test_doctor_labels_a_linear_url_problem_as_linear_not_github(tmp_path: Path)
     assert "restart harbor" not in (result.stdout + result.stderr).lower(), result.stdout + result.stderr
     assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
             "ghe.example.test\n") in result.stdout, result.stdout
+
+
+# ------------------------------------------- github_api_url in the project registry
+#
+# Regression: the docs say the registry can set github_api_url, but the registry
+# loader dropped the key, so a GitHub Enterprise host set only there was replaced
+# by https://api.github.com without a word (and the token was sent there).
+
+GHES_GRAPHQL = "https://ghe.example.test/api/graphql"
+
+
+def registry_project(tmp_path: Path, monkeypatch, registry: dict[str, str], pipeline: str = ""):
+    from harbor.config.projects import get_project
+    from workflow_support import materialize
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    materialize(repo)
+    pipeline_path = tmp_path / "pipeline.md"
+    pipeline_path.write_text(f"# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\n{pipeline}\n")
+    projects = tmp_path / "projects.md"
+    projects.write_text(
+        "| name | repo_path | pipeline_path |" + "".join(f" {key} |" for key in registry) + "\n"
+        + "| --- | --- | --- |" + " --- |" * len(registry) + "\n"
+        + f"| SampleProject | {repo} | {pipeline_path} |" + "".join(f" {value} |" for value in registry.values()) + "\n"
+    )
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(projects))
+    return get_project("SampleProject")
+
+
+@pytest.mark.parametrize("key", ["github_api_url", "github_graphql_url", "github_endpoint"])
+def test_a_registry_github_endpoint_reaches_the_builder(tmp_path: Path, monkeypatch, key: str) -> None:
+    from harbor.config.profile import PipelineProfile
+    config = registry_project(tmp_path, monkeypatch, {key: GHES_GRAPHQL})
+    assert config.github_api_url == GHES_GRAPHQL
+    assert PipelineProfile.from_project(config).github_api_url == GHES_GRAPHQL
+    github = builder_github(config, workflow(), "claude", env={"GITHUB_TOKEN": TOKEN})
+    assert github["env"]["HARBOR_GITHUB_API_URL"] == "https://ghe.example.test/api/v3"
+    assert "ghe.example.test" in github["sandbox_hosts"]
+
+
+def test_the_registry_github_endpoint_wins_over_the_pipeline_file(tmp_path: Path, monkeypatch) -> None:
+    from harbor.config.profile import PipelineProfile
+    config = registry_project(tmp_path, monkeypatch, {"github_api_url": GHES_GRAPHQL},
+                              "github_api_url: https://api.github.com/graphql")
+    assert PipelineProfile.from_project(config).github_api_url == GHES_GRAPHQL
+
+
+def test_an_empty_registry_github_column_keeps_the_pipeline_value(tmp_path: Path, monkeypatch) -> None:
+    from harbor.config.profile import PipelineProfile
+    config = registry_project(tmp_path, monkeypatch, {"github_api_url": "", "github_endpoint": ""},
+                              f"github_api_url: {GHES_GRAPHQL}")
+    assert config.github_api_url == ""
+    assert PipelineProfile.from_project(config).github_api_url == GHES_GRAPHQL
+
+
+def test_an_empty_registry_github_column_falls_through_to_a_filled_alias(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"github_api_url": "", "github_endpoint": GHES_GRAPHQL})
+    assert config.github_api_url == GHES_GRAPHQL
+
+
+def test_without_any_github_endpoint_the_default_is_github_com(tmp_path: Path, monkeypatch) -> None:
+    from harbor.config.profile import PipelineProfile
+    config = registry_project(tmp_path, monkeypatch, {})
+    assert PipelineProfile.from_project(config).github_api_url == "https://api.github.com/graphql"
+
+
+def test_a_malformed_registry_github_endpoint_fails_closed_for_a_claude_builder(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"github_api_url": "https://*.example.test/api/graphql"})
+    with pytest.raises(ValueError, match="GitHub API URL"):
+        builder_github(config, workflow(), "claude", env={"GITHUB_TOKEN": TOKEN})
+
+
+def test_the_production_factory_uses_a_registry_github_endpoint(tmp_path: Path, monkeypatch) -> None:
+    domains = production_claude_domains(tmp_path, monkeypatch, github_api_url=GHES_GRAPHQL)
+    assert domains == [*GITHUB_COM_DOMAINS, "ghe.example.test"]
+
+
+def test_doctor_uses_a_github_endpoint_set_only_in_the_registry(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "claude", None, registry={"github_api_url": GHES_GRAPHQL})
+    assert ("Builder sandbox network: github.com, api.github.com, api.linear.app, registry.npmjs.org, "
+            "ghe.example.test, linear.invalid") in result.stdout, result.stdout + result.stderr
+
+
+def test_doctor_fails_closed_on_a_malformed_registry_github_endpoint(tmp_path: Path) -> None:
+    result = run_doctor(tmp_path, "claude", None, registry={"github_api_url": "https://10.0.0.5/api/graphql"})
+    assert "GitHub transport: invalid (the GitHub API URL must be" in result.stdout, result.stdout
+    assert result.returncode == 1
