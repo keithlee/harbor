@@ -704,3 +704,293 @@ def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
         assert mate.prompts == linear.comments == resumed == []
     finally:
         db.close()
+
+
+def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path):
+    # The watchdog flags HAN-86, then the operator moves it to a backlog-type
+    # state before the next poll. SQLite still holds its old active state, so
+    # find_cases keeps the flag; the poll no longer observes the ticket.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+
+    async def scenario():
+        cutoff = recovery.latest_flag_id(db.connection)
+        await supervisor._monitor_blocked(set(), flags_before=cutoff)  # unpolled pass
+        await supervisor._drain_recoveries()
+        seen = db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
+        assert seen == 1  # the stale flag is consumed, not left pending
+        # Days later the ticket returns to In Progress and is polled again.
+        await supervisor._monitor_blocked({"HAN-86"})
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert mate.prompts == [] and linear.comments == [] and resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_flag_cutoff_is_the_newest_event_of_any_kind(tmp_path):
+    # The cutoff must not scan the ledger for the newest watchdog flag: a poll
+    # reads it every cycle and the events table only grows. The newest id of
+    # any event is an equally valid cutoff, read straight from the rowid.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    try:
+        flag(db, "HAN-86")
+        db.connection.execute(
+            "INSERT INTO events(project, identifier, event_type, payload_json, at) "
+            "VALUES ('SampleProject', 'HAN-86', 'ticket.observed', '{}', '2026-01-01T00:00:00+00:00')"
+        )
+        newest = db.connection.execute("SELECT MAX(id) FROM events").fetchone()[0]
+        assert recovery.latest_flag_id(db.connection) == newest
+        plan = " ".join(str(row) for row in db.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT MAX(id) FROM events").fetchall())
+        assert "SCAN" not in plan
+    finally:
+        db.close()
+
+
+# ---- #23 relies on a complete poll: absence must mean "left the polled states" ----
+
+def _filler(number):
+    return {"id": f"lin-f{number}", "identifier": f"HAN-{1000 + number}", "title": f"Filler {number}",
+            "state": {"name": "In Progress", "type": "started"}}
+
+
+HAN86_NODE = {"id": "lin-86", "identifier": "HAN-86", "title": "Sample issue",
+              "state": {"name": "In Progress", "type": "started"}}
+
+
+def _paged_linear(pages_for):
+    """Serve Linear's cursor pagination; ``pages_for()`` gives the current pages."""
+
+    def handler(request):
+        pages = pages_for()
+        after = json.loads(request.content)["variables"].get("after")
+        index = 0 if after is None else int(after.removeprefix("cursor-")) + 1
+        page = pages[min(index, len(pages) - 1)]
+        if page == "endless":  # a misbehaving server that never ends pagination
+            nodes, has_next = [], True
+        else:
+            nodes, has_next = page, index + 1 < len(pages)
+        return httpx.Response(200, json={"data": {"issues": {
+            "nodes": nodes, "pageInfo": {"hasNextPage": has_next, "endCursor": f"cursor-{index}"}}}})
+
+    return httpx.MockTransport(handler)
+
+
+def _flagged_supervisor(tmp_path, pages_for):
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86", "repeated_answer")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client = LinearClient(token="test-key", transport=_paged_linear(pages_for))
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    return db, client, supervisor, mate, linear, resumed
+
+
+def _seen(db):
+    recovery.initialize(db.connection)  # the monitor may never have run
+    return db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
+
+
+def test_failed_poll_keeps_a_pending_flag_for_the_next_complete_poll(tmp_path):
+    # Page 1 does not contain HAN-86 and the server never ends pagination, so
+    # the client refuses the partial poll. A truncated snapshot must not reach
+    # _monitor_blocked, or #23 would consume HAN-86's flag (never re-emitted).
+    fillers = [_filler(n) for n in range(50)]
+    current = {"pages": [fillers, "endless"]}
+    db, client, supervisor, mate, linear, resumed = _flagged_supervisor(tmp_path, lambda: current["pages"])
+
+    async def scenario():
+        assert await supervisor.poll_once() is None
+        assert supervisor.linear_healthy is False
+        assert "pagination limit" in (supervisor.last_error or "")
+        await supervisor._drain_recoveries()
+        assert _seen(db) == 0  # still pending
+        assert mate.prompts == [] and resumed == []
+        # The next poll completes, with HAN-86 on its second page.
+        current["pages"] = [fillers, [HAN86_NODE]]
+        observed = await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert observed is not None and "HAN-86" in {t["identifier"] for t in observed.tickets}
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == 1 and "repeated_answer" in mate.prompts[0]
+        triggers = db.connection.execute("SELECT ticket, trigger FROM first_mate_recoveries").fetchall()
+        assert [tuple(row) for row in triggers] == [("HAN-86", "watchdog:repeated_answer")]
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_ticket_on_a_later_page_is_observed_and_its_flag_drives_recovery(tmp_path):
+    fillers = [_filler(n) for n in range(50)]
+    db, client, supervisor, mate, linear, resumed = _flagged_supervisor(
+        tmp_path, lambda: [fillers, [HAN86_NODE]])
+
+    async def scenario():
+        observed = await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert observed is not None and len(observed.tickets) == 51
+        assert "HAN-86" in {t["identifier"] for t in observed.tickets}
+
+    try:
+        asyncio.run(scenario())
+        # The flag reached First Mate instead of being consumed as "unpolled".
+        assert len(mate.prompts) == 1 and "repeated_answer" in mate.prompts[0]
+        triggers = db.connection.execute("SELECT ticket, trigger FROM first_mate_recoveries").fetchall()
+        assert [tuple(row) for row in triggers] == [("HAN-86", "watchdog:repeated_answer")]
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+# ---- a flag the poll could not have seen is never consumed against it ----
+
+def _switchable_linear(state, on_request=None):
+    """HAN-86 is returned only while ``state['polled']`` is true."""
+
+    def handler(request):
+        nodes = [HAN86_NODE] if state["polled"] else []
+        response = httpx.Response(200, json={"data": {"issues": {
+            "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+        if on_request is not None:
+            on_request()
+        return response
+
+    return httpx.MockTransport(handler)
+
+
+def _poll_driven_supervisor(tmp_path, *, status, transport):
+    db = ledger(tmp_path, status=status, final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")  # last observed state, now stale
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client = LinearClient(token="test-key", transport=transport)
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    return db, client, supervisor, mate
+
+
+def _receipts(db):
+    rows = db.connection.execute("SELECT ticket, trigger FROM first_mate_recoveries").fetchall()
+    return [tuple(row) for row in rows]
+
+
+def test_flag_written_after_the_linear_fetch_is_not_consumed_by_that_poll(tmp_path):
+    # Poll A fetches while HAN-86 is parked in Icebox (absent). While A is
+    # still in flight the operator moves HAN-86 back to In Progress and the
+    # watchdog flags it. A's monitor must not consume a flag A could not see:
+    # _flag_once never re-emits it, so poll B would otherwise never triage it.
+    state = {"polled": False, "db": None}
+
+    def watchdog_flags_during_poll_a():
+        if not state["polled"] and state["db"] is not None:
+            flag(state["db"], "HAN-86")
+
+    db, client, supervisor, mate = _poll_driven_supervisor(
+        tmp_path, status="waiting", transport=_switchable_linear(state, watchdog_flags_during_poll_a))
+    state["db"] = db
+
+    async def scenario():
+        first = await supervisor.poll_once()  # poll A
+        await supervisor._drain_recoveries()
+        assert first is not None and first.tickets == ()
+        assert _seen(db) == 0  # the new flag stays pending
+        state["polled"] = True
+        await supervisor.poll_once()  # poll B observes HAN-86 In Progress
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == 1 and "no_progress" in mate.prompts[0]
+        assert _receipts(db) == [("HAN-86", "watchdog:no_progress")]
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_every_stale_flag_of_an_unpolled_ticket_is_consumed(tmp_path):
+    # Two flags were pending before the fetch; the ticket is unpolled. Both
+    # are stale, so neither may trigger triage when the ticket returns.
+    state = {"polled": False}
+    db, client, supervisor, mate = _poll_driven_supervisor(
+        tmp_path, status="running", transport=_switchable_linear(state))
+    flag(db, "HAN-86", "repeated_answer")
+    flag(db, "HAN-86", "no_progress")
+
+    async def scenario():
+        await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+        assert _seen(db) == 2
+        state["polled"] = True
+        await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert mate.prompts == [] and _receipts(db) == []
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_superseded_poll_does_not_run_the_monitor(tmp_path):
+    # Poll A is overtaken by poll B during A's post-fetch work. A's snapshot
+    # is older than B's, so A must not run the First Mate monitor at all.
+    state = {"polled": False}
+    db, client, supervisor, mate = _poll_driven_supervisor(
+        tmp_path, status="running", transport=_switchable_linear(state))
+    monitored = []
+    original_monitor = supervisor._monitor_blocked
+    original_retry = supervisor._retry_stopped_builders
+
+    async def monitor(observed, *args, **kwargs):
+        monitored.append(sorted(observed))
+        return await original_monitor(observed, *args, **kwargs)
+
+    async def retry_then_overtake():
+        await original_retry()
+        if not monitored and not state["polled"]:
+            state["polled"] = True
+            await supervisor.poll_once()  # poll B publishes while A is in flight
+
+    supervisor._monitor_blocked = monitor
+    supervisor._retry_stopped_builders = retry_then_overtake
+
+    async def scenario():
+        await supervisor.poll_once()  # poll A
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert monitored == [["HAN-86"]]  # only B's monitor ran
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_one_triage_consumes_every_flag_it_was_shown(tmp_path):
+    # Both flags are folded into one case and shown to First Mate together,
+    # so recording that decision consumes both, not just the last one.
+    state = {"polled": True}
+    db, client, supervisor, mate = _poll_driven_supervisor(
+        tmp_path, status="waiting", transport=_switchable_linear(state))
+    flag(db, "HAN-86", "repeated_answer")
+    flag(db, "HAN-86", "no_progress")
+
+    async def scenario():
+        await supervisor.poll_once()
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == 1
+        assert "repeated_answer" in mate.prompts[0] and "no_progress" in mate.prompts[0]
+        assert _seen(db) == 2
+    finally:
+        asyncio.run(client.close())
+        db.close()

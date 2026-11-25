@@ -3159,6 +3159,8 @@ class Supervisor:
         # on every live cycle instead of requiring a supervisor restart.
         if not self.shadow:
             await self._reconcile_completed_merges()
+        # Only flags that existed before this fetch can be judged by its result.
+        flags_before = self._latest_flag_id()
         try:
             result = await self.poller.poll()
         except Exception as exc:  # keep the console alive through a transient API error
@@ -3268,7 +3270,10 @@ class Supervisor:
             from harbor.answer_queue import drain
             drain(self)
             await self._retry_stopped_builders()
-            await self._monitor_blocked({self._ticket_key(ticket) for ticket in result.tickets})
+            if not is_current():
+                return result  # a newer poll published while this one awaited
+            await self._monitor_blocked({self._ticket_key(ticket) for ticket in result.tickets},
+                                        flags_before=flags_before)
         if self.on_update:
             update = self.on_update(result)
             if asyncio.iscoroutine(update):
@@ -4016,8 +4021,19 @@ class Supervisor:
                 return str(candidate)
         return ""
 
-    async def _monitor_blocked(self, observed_tickets: set[str]) -> None:
-        """Recover stuck runs only when the current Linear poll observed them."""
+    def _latest_flag_id(self) -> int | None:
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None:
+            return None
+        from harbor import first_mate_recovery as recovery
+        return recovery.latest_flag_id(connection)
+
+    async def _monitor_blocked(self, observed_tickets: set[str], *, flags_before: int | None = None) -> None:
+        """Recover stuck runs only when the current Linear poll observed them.
+
+        ``flags_before`` is the newest watchdog flag id read before that poll's
+        Linear fetch; only flags up to it are consumed for an unobserved ticket.
+        """
 
         workflow = getattr(self.dispatcher, "workflow", None)
         ladder = self.unblock_ladder
@@ -4057,7 +4073,15 @@ class Supervisor:
                 continue
             if case.ticket not in observed_tickets:
                 # An issue moved out of the polled states retains its previous
-                # SQLite row. That row cannot authorize recovery.
+                # SQLite row. That row cannot authorize recovery. A watchdog
+                # flag is a point-in-time observation, so consume it here
+                # (as find_cases does for shelved tickets); otherwise it
+                # would trigger recovery days later when the ticket returns.
+                # A flag written after the fetch started may postdate the
+                # ticket's return to a polled state; leave it for the next poll.
+                for event_id in case.flag_ids:
+                    if flags_before is not None and event_id <= flags_before:
+                        recovery.mark_flag(connection, event_id)
                 continue
             try:
                 proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
