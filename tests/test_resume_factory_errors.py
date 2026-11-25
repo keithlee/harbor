@@ -758,6 +758,12 @@ def test_overlapping_retries_leave_no_stale_cause_once_a_builder_is_live(
 
         assert resumed == ["run-1"], "exactly one retry resumes the builder"
         assert isinstance(results[0], RuntimeError)
+        expected = (
+            "retained builder for SAMPLE-42 cannot be rebuilt: transient: provider CLI busy"
+            if failure_first
+            else "a retry is already active for SAMPLE-42"
+        )
+        assert str(results[0]) == expected
         assert dispatcher.runners.get("SAMPLE-42") is not None, "retry B left a live builder"
         assert dispatcher.resume_unavailable_reason("SAMPLE-42") is None, (
             "a live builder must not be reported as unresumable"
@@ -855,6 +861,54 @@ def test_a_single_retired_event_notice_uses_singular_wording(tmp_path: Path) -> 
         assert "; it was not handed to the current builder" in notices[0]
         assert "they were" not in notices[0]
         assert "; they were not handed to the current builder" in notices[1]
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stale_outcome", ["success", "failure"])
+def test_a_stale_runs_factory_outcome_keeps_the_current_runs_cause(
+    tmp_path: Path, stale_outcome: str
+) -> None:
+    """run-1's slow factory call finishing after run-2 took over must not touch run-2's cause."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        release = asyncio.Event()
+        run_2_reason = "model 'nonexistent' is invalid for run-2"
+
+        class Runner:
+            default_run_id = "run-1"
+
+        async def factory(_wt: Any, wake: Wake) -> Any:
+            if wake.run_id == "run-1":
+                await release.wait()
+                if stale_outcome == "failure":
+                    raise ValueError("stale run-1 failure")
+                return Runner()
+            raise ValueError(run_2_reason)
+
+        dispatcher.runner_factory = factory
+        stale = asyncio.create_task(dispatcher.hydrate("SAMPLE-42"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs(id, ticket, status, session_id, worktree) "
+                "VALUES ('run-2', 'SAMPLE-42', 'waiting', 'session-2', ?)",
+                (str(tmp_path / "wt" / "SAMPLE-42"),),
+            )
+        assert await dispatcher.hydrate("SAMPLE-42") is None
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == run_2_reason
+
+        release.set()
+        assert await stale is None, "a superseded run must not install a runner"
+        print(
+            f"after stale run-1 {stale_outcome}: "
+            f"{dispatcher.resume_unavailable_reason('SAMPLE-42')!r} {dispatcher.runners}"
+        )
+        assert dispatcher.runners == {}
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == run_2_reason
         ledger.close()
 
     asyncio.run(scenario())

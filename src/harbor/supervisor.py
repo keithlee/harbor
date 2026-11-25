@@ -652,6 +652,11 @@ class WorktreeDispatcher:
             return None
         # This attempt reaches the factory: its outcome replaces any old reason.
         self._clear_resume_error(identifier)
+        # The handle retained before this call (fresh_session keeps the stuck
+        # one); a different handle appearing meanwhile was installed by an
+        # overlapping attempt.
+        live_key = self._live_runner_key(identifier)
+        retained = self.runners.get(live_key) if live_key is not None else None
         try:
             runner = await self._factory(worktree, wake)
         except Exception as exc:
@@ -669,16 +674,23 @@ class WorktreeDispatcher:
             # Hydrate runs outside the execution lock, so an overlapping
             # attempt (operator /retry beside the recovery scheduler) may have
             # installed a live builder while this factory call was failing.
-            # A live builder is resumable: this cause no longer describes it.
-            if self._live_runner_key(identifier) is None:
+            # That builder is resumable: this cause no longer describes it.
+            # A run superseded while the factory ran must not overwrite the
+            # current run's cause (the store is keyed by ticket, not run).
+            live_key = self._live_runner_key(identifier)
+            installed = live_key is not None and self.runners.get(live_key) is not retained
+            if not installed and self._run_is_current(identifier, row["id"]):
                 self._resume_errors[identifier.casefold()] = _ResumeFailure(row["id"], reason, fingerprint)
             return None
-        # The factory can rebuild this builder: a cause stored by an
+        if not self._run_is_current(identifier, row["id"]):
+            # Superseded while the factory ran: the current run's cause stands.
+            return None
+        if runner is None:
+            return None
+        # The factory rebuilt this run's builder: a cause stored by an
         # overlapping attempt that failed while this call was in flight is stale.
         self._clear_resume_error(identifier)
-        if not self._run_is_current(identifier, row["id"]):
-            return None
-        return (worktree, runner) if runner is not None else None
+        return worktree, runner
 
     async def fresh_session(
         self, identifier: str, instruction: str, *, switch: Any | None = None,
