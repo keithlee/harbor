@@ -85,6 +85,14 @@ class PREventDeliveryExhausted(PREventError):
         super().__init__(f"builder failed {attempts} times handling a PR event for {ticket or '(unknown ticket)'}")
 
 
+class PREventSuperseded(PREventError):
+    """The PR event's run no longer owns its ticket; it can never be delivered.
+
+    Unlike a transient refusal (a live process, an active handoff), this one is
+    permanent, so the processor retires the event instead of re-offering it.
+    """
+
+
 def _connection(db: Any) -> sqlite3.Connection | None:
     if isinstance(db, sqlite3.Connection):
         return db
@@ -938,33 +946,17 @@ class PREventProcessor:
 
         if previous and previous.get("head_sha") != head_sha and risk_status != "valid":
             # A new PR head requires the risk event to be offered again.  The
-            # event identity remains ticket+PR for idempotence, while this
-            # local flag reopens delivery after invalidation.
-            self._reset_pr_event_offer(state_key)
+            # event identity remains ticket+PR for idempotence; reopening
+            # rebinds it to this head and to the run observing it, so a ticket
+            # that changed runs does not retire its own new risk request.
+            self._reset_pr_event_offer(
+                state_key,
+                self._pr_created_event(ticket, facts, run, state_key, identifier, number, pr_url, head_sha),
+            )
 
         events: list[PREvent] = []
         if previous is None or not self._comment_seen(_event_key(PR_CREATED, state_key)):
-            payload = {
-                "ticket": identifier,
-                "pr_number": number,
-                "number": number,
-                "head_sha": head_sha,
-                "created_at": _value(facts, "created_at", "createdAt", default=None),
-                "url": _value(facts, "url", default=None),
-                "title": _value(facts, "title", default=None),
-                "ci": _value(facts, "ci", default=None),
-            }
-            event = PREvent(
-                PR_CREATED,
-                state_key,
-                identifier,
-                number,
-                pr_url,
-                head_sha,
-                payload,
-                build_risk_instruction(ticket, facts, skill=self.risk_skill, run=run),
-                _run_id(ticket, facts, run),
-            )
+            event = self._pr_created_event(ticket, facts, run, state_key, identifier, number, pr_url, head_sha)
             if self._insert_event(event):
                 events.append(event)
 
@@ -1174,19 +1166,66 @@ class PREventProcessor:
 
         clear_pr_event(connection, event_key)
 
-    def _reset_pr_event_offer(self, state_key: str) -> None:
-        """Reopen the ticket's PR-created event after a head invalidation."""
+    def _pr_created_event(
+        self,
+        ticket: Any,
+        facts: Mapping[str, Any],
+        run: Any | None,
+        state_key: str,
+        identifier: str,
+        number: int,
+        pr_url: str,
+        head_sha: str | None,
+    ) -> PREvent:
+        """Build the PR's risk-analysis request for the observed head and run."""
+
+        payload = {
+            "ticket": identifier,
+            "pr_number": number,
+            "number": number,
+            "head_sha": head_sha,
+            "created_at": _value(facts, "created_at", "createdAt", default=None),
+            "url": _value(facts, "url", default=None),
+            "title": _value(facts, "title", default=None),
+            "ci": _value(facts, "ci", default=None),
+        }
+        return PREvent(
+            PR_CREATED,
+            state_key,
+            identifier,
+            number,
+            pr_url,
+            head_sha,
+            payload,
+            build_risk_instruction(ticket, facts, skill=self.risk_skill, run=run),
+            _run_id(ticket, facts, run),
+        )
+
+    def _reset_pr_event_offer(self, state_key: str, event: PREvent | None = None) -> None:
+        """Reopen the ticket's PR-created event after a head invalidation.
+
+        ``event`` is the request rebuilt for the new head and current run; its
+        payload replaces the stored one so delivery targets that run and head.
+        """
 
         event_key = _event_key(PR_CREATED, state_key)
         connection = _connection(self.db)
         if connection is None:
             self._offered.discard(event_key)
+            if event is not None and event_key in self._events:
+                self._events[event_key] = event.as_dict()
             return
         with _lock(self.db):
-            connection.execute(
-                "UPDATE github_pr_events SET offered=0 WHERE event_key=?",
-                (event_key,),
-            )
+            if event is None:
+                connection.execute(
+                    "UPDATE github_pr_events SET offered=0 WHERE event_key=?",
+                    (event_key,),
+                )
+            else:
+                connection.execute(
+                    "UPDATE github_pr_events SET offered=0, head_sha=?, payload_json=? WHERE event_key=?",
+                    (event.head_sha, _json(event.as_dict()), event_key),
+                )
             connection.commit()
 
     def _event_flags(self, event_key: str) -> tuple[bool, bool]:
@@ -1683,6 +1722,15 @@ class PREventProcessor:
                     # Unknown local events are not silently marked as delivered;
                     # this keeps future event types fail-closed.
                     raise PREventError(f"unsupported PR event type: {event.event_type}")
+            except PREventSuperseded as exc:
+                # The run that observed this event was replaced, so the event
+                # can never reach its session.  Retire it as offered-not-replied:
+                # it stops being re-offered every poll (and from blocking the
+                # events queued behind it), while the unreplied comment stays a
+                # handoff gap for the run that now owns the ticket.
+                logger.warning("retiring PR event %s: %s", event.event_key, exc)
+                self._mark_offered(event.event_key, replied=False)
+                delivered.append({**event.as_dict(), "superseded": True, "reason": str(exc)})
             finally:
                 await self._end_delivery(event.event_key)
         return delivered
@@ -1828,6 +1876,7 @@ __all__ = [
     "PREventDeliveryExhausted",
     "PREventError",
     "PREventProcessor",
+    "PREventSuperseded",
     "PrEventProcessor",
     "PRFeedbackProcessor",
     "PR_CREATED",

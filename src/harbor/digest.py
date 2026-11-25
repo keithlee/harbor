@@ -201,6 +201,12 @@ def render_digest(source: Any, *, detailed: bool = True) -> str:
     tickets.sort(key=lambda item: _text(_get(item, "identifier", "id", default="")))
     runs = _items(_get(source, "runs", default=()))
     runs.sort(key=lambda item: _text(_get(item, "id", "run_id", default="")))
+    for run in runs:
+        failure = _folded(_get(run, "resume_failure", default=""), 160)
+        if failure:
+            identifier = _text(_get(run, "ticket", default="?"))
+            run_id = _text(_get(run, "id", "run_id", default="?"))
+            lines.append(f"Builder resume error for {identifier} (run {run_id}): {failure}")
     builder_states: dict[str, list[str]] = {}
     if not detailed:
         for run in runs:
