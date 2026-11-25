@@ -58,13 +58,25 @@ def poll(api_url: str | None, url: str) -> tuple[FakeGitHubClient, list]:
         ("https://ghe.example.test:443/api/graphql", "ghe.example.test"),
         ("http://ghe.example.test:80/api/graphql", "ghe.example.test"),
         ("http://ghe.example.test:443/api/graphql", "ghe.example.test:443"),
+        # One trailing dot (a fully qualified name) is dropped.
+        ("https://api.github.com./graphql", "github.com"),
+        ("https://ghe.example.test./api/graphql", "ghe.example.test"),
+        ("https://API.GitHub.com/graphql", "github.com"),
     ],
 )
 def test_web_host_follows_the_configured_api_endpoint(api_url, host) -> None:
     assert github_poller.github_web_host(api_url) == host
 
 
-@pytest.mark.parametrize("api_url", ["not a url", "https:///api/graphql", "ftp://ghe.example.test/api/graphql"])
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "not a url",
+        "https:///api/graphql",
+        "ftp://ghe.example.test/api/graphql",
+        "https://g\u0131thub.example.test/api/graphql",  # non-ASCII host: give its xn-- form
+    ],
+)
 def test_a_malformed_endpoint_fails_closed(api_url) -> None:
     with pytest.raises(ValueError):
         github_poller.github_web_host(api_url)
@@ -95,6 +107,15 @@ def test_a_ghe_com_link_is_recognized_for_a_ghe_com_project() -> None:
         # The configured host appearing later in a foreign link does not make it ours.
         (None, f"https://evil.example.test/redirect?to={DOTCOM_PR}"),
         (GHES_API, f"https://evil.example.test/{GHES_PR}"),
+        # Unicode case folding must not make a look-alike host match: each is a
+        # different domain (gıthub.com is xn--gthub-n4a.com).
+        (None, "https://g\u0131thub.com/example/SampleProject/pull/7"),  # dotless i
+        (None, "https://g\u0130thub.com/example/SampleProject/pull/7"),  # dotted capital I
+        (None, "https://github.com/example/SampleProject/pull/\uff17"),  # fullwidth digit 7
+        (None, "https://github.com/example/\u017fampleProject/pull/7"),  # long s in the repository
+        ("https://ghe.\u212aube.test/api/graphql".replace("\u212a", "k"),
+         "https://ghe.\u212aube.test/example/SampleProject/pull/7"),  # Kelvin sign for k
+        (GHES_API, "https://ghe.example.te\u017ft/example/SampleProject/pull/7"),  # long s for s
     ],
 )
 def test_a_link_on_another_host_is_never_queried(api_url, url) -> None:
@@ -109,6 +130,12 @@ def test_an_explicit_default_port_still_recognizes_ordinary_links() -> None:
     assert facts[0]["url"] == DOTCOM_PR
     client, _ = poll("https://ghe.example.test:443/api/graphql", GHES_PR)
     assert client.calls == [("example", "SampleProject", (7,))]
+
+
+def test_a_fully_qualified_endpoint_still_recognizes_ordinary_links() -> None:
+    client, facts = poll("https://api.github.com./graphql", DOTCOM_PR)
+    assert client.calls == [("example", "SampleProject", (7,))]
+    assert facts[0]["url"] == DOTCOM_PR
 
 
 def test_github_com_default_is_unchanged() -> None:

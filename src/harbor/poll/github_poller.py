@@ -30,18 +30,26 @@ def github_web_host(api_url: str | None) -> str:
     -> ``<host>``, which serves its API and web pages from one host (the path
     rule ``rest_base_url`` uses). A non-default port is kept. An IP literal or
     single-label GHES host is accepted, as Codex projects may use one.
-    An endpoint with no host raises, so a bad value fails closed.
+    One trailing dot (a fully qualified name such as ``api.github.com.``) is
+    dropped. An endpoint with no host, or a non-ASCII host (give an
+    internationalized name in its ``xn--`` form), raises, so a bad value
+    fails closed.
     """
 
     text = str(api_url or "").strip() or DEFAULT_API_URL
     try:
         parts = urlsplit(text)
-        host = (parts.hostname or "").casefold()
+        host = parts.hostname or ""
         port = parts.port
     except ValueError as exc:
         raise ValueError("the GitHub API URL must be a URL with a host name") from exc
+    if host.endswith("."):
+        host = host[:-1]
     if parts.scheme not in {"http", "https"} or not host or "@" in parts.netloc:
         raise ValueError("the GitHub API URL must be a URL with a host name")
+    if not host.isascii():
+        raise ValueError("the GitHub API URL host must be ASCII; give an internationalized name in its xn-- form")
+    host = host.lower()
     path = parts.path.rstrip("/")
     enterprise_server = path == "/api" or path.startswith("/api/")
     if not enterprise_server and host.startswith("api.") and host.count(".") >= 2:
@@ -55,14 +63,19 @@ def github_web_host(api_url: str | None) -> str:
 
 @lru_cache(maxsize=32)
 def _pr_url_pattern(web_host: str) -> re.Pattern[str]:
-    host = re.escape(web_host.casefold())
-    if web_host.casefold() == DEFAULT_WEB_HOST:
+    host = re.escape(web_host.lower())
+    if web_host.lower() == DEFAULT_WEB_HOST:
         host = r"(?:www\.)?" + host
     # Anchored: a link on another host never counts as the project's PR, even
     # when the configured host appears later in it (a redirect or query value).
+    # ASCII: case-insensitive for A-Z only. Without it, Unicode case folding
+    # lets a look-alike host such as gıthub.com (dotless i), gİthub.com,
+    # ſ (long s) or the Kelvin sign K match the configured host, and \d match
+    # non-ASCII digits. Owner and repository are limited to the characters
+    # GitHub allows in those names.
     return re.compile(
-        rf"https?://{host}/(?P<owner>[^/?#]+)/(?P<repo>[^/?#]+)/pulls?/(?P<number>\d+)(?:[/?#].*)?",
-        re.IGNORECASE,
+        rf"https?://{host}/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pulls?/(?P<number>[0-9]+)(?:[/?#].*)?",
+        re.IGNORECASE | re.ASCII,
     )
 
 
@@ -138,7 +151,7 @@ def attached_pull_requests(
     if repository:
         repo_parts = repository.rstrip("/").split("/")
         if len(repo_parts) >= 2:
-            expected_owner, expected_repo = repo_parts[-2].casefold(), repo_parts[-1].removesuffix(".git").casefold()
+            expected_owner, expected_repo = repo_parts[-2].lower(), repo_parts[-1].removesuffix(".git").lower()
 
     result: list[tuple[int, str | None]] = []
     seen: set[int] = set()
@@ -160,7 +173,7 @@ def attached_pull_requests(
                 url = attachment
             match = match_pull_request_url(str(url), web_host) if url is not None else None
             if match and expected_owner and expected_repo:
-                if (match.group("owner").casefold(), match.group("repo").removesuffix(".git").casefold()) != (
+                if (match.group("owner").lower(), match.group("repo").removesuffix(".git").lower()) != (
                     expected_owner,
                     expected_repo,
                 ):
