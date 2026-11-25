@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 
+from harbor.clients.linear import LinearClientError
 from harbor.recovery import BlockerPolicy
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -177,6 +178,17 @@ def _paths(value: Any) -> list[str]:
 
 def _normalise_paths(value: Any) -> tuple[str, ...]:
     return tuple(item.replace("\\", "/").lstrip("./") for item in _paths(value))
+
+
+class BlockerContextUnavailable(LinearClientError):
+    """Harbor could not read or verify a blocked ticket's fresh Linear context.
+
+    Raised only from the pre-triage reads in ``UnblockLadder.handle`` (the
+    blocker-context fetch and the project-scope check), before any model call
+    or Linear write, so replaying triage after it is safe.  A
+    ``LinearClientError`` raised later (a comment or state write) is not this
+    type: triage already ran and must not be replayed.
+    """
 
 
 class TicketNotUnblockable(ValueError):
@@ -1115,10 +1127,16 @@ class UnblockLadder:
         fetch = getattr(self.linear, "fetch_blocker_context", None)
         if callable(fetch):
             from harbor.poll.linear_poller import normalize_issue
-            observed = await fetch(_identifier(ticket))
-            if self.linear_projects:
-                from harbor.project_identity import require_scope
-                await require_scope(self.linear, self.linear_projects, observed.get("project") or {})
+            try:
+                observed = await fetch(_identifier(ticket))
+                if self.linear_projects:
+                    from harbor.project_identity import require_scope
+                    await require_scope(self.linear, self.linear_projects, observed.get("project") or {})
+            except BlockerContextUnavailable:
+                raise
+            except LinearClientError as exc:
+                # Classified by origin: nothing has been decided or written yet.
+                raise BlockerContextUnavailable(str(exc)) from exc
             fresh = normalize_issue(observed, hold_all=bool(ticket.get("hold", True)))
             # Human Review is deliberately active: Harbor parks escalations
             # there and delivers the operator's answer to the builder, so a

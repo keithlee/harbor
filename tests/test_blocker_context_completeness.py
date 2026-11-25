@@ -471,3 +471,151 @@ def test_linear_context_triage_retry_is_bounded_and_escalates_with_its_cause(tmp
         "SELECT last_reason FROM recovery_receipts WHERE run_id='triage:run-1'").fetchone()[0] == \
         "Linear blocker context unavailable"
     db.close()
+
+
+def _post_triage_failure(tmp_path, caplog, *, failing, disposition):
+    """Complete context, First Mate decides, then a Linear write fails; replay 5 polls."""
+    import logging
+    from harbor.recovery import BlockerPolicy
+    from harbor.runner.base import apply_phase9_migration
+    from harbor.supervisor import Lifecycle
+
+    queries = []
+
+    def handler(request):
+        query = json.loads(request.content)["query"]
+        queries.append(query)
+        if "HarborComment" in query:
+            if failing == "comment":
+                return httpx.Response(200, json={"data": {"commentCreate": {"success": False, "comment": None}}})
+            return httpx.Response(200, json={"data": {"commentCreate": {
+                "success": True, "comment": {"id": f"c-{len(queries)}", "body": "", "createdAt": "2026-09-05T00:00:00Z"}}}})
+        if "HarborStates" in query:
+            return httpx.Response(200, json={"data": {"issue": {"id": "uuid-1", "team": {"id": "team-1", "name": "Team", "states": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"id": "11111111-1111-1111-1111-111111111111", "name": "Human Review", "type": "started"},
+                          {"id": "22222222-2222-2222-2222-222222222222", "name": "Blocked", "type": "started"}]}}}}})
+        if "HarborProgress" in query:
+            return httpx.Response(200, json={"data": {"issueUpdate": {"success": False, "issue": None}}})
+        issue = complete_issue()
+        issue["description"] = "The button color must be blue."
+        issue["state"] = {"name": "In Progress", "type": "started"}
+        return httpx.Response(200, json={"data": {"issue": issue}})
+
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    apply_phase9_migration(db)
+    ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "Color", "state": "In Progress",
+              "owned": True, "hold": False}
+    final = {"status": "blocked", "summary": "Need a color", "run_id": "run-1",
+             "blocker": {"kind": "product_decision", "question": "What button color?"}}
+    db.replace_tickets("mock", [ticket], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,session_id,deadline_seconds,final_json) VALUES (?,?,?,?,?,?,?)",
+        ("run-1", "MOCK-1", "blocked", str(tmp_path), "session-1", 60, json.dumps(final)))
+    db.connection.commit()
+    linear = LinearClient(token="mock", transport=httpx.MockTransport(handler))
+    prompts = []
+
+    async def mate(prompt, **kwargs):
+        prompts.append(prompt)
+        return disposition
+
+    async def resume(run_id, prompt):
+        return True
+
+    class Dispatcher:
+        async def retry(self, *args):
+            raise AssertionError("builder must not be retried")
+
+    notifier = Notifier()
+    poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=BlockerPolicy((0, 0))))
+    supervisor = Supervisor(poller, db=db, dispatcher=Dispatcher(), notifier=notifier)
+    supervisor.unblock_ladder = UnblockLadder(db, linear=linear, first_mate=mate, resumer=resume, repo_path=tmp_path)
+    supervisor.lifecycle = Lifecycle.RUNNING
+    supervisor.linear_healthy = True
+    supervisor._fleet_tickets = (ticket,)
+    wake = Wake(ticket=ticket, action="reengage", resume="run-1")
+
+    async def scenario():
+        try:
+            await supervisor._handle_runner_result(wake, final)
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                await supervisor._retry_stopped_builders()
+                await asyncio.gather(*list(supervisor._dispatch_tasks.values()))
+        finally:
+            await linear.close()
+
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        asyncio.run(scenario())
+    receipts = db.connection.execute(
+        "SELECT run_id FROM recovery_receipts").fetchall() if db.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='recovery_receipts'").fetchone() else []
+    db.close()
+    return prompts, queries, notifier.messages, [row[0] for row in receipts], caplog.records
+
+
+@pytest.mark.parametrize("failing,disposition,mutation", [
+    ("comment", {"disposition": "resolve", "answer": "Use blue", "citation": "ticket:MOCK-1:1",
+                 "reason": "AC says blue."}, "HarborComment"),
+    ("state", {"disposition": "escalate", "reason": "A human decision is required."}, "HarborProgress"),
+])
+def test_linear_write_failure_after_triage_is_not_replayed_as_context_failure(tmp_path, caplog, failing,
+                                                                                disposition, mutation):
+    from harbor.clients.linear import LinearClientError
+
+    prompts, queries, messages, receipts, records = _post_triage_failure(
+        tmp_path, caplog, failing=failing, disposition=disposition)
+    assert len(prompts) == 1  # triage ran once and was not replayed
+    assert len([q for q in queries if mutation in q]) == 1
+    assert [r for r in receipts if r.startswith("triage:")] == []
+    assert len(messages) == 1, messages
+    assert "not triaged" not in messages[0] and "could not be verified" not in messages[0]
+    assert "MOCK-1" in messages[0] and "after triage" in messages[0]
+    assert any(record.exc_info and issubclass(record.exc_info[0], LinearClientError) for record in records)
+
+
+def test_blocked_final_generic_error_is_logged_and_notified(tmp_path, caplog):
+    import logging
+
+    class Ladder:
+        async def handle(self, ticket, run, final, *, blocker=None):
+            raise KeyError("missing field")
+
+    db = HarborDB(":memory:")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    notifier = Notifier()
+    supervisor = Supervisor(SimpleNamespace(project_name="mock", config=SimpleNamespace()), db=db,
+                            unblock_ladder=Ladder(), notifier=notifier)
+    wake = Wake(ticket={"identifier": "MOCK-1"}, action="reengage", resume="logical")
+    final = {"status": "blocked", "run_id": "logical", "blocker": {"kind": "ambiguous_ac", "question": "Which?"}}
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        asyncio.run(supervisor._handle_runner_result(wake, final))
+        asyncio.run(supervisor._handle_runner_result(wake, final))
+    db.close()
+    assert "missing field" in (supervisor.last_error or "")
+    assert len(notifier.messages) == 1, notifier.messages  # deduplicated
+    assert "MOCK-1" in notifier.messages[0] and "KeyError" in notifier.messages[0]
+    assert "Linear" not in notifier.messages[0]
+    assert any(record.exc_info and record.exc_info[0] is KeyError for record in caplog.records)
+
+
+def test_context_notice_dedupes_on_cause_not_transport_detail(tmp_path):
+    """A changing error text across replays must not page again."""
+    from harbor.unblock import BlockerContextUnavailable
+
+    db = HarborDB(":memory:")
+    notifier = Notifier()
+    supervisor = Supervisor(SimpleNamespace(project_name="mock", config=SimpleNamespace()), db=db, notifier=notifier)
+
+    async def run():
+        for detail in ("Linear request failed: timed out", "Linear request failed: connection reset"):
+            await supervisor._report_unblock_failure("MOCK-1", "run-1", BlockerContextUnavailable(detail),
+                                                     action="handle the blocked result")
+
+    asyncio.run(run())
+    db.close()
+    assert len(notifier.messages) == 1 and "timed out" in notifier.messages[0]

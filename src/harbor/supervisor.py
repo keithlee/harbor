@@ -2927,26 +2927,71 @@ class Supervisor:
                     quota_schema(connection)
                     connection.execute("DELETE FROM quota_recovery WHERE run_id=?", ("triage:" + run_id,))
         except Exception as exc:
-            from harbor.clients.linear import LinearClientError
             from harbor.first_mate import FirstMateError, FirstMateQuotaError
             from harbor.recovery import defer_quota
             import time
-            # Only a failed model invocation, or a Linear blocker context that
-            # could not be read or proven complete, gets an automatic triage
-            # retry (bounded by blocker_policy.retry_delays, then escalated);
-            # explicit task cancellation is a BaseException and bypasses this.
+            # Only a failed model invocation gets an automatic triage retry
+            # here; an unreadable blocker context is handled (and retried) by
+            # _report_unblock_failure.  Explicit task cancellation is a
+            # BaseException and bypasses this.
             connection = getattr(self.db, "connection", None)
             if isinstance(exc, FirstMateQuotaError) and connection is not None and run_id:
                 defer_quota(connection, "triage:" + run_id, exc.provider, exc.reset, time.time())
-            elif isinstance(exc, (FirstMateError, LinearClientError)) and run_id:
-                self._schedule_triage_retry(
-                    run_id, _LINEAR_CONTEXT_REASON if isinstance(exc, LinearClientError) else "First Mate invocation failed"
-                )
+            elif isinstance(exc, FirstMateError) and run_id:
+                self._schedule_triage_retry(run_id, "First Mate invocation failed")
             # A malformed blocked final must not stop source polling.  The
             # literal error remains visible in /status for operator action.
             self.last_error = str(exc)
-            if isinstance(exc, LinearClientError):
-                await self._notify_blocker_context_failure(self._ticket_key(wake.ticket), run_id, exc)
+            if not isinstance(exc, FirstMateError):
+                await self._report_unblock_failure(
+                    self._ticket_key(wake.ticket), run_id, exc, action="handle the blocked result"
+                )
+
+    async def _report_unblock_failure(self, identifier: str, run_id: Any, exc: Exception, *, action: str) -> None:
+        """Log, notify and (only when safe) schedule a retry for a failed unblock.
+
+        Classified by where the error came from, not only its type:
+
+        * ``BlockerContextUnavailable`` -- the pre-triage Linear reads failed,
+          nothing was decided or written, so a bounded triage replay is safe.
+        * ``TicketNotUnblockable`` -- an expected state (stopped ticket or an
+          open dependency): recorded, never paged.
+        * any other ``LinearClientError`` -- a Linear request after triage
+          (a comment or state write); triage already ran and is not replayed.
+        * anything else -- logged with its traceback and reported.
+
+        Notice keys use the ticket, run and error class, never the error text,
+        so a changing transport detail does not page on every replay.
+        """
+
+        from harbor.clients.linear import LinearClientError
+        from harbor.unblock import BlockerContextUnavailable, TicketNotUnblockable
+
+        run_text = str(run_id or "")
+        if isinstance(exc, BlockerContextUnavailable):
+            if run_text:
+                self._schedule_triage_retry(run_text, _LINEAR_CONTEXT_REASON)
+            _LOG.warning("blocker context unavailable for %s run %s: %s", identifier, run_text, exc)
+            await self._notify_operator(
+                f"blocker-context:{identifier}:{run_text}",
+                f"{identifier}: blocked run {run_text or 'unknown'} was not triaged because its Linear "
+                f"blocker context could not be verified: {exc}",
+            )
+        elif isinstance(exc, TicketNotUnblockable):
+            _LOG.info("blocked run %s for %s not unblocked: %s", run_text, identifier, exc)
+        elif isinstance(exc, LinearClientError):
+            _LOG.error("Linear request failed after triage for %s run %s", identifier, run_text, exc_info=exc)
+            await self._notify_operator(
+                f"unblock-linear-after-triage:{identifier}:{run_text}:{type(exc).__name__}",
+                f"{identifier}: a Linear request failed after triage of blocked run {run_text or 'unknown'} "
+                f"(triage is not repeated): {exc}",
+            )
+        else:
+            _LOG.error("could not %s for %s run %s", action, identifier, run_text, exc_info=exc)
+            await self._notify_operator(
+                f"unblock-failed:{action}:{identifier}:{run_text}:{type(exc).__name__}",
+                f"{identifier}: could not {action} for run {run_text or 'unknown'}: {type(exc).__name__}: {exc}",
+            )
 
     def _schedule_triage_retry(self, run_id: str, reason: str) -> None:
         """Queue a bounded triage replay of a blocked run (see _retry_stopped_builders).
@@ -2969,15 +3014,6 @@ class Supervisor:
                 "ON CONFLICT(run_id) DO UPDATE SET last_reason=excluded.last_reason",
                 ("triage:" + run_id, time.time() + self.blocker_policy.retry_delays[0], reason),
             )
-
-    async def _notify_blocker_context_failure(self, identifier: str, run_id: Any, exc: Exception) -> None:
-        """Tell the operator, once per run and error, that triage could not start."""
-
-        await self._notify_operator(
-            f"blocker-context:{identifier}:{run_id}:{exc}",
-            f"{identifier}: blocked run {run_id or 'unknown'} was not triaged because its Linear "
-            f"blocker context could not be verified: {exc}",
-        )
 
     async def _cleanup_merged_worktree(self, wake: Wake, result: Mapping[str, Any]) -> None:
         """Remove a ticket's worktree once Harbor has verified its merge.
@@ -3911,25 +3947,10 @@ class Supervisor:
             except Exception as exc:
                 # One ticket's failure must not stop start() from reaching
                 # RUNNING and polling every other ticket.
-                from harbor.clients.linear import LinearClientError
-                from harbor.unblock import TicketNotUnblockable
                 self.last_error = f"{identifier}: {exc}"
-                run_id = str(run.get("id") or "")
-                if isinstance(exc, LinearClientError):
-                    if run_id:
-                        self._schedule_triage_retry(run_id, _LINEAR_CONTEXT_REASON)
-                    await self._notify_blocker_context_failure(identifier, run_id, exc)
-                elif isinstance(exc, TicketNotUnblockable):
-                    # Expected: the ticket was stopped or still has a blocking
-                    # dependency.  Recorded, not paged on every restart.
-                    _LOG.info("startup blocker retry skipped for %s: %s", identifier, exc)
-                else:
-                    _LOG.exception("startup blocker retry failed for %s", identifier)
-                    await self._notify_operator(
-                        f"startup-blocker-retry:{identifier}:{run_id}:{type(exc).__name__}:{exc}",
-                        f"{identifier}: could not retry deterministic blocker for run {run_id or 'unknown'}: "
-                        f"{type(exc).__name__}: {exc}",
-                    )
+                await self._report_unblock_failure(
+                    identifier, run.get("id"), exc, action="retry deterministic blocker"
+                )
                 continue
             retried.append(identifier)
         return retried
