@@ -522,3 +522,60 @@ def test_poll_publishes_one_ticket_for_an_issue_repeated_across_pages(tmp_path) 
     result = asyncio.run(scenario())
 
     assert len(result.tickets) == 3
+
+
+# A connection with a valid pageInfo but no ``nodes`` list is malformed too:
+# reading it as an empty page would silently drop that page.
+
+MISSING_NODES = [
+    pytest.param("absent", id="nodes-absent"),
+    pytest.param(None, id="nodes-null"),
+    pytest.param({"id": "x"}, id="nodes-object"),
+]
+
+
+def _connection(nodes, page_info: dict) -> dict:
+    body: dict = {"pageInfo": page_info}
+    if nodes != "absent":
+        body["nodes"] = nodes
+    return body
+
+
+@pytest.mark.parametrize("nodes", MISSING_NODES)
+def test_fetch_issues_rejects_a_page_without_a_nodes_list(nodes) -> None:
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["variables"])
+        if len(calls) == 1:
+            body = _connection(nodes, {"hasNextPage": True, "endCursor": "cursor-0"})
+        else:
+            body = {"nodes": [issue(2)], "pageInfo": {"hasNextPage": False, "endCursor": None}}
+        return httpx.Response(200, json={"data": {"issues": body}})
+
+    with pytest.raises(LinearClientError, match=r"^Linear issues response was malformed$"):
+        fetch(httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("nodes", MISSING_NODES)
+def test_list_projects_rejects_a_page_without_a_nodes_list(nodes) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _connection(nodes, {"hasNextPage": False, "endCursor": None})
+        return httpx.Response(200, json={"data": {"projects": body}})
+
+    with pytest.raises(LinearClientError, match=r"^Linear project response was malformed$"):
+        list_projects(httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("nodes", MISSING_NODES)
+def test_workflow_state_lookup_rejects_a_page_without_a_nodes_list(nodes) -> None:
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        states = _connection(nodes, {"hasNextPage": False, "endCursor": None})
+        return httpx.Response(200, json={"data": {"issue": {"team": {"states": states}}}})
+
+    with pytest.raises(LinearClientError, match=r"^Linear workflow state response was malformed$"):
+        set_state(httpx.MockTransport(handler), "Blocked")
+    assert not any("issueUpdate" in call["query"] for call in calls)

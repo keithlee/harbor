@@ -321,7 +321,7 @@ class LinearClient:
         ``connection`` picks the connection object out of a response's data.
         The query must take ``$after`` (omitted on the first page; GraphQL
         treats it as null) and select ``pageInfo { hasNextPage endCursor }``.
-        A malformed page (a missing/null connection, or a ``pageInfo`` or
+        A malformed page (a missing/null connection or ``nodes`` list, or a ``pageInfo`` or
         ``hasNextPage`` that is absent or not the expected type), a
         missing/repeated cursor, or more than ``LINEAR_POLL_MAX_PAGES`` pages
         raises: callers never see a partial list presented as complete.
@@ -338,7 +338,9 @@ class LinearClient:
             page = connection(data)
             if not isinstance(page, dict):
                 raise LinearClientError(f"Linear {label} response was malformed")
-            nodes = page.get("nodes", [])
+            # The query selects nodes, so an absent nodes list is malformed,
+            # not an empty page: reading it as empty would drop this page.
+            nodes = page.get("nodes")
             if not isinstance(nodes, list):
                 raise LinearClientError(f"Linear {label} response was malformed")
             # The query selects pageInfo, so an absent or non-boolean
