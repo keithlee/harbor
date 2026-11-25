@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import pytest
 
 from harbor.clients.linear import LinearClient
 from harbor.config.projects import ProjectConfig
@@ -146,6 +147,116 @@ def test_status_renders_observed_tickets_and_never_backlog(tmp_path: Path) -> No
         assert f"{identifier} (observed)  {state}" in rendered
     assert "SAMPLE-99" not in rendered
     assert "Backlog" not in rendered
+
+
+@pytest.mark.parametrize("shelved", [True, False], ids=["shelved", "same-linear-snapshot"])
+def test_console_status_keeps_latest_fleet_after_overlapping_polls(tmp_path: Path, shelved: bool) -> None:
+    pr_url = "https://github.com/sample/project/pull/42"
+    ticket = {
+        "id": "linear-42",
+        "identifier": "SAMPLE-42",
+        "title": "Fixture issue",
+        "state": {"name": "In Progress", "type": "started"},
+        "attachments": {"nodes": [{"url": pr_url, "sourceType": "github"}]},
+    }
+    linear_unavailable = False
+
+    def linear(_: httpx.Request) -> httpx.Response:
+        if linear_unavailable:
+            raise httpx.ConnectError("Linear temporarily unavailable")
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+
+    async def scenario() -> None:
+        nonlocal linear_unavailable
+        older_waiting = asyncio.Event()
+        release_older = asyncio.Event()
+        github_calls = 0
+
+        async def github(_):
+            nonlocal github_calls
+            github_calls += 1
+            if github_calls == 1:
+                older_waiting.set()
+                await release_older.wait()
+                return [{"ticket": "SAMPLE-42", "number": 42, "url": pr_url, "ci": "red"}]
+            if shelved:
+                raise RuntimeError("GitHub temporarily unavailable")
+            return [{"ticket": "SAMPLE-42", "number": 42, "url": pr_url, "ci": "green"}]
+
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
+        db = HarborDB(tmp_path / "harbor.db")
+        client = LinearClient(token="test-key", transport=httpx.MockTransport(linear))
+        try:
+            supervisor = Supervisor(LinearPoller(client, config, db=db), db=db, github_poller=github)
+            console = Console(supervisor)
+            older = asyncio.create_task(supervisor.poll_once())
+            try:
+                await asyncio.wait_for(older_waiting.wait(), timeout=2)
+                if shelved:
+                    ticket["state"] = {"name": "Icebox", "type": "backlog"}
+                current = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+                before = await console.handle_command("/status")
+            finally:
+                release_older.set()
+                previous = await asyncio.wait_for(older, timeout=2)
+
+            after = await console.handle_command("/status")
+            status = supervisor.status()
+            print(f"/status after the older poll finishes:\n{after}\nGitHub healthy: {status.github_healthy}")
+            assert after == before
+            if shelved:
+                assert "No tickets in the configured poll states." in after
+                assert status.github_healthy is False
+                assert status.github_error == "GitHub temporarily unavailable"
+            else:
+                assert current.snapshot_hash == previous.snapshot_hash
+                assert "CI green" in after
+                assert status.github_healthy is True
+
+                linear_unavailable = True
+                assert await supervisor.refresh() is None
+                degraded = await console.handle_command("/status")
+                print(f"/status after a Linear failure:\n{degraded}")
+                assert "Linear unavailable" in degraded
+                assert "SAMPLE-42 (observed)  In Progress  Fixture issue  PR #42  CI green" in degraded
+        finally:
+            await client.close()
+            db.close()
+
+    run(scenario())
+
+
+def test_a_poll_publishes_its_github_facts(tmp_path: Path) -> None:
+    """The current poll owns the in-memory PR facts behind /facts and observed_pr_facts."""
+    pr_url = "https://github.com/sample/project/pull/42"
+    ticket = {
+        "id": "linear-42",
+        "identifier": "SAMPLE-42",
+        "title": "Fixture issue",
+        "state": {"name": "In Progress", "type": "started"},
+        "attachments": {"nodes": [{"url": pr_url, "sourceType": "github"}]},
+    }
+    fact = {"ticket": "SAMPLE-42", "number": 42, "url": pr_url, "ci": "green", "threads": [], "mergeable": True}
+
+    def linear(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"issues": {"nodes": [ticket], "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+
+    async def github(_):
+        return [dict(fact)]
+
+    async def scenario() -> None:
+        config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", repo_path=tmp_path)
+        db = HarborDB(tmp_path / "harbor.db")
+        client = LinearClient(token="test-key", transport=httpx.MockTransport(linear))
+        try:
+            supervisor = Supervisor(LinearPoller(client, config, db=db), db=db, github_poller=github)
+            await supervisor.poll_once()
+            assert [dict(item) for item in supervisor.last_pr_facts] == [fact]
+        finally:
+            await client.close()
+            db.close()
+
+    run(scenario())
 
 
 def test_background_output_is_emitted_under_patch_stdout(tmp_path: Path, monkeypatch) -> None:

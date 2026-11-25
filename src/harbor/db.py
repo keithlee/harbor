@@ -448,7 +448,7 @@ class HarborDB:
         timestamp = _now()
         encoded = _json(payload)
         rows = [dict(ticket) for ticket in tickets]
-        with self._lock:
+        with self._lock, self._connection:
             current = self._connection.execute(
                 "SELECT snapshot_hash FROM snapshots WHERE project = ?", (project,)
             ).fetchone()
@@ -500,7 +500,6 @@ class HarborDB:
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (project, identifier, "ticket.observed", _json(ticket), snapshot_hash, timestamp),
                 )
-            self._connection.commit()
             return True
 
     def tickets(self, project: str) -> list[dict[str, Any]]:

@@ -952,7 +952,14 @@ class BaseRunner:
             except asyncio.TimeoutError:
                 continue
 
-    async def _execute(self, context: RunContext, instruction: str, *, resume: bool) -> RunResult:
+    async def _execute(
+        self, context: RunContext, instruction: str, *, resume: bool,
+        before_spawn: Callable[[], None] | None = None,
+    ) -> RunResult:
+        # Provider-specific startup may await external services before reaching
+        # this point. Authorize here, before ledger changes and subprocess spawn.
+        if before_spawn is not None:
+            before_spawn()
         from harbor.recovery import retained_budget
         connection = _db_connection(self.db)
         row = None
@@ -1175,8 +1182,13 @@ class BaseRunner:
             error=summary,
         )
 
-    async def start(self, instruction: str, *, run_id: str | None = None) -> RunResult:
+    async def start(
+        self, instruction: str, *, run_id: str | None = None,
+        before_spawn: Callable[[], None] | None = None,
+    ) -> RunResult:
         context = self._new_context(run_id)
+        if before_spawn is not None:
+            return await self._execute(context, instruction, resume=False, before_spawn=before_spawn)
         return await self._execute(context, instruction, resume=False)
 
     run = start

@@ -1,7 +1,10 @@
 """First Mate monitor-and-recover, including a replay of the HAN-86 deadlock."""
 import asyncio
 import json
+import sys
 import time
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -144,9 +147,13 @@ def supervisor_for(tmp_path, db, answer, *, ticket=None):
     return supervisor, mate, linear
 
 
-async def monitor_observed(supervisor):
-    observed = {ticket["identifier"] for ticket in supervisor.db.tickets(supervisor.project)}
-    await supervisor._monitor_blocked(observed)
+async def monitor_observed(supervisor, tickets=None, *, flags_before=None):
+    if tickets is None:
+        tickets = supervisor.db.tickets(supervisor.project)
+    observation = PollResult(tuple(tickets), "snapshot", True, ())
+    supervisor.last_result = observation
+    supervisor.linear_healthy = True
+    await supervisor._monitor_blocked(observation, flags_before=flags_before)
 
 
 def monitor(supervisor):
@@ -188,7 +195,9 @@ def test_han86_replay_first_mate_resumes_with_close_and_respawn(tmp_path):
     supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
     resumed = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         resumed.append((run_id, prompt))
         return True
 
@@ -369,7 +378,9 @@ def test_recovery_does_not_block_polling(tmp_path):
     never = asyncio.Event()
     calls = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         calls.append(run_id)
         await never.wait()  # a builder that never returns
         return True
@@ -397,7 +408,9 @@ def test_recovery_task_blocks_duplicate_wake(tmp_path):
     never = asyncio.Event()
     delivered = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         await never.wait()
         return True
 
@@ -426,7 +439,9 @@ def test_stalled_live_delivery_is_cancelled_and_replaced(tmp_path):
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
     replaced = []
 
-    async def fresh_session(identifier, instruction):
+    async def fresh_session(identifier, instruction, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         replaced.append(identifier)
         return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "run-HAN-86"}
 
@@ -465,7 +480,9 @@ def test_recovery_failure_escalates_and_frees_the_ticket(tmp_path):
     supervisor, _, _ = supervisor_for(tmp_path, db, {"action": "resume", "instruction": "x", "reason": "r"})
     notices = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         raise RuntimeError("session gone")
 
     async def notify(key, message):
@@ -488,7 +505,9 @@ def test_successful_recovery_notifies_after_completion(tmp_path):
     events = []
     gate = asyncio.Event()
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         events.append("builder-start")
         await gate.wait()
         events.append("builder-done")
@@ -529,7 +548,9 @@ def test_stalled_real_codex_process_is_killed_before_replacement(tmp_path):
     supervisor, mate, _ = supervisor_for(tmp_path, db, {"action": "fresh_session", "instruction": "start over", "reason": "hung"})
     replaced = []
 
-    async def fresh_session(identifier, instruction):
+    async def fresh_session(identifier, instruction, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         replaced.append(identifier)
         return {"status": "completed", "outcome": "no_pr", "summary": "ok", "run_id": "retained"}
 
@@ -568,7 +589,9 @@ def _recording_supervisor(tmp_path, db):
     supervisor, mate, linear = supervisor_for(tmp_path, db, answer)
     resumed = []
 
-    async def resume_session(run_id, prompt):
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        if before_launch is not None:
+            before_launch()
         resumed.append(run_id)
         return True
 
@@ -636,19 +659,7 @@ def test_in_progress_and_human_review_are_still_recovered(tmp_path):
         assert len(prompts) == 1 and resumed == ["run-HAN-86"], name
 
 
-@pytest.mark.parametrize(
-    ("state", "state_type", "recover"),
-    [
-        ("Icebox", "backlog", False),
-        ("Backlog", "backlog", False),
-        ("Shipped", "completed", False),
-        ("In Progress", "started", True),
-    ],
-)
-def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, recover):
-    db = ledger(tmp_path, final=ENV_BLOCKED)
-    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
-    supervisor.dispatcher.workflow.config["states"] = {"terminal": ["Shipped"]}
+def _linear_observation(supervisor, db, *, poll_states=Poller.config.poll_states):
     issue = {
         "identifier": "HAN-86",
         "id": "lin-86",
@@ -663,7 +674,24 @@ def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, 
         return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
 
     client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
-    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    supervisor.poller = LinearPoller(client, replace(Poller.config, poll_states=poll_states), db=db)
+    return client, issue
+
+
+@pytest.mark.parametrize(
+    ("state", "state_type", "recover"),
+    [
+        ("Icebox", "backlog", False),
+        ("Backlog", "backlog", False),
+        ("Shipped", "completed", False),
+        ("In Progress", "started", True),
+    ],
+)
+def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, recover):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    supervisor.dispatcher.workflow.config["states"] = {"terminal": ["Shipped"]}
+    client, issue = _linear_observation(supervisor, db)
 
     async def scenario():
         observed = await supervisor.poller.poll()
@@ -687,6 +715,589 @@ def test_first_mate_requires_a_fresh_polled_ticket(tmp_path, state, state_type, 
         db.close()
 
 
+@pytest.mark.parametrize("blocked_on", ["github", "triage"])
+def test_first_mate_cannot_recover_from_an_older_overlapping_poll(tmp_path, blocked_on):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        older_waiting, release_older = asyncio.Event(), asyncio.Event()
+
+        async def github(tickets):
+            if tickets:
+                older_waiting.set()
+                await release_older.wait()
+            return []
+
+        original_triage = mate.triage
+
+        async def triage(prompt):
+            proposal = await original_triage(prompt)
+            older_waiting.set()
+            await release_older.wait()
+            return proposal
+
+        if blocked_on == "github":
+            supervisor.github_poller = github
+        else:
+            mate.triage = triage
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(older_waiting.wait(), timeout=2)
+            issue["state"] = {"name": "Icebox", "type": "backlog"}
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets == ()
+            assert db.tickets("Demo")[0]["state"] == "In Progress"
+        finally:
+            release_older.set()
+            previous = await asyncio.wait_for(older, timeout=2)
+        assert [ticket["identifier"] for ticket in previous.tickets] == ["HAN-86"]
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == int(blocked_on == "triage")
+        assert linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_first_mate_rechecks_state_after_a_failed_snapshot_write(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db, poll_states=(*Poller.config.poll_states, "Icebox"))
+
+    async def scenario():
+        previous = await supervisor.poller.poll()
+        db.connection.execute("""
+            CREATE TEMP TRIGGER fail_icebox_write BEFORE UPDATE OF state ON tickets
+            WHEN NEW.state = 'Icebox' BEGIN SELECT RAISE(ABORT, 'temporary failure'); END
+        """)
+        issue["state"] = {"name": "Icebox", "type": "backlog"}
+        assert await supervisor.poll_once() is None
+        assert supervisor.linear_healthy is False
+        digest_after_failure = db.snapshot_hash("Demo")
+        db.connection.execute("DROP TRIGGER fail_icebox_write")
+        latest = await supervisor.refresh()
+        await supervisor._drain_recoveries()
+        assert latest.tickets[0]["state"] == "Icebox"
+        assert mate.prompts == linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+        assert digest_after_failure == previous.snapshot_hash
+        assert latest.changed and db.snapshot_hash("Demo") == latest.snapshot_hash
+        assert db.tickets("Demo")[0]["state_type"] == "backlog"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_poll_numbering_follows_linear_fetch_order_not_poll_entry(tmp_path):
+    """A poll that stalls before its Linear fetch still publishes the newer data it fetches.
+
+    Poll A enters first and stalls in merge reconciliation. Poll B fetches and
+    publishes. A then fetches newer Linear data; numbering polls on entry
+    (before the lock) would mark A older than B and discard its fresher fetch.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        a_stalled, release_a = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def reconcile(*args, **kwargs):
+            calls.append(len(calls))
+            if len(calls) == 1:  # poll A
+                a_stalled.set()
+                await release_a.wait()
+
+        supervisor._reconcile_completed_merges = reconcile
+        poll_a = asyncio.create_task(supervisor.poll_once())
+        await asyncio.wait_for(a_stalled.wait(), timeout=2)
+        poll_b = await asyncio.wait_for(supervisor.poll_once(), timeout=2)  # B publishes first
+        assert [ticket["identifier"] for ticket in poll_b.tickets] == ["HAN-86"]
+        issue["state"] = {"name": "Icebox", "type": "backlog"}  # newer Linear data
+        release_a.set()
+        latest = await asyncio.wait_for(poll_a, timeout=2)
+        await supervisor._drain_recoveries()
+        assert latest.tickets == ()
+        assert supervisor.last_result is latest  # A's newer fetch is the published one
+        assert db.snapshot_hash("Demo") == latest.snapshot_hash
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_linear_observations_publish_in_request_order(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    client, issue = _linear_observation(supervisor, db)
+
+    async def scenario():
+        first_response, release_response, release_github = (asyncio.Event() for _ in range(3))
+        refresh_started = asyncio.Event()
+        fetch_issues = client.fetch_issues
+
+        async def fetch(*args):
+            nodes = await fetch_issues(*args)
+            if nodes:
+                first_response.set()
+                await release_response.wait()
+            return nodes
+
+        async def github(tickets):
+            if tickets:
+                await release_github.wait()
+            return []
+
+        async def refresh():
+            refresh_started.set()
+            return await supervisor.refresh()
+
+        client.fetch_issues = fetch
+        supervisor.github_poller = github
+        older = asyncio.create_task(supervisor.poll_once())
+        await asyncio.wait_for(first_response.wait(), timeout=2)
+        issue["state"] = {"name": "Icebox", "type": "backlog"}
+        newer = asyncio.create_task(refresh())
+        await asyncio.wait_for(refresh_started.wait(), timeout=2)
+        release_response.set()
+        try:
+            latest = await asyncio.wait_for(newer, timeout=2)
+            assert latest.tickets == ()
+        finally:
+            release_github.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+        assert supervisor.last_result is latest
+        assert db.snapshot_hash("Demo") == latest.snapshot_hash
+        assert mate.prompts == linear.comments == resumed == []
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("action", ["resume", "retry", "fresh_session"])
+def test_first_mate_rechecks_eligibility_after_runner_hydration(tmp_path, action):
+    status = "failed" if action == "retry" else "blocked"
+    db = ledger(tmp_path, status=status, final=ENV_BLOCKED)
+    decision = {"action": action, "instruction": "continue", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = []
+
+    class Runner:
+        async def resume(self, run_id, instruction):
+            launches.append(("resume", run_id))
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+        async def start(self, instruction, *, run_id=None):
+            launches.append(("start", run_id))
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        hydrating, release_hydration = asyncio.Event(), asyncio.Event()
+
+        async def factory(worktree, wake):
+            hydrating.set()
+            await release_hydration.wait()
+            return Runner()
+
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            await asyncio.wait_for(hydrating.wait(), timeout=2)
+            issue["state"] = {"name": "Icebox", "type": "backlog"}
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets == ()
+        finally:
+            release_hydration.set()
+            await supervisor._drain_recoveries()
+        assert not launches
+        assert len(mate.prompts) == len(linear.comments) == 1
+        assert recovery.history(db.connection, "run-HAN-86") == []
+        row = supervisor.dispatcher._persisted_run("HAN-86")
+        assert (row["status"], row["session_id"]) == (status, "native-1")
+        assert not db.queue_has_idem("HAN-86@retry@run-HAN-86", live_only=False)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+def test_first_mate_preserves_fresh_session_attempt_when_title_changes(tmp_path):
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "fresh_session", "instruction": "start over", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = []
+
+    class Runner:
+        async def start(self, instruction, *, run_id=None):
+            launches.append(run_id)
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        posting, release_comment = asyncio.Event(), asyncio.Event()
+        create_comment = linear.create_comment
+
+        async def comment(issue_id, body):
+            posting.set()
+            await release_comment.wait()
+            return await create_comment(issue_id, body)
+
+        supervisor.dispatcher.runner_factory = lambda worktree, wake: Runner()
+        linear.create_comment = comment
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(posting.wait(), timeout=2)
+            issue["title"] = "Renamed while the comment was pending"
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.tickets[0]["state"] == "In Progress"
+            queued_actions = recovery.history(db.connection, "run-HAN-86")
+        finally:
+            release_comment.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+        assert queued_actions == []
+        assert launches == ["run-HAN-86"]
+        assert len(mate.prompts) == len(linear.comments) == 1
+        assert [item["action"] for item in recovery.history(db.connection, "run-HAN-86")] == ["fresh_session"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("change", ["unrelated_ticket", "recovering_ticket_shelved"])
+def test_first_mate_does_not_charge_a_recovery_abandoned_during_the_comment(tmp_path, change):
+    """A newer poll while the recovery comment is posting must not consume budget.
+
+    An unrelated ticket changing leaves the recovering ticket eligible, so the
+    fresh session still runs and is recorded once.  When the recovering ticket
+    itself is shelved, nothing runs, and nothing is recorded: the run keeps its
+    whole recovery budget, including its single fresh-session allowance.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "fresh_session", "instruction": "start over", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    recovering = {"identifier": "HAN-86", "id": "lin-86", "title": "Sample issue",
+                  "state": {"name": "In Progress", "type": "started"}}
+    unrelated = {"identifier": "HAN-99", "id": "lin-99", "title": "Unrelated issue",
+                 "state": {"name": "Human Review", "type": "started"}}
+
+    def linear_issues(request):
+        states = json.loads(request.content)["variables"]["states"]
+        nodes = [issue for issue in (recovering, unrelated) if issue["state"]["name"] in states]
+        return httpx.Response(200, json={"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}})
+
+    client = LinearClient(token="test-key", transport=httpx.MockTransport(linear_issues))
+    supervisor.poller = LinearPoller(client, Poller.config, db=db)
+    launches = []
+
+    class Runner:
+        async def start(self, instruction, *, run_id=None):
+            launches.append(run_id)
+            return {"status": "completed", "outcome": "no_pr", "run_id": run_id}
+
+    async def scenario():
+        posting, release_comment = asyncio.Event(), asyncio.Event()
+        create_comment = linear.create_comment
+
+        async def comment(issue_id, body):
+            posting.set()
+            await release_comment.wait()
+            return await create_comment(issue_id, body)
+
+        supervisor.dispatcher.runner_factory = lambda worktree, wake: Runner()
+        linear.create_comment = comment
+        older = asyncio.create_task(supervisor.poll_once())
+        try:
+            await asyncio.wait_for(posting.wait(), timeout=2)
+            if change == "unrelated_ticket":
+                unrelated["title"] = "Renamed while the comment was pending"
+            else:
+                recovering["state"] = {"name": "Icebox", "type": "backlog"}
+            previous_hash = supervisor.last_result.snapshot_hash
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert latest.snapshot_hash != previous_hash
+        finally:
+            release_comment.set()
+            await asyncio.wait_for(older, timeout=2)
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert len(mate.prompts) == len(linear.comments) == 1
+        charged = [item["action"] for item in recovery.history(db.connection, "run-HAN-86")]
+        if change == "unrelated_ticket":
+            assert launches == ["run-HAN-86"]
+            assert charged == ["fresh_session"]
+        else:
+            assert launches == []
+            # No receipt: the unexecuted fresh session spent neither the
+            # recovery budget nor the run's single fresh-session allowance.
+            assert charged == []
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "change"),
+    [("resume", "icebox"), ("retry", "icebox"), ("fresh_session", "icebox"),
+     ("resume", "paused_policy"), ("retry", "paused_policy"), ("fresh_session", "paused_policy"),
+     ("resume", "paused_browser_policy"), ("retry", "paused_browser_policy"),
+     ("fresh_session", "paused_browser_policy"),
+     ("fresh_session", "title")],
+)
+def test_first_mate_authorizes_actual_codex_spawn_after_async_preparation(tmp_path, monkeypatch, action, change):
+    from harbor.runner.codex import CodexRunner
+
+    status = "failed" if action == "retry" else "blocked"
+    db = ledger(tmp_path, status=status, final=ENV_BLOCKED)
+    decision = {"action": action, "instruction": "continue", "reason": "stuck"}
+    supervisor, mate, linear = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    launches = tmp_path / "launched"
+    executable = tmp_path / "record-codex"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(launches)!r}).write_text('launched')\n"
+        "sys.stdin.read()\n"
+    )
+    executable.chmod(0o755)
+
+    async def scenario():
+        preparing, release_preparation = asyncio.Event(), asyncio.Event()
+
+        @asynccontextmanager
+        async def runtime(image, *, lifetime_seconds):
+            if change != "paused_policy":
+                preparing.set()
+                await release_preparation.wait()
+            yield "ws://127.0.0.1:3000/test", ""
+
+        async def factory(worktree, wake):
+            if change == "paused_policy":
+                preparing.set()
+                await release_preparation.wait()
+            return CodexRunner(
+                worktree, db=db, ticket="HAN-86", run_id=wake.run_id,
+                executable=str(executable), playwright_browser_image=f"example/browser@sha256:{'a' * 64}",
+            )
+
+        monkeypatch.setattr("harbor.runner.codex.browser_endpoint", runtime)
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            await asyncio.wait_for(preparing.wait(), timeout=2)
+            if change == "icebox":
+                issue["state"] = {"name": "Icebox", "type": "backlog"}
+            elif change in {"paused_policy", "paused_browser_policy"}:
+                workflow = supervisor.dispatcher.workflow.package / "workflow.toml"
+                workflow.write_text(workflow.read_text() + '\n[states]\npaused = ["In Progress"]\n')
+            else:
+                issue["title"] = "Renamed during browser preparation"
+            latest = await asyncio.wait_for(supervisor.refresh(), timeout=2)
+            assert len(latest.tickets) == int(change != "icebox")
+            early_attempts = recovery.history(db.connection, "run-HAN-86")
+        finally:
+            release_preparation.set()
+            await supervisor._drain_recoveries()
+
+        assert launches.exists() == (change == "title")
+        assert early_attempts == []
+        assert len(mate.prompts) == len(linear.comments) == 1
+        actions = [item["action"] for item in recovery.history(db.connection, "run-HAN-86")]
+        assert actions == (["fresh_session"] if change == "title" else [])
+        if change != "title":
+            row = supervisor.dispatcher._persisted_run("HAN-86")
+            assert (row["status"], row["session_id"]) == (status, "native-1")
+            assert not db.queue_has_idem("HAN-86@retry@run-HAN-86", live_only=False)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("shelved", [True, False])
+def test_first_mate_rechecks_authorization_before_model_fallback(tmp_path, shelved):
+    from harbor.runner.codex import CodexRunner
+    from test_model_fallback import provider_error
+
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    decision = {"action": "resume", "instruction": "continue", "reason": "stuck"}
+    supervisor, _, _ = supervisor_for(tmp_path, db, decision)
+    client, issue = _linear_observation(supervisor, db)
+    release = tmp_path / "release"
+    launches = tmp_path / "models"
+    executable = tmp_path / "record-codex"
+    rejection = {"type": "error", "message": json.dumps(provider_error())}
+    final = {"type": "result", "result": {"status": "waiting", "outcome": "no_pr", "waiting_on": "human",
+                                         "summary": "fallback worked", "next_action": "wait", "pr_url": None, "blocker": None}}
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "model = sys.argv[sys.argv.index('-m') + 1]\n"
+        "sys.stdin.read()\n"
+        f"with Path({str(launches)!r}).open('a') as stream:\n"
+        "    stream.write(model + '\\n')\n"
+        "print(json.dumps({'type': 'thread.started', 'thread_id': 'native-1'}), flush=True)\n"
+        "if model == 'primary':\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+        f"    print(json.dumps({rejection!r}), flush=True)\n"
+        "    raise SystemExit(1)\n"
+        f"print(json.dumps({final!r}), flush=True)\n"
+    )
+    executable.chmod(0o755)
+
+    def factory(worktree, wake):
+        return CodexRunner(worktree, db=db, ticket="HAN-86", model="primary", fallback_models=["fallback"],
+                           executable=str(executable), run_id=wake.run_id)
+
+    async def scenario():
+        supervisor.dispatcher.runner_factory = factory
+        await supervisor.poll_once()
+        try:
+            async with asyncio.timeout(3):
+                while not launches.exists():
+                    await asyncio.sleep(0.01)
+            if shelved:
+                issue["state"] = {"name": "Icebox", "type": "backlog"}
+            else:
+                issue["title"] = "Renamed during primary builder process"
+            latest = await supervisor.refresh()
+            assert len(latest.tickets) == int(not shelved)
+        finally:
+            release.touch()
+            await supervisor._drain_recoveries()
+        assert launches.read_text().splitlines() == (["primary"] if shelved else ["primary", "fallback"])
+        attempts = recovery.history(db.connection, "run-HAN-86")
+        assert [item["action"] for item in attempts] == ["resume"]
+        fallback_receipts = db.connection.execute("SELECT COUNT(*) FROM workflow_receipts WHERE kind='model_fallback'").fetchone()[0]
+        assert fallback_receipts == int(not shelved)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(client.close())
+        db.close()
+
+
+@pytest.mark.parametrize("state_type", [" Backlog", "BACKLOG", "Completed ", " canceled"])
+def test_launch_recheck_and_find_cases_agree_on_an_unnormalized_stopped_state_type(tmp_path, state_type):
+    """The launch-time recheck and ``find_cases`` share ``ticket_states.is_stopped``.
+
+    A separate, unnormalized stopped check would call " Backlog" eligible at
+    launch while ``find_cases`` (which normalizes) calls it stopped.
+    """
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+
+    def observe():
+        supervisor.last_result = PollResult(tuple(db.tickets("Demo")), "snapshot", True, ())
+        supervisor.linear_healthy = True
+
+    _shelve(db, state="In Progress", state_type="started")
+    [case] = recovery.find_cases(db.connection, "Demo", SETTINGS)
+    observe()
+    assert supervisor._first_mate_can_recover(case) is True
+
+    _shelve(db, state="Icebox", state_type=state_type)
+    observe()
+    assert recovery.find_cases(db.connection, "Demo", SETTINGS) == []
+    assert supervisor._first_mate_can_recover(case) is False
+    assert supervisor._first_mate_can_recover(case, reload_policy=True) is False
+    assert supervisor._first_mate_can_recover(case, reload_policy=True, attempted=True) is False
+    db.close()
+
+
+@pytest.mark.parametrize("edited", ["before_pass", "during_triage"])
+def test_first_mate_does_not_comment_after_policy_pauses_the_state(tmp_path, edited):
+    """An operator pausing In Progress in workflow.toml stops triage comments, not just the launch."""
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    _shelve(db, state="In Progress", state_type="started")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    workflow = supervisor.dispatcher.workflow.package / "workflow.toml"
+
+    def pause_in_progress():
+        workflow.write_text(workflow.read_text() + '\n[states]\npaused = ["In Progress"]\n')
+
+    if edited == "before_pass":
+        pause_in_progress()
+    else:
+        triage = mate.triage
+
+        async def triage_then_pause(prompt):
+            answer = await triage(prompt)
+            pause_in_progress()
+            return answer
+
+        mate.triage = triage_then_pause
+    monitor(supervisor)
+    assert len(mate.prompts) == int(edited == "during_triage")
+    assert linear.comments == resumed == []
+    assert recovery.history(db.connection, "run-HAN-86") == []
+    db.close()
+
+
+@pytest.mark.parametrize("shelved", [True, False])
+def test_operator_is_told_when_a_failed_attempt_loses_its_fallback(tmp_path, shelved):
+    """A primary run that failed, then lost authorization before its fallback, is not dropped silently."""
+    db = ledger(tmp_path, final=ENV_BLOCKED)
+    _shelve(db, state="In Progress", state_type="started")
+    supervisor, mate, linear, _ = _recording_supervisor(tmp_path, db)
+    notices = []
+
+    async def notify(key, message):
+        notices.append((key, message))
+        return True
+
+    async def resume_session(run_id, prompt, *, before_launch=None):
+        before_launch()  # primary attempt is committed
+        if shelved:
+            _shelve(db, state="Icebox", state_type="backlog")
+            supervisor.last_result = PollResult(tuple(db.tickets("Demo")), "snapshot", True, ())
+        before_launch()  # model fallback re-checks authorization
+        return True
+
+    supervisor._notify_operator = notify
+    supervisor.resume_session = resume_session
+    monitor(supervisor)
+    assert [item["action"] for item in recovery.history(db.connection, "run-HAN-86")] == ["resume"]
+    keys = [key.split(":")[0] for key, _ in notices]
+    if shelved:
+        assert keys == ["recovery-superseded"]
+        assert "HAN-86" in notices[0][1] and "fallback" in notices[0][1]
+    else:
+        assert keys == ["recovery"]
+    db.close()
+
+
 def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
     db = ledger(tmp_path, status="completed", final={"status": "completed", "outcome": "merged"})
     _shelve(db, state="Done", state_type="completed")
@@ -699,7 +1310,7 @@ def test_first_mate_keeps_cleanup_for_an_unpolled_done_ticket(tmp_path):
 
     supervisor._reconcile_completed_merges = reconcile
     try:
-        asyncio.run(supervisor._monitor_blocked(set()))
+        asyncio.run(monitor_observed(supervisor, ()))
         assert reconciled == [("HAN-86", True)]
         assert mate.prompts == linear.comments == resumed == []
     finally:
@@ -717,18 +1328,40 @@ def test_watchdog_flag_for_an_unpolled_ticket_does_not_recover_it_later(tmp_path
 
     async def scenario():
         cutoff = recovery.latest_flag_id(db.connection)
-        await supervisor._monitor_blocked(set(), flags_before=cutoff)  # unpolled pass
+        await monitor_observed(supervisor, (), flags_before=cutoff)  # unpolled pass
         await supervisor._drain_recoveries()
         seen = db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0]
         assert seen == 1  # the stale flag is consumed, not left pending
         # Days later the ticket returns to In Progress and is polled again.
-        await supervisor._monitor_blocked({"HAN-86"})
+        await monitor_observed(supervisor)
         await supervisor._drain_recoveries()
 
     try:
         asyncio.run(scenario())
         assert mate.prompts == [] and linear.comments == [] and resumed == []
         assert db.connection.execute("SELECT COUNT(*) FROM first_mate_recoveries").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_observed_but_ineligible_ticket_keeps_its_watchdog_flag(tmp_path):
+    # Only an unpolled ticket's flags are consumed. A ticket the poll did
+    # observe, but that the launch recheck refuses (held in the latest
+    # observation), keeps its flag for a later pass.
+    db = ledger(tmp_path, status="running", final={}, finished=None, activity=1)
+    _shelve(db, state="In Progress", state_type="started")
+    flag(db, "HAN-86")
+    supervisor, mate, linear, resumed = _recording_supervisor(tmp_path, db)
+    held = [{**ticket, "hold": True} for ticket in db.tickets("Demo")]
+
+    async def scenario():
+        await monitor_observed(supervisor, held, flags_before=recovery.latest_flag_id(db.connection))
+        await supervisor._drain_recoveries()
+
+    try:
+        asyncio.run(scenario())
+        assert mate.prompts == linear.comments == resumed == []
+        assert db.connection.execute("SELECT COUNT(*) FROM first_mate_flags_seen").fetchone()[0] == 0
     finally:
         db.close()
 
@@ -949,7 +1582,7 @@ def test_superseded_poll_does_not_run_the_monitor(tmp_path):
     original_retry = supervisor._retry_stopped_builders
 
     async def monitor(observed, *args, **kwargs):
-        monitored.append(sorted(observed))
+        monitored.append(sorted(supervisor._ticket_key(ticket) for ticket in observed.tickets))
         return await original_monitor(observed, *args, **kwargs)
 
     async def retry_then_overtake():
