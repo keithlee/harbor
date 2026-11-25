@@ -89,6 +89,12 @@ Create `$HOME/.harbor/projects.md` with one row per repository:
 | AnotherProject | ~/Projects/AnotherProject | ~/Projects/AnotherProject/.harbor/pipeline.md | another-project-def456 | OTHER | example/AnotherProject | main |
 ```
 
+A column that has no effect (a typo, a pipeline-only setting such as
+`disk_floor_gb`, or a role model that `.harbor/workflow` sets) is reported by
+`harbor doctor`, `harbor start`, `harbor facts` and `harbor status`, with a
+hint, instead of being dropped silently. See `projects.md` for the optional
+columns.
+
 Set credentials and select the private registry. Credentials stay in the
 environment and must never be written into either Markdown file.
 

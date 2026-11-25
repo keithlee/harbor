@@ -17,7 +17,7 @@ from harbor.clients.github import GitHubClient
 from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
-from harbor.config.projects import get_project
+from harbor.config.projects import get_project, registry_key_warnings
 from harbor.console import Console
 from harbor.db import HarborDB
 from harbor.first_mate import FirstMate
@@ -464,6 +464,9 @@ async def _doctor(project_name: str) -> int:
         print(f"Project: {config.name} · Linear: unavailable ({exc})")
     else:
         print(f"Project: {config.name} · Linear: healthy")
+    # A warning, not a failure: Harbor runs with the value it resolved.
+    for warning in registry_key_warnings(config):
+        print(f"Registry: {warning}")
     scope_ok = True
     if healthy:
         scope_ok = await _check_project_scope(client, config)
@@ -583,6 +586,8 @@ async def _start(
     except ValueError as exc:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
+    for warning in registry_key_warnings(config):
+        print(f"Harbor: warning: {warning}", file=sys.stderr)
     profile = PipelineProfile.from_project(config)
     if github_poller is None and profile.repository_owner and profile.repository_name:
         try:
@@ -793,6 +798,8 @@ async def _facts(project_name: str, *, as_json: bool = True) -> int:
     except ValueError as exc:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
+    for warning in registry_key_warnings(config):
+        print(f"Harbor: warning: {warning}", file=sys.stderr)
     profile = PipelineProfile.from_project(config)
     if profile.repository_owner and profile.repository_name:
         try:
@@ -958,6 +965,8 @@ async def _status(project_name: str, *, as_json: bool = False) -> int:
     except ValueError as exc:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
+    for warning in registry_key_warnings(config):
+        print(f"Harbor: warning: {warning}", file=sys.stderr)
     db = HarborDB(_db_path())
     try:
         tickets = db.tickets(config.name)

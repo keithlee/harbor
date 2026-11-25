@@ -240,6 +240,40 @@ def retired_keys(text: str) -> tuple[str, ...]:
     return tuple(key for key in RETIRED_KEYS if _normal_key(key) in fields)
 
 
+# Pipeline settings and the spellings ``parse_pipeline_markdown`` accepts for
+# each.  Model, heartbeat and poll spellings are read separately below.
+PIPELINE_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "linear_project_slug": ("linear_project_slug", "project_slug", "slug"),
+    "linear_projects": ("linear_projects", "projects", "project_slugs", "included_projects"),
+    "linear_team": ("linear_team", "team"),
+    "linear_api_url": ("linear_api_url", "api_url"),
+    # These values are deliberately data-only.  In particular, ``skill``
+    # is an opaque name/path owned by the delivery runner; Harbor must not
+    # import it, reinterpret it, or silently substitute another skill.
+    "skill": ("skill", "delivery_skill", "pipeline_skill"),
+    "deadline_minutes": ("deadline_minutes", "deadline", "timeout_minutes"),
+    "disk_floor_gb": ("disk_floor_gb", "disk_floor"),
+    "base_branch": ("base_branch", "base_ref", "branch"),
+    "worktree_root": ("worktree_root", "worktrees_root", "worktree_dir"),
+    "dispatch_states": ("dispatch_states",),
+    "poll_states": ("poll_states",),
+    "hold": ("hold", "hold_all", "shadow_hold"),
+    "github_repository": ("github_repository", "github_repo", "repository"),
+    "required_checks": ("required_checks", "ci_required_checks"),
+    # ``bot_rework_rounds`` is the spelling PipelineProfile also reads, so
+    # the wake decider and the GitHub profile see the same cap.
+    "bot_rework_cap": ("bot_rework_cap", "bot_rework_rounds"),
+    # Opaque to Harbor: it runs it in the new worktree, nothing more.
+    "install_command": ("install_command", "install", "setup_command"),
+    "workflow_path": ("workflow_path",),
+    "playwright_browser_image": ("playwright_browser_image",),
+    "builder_provider": ("builder_provider",),
+    "firstmate_provider": ("firstmate_provider",),
+    "builder_fallback_models": ("builder_fallback_models",),
+    "firstmate_fallback_models": ("firstmate_fallback_models",),
+}
+
+
 def parse_pipeline_markdown(text: str, *, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return normalized pipeline settings parsed from Markdown."""
 
@@ -262,36 +296,7 @@ def parse_pipeline_markdown(text: str, *, defaults: Mapping[str, Any] | None = N
     firstmate_effort = first("firstmate_effort", "first_mate_effort", "firstmate_reasoning_effort", "planner_effort", "planning_effort")
     heartbeat = first("heartbeat_seconds", "heartbeat_interval_seconds", "heartbeat_interval")
     poll = first("poll_interval_seconds", "poll_interval")
-    for key, aliases in {
-        "linear_project_slug": ("linear_project_slug", "project_slug", "slug"),
-        "linear_projects": ("linear_projects", "projects", "project_slugs", "included_projects"),
-        "linear_team": ("linear_team", "team"),
-        "linear_api_url": ("linear_api_url", "api_url"),
-        # These values are deliberately data-only.  In particular, ``skill``
-        # is an opaque name/path owned by the delivery runner; Harbor must not
-        # import it, reinterpret it, or silently substitute another skill.
-        "skill": ("skill", "delivery_skill", "pipeline_skill"),
-        "deadline_minutes": ("deadline_minutes", "deadline", "timeout_minutes"),
-        "disk_floor_gb": ("disk_floor_gb", "disk_floor"),
-        "base_branch": ("base_branch", "base_ref", "branch"),
-        "worktree_root": ("worktree_root", "worktrees_root", "worktree_dir"),
-        "dispatch_states": ("dispatch_states",),
-        "poll_states": ("poll_states",),
-        "hold": ("hold", "hold_all", "shadow_hold"),
-        "github_repository": ("github_repository", "github_repo", "repository"),
-        "required_checks": ("required_checks", "ci_required_checks"),
-        # ``bot_rework_rounds`` is the spelling PipelineProfile also reads, so
-        # the wake decider and the GitHub profile see the same cap.
-        "bot_rework_cap": ("bot_rework_cap", "bot_rework_rounds"),
-        # Opaque to Harbor: it runs it in the new worktree, nothing more.
-        "install_command": ("install_command", "install", "setup_command"),
-        "workflow_path": ("workflow_path",),
-        "playwright_browser_image": ("playwright_browser_image",),
-        "builder_provider": ("builder_provider",),
-        "firstmate_provider": ("firstmate_provider",),
-        "builder_fallback_models": ("builder_fallback_models",),
-        "firstmate_fallback_models": ("firstmate_fallback_models",),
-    }.items():
+    for key, aliases in PIPELINE_KEY_ALIASES.items():
         value = first(*aliases)
         if key.endswith("_fallback_models") and _normal_key(aliases[0]) in fields:
             value = fields[_normal_key(aliases[0])]

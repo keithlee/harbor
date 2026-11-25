@@ -32,3 +32,20 @@ PR-event processing, `harbor workflow check` and `harbor doctor` all read that
 resolved value. The supervisor's bot-rework decision reads `bot_rework_cap`
 from the project configuration, which applies the same precedence and accepts
 the same spellings.
+
+Harbor says so when a registry column has no effect, instead of dropping it
+silently. A column is reported when:
+
+- Harbor does not read it: a typo, or a pipeline-only setting such as
+  `disk_floor_gb`, which belongs in the project's `pipeline.md`;
+- `.harbor/workflow` always replaces it: `builder_model`, `firstmate_model`,
+  `builder_fallback_models`, `firstmate_fallback_models` and `workflow_path`;
+- the value Harbor resolved is not the cell's value, for example
+  `builder_effort` when `.harbor/workflow` sets `reasoning_effort`.
+
+`harbor doctor` prints a `Registry:` line for each one. `harbor start`,
+`harbor facts` and `harbor status` print a warning once on stderr (so `--json`
+output on stdout is unchanged). Each names the project, the column and the
+registry file, with a hint when one applies: the registry column you probably
+meant, or where the setting belongs. An empty cell sets nothing and is not
+reported. The warnings do not change doctor's exit status.

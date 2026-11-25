@@ -198,6 +198,12 @@ class ProjectConfig:
     # over the pipeline file in ``PipelineProfile.from_project``; a value that
     # came from the pipeline or a default leaves the profile's own parse alone.
     registry_github_keys: frozenset[str] = frozenset()
+    # Registry columns for this project that Harbor does not read; ``harbor
+    # doctor`` and ``harbor start`` report them (``registry_key_warnings``).
+    registry_unknown_keys: tuple[str, ...] = field(default=(), compare=False)
+    # Registry settings whose value Harbor does not use, as (column, value,
+    # reason); for example a role model that .harbor/workflow always sets.
+    registry_unused_values: tuple[tuple[str, str, str], ...] = field(default=(), compare=False)
     linear_api_url: str = DEFAULT_LINEAR_API_URL
     # GitHub GraphQL endpoint set in the project registry (``github_api_url``,
     # or its aliases ``github_graphql_url`` / ``github_endpoint``).  Empty
@@ -430,11 +436,8 @@ def _resolve_registry_github(name: str, overrides: dict[str, object]) -> frozens
     """
 
     present: set[str] = set()
-    for key, aliases in (
-        ("github_repository", ("github_repository", "github_repo")),
-        ("required_checks", ("required_checks", "ci_required_checks")),
-        ("bot_rework_cap", ("bot_rework_cap", "bot_rework_rounds")),
-    ):
+    for key, names in REGISTRY_GITHUB_ALIASES.items():
+        aliases = (key, *names)
         value = next(
             (overrides[alias] for alias in aliases if str(overrides.get(alias) or "").strip()),
             None,
@@ -455,6 +458,218 @@ def _resolve_registry_github(name: str, overrides: dict[str, object]) -> frozens
         else:
             overrides[key] = str(value).strip()
     return frozenset(present)
+# Registry columns ``get_project`` passes to ``ProjectConfig``.  Any other
+# column is ignored, and reported by ``registry_key_warnings``.
+REGISTRY_SETTING_KEYS = frozenset({
+    "linear_project_slug",
+    "linear_projects",
+    "linear_team",
+    "linear_api_url",
+    "github_api_url",
+    "poll_interval_seconds",
+    "heartbeat_seconds",
+    "poll_states",
+    "dispatch_states",
+    "hold_all",
+    "builder_provider",
+    "firstmate_provider",
+    "builder_model",
+    "builder_fallback_models",
+    "firstmate_fallback_models",
+    "builder_effort",
+    "firstmate_model",
+    "firstmate_effort",
+    "skill",
+    "workflow_path",
+    "playwright_browser_image",
+    "deadline_minutes",
+    "base_branch",
+    "worktree_root",
+    "github_repository",
+    "required_checks",
+    "bot_rework_cap",
+    "hold",
+    "repo_path",
+    "install_command",
+})
+# Alternative registry spellings, by the setting they resolve to.  A scope
+# alias applies only when the setting's own column is absent; an endpoint
+# alias is taken when it is the first non-empty column in (setting, *aliases).
+REGISTRY_SCOPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "linear_project_slug": ("project_slug", "slug"),
+    "linear_team": ("team",),
+    "poll_interval_seconds": ("poll_interval",),
+    "heartbeat_seconds": ("heartbeat_interval",),
+}
+REGISTRY_ENDPOINT_ALIASES: dict[str, tuple[str, ...]] = {
+    "linear_api_url": ("api_url",),
+    "github_api_url": ("github_graphql_url", "github_endpoint"),
+}
+# GitHub columns ``_resolve_registry_github`` parses: the first non-empty
+# column in (setting, *aliases) wins, like the endpoint columns.
+REGISTRY_GITHUB_ALIASES: dict[str, tuple[str, ...]] = {
+    "github_repository": ("github_repo",),
+    "required_checks": ("ci_required_checks",),
+    "bot_rework_cap": ("bot_rework_rounds",),
+}
+REGISTRY_ALIAS_TABLES = (REGISTRY_SCOPE_ALIASES, REGISTRY_ENDPOINT_ALIASES, REGISTRY_GITHUB_ALIASES)
+REGISTRY_ALIAS_KEYS = frozenset(
+    alias for table in REGISTRY_ALIAS_TABLES for aliases in table.values() for alias in aliases
+)
+# Registry columns ``ProjectConfig.from_pipeline`` always replaces with the
+# value from ``.harbor/workflow``: setting one in the registry has no effect.
+WORKFLOW_OWNED_KEYS = frozenset({
+    "builder_model", "firstmate_model", "builder_fallback_models", "firstmate_fallback_models", "workflow_path",
+})
+
+
+def unknown_registry_keys(values: Mapping[str, object]) -> tuple[str, ...]:
+    """Registry columns of one project that Harbor does not read."""
+
+    return tuple(key for key in values if key and key not in REGISTRY_SETTING_KEYS | REGISTRY_ALIAS_KEYS)
+
+
+def _registry_column(setting: str, values: Mapping[str, object]) -> str:
+    """The column the operator wrote for *setting* (the setting or an alias)."""
+
+    aliases = next((table[setting] for table in REGISTRY_ALIAS_TABLES if setting in table), ())
+    for column in (setting, *aliases):
+        if str(values.get(column) or "").strip():
+            return column
+    return setting
+
+
+def _shown(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (tuple, list)):
+        return "[" + ", ".join(str(item) for item in value) + "]"
+    return str(value)
+
+
+def _registry_value_used(raw: object, used: object) -> bool:
+    """Whether the registry cell *raw* is the value Harbor resolved (*used*)."""
+
+    text = str(raw).strip()
+    if isinstance(used, bool):
+        return _as_bool(text, not used) == used
+    if isinstance(used, (tuple, list)):
+        return _split_list(text) == tuple(str(item) for item in used)
+    if isinstance(used, (int, float)):
+        try:
+            return float(text) == float(used)
+        except ValueError:
+            return False
+    return used is not None and text == str(used).strip()
+
+
+def _workflow_settings(config: "ProjectConfig") -> frozenset[str]:
+    """Settings the project's ``.harbor/workflow`` sets over the registry."""
+
+    if not config.workflow_path:
+        return frozenset()
+    from harbor.config.workflow import load_workflow
+
+    try:
+        policy = load_workflow(Path(config.workflow_path)).config
+    except (OSError, ValueError):
+        return frozenset()
+    owned: set[str] = set()
+    for role, prefix in (("controller", "builder"), (None, "firstmate")):
+        settings = policy["roles"][role] if role else policy["first_mate"]
+        if settings.get("reasoning_effort"):
+            owned.add(prefix + "_effort")
+    if "deadline_minutes" in policy.get("execution", {}):
+        owned.add("deadline_minutes")
+    if "ready" in policy.get("states", {}):
+        owned.add("dispatch_states")
+    if policy.get("states", {}).get("ready") or policy.get("states", {}).get("paused"):
+        owned.add("poll_states")
+    return frozenset(owned)
+
+
+def registry_values_not_used(
+    config: "ProjectConfig", settings: Mapping[str, object], values: Mapping[str, object]
+) -> tuple[tuple[str, str, str], ...]:
+    """Registry settings whose value is not the one Harbor resolved.
+
+    *settings* are the registry settings ``get_project`` passed on and
+    *values* the raw columns.  Each result is ``(column, registry value,
+    reason)``.  An empty cell is not reported: it sets nothing.
+    """
+
+    from harbor.config.workflow import MIGRATION_HINT
+
+    workflow = _workflow_settings(config)
+    result: list[tuple[str, str, str]] = []
+    for setting in settings:
+        if setting == "repo_path":
+            continue
+        column = _registry_column(setting, values)
+        if column not in values:
+            continue  # derived by get_project (``hold_all`` from ``hold``), not written by the operator
+        # Compare the cell the operator wrote, not get_project's parsed copy
+        # (``required_checks`` is a tuple and ``bot_rework_cap`` an int there).
+        raw = values[column]
+        if not str(raw).strip():
+            continue
+        if setting in WORKFLOW_OWNED_KEYS:
+            result.append((column, str(raw), f"Harbor ignores it: `{setting}` comes from .harbor/workflow; {MIGRATION_HINT}"))
+            continue
+        used = getattr(config, setting, None)
+        if _registry_value_used(raw, used):
+            continue
+        reason = f"Harbor uses `{_shown(used)}`"
+        if setting in workflow:
+            reason += ", set in .harbor/workflow; change it there"
+        result.append((column, str(raw), reason))
+    return tuple(result)
+
+
+def _registry_key_hint(key: str, pipeline: Path | None) -> str:
+    import difflib
+    from .pipeline import PIPELINE_KEY_ALIASES, RETIRED_KEYS
+    from .workflow import MIGRATION_HINT
+
+    where = f"set it in {pipeline}" if pipeline else "set it in the project's pipeline.md"
+    if key in RETIRED_KEYS:
+        return f" `{key}` belongs in .harbor/workflow; {MIGRATION_HINT}."
+    pipeline_aliases = {
+        **PIPELINE_KEY_ALIASES,
+        "heartbeat_seconds": ("heartbeat_seconds", "heartbeat_interval_seconds", "heartbeat_interval"),
+        "poll_interval_seconds": ("poll_interval_seconds", "poll_interval"),
+    }
+    canonical = {alias: setting for setting, aliases in pipeline_aliases.items() for alias in aliases}
+    # Columns worth suggesting: ones whose registry value Harbor actually uses.
+    columns = (REGISTRY_SETTING_KEYS | REGISTRY_ALIAS_KEYS) - WORKFLOW_OWNED_KEYS - set(RETIRED_KEYS) - {"repo_path"}
+    if canonical.get(key) in columns:
+        return f" The registry column is `{canonical[key]}`."
+    pipeline_keys = set(canonical) - set(RETIRED_KEYS)
+    if key in pipeline_keys:
+        return f" `{key}` is a pipeline setting: {where}."
+    match = difflib.get_close_matches(key, sorted(columns), n=1, cutoff=0.8)
+    if match:
+        return f" Did you mean `{match[0]}`?"
+    match = difflib.get_close_matches(key, sorted(pipeline_keys - columns), n=1, cutoff=0.8)
+    if match:
+        return f" Did you mean the pipeline setting `{match[0]}`? If so, {where}."
+    return ""
+
+
+def registry_key_warnings(config: "ProjectConfig") -> tuple[str, ...]:
+    """One line per registry column of *config* whose value Harbor does not use."""
+
+    where = f" in {config.registry_path}" if config.registry_path else ""
+    unknown = tuple(
+        f"{config.name} sets unknown column `{key}`{where}; Harbor ignores it."
+        + _registry_key_hint(key, config.pipeline_path)
+        for key in config.registry_unknown_keys
+    )
+    unused = tuple(
+        f"{config.name} sets `{column}` to `{raw}`{where}, but {reason}."
+        for column, raw, reason in config.registry_unused_values
+    )
+    return unknown + unused
 
 
 def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
@@ -506,15 +721,9 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
             overrides: dict[str, object] = dict(definition.values)
             # Registry values are intentionally explicit and win over a
             # repository's optional pipeline file for identity/scope fields.
-            for key in ("linear_project_slug", "linear_team", "poll_interval_seconds", "heartbeat_seconds"):
+            for key, aliases in REGISTRY_SCOPE_ALIASES.items():
                 if key in overrides:
                     continue
-                aliases = {
-                    "linear_project_slug": ("project_slug", "slug"),
-                    "linear_team": ("team",),
-                    "poll_interval_seconds": ("poll_interval",),
-                    "heartbeat_seconds": ("heartbeat_interval",),
-                }[key]
                 for alias in aliases:
                     if alias in overrides:
                         overrides[key] = overrides[alias]
@@ -523,11 +732,8 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
             # Take the first one with a value; an empty cell is ignored, so it
             # never replaces the pipeline's value (or the default) with "" and
             # never hides a filled-in alias.
-            for key, aliases in (
-                ("linear_api_url", ("linear_api_url", "api_url")),
-                ("github_api_url", ("github_api_url", "github_graphql_url", "github_endpoint")),
-            ):
-                for alias in aliases:
+            for key, aliases in REGISTRY_ENDPOINT_ALIASES.items():
+                for alias in (key, *aliases):
                     url = str(overrides.get(alias) or "").strip()
                     if url:
                         overrides[key] = url
@@ -541,39 +747,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
             overrides = {
                 key: value
                 for key, value in overrides.items()
-                if key
-                in {
-                    "linear_project_slug",
-                    "linear_projects",
-                    "linear_team",
-                    "linear_api_url",
-                    "github_api_url",
-                    "poll_interval_seconds",
-                    "heartbeat_seconds",
-                    "poll_states",
-                    "dispatch_states",
-                    "hold_all",
-                    "builder_provider",
-                    "firstmate_provider",
-                    "builder_model",
-                    "builder_fallback_models",
-                    "firstmate_fallback_models",
-                    "builder_effort",
-                    "firstmate_model",
-                    "firstmate_effort",
-                    "skill",
-                    "workflow_path",
-                    "playwright_browser_image",
-                    "deadline_minutes",
-                    "base_branch",
-                    "worktree_root",
-                    "github_repository",
-                    "required_checks",
-                    "bot_rework_cap",
-                    "hold",
-                    "repo_path",
-                    "install_command",
-                }
+                if key in REGISTRY_SETTING_KEYS
             }
             if pipeline is None or not pipeline.is_file():
                 expected = pipeline or (definition.repo_path / ".harbor" / "pipeline.md")
@@ -581,10 +755,14 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     f"Harbor project {definition.name} is missing its live pipeline: expected {expected}; "
                     "refusing to fall back to AGENTS.md"
                 )
-            return replace(
+            config = replace(
                 ProjectConfig.from_pipeline(definition.name, pipeline, **overrides),
                 registry_path=registry_path,
                 registry_github_keys=registry_github_keys,
+                registry_unknown_keys=unknown_registry_keys(definition.values),
+            )
+            return replace(
+                config, registry_unused_values=registry_values_not_used(config, overrides, definition.values)
             )
 
     if registry_loaded:
@@ -603,6 +781,9 @@ __all__ = [
     "ProjectConfig",
     "get_project",
     "load_project",
+    "registry_key_warnings",
+    "registry_values_not_used",
+    "unknown_registry_keys",
     "parse_pipeline_markdown",
 ]
 
