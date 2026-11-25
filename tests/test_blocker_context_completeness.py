@@ -619,3 +619,182 @@ def test_context_notice_dedupes_on_cause_not_transport_detail(tmp_path):
     asyncio.run(run())
     db.close()
     assert len(notifier.messages) == 1 and "timed out" in notifier.messages[0]
+
+
+def _context_recovers_then(tmp_path, *, later_issue, comment_ok):
+    """First blocker-context fetch is malformed; later fetches return ``later_issue``.
+
+    Drives the blocked final once, then 5 polls of ``_retry_stopped_builders``
+    with ``BlockerPolicy((0, 0))``.  Returns First Mate prompts, Linear
+    queries, operator notices, escalations and remaining recovery receipts.
+    """
+    from harbor.recovery import BlockerPolicy
+    from harbor.runner.base import apply_phase9_migration
+    from harbor.supervisor import Lifecycle
+
+    queries = []
+    fetches = []
+
+    def handler(request):
+        query = json.loads(request.content)["query"]
+        queries.append(query)
+        if "HarborComment" in query:
+            if not comment_ok:
+                return httpx.Response(200, json={"data": {"commentCreate": {"success": False, "comment": None}}})
+            return httpx.Response(200, json={"data": {"commentCreate": {
+                "success": True, "comment": {"id": f"c-{len(queries)}", "body": "", "createdAt": "2026-09-05T00:00:00Z"}}}})
+        fetches.append(query)
+        issue = mutate(complete_issue(), "labels", "missing pageInfo") if len(fetches) == 1 else later_issue()
+        issue["description"] = "The button color must be blue."
+        issue["state"] = {"name": "In Progress", "type": "started"}
+        return httpx.Response(200, json={"data": {"issue": issue}})
+
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    apply_phase9_migration(db)
+    ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "Color", "state": "In Progress",
+              "owned": True, "hold": False}
+    final = {"status": "blocked", "summary": "Need a color", "run_id": "run-1",
+             "blocker": {"kind": "product_decision", "question": "What button color?"}}
+    db.replace_tickets("mock", [ticket], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,session_id,deadline_seconds,final_json) VALUES (?,?,?,?,?,?,?)",
+        ("run-1", "MOCK-1", "blocked", str(tmp_path), "session-1", 60, json.dumps(final)))
+    db.connection.commit()
+    linear = LinearClient(token="mock", transport=httpx.MockTransport(handler))
+    prompts = []
+
+    async def mate(prompt, **kwargs):
+        prompts.append(prompt)
+        return {"disposition": "resolve", "answer": "Use blue", "citation": "ticket:MOCK-1:1", "reason": "AC says blue."}
+
+    async def resume(run_id, prompt):
+        return True
+
+    class Dispatcher:
+        async def retry(self, *args):
+            raise AssertionError("builder must not be retried")
+
+    notifier = Notifier()
+    poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=BlockerPolicy((0, 0))))
+    supervisor = Supervisor(poller, db=db, dispatcher=Dispatcher(), notifier=notifier)
+    supervisor.unblock_ladder = UnblockLadder(db, linear=linear, first_mate=mate, resumer=resume, repo_path=tmp_path)
+    supervisor.lifecycle = Lifecycle.RUNNING
+    supervisor.linear_healthy = True
+    supervisor._fleet_tickets = (ticket,)
+    wake = Wake(ticket=ticket, action="reengage", resume="run-1")
+
+    async def scenario():
+        try:
+            await supervisor._handle_runner_result(wake, final)
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                await supervisor._retry_stopped_builders()
+                await asyncio.gather(*list(supervisor._dispatch_tasks.values()))
+        finally:
+            await linear.close()
+
+    asyncio.run(scenario())
+    escalations = [(row["status"], row["question"]) for row in db.escalations()]
+    receipts = [tuple(row) for row in db.connection.execute("SELECT run_id,last_reason FROM recovery_receipts")]
+    db.close()
+    return prompts, queries, fetches, notifier.messages, escalations, receipts
+
+
+def test_replay_that_fails_on_a_write_after_triage_is_not_replayed_again(tmp_path):
+    """Review finding A: the context recovers, First Mate resolves, the comment write fails."""
+    prompts, queries, fetches, messages, escalations, receipts = _context_recovers_then(
+        tmp_path, later_issue=complete_issue, comment_ok=False)
+    assert len(fetches) == 2  # the failed read, then one replay that got past it
+    assert len(prompts) == 1
+    assert len([q for q in queries if "HarborComment" in q]) == 1
+    assert receipts == []
+    assert not [m for m in messages if "exhausted" in m or "First Mate" in m], messages
+    assert not [e for e in escalations if "retries exhausted" in e[1]], escalations
+    assert len([m for m in messages if "after triage" in m]) == 1
+
+
+def test_replay_that_finds_an_open_dependency_does_not_blame_first_mate(tmp_path):
+    """Review finding B: the context recovers but the ticket still has a blocking dependency."""
+    def dependent():
+        issue = complete_issue()
+        issue["inverseRelations"]["nodes"] = [
+            {"type": "blocks", "issue": {"identifier": "MOCK-2", "state": {"type": "started"}}}]
+        return issue
+
+    prompts, queries, fetches, messages, escalations, receipts = _context_recovers_then(
+        tmp_path, later_issue=dependent, comment_ok=True)
+    assert len(fetches) == 2
+    assert prompts == []
+    assert all("mutation" not in q for q in queries)
+    assert receipts == []
+    assert not [m for m in messages if "exhausted" in m or "First Mate" in m], messages
+    assert escalations == []
+    assert len([m for m in messages if "could not be verified" in m]) == 1  # only the real context failure
+
+
+def test_context_retry_that_succeeds_is_not_replayed(tmp_path):
+    """The context recovers and triage succeeds: one First Mate call, no lingering receipt."""
+    prompts, queries, fetches, messages, escalations, receipts = _context_recovers_then(
+        tmp_path, later_issue=complete_issue, comment_ok=True)
+    assert len(fetches) == 2
+    assert len(prompts) == 1
+    assert len([q for q in queries if "HarborComment" in q]) == 1
+    assert receipts == []
+    assert not [m for m in messages if "exhausted" in m], messages
+
+
+def test_first_mate_retry_that_succeeds_is_not_replayed(tmp_path):
+    """A First Mate triage retry that succeeds ends its receipt (also wrong on main)."""
+    from harbor.first_mate import FirstMateError
+    from harbor.recovery import BlockerPolicy
+    from harbor.runner.base import apply_phase9_migration
+    from harbor.supervisor import Lifecycle
+
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    apply_phase9_migration(db)
+    ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "T", "description": "Color must be blue.",
+              "state": "In Progress", "owned": True, "hold": False}
+    final = {"status": "blocked", "run_id": "run-1", "blocker": {"kind": "product_decision", "question": "What color?"}}
+    db.replace_tickets("mock", [ticket], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,session_id,deadline_seconds,final_json) VALUES (?,?,?,?,?,?,?)",
+        ("run-1", "MOCK-1", "blocked", str(tmp_path), "session-1", 60, json.dumps(final)))
+    db.connection.commit()
+    calls = []
+
+    async def mate(prompt, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise FirstMateError("First Mate was killed")
+        return {"disposition": "resolve", "answer": "Use blue", "citation": "ticket:MOCK-1:1", "reason": "AC says blue."}
+
+    async def resume(run_id, prompt):
+        return True
+
+    class Dispatcher:
+        async def retry(self, *args):
+            raise AssertionError("builder must not be retried")
+
+    poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=BlockerPolicy((0, 0))))
+    supervisor = Supervisor(poller, db=db, dispatcher=Dispatcher())
+    supervisor.unblock_ladder = UnblockLadder(db, first_mate=mate, resumer=resume, repo_path=tmp_path)
+    supervisor.lifecycle = Lifecycle.RUNNING
+    supervisor.linear_healthy = True
+    supervisor._fleet_tickets = (ticket,)
+
+    async def scenario():
+        await supervisor._handle_runner_result(Wake(ticket=ticket, action="reengage", resume="run-1"), final)
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            await supervisor._retry_stopped_builders()
+            await asyncio.gather(*list(supervisor._dispatch_tasks.values()))
+
+    asyncio.run(scenario())
+    escalations = [(row["status"], row["question"]) for row in db.escalations()]
+    db.close()
+    assert len(calls) == 2  # the killed attempt and one successful retry
+    assert escalations == [("resume_pending", "What color?")]

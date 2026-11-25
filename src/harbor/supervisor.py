@@ -2926,6 +2926,8 @@ class Supervisor:
                 with connection:
                     quota_schema(connection)
                     connection.execute("DELETE FROM quota_recovery WHERE run_id=?", ("triage:" + run_id,))
+            # Triage completed: nothing is left to replay.
+            self._clear_triage_retry(run_id)
         except Exception as exc:
             from harbor.first_mate import FirstMateError, FirstMateQuotaError
             from harbor.recovery import defer_quota
@@ -2968,6 +2970,10 @@ class Supervisor:
         from harbor.unblock import BlockerContextUnavailable, TicketNotUnblockable
 
         run_text = str(run_id or "")
+        if not isinstance(exc, BlockerContextUnavailable):
+            # The pre-triage reads succeeded this time, so whatever failed
+            # later is not a reason to replay triage: end any pending retry.
+            self._clear_triage_retry(run_text)
         if isinstance(exc, BlockerContextUnavailable):
             if run_text:
                 self._schedule_triage_retry(run_text, _LINEAR_CONTEXT_REASON)
@@ -2992,6 +2998,25 @@ class Supervisor:
                 f"unblock-failed:{action}:{identifier}:{run_text}:{type(exc).__name__}",
                 f"{identifier}: could not {action} for run {run_text or 'unknown'}: {type(exc).__name__}: {exc}",
             )
+
+    def _clear_triage_retry(self, run_id: Any) -> None:
+        """End a pending ``triage:<run>`` replay once its cause no longer holds.
+
+        A triage receipt only means "triage could not run yet" (the Linear
+        context was unreadable, or First Mate failed).  Once a replay gets
+        past that point -- triage finished, the ticket is not unblockable, or
+        a later step failed -- replaying would repeat First Mate and its
+        Linear writes, so the receipt is removed.
+        """
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not run_id:
+            return
+        try:
+            with connection:
+                connection.execute("DELETE FROM recovery_receipts WHERE run_id=?", ("triage:" + str(run_id),))
+        except sqlite3.OperationalError:
+            return  # no recovery_receipts table yet: nothing was scheduled
 
     def _schedule_triage_retry(self, run_id: str, reason: str) -> None:
         """Queue a bounded triage replay of a blocked run (see _retry_stopped_builders).
@@ -3807,14 +3832,19 @@ class Supervisor:
             elif not claim_retry(connection, retry_row, self.blocker_policy, time.time()):
                 receipt = connection.execute("SELECT attempts,notified,last_reason FROM recovery_receipts WHERE run_id=?", (retry_row["id"],)).fetchone()
                 if receipt and receipt[0] >= len(self.blocker_policy.retry_delays) and not receipt[1]:
+                    # A surviving receipt names the cause of the latest failed
+                    # replay (see _clear_triage_retry/_schedule_triage_retry).
                     linear_cause = triage_retry and receipt[2] == _LINEAR_CONTEXT_REASON
+                    first_mate_cause = triage_retry and receipt[2] == "First Mate invocation failed"
                     next_step = ("Harbor could not verify the ticket's Linear blocker context; check the ticket in Linear and answer the blocker." if linear_cause
-                                 else "First Mate could not finish triage; inspect its failure and answer the blocker." if triage_retry
+                                 else "First Mate could not finish triage; inspect its failure and answer the blocker." if first_mate_cause
+                                 else "Triage did not finish; inspect the retained run and answer the blocker." if triage_retry
                                  else f"Inspect the retained session; /retry {identifier} is an explicit override.")
                     notified = await self._notify_operator(f"recovery-exhausted:{retry_row['id']}", f"{identifier}: automatic recovery exhausted after {receipt[0]} attempts. {next_step}")
                     if triage_retry:
                         question = ("Linear blocker context retries exhausted; how should this blocker be resolved?" if linear_cause
-                                    else "First Mate retries exhausted; how should this blocker be resolved?")
+                                    else "First Mate retries exhausted; how should this blocker be resolved?" if first_mate_cause
+                                    else "Triage retries exhausted; how should this blocker be resolved?")
                         self.db.record_escalation(identifier, row["id"], "env_blocker", question, 2, status="open", reason=next_step)
                     if notified:
                         with connection:
@@ -3944,6 +3974,7 @@ class Supervisor:
             try:
                 value = ladder.handle(tickets[identifier], run, final)
                 self.last_unblock = await value if inspect.isawaitable(value) else value
+                self._clear_triage_retry(run.get("id"))
             except Exception as exc:
                 # One ticket's failure must not stop start() from reaching
                 # RUNNING and polling every other ticket.
