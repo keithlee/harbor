@@ -19,6 +19,8 @@ def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
         async def close(self):pass
     class GitHub:
         def __init__(self,**kwargs):pass
+        @classmethod
+        def from_profile(cls,profile,**kwargs):return cls(**kwargs)
         async def close(self):pass
         async def fetch_pull_requests(self,*args,**kwargs):
             return {'pr_1':{'number':1,'headRefOid':'abc','url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE','comments':{'nodes':[]}}}
@@ -58,6 +60,10 @@ def test_pre_merge_checks_fresh_linear_state(tmp_path, monkeypatch, capsys, stat
             pass
 
     class GitHub:
+        @classmethod
+        def from_profile(cls, profile, **kwargs):
+            return cls()
+
         async def fetch_pull_requests(self, *args, **kwargs):
             return {"pr_1": {
                 "number": 1,

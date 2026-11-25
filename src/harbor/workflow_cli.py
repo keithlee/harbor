@@ -29,7 +29,15 @@ async def fresh_context(config, db, ticket_id, run, event):
     from harbor.poll.github_poller import GitHubPoller
     from harbor.pr_events import PREventProcessor
     from harbor.project_identity import require_scope
-    linear, github = LinearClient(endpoint=config.linear_api_url), GitHubClient()
+    from harbor.config.profile import PipelineProfile
+    from harbor.github_rest import require_https_api_url
+    # Build the GitHub client from the project's profile, as every other
+    # consumer does, so the token only goes to the configured GitHub host,
+    # and refuse a non-https endpoint before any request is made.
+    profile = PipelineProfile.from_project(config)
+    require_https_api_url(profile.github_api_url)
+    github = GitHubClient.from_profile(profile)
+    linear = LinearClient(endpoint=config.linear_api_url)
     try:
         raw = await linear.fetch_blocker_context(ticket_id)
         if raw.get("identifier") != ticket_id:

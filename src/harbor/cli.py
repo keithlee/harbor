@@ -387,6 +387,14 @@ def resumed_claude_sandbox_hosts(
     return tuple(dict.fromkeys((*github_hosts, *linear_hosts)))
 
 
+def _require_github_api_url(profile: Any) -> None:
+    """Refuse a GitHub endpoint Harbor must not send a token to (non-https or no host)."""
+
+    from harbor.github_rest import require_https_api_url
+
+    require_https_api_url(profile.github_api_url)
+
+
 def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -> dict[str, Any]:
     """Resolve the builder's GitHub transport: REST helper by default, MCP opt-in.
 
@@ -572,10 +580,16 @@ async def _start(
     except ValueError as exc:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
+    profile = PipelineProfile.from_project(config)
+    if github_poller is None and profile.repository_owner and profile.repository_name:
+        try:
+            _require_github_api_url(profile)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
     db = HarborDB(_db_path())
     client = linear_client or LinearClient(endpoint=config.linear_api_url)
     poller = LinearPoller(client, config, db=db)
-    profile = PipelineProfile.from_project(config)
     event_processor = pr_event_processor or PREventProcessor(
         db,
         project=config.name,
@@ -776,9 +790,15 @@ async def _facts(project_name: str, *, as_json: bool = True) -> int:
     except ValueError as exc:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
+    profile = PipelineProfile.from_project(config)
+    if profile.repository_owner and profile.repository_name:
+        try:
+            _require_github_api_url(profile)
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
     db = HarborDB(_db_path())
     client = LinearClient(endpoint=config.linear_api_url)
-    profile = PipelineProfile.from_project(config)
     github_client: GitHubClient | None = None
     github_poller = None
     if profile.repository_owner and profile.repository_name:
