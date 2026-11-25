@@ -181,7 +181,9 @@ class GitHubClient:
 
     @classmethod
     def from_profile(cls, profile: object, **kwargs: Any) -> "GitHubClient":
-        endpoint = getattr(profile, "github_api_url", "https://api.github.com/graphql")
+        # A ProjectConfig carries github_api_url = "" when the registry does
+        # not set it; never post to an empty URL.
+        endpoint = getattr(profile, "github_api_url", "") or "https://api.github.com/graphql"
         token_env = getattr(profile, "github_token_env", "GITHUB_TOKEN")
         return cls(endpoint=endpoint, token_env=token_env, **kwargs)
 

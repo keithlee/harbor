@@ -190,6 +190,14 @@ targets the project's `github_repository`, and derives the REST base from
 GitHub Enterprise Server). The token is passed to `curl` on stdin, so it is never
 on a command line, on disk or in output. Requests only go to that API host.
 
+Set `github_api_url` (or its aliases `github_graphql_url` and `github_endpoint`)
+in the project registry, as a column of the project's row, or in
+`.harbor/pipeline.md`. A non-empty registry value wins over the pipeline file,
+as `linear_api_url` does; an empty registry column is ignored. With neither,
+Harbor uses `https://api.github.com/graphql`. A registry value goes through the
+same checks as a pipeline value, so a malformed one stops `harbor start` and
+fails `harbor doctor` for a Claude builder.
+
 **`mcp` (opt-in, Claude builders only).** Harbor passes the Claude builder a
 GitHub MCP server and pre-approves only its tools; the Bash sandbox and its
 network allowlist are unchanged. The server runs outside the Bash sandbox. The
