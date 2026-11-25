@@ -2950,30 +2950,34 @@ class Supervisor:
                 )
 
     async def _report_unblock_failure(self, identifier: str, run_id: Any, exc: Exception, *, action: str) -> None:
-        """Log, notify and (only when safe) schedule a retry for a failed unblock.
+        """Log, notify and keep or end the triage retry for a failed unblock.
 
         Classified by where the error came from, not only its type:
 
         * ``BlockerContextUnavailable`` -- the pre-triage Linear reads failed,
-          nothing was decided or written, so a bounded triage replay is safe.
+          nothing was decided or written, so a bounded triage replay is
+          scheduled (or kept).
         * ``TicketNotUnblockable`` -- an expected state (stopped ticket or an
-          open dependency): recorded, never paged.
-        * any other ``LinearClientError`` -- a Linear request after triage
-          (a comment or state write); triage already ran and is not replayed.
-        * anything else -- logged with its traceback and reported.
+          open dependency): recorded, never paged.  Any pending replay is kept
+          for when the ticket can be triaged again, and the attempt that
+          discovered the state is refunded, because waiting is not a failure.
+          The poll skips stopped or dependency-blocked tickets, so a kept
+          receipt costs nothing while it waits.
+        * an error after triage began (``triage_ran``), e.g. a Linear comment
+          or state write: a decision may already be recorded, so the replay is
+          ended and triage is never repeated.
+        * any other error (raised before triage began, e.g. a git inspection
+          timeout): logged with its traceback and reported; a pending replay
+          is kept with this cause and consumes its attempt.
 
         Notice keys use the ticket, run and error class, never the error text,
         so a changing transport detail does not page on every replay.
         """
 
         from harbor.clients.linear import LinearClientError
-        from harbor.unblock import BlockerContextUnavailable, TicketNotUnblockable
+        from harbor.unblock import BlockerContextUnavailable, TicketNotUnblockable, triage_ran
 
         run_text = str(run_id or "")
-        if not isinstance(exc, BlockerContextUnavailable):
-            # The pre-triage reads succeeded this time, so whatever failed
-            # later is not a reason to replay triage: end any pending retry.
-            self._clear_triage_retry(run_text)
         if isinstance(exc, BlockerContextUnavailable):
             if run_text:
                 self._schedule_triage_retry(run_text, _LINEAR_CONTEXT_REASON)
@@ -2984,39 +2988,87 @@ class Supervisor:
                 f"blocker context could not be verified: {exc}",
             )
         elif isinstance(exc, TicketNotUnblockable):
+            self._keep_triage_retry(run_text, f"Triage waiting: {exc}", refund=True)
             _LOG.info("blocked run %s for %s not unblocked: %s", run_text, identifier, exc)
-        elif isinstance(exc, LinearClientError):
-            _LOG.error("Linear request failed after triage for %s run %s", identifier, run_text, exc_info=exc)
-            await self._notify_operator(
-                f"unblock-linear-after-triage:{identifier}:{run_text}:{type(exc).__name__}",
-                f"{identifier}: a Linear request failed after triage of blocked run {run_text or 'unknown'} "
-                f"(triage is not repeated): {exc}",
-            )
+        elif triage_ran(exc):
+            self._clear_triage_retry(run_text)
+            if isinstance(exc, LinearClientError):
+                _LOG.error("Linear request failed after triage for %s run %s", identifier, run_text, exc_info=exc)
+                await self._notify_operator(
+                    f"unblock-linear-after-triage:{identifier}:{run_text}:{type(exc).__name__}",
+                    f"{identifier}: a Linear request failed after triage of blocked run {run_text or 'unknown'} "
+                    f"(triage is not repeated): {exc}",
+                )
+            else:
+                _LOG.error("could not %s for %s run %s after triage", action, identifier, run_text, exc_info=exc)
+                await self._notify_operator(
+                    f"unblock-failed-after-triage:{action}:{identifier}:{run_text}:{type(exc).__name__}",
+                    f"{identifier}: could not {action} for run {run_text or 'unknown'} after triage "
+                    f"(triage is not repeated): {type(exc).__name__}: {exc}",
+                )
         else:
+            self._keep_triage_retry(run_text, f"Triage could not start: {type(exc).__name__}")
             _LOG.error("could not %s for %s run %s", action, identifier, run_text, exc_info=exc)
             await self._notify_operator(
                 f"unblock-failed:{action}:{identifier}:{run_text}:{type(exc).__name__}",
                 f"{identifier}: could not {action} for run {run_text or 'unknown'}: {type(exc).__name__}: {exc}",
             )
 
-    def _clear_triage_retry(self, run_id: Any) -> None:
-        """End a pending ``triage:<run>`` replay once its cause no longer holds.
-
-        A triage receipt only means "triage could not run yet" (the Linear
-        context was unreadable, or First Mate failed).  Once a replay gets
-        past that point -- triage finished, the ticket is not unblockable, or
-        a later step failed -- replaying would repeat First Mate and its
-        Linear writes, so the receipt is removed.
-        """
+    def _receipt_write(self, sql: str, params: tuple[Any, ...]) -> None:
+        """Run one write on recovery_receipts; a missing table means nothing was scheduled."""
 
         connection = getattr(self.db, "connection", None) if self.db is not None else None
-        if connection is None or not run_id:
+        if connection is None:
             return
         try:
             with connection:
-                connection.execute("DELETE FROM recovery_receipts WHERE run_id=?", ("triage:" + str(run_id),))
+                connection.execute(sql, params)
+        except sqlite3.OperationalError as exc:
+            if str(exc).startswith("no such table"):
+                return
+            # A locked or broken ledger must not silently leave (or drop) a
+            # receipt that decides whether triage is replayed.
+            _LOG.error("could not update triage retry receipt %s", params[-1], exc_info=exc)
+            self.last_error = f"triage retry receipt update failed: {exc}"
+
+    def _triage_retry_pending(self, run_id: Any) -> bool:
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None or not run_id:
+            return False
+        try:
+            return connection.execute(
+                "SELECT 1 FROM recovery_receipts WHERE run_id=?", ("triage:" + str(run_id),)
+            ).fetchone() is not None
         except sqlite3.OperationalError:
-            return  # no recovery_receipts table yet: nothing was scheduled
+            return False  # no recovery_receipts table yet
+
+    def _clear_triage_retry(self, run_id: Any) -> None:
+        """End a pending ``triage:<run>`` replay once triage has run.
+
+        A triage receipt means "triage could not run yet".  Once triage has
+        run (it completed, or a step after its decision failed), replaying it
+        would repeat First Mate and its Linear writes, so the receipt is
+        removed.
+        """
+
+        if run_id:
+            self._receipt_write("DELETE FROM recovery_receipts WHERE run_id=?", ("triage:" + str(run_id),))
+
+    def _keep_triage_retry(self, run_id: str, reason: str, *, refund: bool = False) -> None:
+        """Keep an existing ``triage:<run>`` replay, recording why triage did not run.
+
+        ``claim_retry`` rewrites ``last_reason`` on every replay, so the real
+        cause is written back for accurate exhaustion wording.  ``refund``
+        returns the attempt a replay spent discovering a legitimate wait.
+        """
+
+        if not run_id:
+            return
+        self._receipt_write(
+            "UPDATE recovery_receipts SET last_reason=?, "
+            "attempts=CASE WHEN ? THEN MAX(attempts-1, 0) ELSE attempts END WHERE run_id=?",
+            (reason, 1 if refund else 0, "triage:" + run_id),
+        )
 
     def _schedule_triage_retry(self, run_id: str, reason: str) -> None:
         """Queue a bounded triage replay of a blocked run (see _retry_stopped_builders).
@@ -3970,6 +4022,11 @@ class Supervisor:
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
             if not isinstance(final, Mapping) or not checker(tickets[identifier], run, final):
+                continue
+            if self._triage_retry_pending(run.get("id")):
+                # The poll's bounded triage replay owns this run (it consumes
+                # attempts and escalates when they run out); replaying here on
+                # every restart would bypass that budget and page again.
                 continue
             try:
                 value = ladder.handle(tickets[identifier], run, final)

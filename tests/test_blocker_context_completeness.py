@@ -715,23 +715,26 @@ def test_replay_that_fails_on_a_write_after_triage_is_not_replayed_again(tmp_pat
     assert len([m for m in messages if "after triage" in m]) == 1
 
 
-def test_replay_that_finds_an_open_dependency_does_not_blame_first_mate(tmp_path):
-    """Review finding B: the context recovers but the ticket still has a blocking dependency."""
+def test_replay_that_finds_an_open_dependency_keeps_the_retry_without_blaming_first_mate(tmp_path):
+    """Review finding B: the context recovers but the ticket still has a blocking dependency.
+
+    Triage cannot run yet, so the replay is kept (and its attempt refunded)
+    for when the dependency clears; nothing blames First Mate.
+    """
     def dependent():
         issue = complete_issue()
         issue["inverseRelations"]["nodes"] = [
             {"type": "blocks", "issue": {"identifier": "MOCK-2", "state": {"type": "started"}}}]
         return issue
 
-    prompts, queries, fetches, messages, escalations, receipts = _context_recovers_then(
-        tmp_path, later_issue=dependent, comment_ok=True)
-    assert len(fetches) == 2
-    assert prompts == []
-    assert all("mutation" not in q for q in queries)
-    assert receipts == []
-    assert not [m for m in messages if "exhausted" in m or "First Mate" in m], messages
-    assert escalations == []
-    assert len([m for m in messages if "could not be verified" in m]) == 1  # only the real context failure
+    result = _triage_phases(tmp_path, first_fetch_malformed=True,
+                            phases=[(dependent, {}, 1), (dependent, {"blocked_by": ["MOCK-2"]}, 4)])
+    assert result["prompts"] == 0
+    assert result["mutations"] == 0
+    assert result["receipts"] == [("triage:run-1", 0, "Triage waiting: blocked ticket has unresolved dependencies")]
+    assert not [m for m in result["messages"] if "exhausted" in m or "First Mate" in m], result["messages"]
+    assert result["escalations"] == []
+    assert len([m for m in result["messages"] if "could not be verified" in m]) == 1
 
 
 def test_context_retry_that_succeeds_is_not_replayed(tmp_path):
@@ -798,3 +801,251 @@ def test_first_mate_retry_that_succeeds_is_not_replayed(tmp_path):
     db.close()
     assert len(calls) == 2  # the killed attempt and one successful retry
     assert escalations == [("resume_pending", "What color?")]
+
+
+def _triage_phases(tmp_path, *, phases, first_fetch_malformed=False, first_mate_fails_first=False, before_poll=None):
+    """Drive one blocked final, then polls of ``_retry_stopped_builders`` in phases.
+
+    Each phase is ``(issue_factory, fleet_overrides, polls)``: the Linear
+    blocker context returned during the phase, and how the poller's view of
+    the ticket differs (for example ``{"blocked_by": [...]}`` once the poll
+    has observed a dependency).
+    """
+    from harbor.first_mate import FirstMateError
+    from harbor.recovery import BlockerPolicy
+    from harbor.runner.base import apply_phase9_migration
+    from harbor.supervisor import Lifecycle
+
+    state = {"issue": complete_issue, "fetches": 0}
+    queries = []
+
+    def handler(request):
+        query = json.loads(request.content)["query"]
+        queries.append(query)
+        if "HarborComment" in query:
+            return httpx.Response(200, json={"data": {"commentCreate": {
+                "success": True, "comment": {"id": f"c-{len(queries)}", "body": "", "createdAt": "2026-09-05T00:00:00Z"}}}})
+        state["fetches"] += 1
+        if first_fetch_malformed and state["fetches"] == 1:
+            issue = mutate(complete_issue(), "labels", "missing pageInfo")
+        else:
+            issue = state["issue"]()
+        issue["description"] = "The button color must be blue."
+        issue.setdefault("state", {"name": "In Progress", "type": "started"})
+        if issue["state"].get("name") == "Blocked":
+            issue["state"] = {"name": "In Progress", "type": "started"}
+        return httpx.Response(200, json={"data": {"issue": issue}})
+
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    apply_phase3_migration(db)
+    apply_phase4_migration(db)
+    apply_phase9_migration(db)
+    ticket = {"identifier": "MOCK-1", "id": "uuid-1", "title": "Color", "state": "In Progress",
+              "owned": True, "hold": False}
+    final = {"status": "blocked", "summary": "Need a color", "run_id": "run-1",
+             "blocker": {"kind": "product_decision", "question": "What button color?"}}
+    db.replace_tickets("mock", [ticket], emit_events=False)
+    db.connection.execute(
+        "INSERT INTO runs(id,ticket,status,worktree,session_id,deadline_seconds,final_json) VALUES (?,?,?,?,?,?,?)",
+        ("run-1", "MOCK-1", "blocked", str(tmp_path), "session-1", 60, json.dumps(final)))
+    db.connection.commit()
+    linear = LinearClient(token="mock", transport=httpx.MockTransport(handler))
+    prompts = []
+
+    async def mate(prompt, **kwargs):
+        prompts.append(prompt)
+        if first_mate_fails_first and len(prompts) == 1:
+            raise FirstMateError("First Mate was killed")
+        return {"disposition": "resolve", "answer": "Use blue", "citation": "ticket:MOCK-1:1", "reason": "AC says blue."}
+
+    async def resume(run_id, prompt):
+        return True
+
+    class Dispatcher:
+        async def retry(self, *args):
+            raise AssertionError("builder must not be retried")
+
+    notifier = Notifier()
+    poller = SimpleNamespace(project_name="mock", config=SimpleNamespace(blocker_policy=BlockerPolicy((0, 0))))
+    supervisor = Supervisor(poller, db=db, dispatcher=Dispatcher(), notifier=notifier)
+    supervisor.unblock_ladder = UnblockLadder(db, linear=linear, first_mate=mate, resumer=resume, repo_path=tmp_path)
+    supervisor.lifecycle = Lifecycle.RUNNING
+    supervisor.linear_healthy = True
+    supervisor._fleet_tickets = (ticket,)
+    wake = Wake(ticket=ticket, action="reengage", resume="run-1")
+
+    async def scenario():
+        try:
+            await supervisor._handle_runner_result(wake, final)
+            poll = 0
+            for issue_factory, fleet, polls in phases:
+                state["issue"] = issue_factory
+                supervisor._fleet_tickets = ({**ticket, **fleet},)
+                for _ in range(polls):
+                    poll += 1
+                    if before_poll is not None:
+                        before_poll(poll)
+                    await asyncio.sleep(0.01)
+                    await supervisor._retry_stopped_builders()
+                    await asyncio.gather(*list(supervisor._dispatch_tasks.values()))
+        finally:
+            await linear.close()
+
+    asyncio.run(scenario())
+    result = {
+        "prompts": len(prompts),
+        "mutations": len([q for q in queries if "mutation" in q]),
+        "fetches": state["fetches"],
+        "messages": notifier.messages,
+        "escalations": [(row["status"], row["question"]) for row in db.escalations()],
+        "receipts": [tuple(row) for row in db.connection.execute(
+            "SELECT run_id,attempts,last_reason FROM recovery_receipts")],
+    }
+    db.close()
+    return result
+
+
+def _dependent():
+    issue = complete_issue()
+    issue["inverseRelations"]["nodes"] = [
+        {"type": "blocks", "issue": {"identifier": "MOCK-2", "state": {"type": "started"}}}]
+    return issue
+
+
+def _waiting_phases():
+    # The poll has not yet seen the dependency, then it has, then it clears.
+    return [(_dependent, {}, 1), (_dependent, {"blocked_by": ["MOCK-2"]}, 3), (complete_issue, {}, 2)]
+
+
+def test_first_mate_failure_then_dependency_is_retriaged_when_it_clears(tmp_path):
+    """Review finding B1, First Mate path (``fm_then_dep_then_resolved``)."""
+    result = _triage_phases(tmp_path, first_mate_fails_first=True, phases=_waiting_phases())
+    assert result["prompts"] == 2  # the failed First Mate call and one triage once the dependency cleared
+    assert result["mutations"] == 1
+    assert result["receipts"] == []
+    assert result["escalations"] == [("resume_pending", "What button color?")]
+    assert not [m for m in result["messages"] if "exhausted" in m], result["messages"]
+
+
+def test_context_failure_then_dependency_is_retriaged_when_it_clears(tmp_path):
+    """Review finding B1, context path (``ctx_then_dep_then_resolved``)."""
+    result = _triage_phases(tmp_path, first_fetch_malformed=True, phases=_waiting_phases())
+    assert result["prompts"] == 1
+    assert result["mutations"] == 1
+    assert result["receipts"] == []
+    assert result["escalations"] == [("resume_pending", "What button color?")]
+    assert len([m for m in result["messages"] if "could not be verified" in m]) == 1
+    assert not [m for m in result["messages"] if "exhausted" in m], result["messages"]
+
+
+def test_waiting_on_a_dependency_does_not_spend_the_retry_budget(tmp_path):
+    """A long wait neither exhausts the retry nor pages; it re-triages once the dependency clears."""
+    phases = [(_dependent, {}, 1), (_dependent, {"blocked_by": ["MOCK-2"]}, 6),
+              (_dependent, {}, 1), (_dependent, {"blocked_by": ["MOCK-2"]}, 3), (complete_issue, {}, 2)]
+    result = _triage_phases(tmp_path, first_mate_fails_first=True, phases=phases)
+    assert result["prompts"] == 2
+    assert result["receipts"] == []
+    assert not [m for m in result["messages"] if "exhausted" in m], result["messages"]
+    assert result["escalations"] == [("resume_pending", "What button color?")]
+
+
+def test_stopped_ticket_keeps_the_retry_until_it_is_active_again(tmp_path):
+    """Decision: "no longer active" keeps the replay (refunded) -- a paused ticket may resume."""
+    def paused():
+        issue = complete_issue()
+        issue["state"] = {"name": "Paused", "type": "started"}
+        return issue
+
+    phases = [(paused, {}, 1), (paused, {"state": "Paused"}, 3), (complete_issue, {}, 2)]
+    result = _triage_phases(tmp_path, first_mate_fails_first=True, phases=phases)
+    assert result["prompts"] == 2
+    assert result["mutations"] == 1
+    assert result["receipts"] == []
+    assert not [m for m in result["messages"] if "exhausted" in m], result["messages"]
+
+
+def test_pre_triage_transient_error_keeps_the_retry(tmp_path, monkeypatch):
+    """Review N1: an error before triage begins (here a git inspection timeout) keeps the replay."""
+    import subprocess
+    import harbor.unblock as unblock
+
+    real = unblock.touches_protected_paths
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        # The ladder's own check runs before triage, then triage() checks
+        # again: calls 1-2 are the first attempt (First Mate fails), call 3
+        # is the first replay's pre-triage check.
+        if calls["n"] == 3:
+            raise subprocess.TimeoutExpired(["git", "diff"], 5)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(unblock, "touches_protected_paths", flaky)
+    result = _triage_phases(tmp_path, first_mate_fails_first=True, phases=[(complete_issue, {}, 4)])
+    assert result["prompts"] == 2  # failed First Mate, then the successful retry after the timeout
+    assert result["mutations"] == 1
+    assert result["receipts"] == []
+    assert any("TimeoutExpired" in m for m in result["messages"])
+    assert not [m for m in result["messages"] if "exhausted" in m], result["messages"]
+
+
+def test_receipt_update_failure_is_logged_not_swallowed(caplog):
+    """Review N2: only a missing table is ignored; a locked ledger is logged."""
+    import logging
+    import sqlite3
+
+    class LockedConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *args):
+            raise sqlite3.OperationalError("database is locked")
+
+    class MissingTable(LockedConnection):
+        def execute(self, *args):
+            raise sqlite3.OperationalError("no such table: recovery_receipts")
+
+    supervisor = Supervisor(SimpleNamespace(project_name="mock", config=SimpleNamespace()))
+    supervisor.db = SimpleNamespace(connection=MissingTable())
+    with caplog.at_level(logging.ERROR, logger="harbor.supervisor"):
+        supervisor._clear_triage_retry("run-1")
+        assert not caplog.records
+        supervisor.db = SimpleNamespace(connection=LockedConnection())
+        supervisor._clear_triage_retry("run-1")
+    assert any("database is locked" in str(record.exc_info[1]) for record in caplog.records if record.exc_info)
+    assert "database is locked" in (supervisor.last_error or "")
+
+
+def test_startup_skips_a_run_whose_triage_retry_is_pending(tmp_path):
+    """Review N3: the poll's bounded replay owns a run with a triage receipt; restarts do not re-run it."""
+    from harbor.recovery import recovery_schema
+
+    handled = []
+
+    class Ladder:
+        def can_retry_deterministically(self, ticket, run_row, final):
+            return True
+
+        async def handle(self, ticket, run_row, final):
+            handled.append(run_row["id"])
+            return "resumed"
+
+    async def nothing():
+        return None
+
+    def factory(db):
+        recovery_schema(db.connection)
+        with db.connection:
+            db.connection.execute(
+                "INSERT INTO recovery_receipts(run_id,next_retry,last_reason) VALUES ('triage:run-1', 0, ?)",
+                ("Linear blocker context unavailable",))
+        return Ladder(), nothing
+
+    notifier = Notifier()
+    _startup_scenario(tmp_path, factory, notifier)
+    assert handled == ["run-2"]
+    assert notifier.messages == []

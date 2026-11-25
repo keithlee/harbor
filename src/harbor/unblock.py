@@ -191,6 +191,23 @@ class BlockerContextUnavailable(LinearClientError):
     """
 
 
+_TRIAGE_RAN_ATTR = "_harbor_triage_ran"
+
+
+def triage_ran(exc: BaseException) -> bool:
+    """Whether ``UnblockLadder.handle`` had begun triage when ``exc`` was raised.
+
+    "Triage" starts once every pre-decision read and check has passed (fresh
+    Linear context, scope, state, dependencies and changed-path inspection)
+    and the ladder moves on to a decision: a deterministic adapter,
+    remediation, First Mate, or an escalation.  An error raised before that
+    point leaves the blocked run untriaged; one raised after it means a
+    decision may already have been recorded or written.
+    """
+
+    return bool(getattr(exc, _TRIAGE_RAN_ATTR, False))
+
+
 class TicketNotUnblockable(ValueError):
     """The fresh ticket state rules out unblocking (stopped or still dependent).
 
@@ -1123,6 +1140,26 @@ class UnblockLadder:
         *,
         blocker: Mapping[str, Any] | None = None,
     ) -> UnblockResult:
+        progress: dict[str, bool] = {}
+        try:
+            return await self._handle(ticket, run, final, blocker=blocker, progress=progress)
+        except Exception as exc:
+            if progress.get("triage"):
+                try:
+                    setattr(exc, _TRIAGE_RAN_ATTR, True)
+                except AttributeError:
+                    pass  # an exception type without a __dict__ reads as untriaged
+            raise
+
+    async def _handle(
+        self,
+        ticket: Mapping[str, Any],
+        run: Mapping[str, Any],
+        final: Mapping[str, Any] | None,
+        *,
+        blocker: Mapping[str, Any] | None,
+        progress: dict[str, bool],
+    ) -> UnblockResult:
         final = final or {}
         fetch = getattr(self.linear, "fetch_blocker_context", None)
         if callable(fetch):
@@ -1189,6 +1226,9 @@ class UnblockLadder:
             if not protected and self._prior_rung_zero(ticket_id, kind) < self.policy.unblock_attempts
             else None
         )
+        # Every pre-decision read and check has passed; from here on the
+        # ladder decides (adapter, remediation, First Mate, escalation).
+        progress["triage"] = True
         if adapter is not None:
             answer, citation, reason = adapter
             escalation = self._record(ticket_id, run_id, kind, question, 0, citation=citation, answer=answer, status="resume_pending", reason=reason)
