@@ -315,6 +315,11 @@ def build_production_dispatcher(
     return dispatcher, manager, factory
 
 
+# The sandbox hosts are resolved once, when ``harbor start`` builds the
+# dispatcher; only the workflow package is reloaded per poll.
+RESTART_TO_APPLY = "Restart Harbor after fixing {setting}; a running harbor start keeps the value it started with"
+
+
 def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
     """The configured Linear host for a Claude builder's sandbox, or why it is left out.
 
@@ -329,7 +334,10 @@ def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
     try:
         return sandbox_hosts(url, "Linear API", git_host=False), None
     except ValueError as exc:
-        return (), f"{exc}; the Claude builder sandbox does not allow it, so builder Bash commands cannot reach Linear"
+        return (), (
+            f"{exc}; the Claude builder sandbox does not allow it, so builder Bash commands cannot reach Linear. "
+            f"{RESTART_TO_APPLY.format(setting='linear_api_url')}"
+        )
 
 
 def claude_sandbox_hosts(config: Any, rest_url: str) -> tuple[str, ...]:
@@ -368,7 +376,8 @@ def resumed_claude_sandbox_hosts(
         reason = (
             f"the retained Claude builder session for {ticket or '(unknown ticket)'} cannot resume: {exc}. "
             "Its project is now set to Codex, so harbor doctor and harbor start do not check this; "
-            "set github_api_url to a host name the Claude sandbox can allow"
+            "set github_api_url to a host name the Claude sandbox can allow. "
+            f"{RESTART_TO_APPLY.format(setting='github_api_url')}"
         )
         warn(reason)
         raise ValueError(reason) from exc

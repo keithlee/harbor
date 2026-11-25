@@ -237,7 +237,12 @@ on a project since switched to Codex. `harbor start` and `harbor doctor` do not
 check such a session, so when it is resumed Harbor prints the same Linear
 warning, and if the GitHub value stops it, a `Harbor: warning: the retained
 Claude builder session for <ticket> cannot resume: ...` line (once per process);
-the session stays unresumed until `github_api_url` is fixed. A configured DNS name is trusted as-is:
+the session stays unresumed until `github_api_url` is fixed and Harbor is
+restarted. Harbor reads `github_api_url` and `linear_api_url` for the sandbox
+once, when `harbor start` builds its dispatcher (only the workflow package is
+reloaded per poll), so after fixing either one restart Harbor: a running
+`harbor start` keeps the old value and, having warned once, prints nothing
+more. Both the GitHub and the Linear warning say so. A configured DNS name is trusted as-is:
 whoever can set `github_api_url` (the registry, `.harbor/pipeline.md` or
 `AGENTS.md` in the main checkout) already decides where the GitHub token is
 sent, so allowing that host gives them nothing new. Verified with unit tests and the production runner factory on macOS

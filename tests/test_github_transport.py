@@ -435,6 +435,9 @@ def test_a_resumed_claude_session_reports_why_it_cannot_resume(tmp_path: Path, m
         err = capsys.readouterr().err
         assert err.count("Harbor: warning: the retained Claude builder session for SAMPLE-1 cannot resume") == 1
         assert "set github_api_url" in err
+        # The URL is read once when harbor start builds the dispatcher, and the
+        # warning is not repeated, so it must say a restart is needed.
+        assert "Restart Harbor after fixing github_api_url" in err
     finally:
         db.close()
 
@@ -485,6 +488,7 @@ def test_a_resumed_claude_session_warns_about_an_unexpressible_linear_url(
         assert sandbox_domains(runner.command("x", run_id="harbor-run-1")) == GITHUB_COM_DOMAINS  # not widened
         err = capsys.readouterr().err
         assert err.count("Harbor: warning: the Linear API URL must be an https URL") == 1
+        assert "Restart Harbor after fixing linear_api_url" in err
     finally:
         db.close()
 
