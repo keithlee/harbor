@@ -225,7 +225,8 @@ def two_team_transport(calls: list[dict[str, Any]]) -> httpx.MockTransport:
         team_id, nodes = teams[issue.split("-")[0][-1]]
         if "HarborStates" in body["query"]:
             return httpx.Response(200, json={"data": {"issue": {"id": issue, "team": {
-                "id": team_id, "name": team_id, "states": {"nodes": nodes}}}}})
+                "id": team_id, "name": team_id, "states": {
+                    "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}})
         state_id = body["variables"]["stateId"]
         if state_id not in {node["id"] for node in nodes}:
             # Linear refuses a state that belongs to another team.

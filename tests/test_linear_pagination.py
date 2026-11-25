@@ -579,3 +579,32 @@ def test_workflow_state_lookup_rejects_a_page_without_a_nodes_list(nodes) -> Non
     with pytest.raises(LinearClientError, match=r"^Linear workflow state response was malformed$"):
         set_state(httpx.MockTransport(handler), "Blocked")
     assert not any("issueUpdate" in call["query"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param({"issue": None}, id="issue-null"),
+        pytest.param({"issue": {"id": "u", "team": None}}, id="team-null"),
+        pytest.param({"issue": {"id": "u", "team": {"id": "team-a", "states": None}}}, id="states-null"),
+    ],
+)
+def test_team_scoped_state_lookup_caches_nothing_for_a_null_link(data) -> None:
+    """A null issue/team/states must fail as malformed, never be cached as an
+    empty per-issue (or per-team) scope that later lookups would trust."""
+
+    async def scenario() -> LinearClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": data})
+
+        client = LinearClient(token="test-key", transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(LinearClientError, match=r"^Linear workflow state response was malformed$"):
+                await client.resolve_state_id("SAMPLE-1", "Blocked")
+        finally:
+            await client.close()
+        return client
+
+    client = asyncio.run(scenario())
+    assert client._issue_teams == {}
+    assert client._state_ids == {} and client._state_types == {}
