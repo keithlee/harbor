@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -54,6 +53,11 @@ def poll(api_url: str | None, url: str) -> tuple[FakeGitHubClient, list]:
         ("https://api.sample.ghe.com/graphql", "sample.ghe.com"),
         ("https://ghe.example.test:8443/api/graphql", "ghe.example.test:8443"),
         ("https://10.0.0.5/api/graphql", "10.0.0.5"),
+        # An explicit default port is dropped; PR links never carry one.
+        ("https://api.github.com:443/graphql", "github.com"),
+        ("https://ghe.example.test:443/api/graphql", "ghe.example.test"),
+        ("http://ghe.example.test:80/api/graphql", "ghe.example.test"),
+        ("http://ghe.example.test:443/api/graphql", "ghe.example.test:443"),
     ],
 )
 def test_web_host_follows_the_configured_api_endpoint(api_url, host) -> None:
@@ -99,6 +103,14 @@ def test_a_link_on_another_host_is_never_queried(api_url, url) -> None:
     assert facts == []
 
 
+def test_an_explicit_default_port_still_recognizes_ordinary_links() -> None:
+    client, facts = poll("https://api.github.com:443/graphql", DOTCOM_PR)
+    assert client.calls == [("example", "SampleProject", (7,))]
+    assert facts[0]["url"] == DOTCOM_PR
+    client, _ = poll("https://ghe.example.test:443/api/graphql", GHES_PR)
+    assert client.calls == [("example", "SampleProject", (7,))]
+
+
 def test_github_com_default_is_unchanged() -> None:
     client, facts = poll(None, DOTCOM_PR)
     assert client.calls == [("example", "SampleProject", (7,))]
@@ -140,50 +152,62 @@ def test_ghes_poll_reaches_only_the_configured_endpoint_through_a_mock_transport
 
 
 def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
+    """A real ProjectConfig whose pipeline names a GHES endpoint, and a real GitHubClient."""
+
+    import harbor.clients.github as github_module
+    from harbor.config.projects import ProjectConfig
     from harbor.workflow_cli import fresh_context
     from workflow_support import config
 
-    raw = {
-        "identifier": "A-1",
-        "project": {"slugId": "canonical"},
-        "description": "Risk: low",
-        "state": {"name": "In Progress", "type": "started"},
-        "comments": {"nodes": []},
-        "attachments": {"nodes": [{"sourceType": "github", "url": GHES_PR}]},
-        "inverseRelations": {"nodes": []},
-    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"data": {"repository": {
+            "pr_7": {"number": 7, "url": GHES_PR, "headRefOid": "abc", "merged": False},
+        }}})
+
+    real_client = github_module.GitHubClient
+
+    class MockTransportGitHubClient(real_client):
+        """The real client, with only its transport swapped for a mock."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
 
     class Linear:
         def __init__(self, **kwargs):
             pass
 
         async def fetch_blocker_context(self, ticket):
-            return raw
-
-        async def close(self):
-            pass
-
-    class GitHub:
-        def __init__(self, **kwargs):
-            pass
-
-        async def fetch_pull_requests(self, owner, repo, numbers):
-            return {f"pr_{n}": {"number": n, "headRefOid": "abc", "url": GHES_PR, "merged": False} for n in numbers}
+            return {
+                "identifier": ticket,
+                "project": {"slugId": "canonical"},
+                "description": "Risk: low",
+                "state": {"name": "In Progress", "type": "started"},
+                "comments": {"nodes": []},
+                "attachments": {"nodes": [{"sourceType": "github", "url": GHES_PR}]},
+                "inverseRelations": {"nodes": []},
+            }
 
         async def close(self):
             pass
 
     monkeypatch.setattr("harbor.clients.linear.LinearClient", Linear)
-    monkeypatch.setattr("harbor.clients.github.GitHubClient", GitHub)
-    cfg = SimpleNamespace(
+    monkeypatch.setattr("harbor.clients.github.GitHubClient", MockTransportGitHubClient)
+    monkeypatch.setenv("GITHUB_TOKEN", "placeholder-not-a-secret")
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text(f"```yaml\nrepo: example/SampleProject\ngithub_api_url: {GHES_API}\n```\n", encoding="utf-8")
+    cfg = ProjectConfig(
         name="A",
+        linear_project_slug="canonical",
         linear_api_url="https://linear.invalid",
-        linear_project_scope=("canonical",),
-        github_repository="example/SampleProject",
-        github_api_url=GHES_API,
-        required_checks=(),
+        repo_path=tmp_path,
+        pipeline_path=pipeline,
         workflow_path=str(config(tmp_path)),
     )
+    assert cfg.github_api_url == ""  # the endpoint comes from the pipeline file only
     db = HarborDB(":memory:")
     try:
         db.replace_tickets("A", [{"identifier": "A-1", "state": "In Progress", "owned": True, "hold": False}])
@@ -192,3 +216,7 @@ def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
         db.close()
     assert context["facts"]["url"] == GHES_PR
     assert context["head_sha"] == "abc"
+    assert requests, "workflow check must have queried GitHub"
+    assert {str(request.url) for request in requests} == {GHES_API}
+    assert all(request.url.host != "api.github.com" for request in requests)
+    assert "pullRequest(number: 7)" in json.loads(requests[0].content)["query"]
