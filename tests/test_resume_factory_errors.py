@@ -547,3 +547,58 @@ def test_superseded_pr_event_notice_survives_a_failed_send(tmp_path: Path) -> No
 
     asyncio.run(scenario())
 
+
+def test_a_retired_superseded_event_does_not_block_the_current_runs_event(tmp_path: Path) -> None:
+    """One pass: the stale run-1 events are retired, then run-2's event is delivered."""
+
+    from harbor.pr_events import PREventProcessor
+    from harbor.supervisor import _ResultRoutingTarget
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        resumed: list[tuple[str, str]] = []
+
+        class CurrentRunner:
+            default_run_id = "run-2"
+
+            async def resume(self, run_id: str, prompt: str) -> dict[str, str]:
+                resumed.append((run_id, prompt))
+                return {"run_id": run_id, "status": "waiting", "summary": "ok"}
+
+        dispatcher.runner_factory = lambda _wt, _wake: CurrentRunner()
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=lambda _text: None)
+        processor = PREventProcessor(ledger, project="SampleProject")
+        url = "https://github.com/acme/demo/pull/7"
+        ticket = {"identifier": "SAMPLE-42", "pr_urls": [url]}
+        stale = {"id": "c-1", "body": "Please fix the timeout.", "surface": "issue",
+                 "author": "reviewer", "created_at": "2026-09-02T10:01:00Z"}
+        fresh = {"id": "c-2", "body": "Also rename the flag.", "surface": "issue",
+                 "author": "reviewer", "created_at": "2026-09-02T11:01:00Z"}
+
+        def facts(*comments: dict[str, Any]) -> dict[str, Any]:
+            return {"number": 7, "url": url, "createdAt": "2026-09-02T10:00:00Z", "headRefOid": "a" * 40,
+                    "state": "OPEN", "ci": {"state": "green"}, "comments": list(comments)}
+
+        old_events = processor.observe(ticket, facts(stale), run={"id": "run-1", "status": "waiting"})
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs(id, ticket, status, session_id, worktree) "
+                "VALUES ('run-2', 'SAMPLE-42', 'waiting', 'session-2', ?)",
+                (str(tmp_path / "wt" / "SAMPLE-42"),),
+            )
+        run_2 = {"id": "run-2", "status": "waiting"}
+        new_events = processor.observe(ticket, facts(stale, fresh), run=run_2)
+        assert [event["run_id"] for event in new_events] == ["run-2"]
+
+        outcome = await processor.process(
+            ticket, facts(stale, fresh), run=run_2, builder=_ResultRoutingTarget(supervisor, processor, dispatcher)
+        )
+        order = [(event["run_id"], bool(event.get("superseded"))) for event in outcome]
+        print(f"Offer order: {order}")
+        print(f"Resumed: {[run for run, _ in resumed]}")
+        assert order[: len(old_events)] == [("run-1", True)] * len(old_events), "stale events come first"
+        assert order[len(old_events):] == [("run-2", False)]
+        assert [run for run, _ in resumed] == ["run-2"] and "Also rename the flag." in resumed[0][1]
+        ledger.close()
+
+    asyncio.run(scenario())
