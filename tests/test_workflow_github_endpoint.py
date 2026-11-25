@@ -18,13 +18,16 @@ from harbor.wake import apply_phase3_migration
 from harbor.workflow_cli import execute
 from workflow_support import config
 
-# Harbor's PR-link matcher only recognises github.com-form links today, so the
-# Linear attachment uses that form; the GraphQL endpoint is what is under test.
+# Harbor recognizes a PR link only on the configured GitHub host, so a GHES
+# project's Linear attachment uses the GHES form.
 PR_URL = "https://github.com/example/repo/pull/1"
+GHES_PR_URL = "https://ghe.example.com/example/repo/pull/1"
 DUMMY_TOKEN = "dummy-test-token-not-a-secret"
 
 
 class Linear:
+    url = PR_URL
+
     def __init__(self, **kwargs):
         pass
 
@@ -34,14 +37,14 @@ class Linear:
             "project": {"slugId": "canonical"},
             "description": "Risk: low",
             "state": {"name": "In Progress", "type": "started"},
-            "attachments": {"nodes": [{"sourceType": "github", "url": PR_URL}]},
+            "attachments": {"nodes": [{"sourceType": "github", "url": self.url}]},
         }
 
     async def close(self):
         pass
 
 
-def _run_workflow_check(tmp_path, monkeypatch, pipeline_text):
+def _run_workflow_check(tmp_path, monkeypatch, pipeline_text, pr_url=PR_URL):
     """Run `harbor workflow check A --ticket A-1 --event pre_merge`; return captured requests."""
 
     sent: list[httpx.Request] = []
@@ -51,7 +54,7 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text):
         return httpx.Response(200, json={"data": {"repository": {"pr_1": {
             "number": 1,
             "headRefOid": "abc",
-            "url": PR_URL,
+            "url": pr_url,
             "merged": False,
             "mergeable": "MERGEABLE",
             "statusCheckRollup": {"contexts": {"nodes": [{"name": "tests", "conclusion": "SUCCESS"}]}},
@@ -66,6 +69,7 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text):
             kwargs["transport"] = httpx.MockTransport(handler)
             super().__init__(*args, **kwargs)
 
+    monkeypatch.setattr(Linear, "url", pr_url)
     monkeypatch.setattr("harbor.clients.linear.LinearClient", Linear)
     monkeypatch.setattr("harbor.clients.github.GitHubClient", MockTransportGitHubClient)
     monkeypatch.setenv("GITHUB_TOKEN", DUMMY_TOKEN)
@@ -103,6 +107,7 @@ def test_workflow_check_sends_github_token_only_to_configured_enterprise_host(tm
         tmp_path,
         monkeypatch,
         "```yaml\nrepo: example/repo\ngithub_api_url: https://ghe.example.com/api/graphql\n```\n",
+        pr_url=GHES_PR_URL,
     )
 
     assert sent, "workflow check must have queried GitHub"
@@ -259,7 +264,7 @@ def test_facts_queries_the_configured_https_endpoint(tmp_path, monkeypatch, caps
         "identifier": "A-1",
         "title": "A ticket",
         "state": {"name": "In Progress", "type": "started"},
-        "attachments": {"nodes": [{"sourceType": "github", "url": PR_URL}]},
+        "attachments": {"nodes": [{"sourceType": "github", "url": GHES_PR_URL}]},
         "comments": {"nodes": []},
         "inverseRelations": {"nodes": []},
     }
