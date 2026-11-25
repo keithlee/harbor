@@ -15,6 +15,8 @@ from harbor.poll.github_poller import GitHubPoller, attached_pull_requests
 GHES_API = "https://ghe.example.test/api/graphql"
 GHES_PR = "https://ghe.example.test/example/SampleProject/pull/7"
 DOTCOM_PR = "https://github.com/example/SampleProject/pull/7"
+REGISTRY_API = "https://ghe-registry.example.test/api/graphql"
+REGISTRY_PR = "https://ghe-registry.example.test/example/SampleProject/pull/7"
 
 
 def run(awaitable):
@@ -178,8 +180,22 @@ def test_ghes_poll_reaches_only_the_configured_endpoint_through_a_mock_transport
     assert [(fact["number"], fact["url"]) for fact in facts] == [(7, GHES_PR)]
 
 
-def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
-    """A real ProjectConfig whose pipeline names a GHES endpoint, and a real GitHubClient."""
+@pytest.mark.parametrize(
+    ("registry_api", "pipeline_api", "endpoint", "pr_url"),
+    [
+        # Pipeline file only: the registry cell is empty.
+        ("", GHES_API, GHES_API, GHES_PR),
+        # A registry value wins over the pipeline file, for the client and the PR host.
+        (REGISTRY_API, GHES_API, REGISTRY_API, REGISTRY_PR),
+        # Neither: the GitHub.com default.
+        ("", None, "https://api.github.com/graphql", DOTCOM_PR),
+    ],
+    ids=["pipeline", "registry-over-pipeline", "default"],
+)
+def test_workflow_check_finds_the_linked_pr_on_the_resolved_host(
+    tmp_path, monkeypatch, registry_api, pipeline_api, endpoint, pr_url
+) -> None:
+    """A real ProjectConfig and a real GitHubClient; the endpoint resolves registry -> pipeline -> default."""
 
     import harbor.clients.github as github_module
     from harbor.config.projects import ProjectConfig
@@ -191,7 +207,7 @@ def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         return httpx.Response(200, json={"data": {"repository": {
-            "pr_7": {"number": 7, "url": GHES_PR, "headRefOid": "abc", "merged": False},
+            "pr_7": {"number": 7, "url": pr_url, "headRefOid": "abc", "merged": False},
         }}})
 
     real_client = github_module.GitHubClient
@@ -214,7 +230,11 @@ def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
                 "description": "Risk: low",
                 "state": {"name": "In Progress", "type": "started"},
                 "comments": {"nodes": []},
-                "attachments": {"nodes": [{"sourceType": "github", "url": GHES_PR}]},
+                "attachments": {"nodes": [
+                    {"sourceType": "github", "url": pr_url},
+                    # A link on a host other than the resolved one is never polled.
+                    {"sourceType": "github", "url": "https://ghe.other.test/example/SampleProject/pull/9"},
+                ]},
                 "inverseRelations": {"nodes": []},
             }
 
@@ -225,25 +245,28 @@ def test_workflow_check_finds_the_linked_ghes_pr(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("harbor.clients.github.GitHubClient", MockTransportGitHubClient)
     monkeypatch.setenv("GITHUB_TOKEN", "placeholder-not-a-secret")
     pipeline = tmp_path / "pipeline.md"
-    pipeline.write_text(f"```yaml\nrepo: example/SampleProject\ngithub_api_url: {GHES_API}\n```\n", encoding="utf-8")
+    endpoint_line = f"github_api_url: {pipeline_api}\n" if pipeline_api else ""
+    pipeline.write_text(f"```yaml\nrepo: example/SampleProject\n{endpoint_line}```\n", encoding="utf-8")
     cfg = ProjectConfig(
         name="A",
         linear_project_slug="canonical",
         linear_api_url="https://linear.invalid",
         repo_path=tmp_path,
         pipeline_path=pipeline,
+        github_api_url=registry_api,
         workflow_path=str(config(tmp_path)),
     )
-    assert cfg.github_api_url == ""  # the endpoint comes from the pipeline file only
     db = HarborDB(":memory:")
     try:
         db.replace_tickets("A", [{"identifier": "A-1", "state": "In Progress", "owned": True, "hold": False}])
-        context = run(fresh_context(cfg, db, "A-1", {"id": "run", "pr_url": GHES_PR}, "pre_merge"))
+        context = run(fresh_context(cfg, db, "A-1", {"id": "run", "pr_url": pr_url}, "pre_merge"))
     finally:
         db.close()
-    assert context["facts"]["url"] == GHES_PR
+    assert context["facts"]["url"] == pr_url
     assert context["head_sha"] == "abc"
     assert requests, "workflow check must have queried GitHub"
-    assert {str(request.url) for request in requests} == {GHES_API}
-    assert all(request.url.host != "api.github.com" for request in requests)
-    assert "pullRequest(number: 7)" in json.loads(requests[0].content)["query"]
+    assert {str(request.url) for request in requests} == {endpoint}
+    if endpoint != "https://api.github.com/graphql":
+        assert all(request.url.host != "api.github.com" for request in requests)
+    query = json.loads(requests[0].content)["query"]
+    assert "pullRequest(number: 7)" in query and "number: 9" not in query
