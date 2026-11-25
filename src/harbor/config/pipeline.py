@@ -507,7 +507,20 @@ class ProjectDefinition:
     values: Mapping[str, Any] = field(default_factory=dict)
 
 
-def _table_rows(lines: list[str]) -> list[dict[str, str]]:
+_YAML_LIST_ENTRY = re.compile(r"^-\s*(?:name|project)\s*:")
+
+
+def _yaml_list_error(line: int, where: str) -> str:
+    return (
+        f"unsupported Harbor project registry format: line {line} starts a YAML-style list entry "
+        f"({where}); YAML lists are not supported. Use one table row or one heading section per "
+        "project (see 'Manual multi-project setup' in README.md)"
+    )
+
+
+def _project_rows(text: str) -> list[dict[str, str]]:
+    raw_lines = text.splitlines()
+    lines = [line.strip() for line in raw_lines]
     rows: list[dict[str, str]] = []
     for index, line in enumerate(lines[:-1]):
         if not line.startswith("|"):
@@ -525,87 +538,51 @@ def _table_rows(lines: list[str]) -> list[dict[str, str]]:
             rows.append({headers[pos]: values[pos] for pos in range(len(headers))})
         if rows:
             return rows
-    return rows
-
-
-_YAML_ITEM = re.compile(r"^(\s*)-\s*(?:name|project)\s*:\s*(.*?)\s*$")
-_YAML_FIELD = re.compile(r"^(\s+)(?:[-*]\s*)?([A-Za-z][\w .-]*)\s*:\s*(.*?)\s*$")
-
-
-def _yaml_list_rows(raw_lines: list[str]) -> list[dict[str, str]]:
-    """Read a compact YAML-like list of projects.
-
-    This is still not a YAML parser: only one-level list entries with scalar
-    key/value fields are recognized. Indentation is significant, so this reads
-    the original (unstripped) lines: a field belongs to the entry above it only
-    when it is indented deeper than that entry's ``-``. The format is used only
-    when at least one entry has such an indented field, so heading sections
-    written with ``- key: value`` bullets keep their meaning.
-    """
-
-    rows: list[dict[str, str]] = []
-    current: dict[str, str] | None = None
-    indent = -1
-    has_fields = False
-    for raw in raw_lines:
-        if not raw.strip():
-            continue
-        item = _YAML_ITEM.match(raw)
-        if item:
-            if current is not None:
-                rows.append(current)
-            current = {"name": _scalar(item.group(2))}
-            indent = len(item.group(1).expandtabs())
-            continue
-        if current is None:
-            continue
-        field_match = _YAML_FIELD.match(raw)
-        if field_match and len(field_match.group(1).expandtabs()) > indent:
-            current[_normal_key(field_match.group(2))] = _scalar(field_match.group(3))
-            has_fields = True
-            continue
-        # Anything at or left of the entry's indentation (a closing code
-        # fence, prose, a heading) ends the entry.
-        rows.append(current)
-        current = None
-    if current is not None:
-        rows.append(current)
-    if not has_fields:
-        return []
-    return [row for row in rows if row.get("name")]
-
-
-def _heading_rows(lines: list[str]) -> list[dict[str, str]]:
     # Heading + key/value sections are easier for a human to maintain than a
     # wide table and are intentionally supported too.
-    rows: list[dict[str, str]] = []
     current: dict[str, str] | None = None
-    for raw in lines:
+    section_title = ""
+    section_entries: list[int] = []
+    yaml_entry: int | None = None
+    for number, raw in enumerate(lines, start=1):
         heading = re.match(r"^#{1,6}\s+(.+?)\s*$", raw)
+        if _YAML_LIST_ENTRY.match(raw):
+            yaml_entry = number
+        elif raw and not raw_lines[number - 1][:1].isspace():
+            yaml_entry = None
+        elif heading and yaml_entry is not None:
+            # An indented "# ..." inside a YAML-style entry is a YAML comment;
+            # reading it as a heading would invent a project named after it.
+            raise ValueError(_yaml_list_error(yaml_entry, f"with a comment on line {number}"))
         if heading:
             if current and current.get("name"):
                 rows.append(current)
             title = _scalar(heading.group(1)).strip("# ")
             current = {"name": title} if title.casefold() not in {"projects", "harbor projects", "project registry"} else None
+            section_title, section_entries = title, []
             continue
         if current is None:
             continue
+        if _YAML_LIST_ENTRY.match(raw):
+            section_entries.append(number)
+            if len(section_entries) == 2:
+                # Two list entries in one heading section is a YAML-style list,
+                # not one project: merging them would give one project the
+                # fields of several. Fail closed instead.
+                raise ValueError(_yaml_list_error(section_entries[0], f"under the heading {section_title!r}"))
         match = re.match(r"^(?:[-*]\s*)?([A-Za-z][\w .-]*)\s*:\s*(.*?)\s*$", raw)
         if match:
             current[_normal_key(match.group(1))] = _scalar(match.group(2))
     if current and current.get("name"):
         rows.append(current)
+    if rows:
+        return rows
+    # YAML-style lists ("- name: ..." entries with indented fields) are not a
+    # registry format. Name the line instead of reporting the project unknown.
+    for number, raw in enumerate(lines, start=1):
+        if _YAML_LIST_ENTRY.match(raw):
+            raise ValueError(_yaml_list_error(number, "and no table or heading-section projects were found"))
     return rows
-
-
-def _project_rows(text: str) -> list[dict[str, str]]:
-    raw_lines = text.splitlines()
-    lines = [line.strip() for line in raw_lines]
-    # Formats are tried in order; the first that yields rows wins. The YAML
-    # list is tried before heading sections because a YAML list placed under a
-    # custom heading would otherwise be read as one heading section, merging
-    # every entry's fields into a single wrong project.
-    return _table_rows(lines) or _yaml_list_rows(raw_lines) or _heading_rows(lines)
 
 
 def parse_projects_markdown(text: str, *, source: str | Path | None = None) -> tuple[ProjectDefinition, ...]:
