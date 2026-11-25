@@ -48,6 +48,8 @@ def github_web_host(api_url: str | None) -> str:
         host = host[len("api."):]
     if ":" in host:
         host = f"[{host}]"  # an IPv6 literal, as it appears in a URL
+    if port == {"https": 443, "http": 80}[parts.scheme]:
+        port = None  # an explicit default port never appears in PR links
     return f"{host}:{port}" if port is not None else host
 
 
