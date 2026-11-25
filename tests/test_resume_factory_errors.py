@@ -912,3 +912,24 @@ def test_a_stale_runs_factory_outcome_keeps_the_current_runs_cause(
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_fresh_session_factory_failure_beside_the_retained_builder_keeps_its_cause(tmp_path: Path) -> None:
+    """fresh_session keeps the stuck handle while it builds the new one; that handle is not an overlap."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+
+        class StuckRunner:
+            default_run_id = "run-1"
+
+        stuck = StuckRunner()
+        dispatcher.runners["SAMPLE-42"] = stuck
+        with pytest.raises(RuntimeError, match="cannot be attached"):
+            await dispatcher.fresh_session("SAMPLE-42", "Take over from the stuck session.")
+        print(f"Stored cause: {dispatcher.resume_unavailable_reason('SAMPLE-42')!r}")
+        assert dispatcher.runners.get("SAMPLE-42") is stuck
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        ledger.close()
+
+    asyncio.run(scenario())
