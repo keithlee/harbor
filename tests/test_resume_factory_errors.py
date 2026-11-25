@@ -602,3 +602,61 @@ def test_a_retired_superseded_event_does_not_block_the_current_runs_event(tmp_pa
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_a_risk_request_reopened_by_a_push_goes_to_the_run_that_owns_the_ticket(tmp_path: Path) -> None:
+    """run-2 took over PR #7; its own push reopens the risk request for run-2, not run-1."""
+
+    from harbor.pr_events import PREventProcessor
+    from harbor.supervisor import _ResultRoutingTarget
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        resumed: list[tuple[str, str]] = []
+
+        class CurrentRunner:
+            default_run_id = "run-2"
+
+            async def resume(self, run_id: str, prompt: str) -> dict[str, str]:
+                resumed.append((run_id, prompt))
+                return {"run_id": run_id, "status": "waiting", "summary": "ok"}
+
+        dispatcher.runner_factory = lambda _wt, _wake: CurrentRunner()
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        processor = PREventProcessor(ledger, project="SampleProject")
+        target = _ResultRoutingTarget(supervisor, processor, dispatcher)
+        url = "https://github.com/acme/demo/pull/7"
+        ticket = {"identifier": "SAMPLE-42", "pr_urls": [url]}
+
+        def facts(head: str) -> dict[str, Any]:
+            return {"number": 7, "url": url, "createdAt": "2026-09-02T10:00:00Z", "headRefOid": head,
+                    "state": "OPEN", "ci": {"state": "green"}, "comments": []}
+
+        processor.observe(ticket, facts("a" * 40), run={"id": "run-1", "status": "waiting"})
+        with ledger.connection:
+            ledger.connection.execute(
+                "INSERT INTO runs(id, ticket, status, session_id, worktree) "
+                "VALUES ('run-2', 'SAMPLE-42', 'waiting', 'session-2', ?)",
+                (str(tmp_path / "wt" / "SAMPLE-42"),),
+            )
+        run_2 = {"id": "run-2", "status": "waiting"}
+        first = await processor.process(ticket, facts("a" * 40), run=run_2, builder=target)
+        await supervisor._notify_superseded_pr_events()
+        print(f"Poll 1: {[(e['event_type'], e['run_id'], bool(e.get('superseded'))) for e in first]}")
+        assert [(e["run_id"], bool(e.get("superseded"))) for e in first] == [("run-1", True)]
+
+        # run-2 pushes head b: the risk result is invalidated and the request reopens.
+        second = await processor.process(ticket, facts("b" * 40), run=run_2, builder=target)
+        await supervisor._notify_superseded_pr_events()
+        print(f"Poll 2: {[(e['event_type'], e['run_id'], bool(e.get('superseded'))) for e in second]}")
+        print(f"Resumed: {[run for run, _ in resumed]}")
+        assert [(e["event_type"], e["run_id"], bool(e.get("superseded"))) for e in second] == [
+            ("PR_CREATED", "run-2", False)
+        ]
+        assert [run for run, _ in resumed] == ["run-2"]
+        assert "b" * 40 in resumed[0][1] and "a" * 40 not in resumed[0][1], "risk runs at the new head"
+        assert len(notices) == 1, "only the genuinely superseded request was retired"
+        ledger.close()
+
+    asyncio.run(scenario())
