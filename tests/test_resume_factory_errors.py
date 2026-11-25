@@ -686,3 +686,30 @@ def test_an_answer_turned_away_by_a_still_running_run_keeps_the_cause(tmp_path: 
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_overlapping_flushes_send_one_superseded_notice(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        sent: list[str] = []
+        release = asyncio.Event()
+
+        async def slow_notifier(text: str) -> None:
+            await release.wait()
+            sent.append(text)
+
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=slow_notifier)
+        event = {"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "PR_CREATED"}
+        supervisor._note_superseded_pr_event(event)
+        first = asyncio.create_task(supervisor._notify_superseded_pr_events())
+        await asyncio.sleep(0)
+        supervisor._note_superseded_pr_event(event)
+        second = asyncio.create_task(supervisor._notify_superseded_pr_events())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        print(sent)
+        assert len(sent) == 1
+        ledger.close()
+
+    asyncio.run(scenario())

@@ -1776,6 +1776,9 @@ class Supervisor:
         text = " ".join(str(message).split())
         if len(text) > _MAX_NOTICE_CHARS:
             text = text[: _MAX_NOTICE_CHARS - 1] + "…"
+        # Reserve the key before awaiting so an overlapping send of the same
+        # notice is suppressed while this one is in flight.
+        self._operator_notices.add(key)
         try:
             value = target(text)
             if inspect.isawaitable(value):
@@ -1783,9 +1786,13 @@ class Supervisor:
         except Exception as exc:
             # Only a delivered notice is deduplicated; a flaky notifier is
             # retried the next time the same event is reported.
+            self._operator_notices.discard(key)
             self.last_error = f"operator notification failed: {exc}"
             return False
-        self._operator_notices.add(key)
+        except BaseException:
+            # A cancelled send was not delivered: release the reservation.
+            self._operator_notices.discard(key)
+            raise
         return True
 
     async def _notify_orphaned_runs(self, run_ids: Iterable[str] | None) -> None:
