@@ -660,3 +660,29 @@ def test_a_risk_request_reopened_by_a_push_goes_to_the_run_that_owns_the_ticket(
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_an_answer_turned_away_by_a_still_running_run_keeps_the_cause(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        console = Console(supervisor)
+        await supervisor.poll_once()
+        assert await dispatcher.hydrate("SAMPLE-42") is None
+        with ledger.connection:
+            ledger.connection.execute("UPDATE runs SET status='running' WHERE id='run-1'")
+        enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
+        assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+        with ledger.connection:
+            ledger.connection.execute("UPDATE runs SET status='waiting' WHERE id='run-1'")
+
+        status = await console.handle_command("/status")
+        print(status)
+        print(notices)
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        assert f"Builder resume error for SAMPLE-42 (run run-1): {REASON}" in status
+        assert len(notices) == 1 and REASON not in notices[0]
+        ledger.close()
+
+    asyncio.run(scenario())
