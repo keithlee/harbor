@@ -474,3 +474,51 @@ def test_answer_on_a_terminal_run_after_a_failed_retry_keeps_the_factory_cause(
         ledger.close()
 
     asyncio.run(scenario())
+
+
+def test_retry_refused_on_a_waiting_run_keeps_the_cause_in_status(tmp_path: Path) -> None:
+    """A /retry turned away before the factory is not a new attempt."""
+
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        notices: list[str] = []
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notices.append)
+        console = Console(supervisor)
+        await supervisor.poll_once()
+        enqueue(ledger.connection, "7", "SampleProject", "SAMPLE-42", "run-1", "Use option A")
+        assert await deliver(supervisor, "7", "run-1", "Use option A") is False
+        assert REASON in notices[0]
+
+        refusal = await console.handle_command("/retry SAMPLE-42")
+        print(refusal)
+        assert "is waiting, not recoverable" in refusal
+        status = await console.handle_command("/status")
+        print(status)
+        assert f"Builder resume error for SAMPLE-42 (run run-1): {REASON}" in status
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        ledger.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_whose_rebuild_stops_before_the_factory_does_not_cite_the_old_cause(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "terminated")
+        with pytest.raises(RuntimeError, match="cannot be rebuilt"):
+            await dispatcher.retry("SAMPLE-42")
+
+        async def early_return(*_args: Any, **_kwargs: Any) -> None:
+            return None  # e.g. an attach-path or custody mismatch: no factory call
+
+        dispatcher.hydrate = early_return
+        with pytest.raises(RuntimeError) as caught:
+            await dispatcher.retry("SAMPLE-42")
+        print(caught.value)
+        assert REASON not in str(caught.value)
+        assert dispatcher.resume_unavailable_reason("SAMPLE-42") == REASON
+        ledger.close()
+
+    asyncio.run(scenario())
+

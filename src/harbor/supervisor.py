@@ -730,7 +730,8 @@ class WorktreeDispatcher:
         identifier = str(identifier or "").strip()
         if not identifier or not self._in_scope(identifier):
             raise ValueError(f"ticket is outside this supervisor's scope: {identifier or '(empty)'}")
-        self._clear_resume_error(identifier)
+        # A refusal below is not a new attempt: the stored cause stays in /status
+        # until hydrate() reaches the factory or finds the worktree gone.
         row = self._persisted_run(identifier)
         if row is None:
             raise RuntimeError(f"no retained builder exists for {identifier}")
@@ -748,10 +749,12 @@ class WorktreeDispatcher:
         # context. Rebuild its lightweight handle from the durable session so
         # the retry cannot inherit the prior process's terminal flags.
         self.runners.pop(identifier, None)
+        prior = self.resume_failure(identifier, run_id)
         runner = await self.hydrate(identifier, recover_terminal=True, expected_run_id=run_id)
         if runner is None:
             failure = self.resume_failure(identifier, run_id)
-            if failure is not None:
+            # Each factory failure is a new record: cite only one this retry produced.
+            if failure is not None and failure is not prior:
                 raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {failure.reason}")
             raise RuntimeError(
                 f"retained builder for {identifier} cannot attach its existing worktree"
