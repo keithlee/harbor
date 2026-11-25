@@ -25,7 +25,6 @@ def add_commands(commands):
 async def fresh_context(config, db, ticket_id, run, event):
     from harbor.clients.linear import LinearClient
     from harbor.clients.github import GitHubClient
-    from harbor.config.profile import PipelineProfile
     from harbor.poll.linear_poller import normalize_issue
     from harbor.poll.github_poller import GitHubPoller
     from harbor.pr_events import PREventProcessor
@@ -50,9 +49,9 @@ async def fresh_context(config, db, ticket_id, run, event):
         ticket = normalize_issue(raw, hold_all=retained.get("hold", True))
         if not ticket:
             raise ValueError("ticket state unavailable")
-        # The resolved profile, as `harbor poll` and `harbor start` use, so the
-        # workflow check reads the same repository and required checks.
-        profile = PipelineProfile.from_project(config)
+        # The same resolved profile the GitHub client uses (and `harbor poll`
+        # and `harbor start` use), so the workflow check reads the same
+        # repository and required checks.
         processor = PREventProcessor(db, project=config.name, profile=profile)
         poller = GitHubPoller(github, profile=profile, db=db, project=config.name, event_processor=processor)
         facts = await poller.poll([ticket])

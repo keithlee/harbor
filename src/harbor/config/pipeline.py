@@ -280,7 +280,9 @@ def parse_pipeline_markdown(text: str, *, defaults: Mapping[str, Any] | None = N
         "hold": ("hold", "hold_all", "shadow_hold"),
         "github_repository": ("github_repository", "github_repo", "repository"),
         "required_checks": ("required_checks", "ci_required_checks"),
-        "bot_rework_cap": ("bot_rework_cap",),
+        # ``bot_rework_rounds`` is the spelling PipelineProfile also reads, so
+        # the wake decider and the GitHub profile see the same cap.
+        "bot_rework_cap": ("bot_rework_cap", "bot_rework_rounds"),
         # Opaque to Harbor: it runs it in the new worktree, nothing more.
         "install_command": ("install_command", "install", "setup_command"),
         "workflow_path": ("workflow_path",),

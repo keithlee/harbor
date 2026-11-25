@@ -268,36 +268,36 @@ class PipelineProfile:
 
 
 def _apply_project_values(profile: PipelineProfile, project: object) -> PipelineProfile:
-    """Let the project's resolved GitHub settings win over the pipeline parse.
+    """Let the project registry's GitHub settings win over the pipeline file.
 
-    A ``ProjectConfig`` already holds registry -> pipeline -> default for
-    ``github_repository``, ``required_checks``, ``bot_rework_cap`` and
-    ``github_api_url`` (an empty registry cell is ignored).  Re-reading the
-    pipeline file here must not undo that: the builder environment, the
-    supervisor's wake decider and the GitHub poller all have to see the same
-    repository, checks and cap.  A project value that is empty (or absent on
-    a duck-typed fake) leaves the pipeline file's value in place.
+    ``get_project`` records in ``registry_github_keys`` which of
+    ``github_repository``, ``required_checks`` and ``bot_rework_cap`` a
+    non-empty registry cell set.  Only those replace the pipeline parse, so a
+    value from the pipeline (in any spelling the profile reads, such as
+    ``github_owner`` or ``bot_rework_rounds``) or a ``ProjectConfig`` default
+    never undoes what ``from_markdown`` resolved.  A registry repository
+    without an owner (a bare name) keeps the owner the pipeline resolved.
     """
 
+    registry_keys = frozenset(getattr(project, "registry_github_keys", ()) or ())
     changes: dict[str, object] = {}
-    repository = str(getattr(project, "github_repository", "") or "").strip()
-    if repository:
-        owner, name = _repository_parts(repository)
-        if name:
+    if "github_repository" in registry_keys:
+        owner, name = _repository_parts(str(getattr(project, "github_repository", "") or ""))
+        if owner:
             changes["repository_owner"] = owner
+        if name:
             changes["repository_name"] = name
-    checks = _split_list(getattr(project, "required_checks", None))  # type: ignore[arg-type]
-    if checks:
-        changes["required_checks"] = checks
-    if hasattr(project, "bot_rework_cap"):
-        try:
-            changes["bot_rework_cap"] = max(0, int(getattr(project, "bot_rework_cap")))
-        except (TypeError, ValueError):
-            pass
+    if "required_checks" in registry_keys:
+        checks = _split_list(getattr(project, "required_checks", None))  # type: ignore[arg-type]
+        if checks:
+            changes["required_checks"] = checks
+    if "bot_rework_cap" in registry_keys:
+        changes["bot_rework_cap"] = max(0, int(getattr(project, "bot_rework_cap")))
     # A GitHub endpoint set in the project registry is explicit and wins over
     # the pipeline file, as ``linear_api_url`` does; otherwise an Enterprise
     # host set only in the registry would be replaced by the GitHub.com
-    # default without a word.
+    # default without a word.  (``ProjectConfig.github_api_url`` is only ever
+    # set from the registry.)
     url = str(getattr(project, "github_api_url", "") or "").strip()
     if url:
         changes["github_api_url"] = url

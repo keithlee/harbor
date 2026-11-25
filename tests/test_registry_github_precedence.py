@@ -117,6 +117,55 @@ def test_the_builder_targets_the_repository_the_poller_reads(tmp_path: Path, mon
     assert builder_repository(config) == "pipe/repo"
 
 
+# ------------------------------------------- review follow-ups
+#
+# Regression: the first fix applied every ProjectConfig value over the
+# profile, so a bare repository name dropped the owner the pipeline resolved,
+# and ProjectConfig defaults replaced profile-only spellings.
+
+
+def test_a_pipeline_owner_and_bare_repository_keep_the_owner(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {}, "github_owner: sample\ngithub_repository: repo\n")
+    profile = PipelineProfile.from_project(config)
+    assert (profile.repository_owner, profile.repository_name) == ("sample", "repo")
+    assert builder_repository(config) == "sample/repo"
+
+
+def test_a_bare_registry_name_keeps_the_pipeline_owner(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"github_repository": "repo"},
+                              "github_owner: sample\ngithub_repository: other\n")
+    profile = PipelineProfile.from_project(config)
+    assert (profile.repository_owner, profile.repository_name) == ("sample", "repo")
+    assert builder_repository(config) == "sample/repo"
+
+
+@pytest.mark.parametrize("pipeline", [
+    PIPELINE_GITHUB,
+    "github_owner: sample\ngithub_repository: repo\n",
+    "github_repository: p/r\nrepository_name: other\n",
+    "repo: pipe/repo\nbot_rework_rounds: 3\nrequired_check: [only-ci]\n",
+    "github_repository: pipe/repo\nbot_rework_cap: 0\n",
+])
+def test_a_pipeline_only_setup_matches_the_pipeline_profile(tmp_path: Path, monkeypatch, pipeline: str) -> None:
+    config = registry_project(tmp_path, monkeypatch, {}, pipeline)
+    expected = PipelineProfile.from_file(config.pipeline_path)
+    resolved = PipelineProfile.from_project(config)
+    assert (resolved.repository, resolved.required_checks, resolved.bot_rework_cap) == (
+        expected.repository, expected.required_checks, expected.bot_rework_cap)
+
+
+def test_the_wake_decider_cap_matches_the_profile_cap(tmp_path: Path, monkeypatch) -> None:
+    # The supervisor's WakeDecider reads ProjectConfig.bot_rework_cap.
+    config = registry_project(tmp_path, monkeypatch, {}, "github_repository: pipe/repo\nbot_rework_rounds: 3\n")
+    assert config.bot_rework_cap == PipelineProfile.from_project(config).bot_rework_cap == 3
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "2.5"])
+def test_an_unparseable_registry_cap_fails_closed(tmp_path: Path, monkeypatch, value: str) -> None:
+    with pytest.raises(ValueError, match="bot_rework_cap must be a non-negative integer"):
+        registry_project(tmp_path, monkeypatch, {"bot_rework_cap": value}, PIPELINE_GITHUB)
+
+
 def test_workflow_check_polls_the_resolved_repository(tmp_path: Path, monkeypatch) -> None:
     from harbor.db import HarborDB
     from harbor.workflow_cli import fresh_context
@@ -142,6 +191,10 @@ def test_workflow_check_polls_the_resolved_repository(tmp_path: Path, monkeypatc
     class GitHub:
         def __init__(self, **kwargs):
             pass
+
+        @classmethod
+        def from_profile(cls, profile):
+            return cls()
 
         async def fetch_pull_requests(self, owner, repo, *args, **kwargs):
             seen.append((owner, repo))
