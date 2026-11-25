@@ -28,6 +28,7 @@ from .pipeline import (
     DEFAULT_SKILL,
     DEFAULT_WORKTREE_ROOT,
     PipelineConfig,
+    VALID_EFFORTS,
     load_projects,
     parse_pipeline_markdown as parse_pipeline_settings,
 )
@@ -457,6 +458,57 @@ def _resolve_registry_github(name: str, overrides: dict[str, object]) -> frozens
     return frozenset(present)
 
 
+def _parse_registry_values(name: str, overrides: dict[str, object]) -> None:
+    """Type the registry's remaining raw string cells in place.
+
+    Registry cells are always strings, so without this ``hold | false`` was
+    truthy, ``[Ready]`` became a tuple of characters and ``30`` stayed a
+    string.  Rules, matching the pipeline parser and the endpoint/GitHub
+    columns: an empty cell is dropped (the pipeline's value, then the default,
+    applies); a non-empty cell wins over the pipeline.  ``hold`` beats
+    ``hold_all`` when both are set, as in the pipeline.  A value that cannot
+    be parsed is an error, so an unreadable ``hold`` never releases hold.
+    """
+
+    def fail(key: str, expected: str, value: object) -> ValueError:
+        return ValueError(f"Harbor project {name}: registry {key} must be {expected}, got {str(value).strip()!r}")
+
+    for key in [key for key, value in overrides.items() if isinstance(value, str) and not value.strip()]:
+        del overrides[key]
+    holds = {}
+    for key in ("hold", "hold_all"):
+        if key in overrides:
+            holds[key] = _as_bool(str(overrides[key]), None)  # type: ignore[arg-type]
+            if holds[key] is None:
+                raise fail(key, "true or false (yes/no, on/off, 1/0)", overrides[key])
+    if holds:
+        overrides["hold"] = overrides["hold_all"] = holds.get("hold", holds.get("hold_all"))
+    for key in ("poll_states", "dispatch_states", "linear_projects"):
+        if key in overrides:
+            overrides[key] = _split_list(overrides[key])  # type: ignore[arg-type]
+    for key, aliases in (
+        ("poll_interval_seconds", ("poll_interval",)),
+        ("heartbeat_seconds", ("heartbeat_interval",)),
+        ("deadline_minutes", ()),
+    ):
+        column = next((column for column in (key, *aliases) if column in overrides), None)
+        if column is None:
+            continue
+        try:
+            number = float(str(overrides[column]).strip())
+        except ValueError:
+            number = float("nan")
+        if not 0 < number < float("inf"):
+            raise fail(column, "a positive number", overrides[column])
+        overrides[key] = number
+    for key in ("builder_effort", "firstmate_effort"):
+        if key in overrides:
+            effort = str(overrides[key]).strip().casefold()
+            if effort not in VALID_EFFORTS:
+                raise fail(key, "one of " + ", ".join(sorted(VALID_EFFORTS)), overrides[key])
+            overrides[key] = effort
+
+
 def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
     """Resolve a named project, optionally from a local config root."""
 
@@ -535,8 +587,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                 else:
                     overrides.pop(key, None)
             registry_github_keys = _resolve_registry_github(definition.name, overrides)
-            if "hold" in overrides and "hold_all" not in overrides:
-                overrides["hold_all"] = _as_bool(str(overrides["hold"]), True)
+            _parse_registry_values(definition.name, overrides)
             overrides["repo_path"] = definition.repo_path
             overrides = {
                 key: value
