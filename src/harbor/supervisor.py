@@ -3197,12 +3197,18 @@ class Supervisor:
 
         pending, self._superseded_pr_events = self._superseded_pr_events, {}
         for (ticket, run_id), kinds in pending.items():
-            await self._notify_operator(
-                f"pr-event-superseded:{ticket}:{run_id}",
+            notice_key = f"pr-event-superseded:{ticket}:{run_id}"
+            sent = await self._notify_operator(
+                notice_key,
                 f"{ticket}: retired {_describe_superseded_pr_events(kinds)} observed for superseded run "
                 f"{run_id}; they were not handed to the current builder, which sees "
                 "the open work as handoff gaps.",
             )
+            deliverable = self.notifier is not None and not self.shadow and not self.read_only
+            if not sent and deliverable and notice_key not in self._operator_notices:
+                # The events are already retired and never re-offered, so a
+                # failed send is retried after the next PR-event offer.
+                self._superseded_pr_events.setdefault((ticket, run_id), []).extend(kinds)
 
     async def _process_pr_events(
         self,

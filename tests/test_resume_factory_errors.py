@@ -522,3 +522,28 @@ def test_retry_whose_rebuild_stops_before_the_factory_does_not_cite_the_old_caus
 
     asyncio.run(scenario())
 
+
+def test_superseded_pr_event_notice_survives_a_failed_send(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        dispatcher, ledger = _dispatcher(tmp_path, "waiting")
+        sent: list[str] = []
+        failures = [RuntimeError("notifier offline")]
+
+        def notifier(text: str) -> None:
+            if failures:
+                raise failures.pop()
+            sent.append(text)
+
+        supervisor = Supervisor(FakePoller(), db=ledger, dispatcher=dispatcher, notifier=notifier)
+        supervisor._note_superseded_pr_event({"ticket": "SAMPLE-42", "run_id": "run-1", "event_type": "PR_CREATED"})
+        await supervisor._notify_superseded_pr_events()
+        assert sent == [] and "notifier offline" in (supervisor.last_error or "")
+        await supervisor._notify_superseded_pr_events()
+        print(sent)
+        assert len(sent) == 1 and "superseded run run-1" in sent[0]
+        await supervisor._notify_superseded_pr_events()
+        assert len(sent) == 1
+        ledger.close()
+
+    asyncio.run(scenario())
+
