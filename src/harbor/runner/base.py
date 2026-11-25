@@ -1013,39 +1013,37 @@ class BaseRunner:
             raise
         self._queue_transition(context, "running")
         _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
-        if process.stdin is not None:
-            try:
-                process.stdin.write(instruction.encode("utf-8"))
-                await process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                # The builder exited, or closed its stdin, before taking the
-                # prompt.  That is the builder's failure, not Harbor's: its
-                # output and exit status are still read below and recorded
-                # as this run's result.
-                pass
-            finally:
-                process.stdin.close()
-
+        # Read the builder's output and watch the deadline before the prompt
+        # is written.  A prompt larger than the pipe buffer only drains as
+        # fast as the builder reads it: a builder that writes its own output
+        # first, or never reads stdin at all, must not stall Harbor outside
+        # the run's deadline.
         drain_task = asyncio.create_task(self._drain(context), name=f"harbor-stream-{context.run_id}")
         deadline_task = asyncio.create_task(self._deadline_watch(context), name=f"harbor-deadline-{context.run_id}")
+        prompt_task = asyncio.create_task(self._write_prompt(process, instruction), name=f"harbor-prompt-{context.run_id}")
         try:
+            await prompt_task
             await drain_task
             exit_code = await process.wait()
         except asyncio.CancelledError:
-            await self.terminate(context, reason="operator exit")
-            self._queue_transition(context, "failed", error="operator exit")
-            context.process = None
-            if self.active is context:
-                self.active = None
+            await self._abandon(context, "operator exit")
+            raise
+        except BaseException as exc:
+            # Anything else escaping here is Harbor's failure, not the
+            # builder's: stop the builder before the error propagates so it
+            # never keeps running unsupervised.
+            await self._abandon(context, f"harbor error: {type(exc).__name__}")
             raise
         finally:
-            deadline_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await deadline_task
-            if not drain_task.done():
-                drain_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await drain_task
+            for task in (prompt_task, deadline_task, drain_task):
+                # An expired deadline's watcher is mid-terminate: let it
+                # finish recording the stop reason instead of cancelling it.
+                if not task.done() and not (task is deadline_task and context.deadline_expired):
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            if process.stdin is not None:
+                process.stdin.close()
         context.process = None
         if self.active is context:
             self.active = None
@@ -1136,6 +1134,34 @@ class BaseRunner:
         ):
             await self.cleanup_after_merge(context, result)
         return result
+
+    @staticmethod
+    async def _write_prompt(process: asyncio.subprocess.Process, instruction: str) -> None:
+        if process.stdin is None:
+            return
+        try:
+            process.stdin.write(instruction.encode("utf-8"))
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The builder exited, or closed its stdin, before taking the
+            # prompt (or was stopped by the deadline while it was being
+            # written).  That is the builder's failure, not Harbor's: its
+            # output and exit status are still read and recorded as this
+            # run's result.
+            pass
+        finally:
+            process.stdin.close()
+
+    async def _abandon(self, context: RunContext, reason: str) -> None:
+        """Stop a builder Harbor can no longer supervise and release custody."""
+
+        try:
+            await self.terminate(context, reason=reason)
+            self._queue_transition(context, "failed", error=reason)
+        finally:
+            context.process = None
+            if self.active is context:
+                self.active = None
 
     def _failure(self, context: RunContext, summary: str, *, status: str, exit_code: int | None = None) -> RunResult:
         return RunResult(
