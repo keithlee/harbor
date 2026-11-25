@@ -5,7 +5,9 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Callable, Iterable, Mapping
+from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit
 
 from harbor.clients.github import GitHubClient, build_pull_requests_query
 from harbor.config.profile import PipelineProfile
@@ -14,14 +16,66 @@ from harbor.facts.threads import parse_comment_surfaces, parse_threads
 from harbor.pr_events import PREventProcessor
 
 
-_PR_URL = re.compile(
-    r"https?://(?:www\.)?github\.com/(?P<owner>[^/]+)/(?P<repo>[^/#]+)/pulls?/(?P<number>\d+)",
-    re.IGNORECASE,
-)
+DEFAULT_WEB_HOST = "github.com"
+DEFAULT_API_URL = "https://api.github.com/graphql"
 
 
-def pull_number(value: Any) -> int | None:
-    """Extract a GitHub PR number from an attachment URL or number value."""
+def github_web_host(api_url: str | None) -> str:
+    """The host that serves PR pages for a configured GitHub API endpoint.
+
+    ``https://api.github.com/graphql`` -> ``github.com``; GHE.com
+    ``https://api.<sub>.ghe.com/graphql`` -> ``<sub>.ghe.com`` (the same
+    ``api.<host>`` -> ``<host>`` rule as the Claude sandbox's ``sandbox_hosts``);
+    GitHub Enterprise Server ``https://<host>/api/graphql`` or ``/api/v3``
+    -> ``<host>``, which serves its API and web pages from one host (the path
+    rule ``rest_base_url`` uses). A non-default port is kept. An IP literal or
+    single-label GHES host is accepted, as Codex projects may use one.
+    An endpoint with no host raises, so a bad value fails closed.
+    """
+
+    text = str(api_url or "").strip() or DEFAULT_API_URL
+    try:
+        parts = urlsplit(text)
+        host = (parts.hostname or "").casefold()
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("the GitHub API URL must be a URL with a host name") from exc
+    if parts.scheme not in {"http", "https"} or not host or "@" in parts.netloc:
+        raise ValueError("the GitHub API URL must be a URL with a host name")
+    path = parts.path.rstrip("/")
+    enterprise_server = path == "/api" or path.startswith("/api/")
+    if not enterprise_server and host.startswith("api.") and host.count(".") >= 2:
+        host = host[len("api."):]
+    if ":" in host:
+        host = f"[{host}]"  # an IPv6 literal, as it appears in a URL
+    return f"{host}:{port}" if port is not None else host
+
+
+@lru_cache(maxsize=32)
+def _pr_url_pattern(web_host: str) -> re.Pattern[str]:
+    host = re.escape(web_host.casefold())
+    if web_host.casefold() == DEFAULT_WEB_HOST:
+        host = r"(?:www\.)?" + host
+    # Anchored: a link on another host never counts as the project's PR, even
+    # when the configured host appears later in it (a redirect or query value).
+    return re.compile(
+        rf"https?://{host}/(?P<owner>[^/?#]+)/(?P<repo>[^/?#]+)/pulls?/(?P<number>\d+)(?:[/?#].*)?",
+        re.IGNORECASE,
+    )
+
+
+def match_pull_request_url(value: str, web_host: str = DEFAULT_WEB_HOST) -> re.Match[str] | None:
+    """Match a PR link on ``web_host`` only; links to any other host are refused."""
+
+    return _pr_url_pattern(web_host).fullmatch(value.strip())
+
+
+def pull_number(value: Any, *, web_host: str = DEFAULT_WEB_HOST) -> int | None:
+    """Extract a GitHub PR number from an attachment URL or number value.
+
+    A URL counts only when it is a PR link on ``web_host``, the project's
+    configured GitHub host.
+    """
 
     if isinstance(value, bool):
         return None
@@ -31,11 +85,11 @@ def pull_number(value: Any) -> int | None:
         if value.strip().isdigit():
             number = int(value.strip())
             return number if number > 0 else None
-        match = _PR_URL.search(value.strip())
+        match = match_pull_request_url(value, web_host)
         return int(match.group("number")) if match else None
     if isinstance(value, Mapping):
         for key in ("url", "href", "number"):
-            number = pull_number(value.get(key))
+            number = pull_number(value.get(key), web_host=web_host)
             if number is not None:
                 return number
     return None
@@ -62,8 +116,12 @@ def attached_pull_requests(
     tickets: Iterable[Mapping[str, Any]] | Mapping[str, Mapping[str, Any]],
     *,
     repository: str | None = None,
+    web_host: str = DEFAULT_WEB_HOST,
 ) -> tuple[tuple[int, str | None], ...]:
-    """Return unique ``(number, ticket_identifier)`` pairs in stable order."""
+    """Return unique ``(number, ticket_identifier)`` pairs in stable order.
+
+    Only PR links on ``web_host`` (see ``github_web_host``) are recognized.
+    """
 
     if isinstance(tickets, Mapping):
         # A single ticket dict is common in unit tests; otherwise map values
@@ -98,14 +156,14 @@ def attached_pull_requests(
                 url = attachment.get("url") or attachment.get("href")
             else:
                 url = attachment
-            match = _PR_URL.search(str(url)) if url is not None else None
+            match = match_pull_request_url(str(url), web_host) if url is not None else None
             if match and expected_owner and expected_repo:
                 if (match.group("owner").casefold(), match.group("repo").removesuffix(".git").casefold()) != (
                     expected_owner,
                     expected_repo,
                 ):
                     continue
-            number = pull_number(url)
+            number = pull_number(url, web_host=web_host)
             if number is None or number in seen:
                 continue
             seen.add(number)
@@ -214,6 +272,9 @@ class GitHubPoller:
             if required_checks is not None
             else getattr(profile, "required_checks", ())
         )
+        api_url = getattr(profile, "github_api_url", None)
+        # Only PR links on the configured GitHub host are this project's PRs.
+        self.web_host = github_web_host(api_url if isinstance(api_url, str) else None)
         self.event_processor = event_processor
         if self.event_processor is None:
             # Keep event identity stable across polls in a process even when
@@ -248,6 +309,7 @@ class GitHubPoller:
                 if (owner or self.owner) and (repo or self.repo)
                 else None
             ),
+            web_host=self.web_host,
         )
         attached = tuple(sorted(attached, key=lambda item: item[0]))
         if not attached:
@@ -291,7 +353,7 @@ class GitHubPoller:
             # The poll target is already constrained by the configured
             # owner/repository and Linear attachment, so reconstruct only that
             # exact canonical URL rather than falling back to PR-number identity.
-            node.setdefault("url", f"https://github.com/{owner}/{repo}/pull/{number}")
+            node.setdefault("url", f"https://{self.web_host}/{owner}/{repo}/pull/{number}")
             facts = parse_pull_request(
                 node, required_checks=self.required_checks, ticket=ticket
             )
@@ -372,6 +434,8 @@ async def poll_github(
 __all__ = [
     "GitHubPoller",
     "attached_pull_requests",
+    "github_web_host",
+    "match_pull_request_url",
     "parse_pull_request",
     "poll_github",
     "pull_number",

@@ -269,6 +269,14 @@ sent, so allowing that host gives them nothing new. Verified with unit tests and
 not run against a real GitHub Enterprise Server, a custom Linear endpoint, or
 on Linux.
 
+**Linked PRs.** Harbor finds a ticket's PRs from its Linear GitHub attachments,
+and counts a link only when it is a PR of the project's `github_repository` on
+the web host of `github_api_url`: `github.com` for the default endpoint,
+`<sub>.ghe.com` for `https://api.<sub>.ghe.com/graphql`, and `<host>` (with any
+port) for GitHub Enterprise Server's `https://<host>/api/graphql`. A link to any
+other host is ignored, so Harbor never queries or acts on it. Nothing new to
+configure.
+
 ### Editing mid-run
 
 Editing `.harbor/workflow/` while a ticket is in flight never blocks it. The
