@@ -9,6 +9,10 @@ of silently reading `AGENTS.md` or inheriting another product's identity.
 | name | repo_path | pipeline_path | linear_project_slug | linear_team | github_repository | base_branch |
 | --- | --- | --- | --- | --- | --- | --- |
 
-Optional columns include `linear_api_url` and, for GitHub Enterprise Server,
-`github_api_url` (for example `https://ghe.example.com/api/graphql`). A value
-here wins over the same key in the project's pipeline; an empty cell is ignored.
+Optional endpoint columns are `linear_api_url` (alias `api_url`) and, for
+GitHub Enterprise Server, `github_api_url` (aliases `github_graphql_url` and
+`github_endpoint`; for example `https://ghe.example.com/api/graphql`). For
+these endpoint columns, a non-empty cell wins over the same setting in the
+project's pipeline, and an empty cell is ignored: Harbor uses the pipeline's
+value, then the default (`https://api.linear.app/graphql` or
+`https://api.github.com/graphql`).

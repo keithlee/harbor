@@ -461,13 +461,12 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
             overrides: dict[str, object] = dict(definition.values)
             # Registry values are intentionally explicit and win over a
             # repository's optional pipeline file for identity/scope fields.
-            for key in ("linear_project_slug", "linear_team", "linear_api_url", "poll_interval_seconds", "heartbeat_seconds"):
+            for key in ("linear_project_slug", "linear_team", "poll_interval_seconds", "heartbeat_seconds"):
                 if key in overrides:
                     continue
                 aliases = {
                     "linear_project_slug": ("project_slug", "slug"),
                     "linear_team": ("team",),
-                    "linear_api_url": ("api_url",),
                     "poll_interval_seconds": ("poll_interval",),
                     "heartbeat_seconds": ("heartbeat_interval",),
                 }[key]
@@ -475,16 +474,21 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     if alias in overrides:
                         overrides[key] = overrides[alias]
                         break
-            # The registry may name the GitHub endpoint under the same keys a
-            # pipeline file accepts; take the first one with a value so an empty
-            # column never hides a filled-in alias.
-            for alias in ("github_api_url", "github_graphql_url", "github_endpoint"):
-                github_url = str(overrides.get(alias) or "").strip()
-                if github_url:
-                    overrides["github_api_url"] = github_url
-                    break
-            else:
-                overrides.pop("github_api_url", None)
+            # Endpoint columns may use the same aliases a pipeline file accepts.
+            # Take the first one with a value; an empty cell is ignored, so it
+            # never replaces the pipeline's value (or the default) with "" and
+            # never hides a filled-in alias.
+            for key, aliases in (
+                ("linear_api_url", ("linear_api_url", "api_url")),
+                ("github_api_url", ("github_api_url", "github_graphql_url", "github_endpoint")),
+            ):
+                for alias in aliases:
+                    url = str(overrides.get(alias) or "").strip()
+                    if url:
+                        overrides[key] = url
+                        break
+                else:
+                    overrides.pop(key, None)
             if "hold" in overrides and "hold_all" not in overrides:
                 overrides["hold_all"] = _as_bool(str(overrides["hold"]), True)
             overrides["repo_path"] = definition.repo_path

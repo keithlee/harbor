@@ -738,3 +738,45 @@ def test_doctor_fails_closed_on_a_malformed_registry_github_endpoint(tmp_path: P
     result = run_doctor(tmp_path, "claude", None, registry={"github_api_url": "https://10.0.0.5/api/graphql"})
     assert "GitHub transport: invalid (the GitHub API URL must be" in result.stdout, result.stdout
     assert result.returncode == 1
+
+
+# ------------------------------------------- empty registry endpoint cells
+#
+# Regression: an empty linear_api_url registry cell was kept as "" and replaced
+# the pipeline's Linear endpoint, so LinearClient posted to an empty URL.
+
+LINEAR_CUSTOM = "https://linear.example.test/graphql"
+
+
+def test_an_empty_registry_linear_cell_keeps_the_pipeline_value(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"linear_api_url": "", "github_api_url": ""},
+                              f"linear_api_url: {LINEAR_CUSTOM}")
+    assert config.linear_api_url == LINEAR_CUSTOM
+
+
+def test_an_empty_registry_linear_cell_falls_back_to_the_default(tmp_path: Path, monkeypatch) -> None:
+    from harbor.clients.linear import DEFAULT_LINEAR_API_URL
+    config = registry_project(tmp_path, monkeypatch, {"linear_api_url": "", "api_url": ""})
+    assert config.linear_api_url == DEFAULT_LINEAR_API_URL
+
+
+def test_an_empty_registry_linear_cell_falls_through_to_a_filled_alias(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"linear_api_url": "", "api_url": LINEAR_CUSTOM},
+                              "linear_api_url: https://other.example.test/graphql")
+    assert config.linear_api_url == LINEAR_CUSTOM
+
+
+def test_a_registry_linear_value_wins_over_the_pipeline(tmp_path: Path, monkeypatch) -> None:
+    config = registry_project(tmp_path, monkeypatch, {"linear_api_url": LINEAR_CUSTOM},
+                              "linear_api_url: https://other.example.test/graphql")
+    assert config.linear_api_url == LINEAR_CUSTOM
+
+
+def test_a_github_client_built_from_a_project_config_never_gets_an_empty_endpoint(tmp_path: Path, monkeypatch) -> None:
+    from harbor.clients.github import GitHubClient
+    config = registry_project(tmp_path, monkeypatch, {})
+    assert config.github_api_url == ""
+    assert GitHubClient.from_profile(config).endpoint == "https://api.github.com/graphql"
+    (tmp_path / "ghes").mkdir()
+    configured = registry_project(tmp_path / "ghes", monkeypatch, {"github_api_url": GHES_GRAPHQL})
+    assert GitHubClient.from_profile(configured).endpoint == GHES_GRAPHQL
