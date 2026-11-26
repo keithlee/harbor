@@ -148,7 +148,7 @@ model = "gpt-6-luna"
 | --- | --- | --- |
 | `[delivery]` | `merge_mode = "human"` | `workflow_checked` allows merges for `auto_merge_risks` when `pre_merge` readiness passes |
 | `[recovery]` | enabled, 30/120/300 s, 3 attempts | crash retries after an unexpected builder exit |
-| `[decisions]` | `cite_only` | how First Mate answers blockers: `human`, `cite_only`, `bounded` |
+| `[decisions]` | `cite_only`, `delegate_permissions = false` | how First Mate answers blockers: `human`, `cite_only`, `bounded`; `delegate_permissions` lets First Mate run permission-blocked commands (below) |
 | `[evidence]` | `ci = "required"`, `feedback = "advisory"` | what readiness gates on |
 | `[cleanup]` | `after_merge` | worktree cleanup after an observed merge |
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
@@ -551,7 +551,8 @@ directory for operational receipts; the registry remains read-only.
 
 **Claude builder permissions.** Every Claude Code process Harbor launches runs
 in Claude Code's `auto` permission mode: builders and their children, First
-Mate's answers and triage (which still get no tools at all). In `auto` mode Claude Code's classifier approves routine
+Mate's answers and triage (which still get no tools at all), and First Mate's
+operator run below. In `auto` mode Claude Code's classifier approves routine
 actions and refuses risky ones, instead of `dontAsk` refusing everything that
 is not pre-approved. Builders keep their OS sandbox, and Harbor still
 pre-approves the rules below so they never depend on the classifier.
@@ -575,6 +576,56 @@ Codex builders need neither: their
 `workspace-write` sandbox reads anywhere and has no per-command approval.
 Verified on macOS with Claude Code 2.1.332 by running the generated command
 against a throwaway repository and worktree; not run on Linux.
+
+**Permission blockers (opt-in).** Some commands cannot work inside the
+builder's sandbox at all. On macOS, `gh` fails TLS there, `adb` and
+`xcrun simctl` cannot reach their services, and writes outside the allowed
+paths are denied. The builder reports such a command as a blocker with
+`kind = "permission_blocker"`, the exact `commands`, the `cwd` (relative to
+the worktree), and the denial as `evidence`. An `env_blocker` that names
+`commands` and whose question or evidence reports a permission or sandbox
+denial is treated the same way.
+
+With `[decisions] delegate_permissions = false` (the default), a person is
+asked, as before. With `true`, the unblock ladder first hands the commands to
+First Mate's *operator* run:
+
+- It runs Claude Code in `auto` permission mode with only the `Bash` tool and
+  **without the builder's sandbox**. The auto-mode classifier is the safety
+  gate for every command.
+- The working directory is the ticket worktree (or `cwd` inside it). The
+  environment is the one `harbor start` was launched with, plus the builder's
+  GitHub settings. When gh would not otherwise find a token, it gets the
+  configured token variable's value as `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` for
+  GitHub Enterprise Server). A token travels only in the environment. Harbor
+  redacts credential values from the prompt, the receipt, the builder's resume
+  text and the Linear comment, and refuses a command that contains one.
+- It uses First Mate's model when First Mate runs on Claude, otherwise the
+  controller's model when builders run on Claude. Codex has no equivalent of
+  `auto` mode between a read-only sandbox and full access, so with neither
+  provider on Claude the option stays off and `harbor doctor` fails.
+- Harbor records a receipt in the ledger table `permission_delegations`, with
+  the exit codes and output (each stream truncated to 4,000 characters). It
+  posts a short Linear comment and resumes the same builder session with the
+  results.
+
+Harbor does not run the commands, and asks a person instead, when any of
+these is true:
+
+- a command reaches outside the worktree, other than the system temp
+  directory and never another ticket's worktree;
+- a command touches a protected path;
+- a command uses command substitution (Harbor cannot check it before it runs);
+- a command contains a credential;
+- the same commands already ran for the ticket;
+- the ticket has already used its 3 operator runs;
+- First Mate refuses, the classifier denies a command, or the run fails.
+
+**What a new user needs:** Claude Code on `PATH` (or `HARBOR_CLAUDE_EXECUTABLE`),
+First Mate or the builder on Claude, and `delegate_permissions = true`. Restart
+`harbor start` after changing the setting. `harbor doctor` prints the result as
+`Permission delegation:`. Verified on macOS with Claude Code 2.1.332; not run on
+Linux or against GitHub Enterprise Server.
 
 ## Verification map
 

@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
+from harbor.permission_delegation import is_delegable
 from harbor.resources import runtime_asset
 from harbor.wake import apply_phase3_migration
 
@@ -946,8 +947,14 @@ class UnblockLadder:
         policy: BlockerPolicy | None = None,
         base_branch: str = "main",
         linear_projects: Iterable[str] = (),
+        operator: Any | None = None,
+        delegation_cap: int | None = None,
     ) -> None:
         self.db = db
+        # First Mate's operator run for permission blockers (see
+        # harbor.permission_delegation); None keeps today's escalation.
+        self.operator = operator
+        self.delegation_cap = delegation_cap
         if db is not None:
             try:
                 # The comment receipt table is owned by Phase 3 and is kept
@@ -1315,7 +1322,19 @@ class UnblockLadder:
             )
 
         triage_result: TriageResult
-        if self._prior_rung_one(ticket_id, kind) >= self.rung_one_cap:
+        delegation_refusal: str | None = None
+        if self.operator is not None and is_delegable(blocker_value):
+            delegated, delegation_refusal = await self._delegate(
+                ticket, run, final, blocker_value, ticket_id=ticket_id, run_id=run_id, kind=kind,
+                question=question, worktree=run_repo, authority_repo=authority_repo, progress=progress,
+            )
+            if delegated is not None:
+                return delegated
+        if delegation_refusal is not None:
+            # A permission denial is not a policy question: once First Mate
+            # could not run the commands, only a person can.
+            triage_result = TriageResult("escalate", reason=delegation_refusal)
+        elif self._prior_rung_one(ticket_id, kind) >= self.rung_one_cap:
             triage_result = TriageResult("escalate", reason="same-kind rung-1 cap reached")
         else:
             triage_result = await triage(
@@ -1468,6 +1487,93 @@ class UnblockLadder:
             reason=reason,
             escalation=escalation,
         )
+
+    async def _delegate(
+        self,
+        ticket: Mapping[str, Any],
+        run: Mapping[str, Any],
+        final: Mapping[str, Any],
+        blocker_value: Mapping[str, Any],
+        *,
+        ticket_id: str,
+        run_id: str,
+        kind: str,
+        question: str,
+        worktree: Path | None,
+        authority_repo: Path | None,
+        progress: dict[str, bool],
+    ) -> tuple[UnblockResult | None, str | None]:
+        """Hand a permission-blocked command list to First Mate's operator run.
+
+        Returns the resumed result, or the reason it fell through to a person.
+        Every refusal is decided before anything runs, except First Mate's own
+        refusal or failure, which is recorded on the receipt.
+        """
+
+        from harbor import permission_delegation as delegation
+
+        if worktree is None or not worktree.is_dir():
+            return None, "First Mate could not run the commands: the ticket has no retained worktree"
+        root = worktree.resolve()
+        requested = _text(blocker_value.get("cwd")).strip()
+        cwd = (root / requested).resolve() if requested else root
+        commands = delegation.blocker_commands(blocker_value)
+        secrets_of = getattr(self.operator, "secrets", None)
+        secrets = tuple(secrets_of(root)) if callable(secrets_of) else ()
+
+        def protected(paths: Sequence[str]) -> bool:
+            return touches_protected_paths({"paths": list(paths)}, protected_paths=self.protected_paths,
+                                           repo_path=authority_repo)
+
+        refusal = delegation.scope_refusal(commands, cwd, root, protected=protected, secrets=secrets)
+        if refusal is None and not cwd.is_dir():
+            refusal = f"the requested working directory {cwd} does not exist"
+        if refusal is not None:
+            return None, f"First Mate did not run the permission-blocked commands: {refusal}"
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None:
+            return None, "First Mate did not run the permission-blocked commands: no ledger to record a receipt"
+        cap = self.delegation_cap if self.delegation_cap is not None else delegation.MAX_DELEGATIONS_PER_TICKET
+        claimed = delegation.claim(connection, ticket_id, run_id, delegation.request_digest(commands, cwd), cwd,
+                                   commands, cap=cap)
+        if claimed.receipt_id is None:
+            return None, f"First Mate did not run the permission-blocked commands: {claimed.refusal}"
+        explanation = " ".join(_text(blocker_value.get(key)) for key in ("question", "evidence")).strip()
+        try:
+            outcome = await self.operator.run(ticket=ticket_id, commands=commands, cwd=cwd, worktree=root,
+                                              reason=explanation)
+        except Exception as exc:  # recorded on the receipt, then a person decides
+            outcome = delegation.OperatorOutcome("failed", delegation.redact(
+                delegation.truncate(f"First Mate's operator run raised {type(exc).__name__}: {exc}", 500), secrets))
+        delegation.finish(connection, claimed.receipt_id, outcome)
+        receipt = f"permission delegation receipt #{claimed.receipt_id}"
+        if not outcome.ran:
+            verb = "refused" if outcome.status == "refused" else "could not run"
+            detail = f": {outcome.reason}" if outcome.reason else ""
+            return None, f"First Mate {verb} the permission-blocked commands ({receipt}){detail}"
+        citation = f"first_mate:operator:{claimed.receipt_id}"
+        reason = "First Mate ran the permission-blocked commands outside the builder sandbox"
+        results = delegation.results_text(outcome)
+        summary = "; ".join(f"`{item['command']}` exit {item['exit_code']}" for item in outcome.results)
+        escalation = self._decide(progress, ticket_id, run_id, kind, question, 1, citation=citation,
+                                  answer=delegation.truncate(summary, 1_000), status="resume_pending", reason=reason)
+        writes: list[str] = []
+        body = (f"[harbor] First Mate ran {len(outcome.results)} permission-blocked command(s) for {ticket_id} "
+                f"outside the builder sandbox ({receipt}): {summary}. Resuming the same builder session.")
+        if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
+            writes.append("comment")
+        resumed, command = await self._resume(
+            ticket_id, run_id,
+            answer=f"First Mate ran these commands for you in {cwd}, outside your sandbox:\n{results}",
+            citation=citation, reason=reason,
+            next_action=("Use these results instead of running the commands again yourself, then continue from "
+                         + (str(final.get("next_action") or "").strip() or "where you stopped") + "."),
+        )
+        return UnblockResult(
+            ticket_id, run_id, kind, question, 1, "resume" if resumed or command else "escalate", resumed,
+            answer=results, citation=citation, resume_command=command, linear_writes=tuple(writes),
+            reason=reason, escalation=escalation,
+        ), None
 
     unblock = handle
     resolve = handle

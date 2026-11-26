@@ -26,6 +26,11 @@ max_attempts = 3
 mode = "cite_only"
 require_citation = true
 require_rationale = true
+# true: when the builder's sandbox or permissions deny a command, First Mate
+# runs it in the ticket worktree with Claude Code in auto permission mode,
+# OUTSIDE the builder sandbox, and resumes the builder with the output. Needs
+# First Mate or the builder on Claude. false: a person is asked instead.
+delegate_permissions = false
 
 [cleanup]
 mode = "after_merge"

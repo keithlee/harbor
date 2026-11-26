@@ -513,6 +513,45 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     }
 
 
+def permission_operator(config: Any, workflow: Any, env: Any = None) -> tuple[Any, str, bool]:
+    """First Mate's operator for permission blockers: (operator or None, report line, configuration ok).
+
+    Off unless ``[decisions] delegate_permissions = true``. When it is on but
+    cannot run (no Claude provider, no Claude Code executable), the line says
+    why and ``ok`` is False so ``harbor doctor`` fails closed; permission
+    blockers then escalate to a person as before.
+    """
+
+    import shutil
+    from harbor.permission_delegation import github_operator_env, operator_for
+
+    environ = os.environ if env is None else env
+    enabled = bool(((workflow.config or {}).get("decisions") or {}).get("delegate_permissions", False))
+    executable = environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
+    github_env: dict[str, str] = {}
+    secret_names: list[str] = []
+    if enabled:
+        github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"), env=environ)
+        github_env = github_operator_env(github["env"], environ)
+        secret_names = [name for name in (github["token_env"], getattr(PipelineProfile.from_project(config),
+                                                                        "github_token_env", None)) if name]
+    operator, line = operator_for(
+        enabled=enabled,
+        firstmate_provider=getattr(config, "firstmate_provider", "codex"),
+        firstmate_model=str(getattr(config, "firstmate_model", "") or ""),
+        firstmate_effort=getattr(config, "firstmate_effort", None),
+        builder_provider=getattr(config, "builder_provider", "codex"),
+        builder_model=str(getattr(config, "builder_model", "") or ""),
+        builder_effort=getattr(config, "builder_effort", None),
+        executable=executable,
+        env=github_env,
+        secret_names=secret_names,
+    )
+    if operator is not None and shutil.which(executable) is None:
+        return None, f"off: Claude Code executable {executable!r} unavailable", False
+    return operator, line, operator is not None or not enabled
+
+
 async def _doctor(project_name: str) -> int:
     try:
         config = get_project(project_name)
@@ -567,6 +606,13 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
+    try:
+        _, delegation_line, delegation_ok = permission_operator(config, workflow)
+    except ValueError as exc:
+        delegation_line, delegation_ok = f"invalid ({exc})", False
+    print(f"Permission delegation: {delegation_line}")
+    if not delegation_ok:
+        scope_ok = False
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
@@ -773,6 +819,16 @@ async def _start(
         # ladder silently degrades to rung 0 only.
         from harbor.unblock import UnblockLadder
 
+        operator = None
+        bound_workflow = getattr(production_dispatcher, "workflow", None)
+        if bound_workflow is not None and not read_only:
+            try:
+                operator, delegation_line, delegation_ok = permission_operator(config, bound_workflow)
+            except ValueError as exc:
+                operator, delegation_line, delegation_ok = None, f"invalid ({exc})", False
+            if not delegation_ok:
+                print(f"Harbor: warning: permission delegation {delegation_line}; permission blockers "
+                      "escalate to a person", file=sys.stderr)
         supervisor.unblock_ladder = UnblockLadder(
             db,
             linear=client,
@@ -784,6 +840,7 @@ async def _start(
             policy=config.blocker_policy,
             base_branch=config.base_branch,
             linear_projects=config.linear_project_scope,
+            operator=operator,
         )
     workflow = getattr(production_dispatcher, "workflow", None)
     if workflow is not None:

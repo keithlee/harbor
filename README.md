@@ -414,6 +414,15 @@ A resumed decision stays `resume_pending` until a later successful delivery
 result shows progress. `/status --full` includes stop reason and retry receipts.
 First Mate decisions do not relax PR proof, review or merge gates.
 
+When a builder's sandbox or permissions deny a command, the builder reports a
+`permission_blocker` with the exact commands. With
+`[decisions] delegate_permissions = true` (off by default), First Mate runs them
+in the ticket worktree outside the builder sandbox, using Claude Code in `auto`
+permission mode. Harbor records a receipt and resumes the same builder session
+with the output. Commands that leave the worktree or touch protected paths,
+repeats, more than 3 runs per ticket, and First Mate refusals go to a person.
+See `docs/configurable-workflows.md` ("Permission blockers").
+
 #### First Mate monitor and recover
 
 Every poll, First Mate reviews runs that are stuck: blocked runs older than
