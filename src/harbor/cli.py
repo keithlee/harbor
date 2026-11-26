@@ -173,8 +173,6 @@ def _deadline_seconds(config: Any, default_minutes: float = 90.0) -> float:
 
 def _worktree_root(config: Any) -> Path:
     configured = getattr(config, "worktree_root", None)
-    if configured is None:
-        configured = os.environ.get("HARBOR_WORKTREE_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".harbor" / "wt" / str(getattr(config, "name", "project"))).resolve()
