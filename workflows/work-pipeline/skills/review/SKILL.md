@@ -15,6 +15,7 @@ with your findings (Claude Code). Return ONLY one JSON object for your entire fi
 {"review":{"head_sha":"<full reviewed commit>","verdict":"approve or reject","proof_verified":true,"feedback_digest":"<current readiness feedback_digest>","risk":"low or medium or high"}}
 Set proof_verified=false when required proof is missing. Keep any existing ticket
 risk floor; an implementation or wording change cannot downgrade it.
-Post the verdict as a PR comment so the human merger can see it.
+Post the verdict as a PR comment whose body is exactly that JSON verdict object (no prose around it),
+so the human merger can see it and the controller can count review rounds from the PR.
 
 Obtain feedback_digest from the current `harbor workflow check` result before review. A failed check still reports this digest. New feedback invalidates the previous approval.

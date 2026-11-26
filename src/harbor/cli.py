@@ -113,17 +113,20 @@ CHILD_AGENT_INSTRUCTIONS = (
     "rules win; a Codex builder still follows the skills' list, resume and close steps. "
     "Codex: use the native collaboration tools (spawn, list, wait, resume, close). "
     # Claude Code runs an `Agent` child in the background when the parameter is omitted.
-    "Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`; leaving it "
-    "out starts a background child whose result is lost when your turn ends. A foreground call waits and returns the child's "
+    "Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`; if you leave it "
+    "out, the child runs in the background and your turn can end before it returns, so you would hand off without "
+    "its result. A foreground call waits and returns the child's "
     "result, and a finished child needs no close. Claude Code has no list, resume, message or close, so track "
     "the children you started in this session yourself. Wherever the workflow says to resume, message or "
     "return work to an existing child (for example review fixes to the same implementor), spawn a fresh child "
     "for that role instead and give it the earlier child's report plus the current ticket, PR and review state. "
     "The fresh child replaces the earlier one, so the ticket still has one child per role. In a new session "
     "with no earlier child report, give it the PR and its review comments instead. "
-    "Either runtime: count failed review rounds from the PR, not from memory, so the three-round limit holds "
-    "across a fresh session. A failed round is a distinct `head_sha` with `\"verdict\": \"reject\"` in a "
-    "reviewer's JSON verdict comment; ignore every other comment, such as a human \"FAIL\"."
+    "Either runtime: stop after three failed review rounds. The count is the larger of the rounds you counted in "
+    "this session and the rounds on the PR, so the three-round limit holds across a fresh session. On the PR, each "
+    "reviewer JSON verdict comment with `\"verdict\": \"reject\"` is one failed round, even when it rejects the "
+    "same head again; count only comments whose `head_sha` is a commit on the PR, and ignore every other comment, "
+    "such as a human \"FAIL\"."
 )
 
 

@@ -36,9 +36,34 @@ def assert_explicit_foreground(text: str) -> None:
 
 
 def assert_round_count_rule(text: str) -> None:
-    """Failed rounds are distinct rejected head SHAs in reviewer JSON verdicts, nothing else."""
-    assert "distinct `head_sha`" in text and '`"verdict": "reject"`' in text, text
-    assert "JSON verdict comment" in text and "human" in text
+    """The three-round limit cannot be reset, stalled or spoofed by PR comments.
+
+    - The session's own count is a floor (a reviewer that writes prose leaves the PR count at 0).
+    - Every reject counts, even of the same head (a fix that failed to push).
+    - Only reviewer JSON verdicts on a commit of the PR count; a human "FAIL" does not.
+    """
+    text = " ".join(text.split())
+    assert "larger of the rounds you counted in this session and the rounds on the PR" in text, text
+    assert '`"verdict": "reject"`' in text and "JSON verdict comment" in text
+    assert "even when it rejects the same head again" in text
+    assert "`head_sha` is a commit on the PR" in text
+    assert 'such as a human "FAIL"' in text
+    assert "distinct `head_sha`" not in text  # a repeat reject of one head is still a round
+
+
+@pytest.mark.parametrize("wrong", [
+    # PR comments alone: a prose-only reviewer leaves the count at 0 forever.
+    'Count failed rounds from the PR: each reviewer JSON verdict comment with `"verdict": "reject"` is one '
+    "round, even when it rejects the same head again; count only comments whose `head_sha` is a commit on "
+    'the PR, ignoring others such as a human "FAIL".',
+    # Distinct heads: a fix that never pushed keeps the count at 1.
+    "The count is the larger of the rounds you counted in this session and the rounds on the PR. A failed "
+    'round is a distinct `head_sha` with `"verdict": "reject"` in a JSON verdict comment, even when it '
+    'rejects the same head again; `head_sha` is a commit on the PR; ignore others such as a human "FAIL".',
+])
+def test_round_count_rule_rejects_counts_that_can_stall(wrong):
+    with pytest.raises(AssertionError):
+        assert_round_count_rule(wrong)
 
 
 @pytest.mark.parametrize("wrong", [
@@ -60,8 +85,11 @@ def _assert_provider_correct(text: str) -> None:
     assert "`Agent` tool" in claude[:200]
     assert "no list, resume, message or close" in claude
     assert "spawn a fresh child for that role" in claude
-    # A background child outlives the builder's --print turn and its verdict is lost.
+    # A background child is still running when the builder's turn ends, so it hands off without the result.
+    # (Claude Code does deliver the result in a later turn, so "lost" would be the wrong reason.)
     assert_explicit_foreground(claude)
+    flat = " ".join(claude.split())
+    assert "turn can end before it returns" in flat and "result is lost" not in flat
     # A fresh session has no earlier child report to hand over.
     assert "no earlier child report" in claude and "review comments" in claude
     # A respawned child replaces the old one; it does not break "one per role".
@@ -114,6 +142,8 @@ def test_review_fixes_and_planner_continuation_have_a_claude_path():
     assert_round_count_rule(review_step)
     review = (SKILL.parent.parent / "review" / "SKILL.md").read_text(encoding="utf-8")
     assert "retained implementor (Codex)" in review and "fresh implementor" in review and "(Claude Code)" in review
+    # The PR count only works if the reviewer posts the machine-readable verdict, not prose.
+    assert "PR comment whose body is exactly that JSON verdict object" in review
 
 
 def test_launch_rules_override_older_installed_skill_copies(tmp_path, monkeypatch):

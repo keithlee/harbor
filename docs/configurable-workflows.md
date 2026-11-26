@@ -341,14 +341,19 @@ both providers:
   and review state. Harbor does not give the Claude builder `SendMessage`, so
   its tool set and its children's stay unchanged. The `false` must be explicit:
   when the parameter is left out, Claude Code starts the child in the
-  background. That child is still running when the builder's `--print` turn
-  ends, and its result is lost. The fresh child replaces
+  background, and the builder's turn can end before the child returns. Claude
+  Code later runs a follow-up turn with the child's result, but by then the
+  builder has already reported its run result without it. The fresh child replaces
   the earlier one, so a ticket keeps one child per role. A new session with no
   earlier child report hands the child the PR and its review comments instead.
-- Both providers count failed review rounds from the PR, so the three-round
-  limit holds across a fresh session. A failed round is a distinct `head_sha`
-  with `"verdict": "reject"` in a reviewer's JSON verdict comment. Other
-  comments, such as a human "FAIL", do not count.
+- Both providers stop after three failed review rounds. The count is the
+  larger of the rounds the builder counted in its session and the rounds on
+  the PR, so the limit holds across a fresh session. The review skill posts
+  its exact JSON verdict object as a PR comment. Each such comment with
+  `"verdict": "reject"` is one failed round, even when it rejects the same
+  head again (for example after a fix failed to push). Only comments whose
+  `head_sha` is a commit on the PR count. Other comments, such as a human
+  "FAIL", do not count.
 
 The launch prompt says that where these rules conflict with the child-agent
 steps in the workflow's skills, the launch rules win. A Codex builder still
