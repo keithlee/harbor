@@ -211,10 +211,15 @@ class GitHubClient:
         elif self.transport is not None:
             result = await self._transport_call(payload, headers)
         else:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.endpoint, json=payload, headers=headers)
-                response.raise_for_status()
-                result = response.json()
+            # The production default: wrap failures exactly like the injected
+            # client above, so callers only ever need to handle GitHubError.
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self.endpoint, json=payload, headers=headers)
+                    response.raise_for_status()
+                    result = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise GitHubError(f"GitHub request failed: {exc}") from exc
         if not isinstance(result, Mapping):
             raise GitHubError("GitHub response was not a JSON object")
         errors = result.get("errors")
