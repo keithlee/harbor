@@ -499,22 +499,28 @@ builder process (and every child agent it starts) inherits it:
   `$XDG_STATE_HOME/harbor/builder-bin/<id>/harbor` (default
   `~/.local/state/...`), a small `sh` script that runs this exact Harbor
   install (its Python with `-P`, so a `harbor` package in the worktree cannot
-  shadow it) with that registry and ledger. Harbor refuses to start if that
-  directory is inside one a builder can write (the ledger directory, the
-  worktree root or the repository's `.git`); set `XDG_STATE_HOME` elsewhere.
-  Harbor rewrites the shim before each builder starts.
+  shadow it) with that registry and ledger. Harbor refuses to start (and
+  refuses each builder) if that directory is inside one a builder can write:
+  the ledger directory, the worktree root, the repository's real git
+  directory, or a system temporary directory (`$TMPDIR`, `/tmp`,
+  `/var/folders`, which both builder sandboxes can write). Set
+  `XDG_STATE_HOME` to an absolute directory elsewhere; a relative value is
+  ignored, as the XDG spec says. Harbor also refuses a shim directory that
+  holds anything besides `harbor`, and rewrites the shim before each builder
+  starts.
 - `HARBOR_BIN`: the shim's absolute path.
 - The GitHub token variables (`github_token_env`, then `GITHUB_TOKEN` /
-  `GH_TOKEN`), pinned to their values at start and removed for builders when
-  unset then. Values are held in memory and handed only to the builder
+  `GH_TOKEN`), with the values Harbor had at start (removed for builders when
+  unset then). Values are held in memory and handed only to the builder
   process; they are never written to the shim, config, ledger, prompt or logs.
 
 Harbor launches `codex` / `claude` by the absolute path it finds on its own
 `PATH`, never through the builder's `PATH`, so nothing placed on the builder's
 `PATH` can stand in for the builder CLI.
 
-Changing Harbor's shell environment after start does not reach builders;
-restart Harbor to pick up a new registry, ledger or token. Without a registry,
+A running Harbor's environment does not change on its own, so in practice
+this only matters if something inside Harbor changes `os.environ`; to use a new
+registry, ledger or token, restart Harbor. Without a registry,
 `harbor start` fails closed, and a retained builder whose registry has since
 disappeared is refused with the reason. The ticket identifier stays a command
 argument, and the worktree is the builder's working directory. The prompt
@@ -528,7 +534,8 @@ and Claude Code runs Bash from a snapshot of a login, interactive shell. So the
 prompt tells builders to compare `command -v harbor` with `printenv HARBOR_BIN`
 and, when they differ, to run the absolute shim path written out. A command
 that expands `"$HARBOR_BIN"` is refused by Claude Code's `dontAsk` mode, while
-the written-out path is allowed (checked live with Claude Code 2.1.332).
+the written-out path is allowed (checked live with Claude Code 2.1.332; rerun
+it with `uv run python dev/scripts/live_claude_dontask.py`).
 
 `harbor doctor <project>` prints the settings (names and paths, never a token
 value) as `Builder environment:` and `Builder PATH:`, writes the same shim, and
