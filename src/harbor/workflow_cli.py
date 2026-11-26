@@ -8,10 +8,10 @@ from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
 
 WORKFLOW_CHECK_TOKEN_HELP = (
-    "workflow check cannot read GitHub: {problem}. This command does not reuse `gh auth token` "
-    "(it also runs inside the builder sandbox, where gh hangs). Inside a builder it uses the token "
-    "harbor start passed in; from a terminal, export GITHUB_TOKEN or GH_TOKEN (or the variable "
-    "named by github_token_env) with access to the project's repository, then run it again."
+    "workflow check cannot read GitHub: {problem}. It uses the project's GitHub token: inside a "
+    "builder, the variable harbor start named; from a terminal, export the variable named by the "
+    "project's github_token_env (or GITHUB_TOKEN or GH_TOKEN when github_token_env is not set), "
+    "then run it again."
 )
 
 
@@ -45,9 +45,9 @@ async def fresh_context(config, db, ticket_id, run, event):
     from harbor.github_token import preferred_token_env
     profile = PipelineProfile.from_project(config)
     require_https_api_url(profile.github_api_url)
-    # This command also runs inside the builder sandbox, where gh hangs, so it
-    # never asks gh: it reads the token Harbor put in the builder environment
-    # (HARBOR_GITHUB_TOKEN_ENV names it), or one the operator exported.
+    # The project's token: inside a builder, the variable Harbor named in
+    # HARBOR_GITHUB_TOKEN_ENV; from a terminal, github_token_env (strict) or
+    # GITHUB_TOKEN/GH_TOKEN. Never gh, which hangs in the builder sandbox.
     github = GitHubClient.from_profile(profile, token_env=preferred_token_env(profile))
     linear = LinearClient(endpoint=config.linear_api_url)
     try:

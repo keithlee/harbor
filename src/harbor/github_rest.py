@@ -109,9 +109,18 @@ class Client:
     def __init__(self, env: Mapping[str, str] | None = None, *, curl: str = "curl", timeout: int = 60) -> None:
         self.env = dict(os.environ if env is None else env)
         self.base = rest_base_url(self.env.get("HARBOR_GITHUB_API_URL") or DEFAULT_REST_URL)
-        name = token_env_name(self.env, self.env.get("HARBOR_GITHUB_TOKEN_ENV"))
+        # Harbor names the project's token variable; then only that one is
+        # used. Run by hand without it, GITHUB_TOKEN, then GH_TOKEN.
+        named = (self.env.get("HARBOR_GITHUB_TOKEN_ENV") or "").strip()
+        if named:
+            name = named if self.env.get(named, "").strip() else None
+        else:
+            name = token_env_name(self.env)
         if name is None:
-            raise GitHubRestError("no GitHub token in the environment (GITHUB_TOKEN or GH_TOKEN)")
+            raise GitHubRestError(
+                f"no GitHub token in the environment ({named or 'GITHUB_TOKEN or GH_TOKEN'}); "
+                "the project's github_token_env names the variable to export"
+            )
         self._token = self.env[name].strip()
         self.curl = curl
         self.timeout = timeout

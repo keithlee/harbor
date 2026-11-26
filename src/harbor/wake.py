@@ -838,7 +838,7 @@ def github_transport_fact(
     helper: str = "",
     repository: str = "",
     token_available: bool = True,
-    gh_result: str = "",
+    token_names: str = "",
 ) -> str:
     """Tell the builder which GitHub transport this run actually has.
 
@@ -875,20 +875,17 @@ def github_transport_fact(
                 "(a PR, a comment, a merge), report a delivery-transport blocker saying the project has "
                 "no GitHub repository configured. " + no_gh
             )
-        # gh_result is what Harbor's own launch-time `gh auth token` returned:
-        # "none" (no login), "timed out", or "" when Harbor did not ask.
-        checked = {
-            "none": " (none exported, and `gh auth token` had none at launch)",
-            "timed out": " (none exported, and `gh auth token` did not answer at launch)",
-        }.get(gh_result, " (none exported)")
+        names = f" ({token_names} is not set)" if token_names else ""
         return (
-            f"GitHub transport: no GitHub token is available to this run{checked}, so the REST helper "
+            f"GitHub transport: the project's GitHub token is not available to this run{names}, so the REST helper "
             f"`{helper}`{target} cannot authenticate. Do your local work, then report a "
             "delivery-transport blocker saying a GitHub token is missing. " + no_gh
         )
     common = (
         "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
-        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual."
+        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual. "
+        "Your child agents (planner, implementor, reviewer) inherit this environment and the same "
+        "project token; have them use this helper too."
     )
     if transport == "mcp":
         return (

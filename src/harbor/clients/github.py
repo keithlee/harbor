@@ -27,15 +27,15 @@ class GitHubGraphQLError(GitHubError):
 GITHUB_TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
 
 
-def _github_token_from_environment(preferred: str) -> str | None:
-    """Read the configured token name, then GitHub's two standard aliases.
+def _github_token_from_environment(preferred: str, *, fallbacks: bool = True) -> str | None:
+    """Read the configured token name, then (unless ``fallbacks`` is off) GitHub's two standard aliases.
 
     A whitespace-only value counts as unset, exactly as the builder's REST
-    helper (``harbor.github_rest.token_env_name``) treats it, so the poller and
-    the builder always pick the same variable.
+    helper (``harbor.github_rest``) treats it, so the poller and the builder
+    always pick the same variable.
     """
 
-    names = tuple(dict.fromkeys(name for name in (preferred, *GITHUB_TOKEN_ENV_VARS) if name))
+    names = tuple(dict.fromkeys(name for name in (preferred, *(GITHUB_TOKEN_ENV_VARS if fallbacks else ())) if name))
     for name in names:
         value = (os.environ.get(name) or "").strip()
         if value:
@@ -174,8 +174,9 @@ class GitHubClient:
         timeout: float = 20.0,
         token_env: str = "GITHUB_TOKEN",
         http_client: httpx.AsyncClient | None = None,
+        token_fallbacks: bool = True,
     ) -> None:
-        self.token = token or _github_token_from_environment(token_env)
+        self.token = token or _github_token_from_environment(token_env, fallbacks=token_fallbacks)
         self.endpoint = endpoint
         self.transport = transport
         self.timeout = timeout
@@ -189,10 +190,12 @@ class GitHubClient:
         # A ProjectConfig carries github_api_url = "" when the registry does
         # not set it; never post to an empty URL.
         endpoint = getattr(profile, "github_api_url", "") or "https://api.github.com/graphql"
-        # A caller may name the variable to read first (for example the
-        # GH_ENTERPRISE_TOKEN Harbor adopted from gh for an Enterprise host).
-        token_env = kwargs.pop("token_env", None) or getattr(profile, "github_token_env", "GITHUB_TOKEN")
-        return cls(endpoint=endpoint, token_env=token_env, **kwargs)
+        # The project's github_token_env (or a variable a caller names, such as
+        # the one Harbor passed a builder) is the only source when set; only an
+        # unconfigured project falls back to GITHUB_TOKEN, then GH_TOKEN.
+        token_env = kwargs.pop("token_env", None) or getattr(profile, "github_token_env", "") or ""
+        return cls(endpoint=endpoint, token_env=token_env or "GITHUB_TOKEN",
+                   token_fallbacks=not token_env, **kwargs)
 
     async def query(
         self,

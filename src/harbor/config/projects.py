@@ -206,6 +206,10 @@ class ProjectConfig:
     # reads the pipeline file and then the GitHub.com default.  When set, it
     # wins over the pipeline file, like ``linear_api_url``.
     github_api_url: str = ""
+    # Name of the environment variable holding the project's GitHub token, set
+    # in the project registry (never the token itself). Empty means the
+    # registry does not set it; the pipeline file may (see harbor.github_token).
+    github_token_env: str = ""
     poll_states: tuple[str, ...] = POLL_STATES
     dispatch_states: tuple[str, ...] = DISPATCH_STATES
     poll_interval_seconds: float = 60.0
@@ -586,6 +590,14 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                         break
                 else:
                     overrides.pop(key, None)
+            # A variable name, never a token; an empty cell is ignored.
+            from harbor.github_token import validate_token_env
+            token_env = validate_token_env(overrides.get("github_token_env"),
+                                           where=f"Harbor project {definition.name} github_token_env")
+            if token_env:
+                overrides["github_token_env"] = token_env
+            else:
+                overrides.pop("github_token_env", None)
             registry_github_keys = _resolve_registry_github(definition.name, overrides)
             _parse_registry_values(definition.name, overrides)
             overrides["repo_path"] = definition.repo_path
@@ -599,6 +611,7 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     "linear_team",
                     "linear_api_url",
                     "github_api_url",
+                    "github_token_env",
                     "poll_interval_seconds",
                     "heartbeat_seconds",
                     "poll_states",
@@ -632,11 +645,19 @@ def get_project(name: str, *, config_root: Path | None = None) -> ProjectConfig:
                     f"Harbor project {definition.name} is missing its live pipeline: expected {expected}; "
                     "refusing to fall back to AGENTS.md"
                 )
-            return replace(
+            resolved = replace(
                 ProjectConfig.from_pipeline(definition.name, pipeline, **overrides),
                 registry_path=registry_path,
                 registry_github_keys=registry_github_keys,
             )
+            # Fail closed here, before any command runs, on a pipeline
+            # github_token_env that is not a variable name (or is a token).
+            from harbor.config.profile import PipelineProfile
+            try:
+                PipelineProfile.from_project(resolved)
+            except ValueError as exc:
+                raise ValueError(f"Harbor project {definition.name}: {exc}") from None
+            return resolved
 
     if registry_loaded:
         raise ValueError(f"unknown Harbor project: {name}")

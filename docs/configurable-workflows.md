@@ -184,7 +184,7 @@ transport = "rest"   # default; or "mcp" (Claude builders only)
 `python -m harbor.github_rest`, which calls the GitHub REST API through `curl`.
 Operations: `pr-view`, `pr-create`, `pr-edit`, `pr-comment`, `pr-checks`,
 `pr-merge` (pinned to a head SHA) and `api METHOD /path` for anything else. It
-uses the token you already export for Harbor (`GITHUB_TOKEN` or `GH_TOKEN`),
+uses the project's GitHub token (see **The project's GitHub token** below),
 targets the project's `github_repository`, and derives the REST base from
 `github_api_url` (`https://host/api/graphql` becomes `https://host/api/v3` on
 GitHub Enterprise Server). The token is passed to `curl` on stdin, so it is never
@@ -218,55 +218,67 @@ required, so an Enterprise token is never sent to the GitHub.com server. Codex b
 are refused at startup, because a non-interactive Codex run refuses MCP calls
 that need approval. The REST helper stays available as a fallback.
 
-Token scopes: the builder pushes branches and edits PRs, so a fine-grained token
-needs repository **Contents** and **Pull requests** read/write, plus **Checks**
-and **Commit statuses** read. `harbor doctor` prints the transport and which
-variable the token comes from, and fails when GitHub is configured with no token.
+**The project's GitHub token.** Each project with a `github_repository` uses
+one GitHub API token for all of its GitHub work: Harbor's GitHub poller, the
+builder, the builder's child agents (planner, implementor and reviewer, which run
+inside the builder and inherit its environment), the builder's REST helper,
+`harbor workflow check` and First Mate. Create a fine-grained personal access
+token limited to the project's repository, with these permissions:
 
-**No token exported? Harbor reuses your `gh` login.** `gh auth login` keeps its
-token in the OS keychain, so many machines have no `GITHUB_TOKEN`/`GH_TOKEN`
-exported. For a project that sets `github_repository`, when none of
-`github_token_env`, `GITHUB_TOKEN` and `GH_TOKEN` is set (a whitespace-only value
-counts as unset), `harbor start`, `doctor`, `answer` and `facts` run
-`gh auth token --hostname HOST` once at launch. `HOST` is `github.com` for
-GitHub.com, `acme.ghe.com` for GHE.com data residency (`api.acme.ghe.com`), or
-your GitHub Enterprise Server host (with its port, unless that is 443). The call
-has a 10 second timeout, after which `gh` and every process it started are killed,
-and `doctor` and `start` then say that `gh` did not answer rather than asking you
-to log in again. A GitHub URL Harbor cannot parse skips the lookup. Harbor holds
-the result in its own process environment under the name `gh` itself reads for
-that host: `GH_TOKEN` for GitHub.com and GHE.com, `GH_ENTERPRISE_TOKEN` for GitHub
-Enterprise Server, so a `gh` call a builder makes never sends an Enterprise token
-to github.com. An exported `GH_ENTERPRISE_TOKEN` is used as it is. Its poller and
-the builder's REST helper then use the token exactly as they would an exported
-one. It is never written to config, the ledger,
-logs, prompts or PR text; `doctor` says only that the token was "reused from
-`gh auth token`". Set `HARBOR_GH_EXECUTABLE` to use a `gh` that is not on `PATH`.
-A project without `github_repository` (for example Linear-only) never gets a
-token this way.
+- **Contents:** read and write (push branches)
+- **Pull requests:** read and write (open, edit and comment on PRs)
+- **Checks:** read
+- **Commit statuses:** read
 
-Know what that token can do before relying on it. A `gh` login token is usually
-an OAuth token covering **every repository and organisation your account can
-reach**, with scopes such as `repo`, `read:org`, `gist` and often `workflow`. Like
-an exported token, it is in the environment of everything Harbor starts: builders,
-the project's `install_command`, hooks and notifier commands. The convenience is
-for trying Harbor out. For regular use, export a fine-grained token limited to
-the project's repository with the scopes listed above. An exported token always
-wins, and `gh` is not asked.
+Put it in an environment variable, and name that variable with
+`github_token_env`, either as a column in the project's registry row or in
+`.harbor/pipeline.md` (a non-empty registry value wins):
 
-Builders never fall back to `gh` themselves. Inside Claude Code's sandbox on
-macOS, `gh` cannot reach the keychain or complete TLS, so `gh pr view` and
-`gh pr list` hang until the run's time limit instead of failing. If no token
-can be found at all, `harbor start` prints a warning naming the fix, `doctor`
-fails for a project with a `github_repository`, and the builder is told to
-report a delivery-transport blocker rather than try `gh`.
+```markdown
+github_token_env: SAMPLE_GITHUB_TOKEN
+```
 
-`harbor workflow check` never asks `gh`, because it also runs inside the builder
-sandbox. Inside a builder it uses the token `harbor start` passed in. When you
-run it from a terminal, export `GITHUB_TOKEN` or `GH_TOKEN` (or the variable named
-by `github_token_env`) first. Without one, GitHub answers 401, and the command
-says so and names this fix. `harbor workflow checks` runs repository commands
-only and needs no GitHub token.
+```bash
+export SAMPLE_GITHUB_TOKEN="<fine-grained-github-token>"
+```
+
+`github_token_env` holds a variable name, never the token. Harbor refuses a value
+that is not a variable name, or that looks like a GitHub token (`ghp_…`,
+`github_pat_…`, and so on), and does not echo it. The token stays in the
+environment and is never written to config, MCP config, the ledger, logs,
+prompts or PR text. Harbor passes builders only the variable's name
+(`HARBOR_GITHUB_TOKEN_ENV`).
+
+Precedence:
+
+1. `github_token_env` is set: only that variable is read. If it is unset or
+   blank, the project has no token. Harbor does not fall back to a broader
+   `GITHUB_TOKEN` or `GH_TOKEN` that happens to be exported.
+2. `github_token_env` is not set: `GITHUB_TOKEN`, then `GH_TOKEN`. This is how
+   Harbor behaved before the key existed.
+
+A whitespace-only value counts as unset in every reader.
+
+If a project with a `github_repository` has no token, `harbor doctor` fails and
+`harbor start` refuses to start builders (as does `harbor answer`, which resumes
+one). Both say which key and variable to set, and the permissions listed above.
+A project without a `github_repository` (for example Linear only) needs no GitHub
+token and gets no warning. `harbor doctor` prints which variable the token comes
+from, and never its value.
+
+Harbor never uses the GitHub CLI's login (`gh auth token`). Your `gh` login is
+usually a broad OAuth token for every repository you can reach, not the
+project's token. Builders are also told never to fall back to `gh`: inside Claude
+Code's sandbox on macOS, `gh` cannot reach the keychain or complete TLS, so
+`gh pr view` and `gh pr list` hang until the run's time limit instead of failing.
+If the project's token is missing, the builder is told to report a
+delivery-transport blocker.
+
+`harbor workflow check` reads the same token. Inside a builder it uses the
+variable `harbor start` named. From a terminal, export the variable named by
+`github_token_env` (or `GITHUB_TOKEN`/`GH_TOKEN` when it is not set). Without
+it, GitHub answers 401, and the command says so and names this fix.
+`harbor workflow checks` runs repository commands only and needs no GitHub token.
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 

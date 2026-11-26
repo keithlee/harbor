@@ -15,6 +15,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from harbor.github_token import validate_token_env
+
 
 def _split_list(value: str | Sequence[str] | None) -> tuple[str, ...]:
     """Split a data-only list value. Never eval, never YAML.
@@ -132,7 +134,9 @@ class PipelineProfile:
     required_checks: tuple[str, ...] = ()
     github_api_url: str = "https://api.github.com/graphql"
     bot_rework_cap: int = 1
-    github_token_env: str = "GITHUB_TOKEN"
+    # Name of the environment variable holding the project's GitHub token
+    # (never the token). Empty: GITHUB_TOKEN, then GH_TOKEN. See harbor.github_token.
+    github_token_env: str = ""
 
     @property
     def owner(self) -> str:
@@ -218,7 +222,9 @@ class PipelineProfile:
             required_checks=required,
             github_api_url=endpoint,
             bot_rework_cap=max(0, cap),
-            github_token_env=str(defaults.get("github_token_env", "GITHUB_TOKEN")),
+            github_token_env=validate_token_env(
+                _first(values, "github_token_env") or defaults.get("github_token_env") or ""
+            ),
         )
 
     @classmethod
@@ -301,6 +307,10 @@ def _apply_project_values(profile: PipelineProfile, project: object) -> Pipeline
     url = str(getattr(project, "github_api_url", "") or "").strip()
     if url:
         changes["github_api_url"] = url
+    # Likewise the registry's github_token_env (a variable name, never a token).
+    token_env = validate_token_env(getattr(project, "github_token_env", ""))
+    if token_env:
+        changes["github_token_env"] = token_env
     return replace(profile, **changes) if changes else profile  # type: ignore[arg-type]
 
 
