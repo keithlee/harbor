@@ -201,7 +201,9 @@ fails `harbor doctor` for a Claude builder.
 Neither `github_api_url` nor `linear_api_url` may carry credentials. A URL with
 userinfo, such as `https://user:secret@host/api/graphql`, is refused when the
 project is loaded or by `harbor doctor`, for every builder, because HTTP
-errors would repeat the full URL in logs. Supply the GitHub token through
+errors would repeat the full URL in logs. Look-alike `@` signs (`＠`, `﹫`)
+count as `@`, and a host with any non-ASCII character is refused too (give an
+internationalized name in its `xn--` form). Supply the GitHub token through
 `GITHUB_TOKEN`, `GH_TOKEN` or the variable named by `github_token_env`, and
 the Linear key through `LINEAR_API_KEY` or `HARBOR_LINEAR_API_KEY`.
 

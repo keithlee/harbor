@@ -269,8 +269,15 @@ class GitHubClient:
         as itself.
         """
 
-        request = client.build_request("POST", self.endpoint, json=payload, headers=headers)
         failure: GitHubError | None = None
+        try:
+            request = client.build_request("POST", self.endpoint, json=payload, headers=headers)
+        except httpx.InvalidURL:
+            # Its message repeats part of the URL (for example "Invalid port:
+            # '<password>＠host'"), so it is neither shown nor chained.
+            failure = GitHubError("GitHub request failed: the GitHub API URL is not a valid URL")
+        if failure is not None:
+            raise failure
         try:
             response = await client.send(request)
             response.raise_for_status()

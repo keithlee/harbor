@@ -262,6 +262,10 @@ class LinearClient:
             )
             response.raise_for_status()
             body = response.json()
+        except httpx.InvalidURL:
+            # Not an HTTPError, and its message repeats part of the URL (for
+            # example "Invalid port: '<password>＠host'"), so say nothing of it.
+            failure = LinearClientError("Linear request failed: the Linear API URL is not a valid URL")
         except (httpx.HTTPError, ValueError) as exc:
             # httpx repeats the request URL in its messages; never let
             # userinfo in it reach a log line.

@@ -38,16 +38,23 @@ def github_web_host(api_url: str | None) -> str:
     """
 
     text = str(api_url or "").strip() or DEFAULT_API_URL
+    invalid = "the GitHub API URL must be a URL with a host name"
+    if has_userinfo(text):
+        raise ValueError(invalid)
     try:
         parts = urlsplit(text)
         host = parts.hostname or ""
         port = parts.port
-    except ValueError as exc:
-        raise ValueError("the GitHub API URL must be a URL with a host name") from exc
+    except ValueError:
+        # urlsplit's message repeats the netloc, which may hold a credential,
+        # so the original is neither shown nor chained (raised below).
+        parts = None
+    if parts is None:
+        raise ValueError(invalid)
     if host.endswith("."):
         host = host[:-1]
-    if parts.scheme not in {"http", "https"} or not host or has_userinfo(text):
-        raise ValueError("the GitHub API URL must be a URL with a host name")
+    if parts.scheme not in {"http", "https"} or not host:
+        raise ValueError(invalid)
     if not host.isascii():
         raise ValueError("the GitHub API URL host must be ASCII; give an internationalized name in its xn-- form")
     host = host.lower()

@@ -32,9 +32,13 @@ GITHUB_WITH_USERINFO = [
     f"https://{SECRET}@ghes.example.test/api/graphql",
     f"https://u:{SECRET}@api.github.com/graphql",
     f"https://u:{SECRET}@[2001:db8::1]:8443/api/graphql",
-    f"HTTPS://u:{SECRET}@ghes.example.test/api/graphql",
+    # NFKC turns these into '@', and urlsplit and httpx normalize them.
+    f"https://u:{SECRET}＠ghes.example.test/api/graphql",
+    f"https://u:{SECRET}﹫ghes.example.test/api/graphql",
 ]
+UPPERCASE_WITH_USERINFO = f"HTTPS://u:{SECRET}@ghes.example.test/api/graphql"
 LINEAR_WITH_USERINFO = f"https://u:{SECRET}@linear.example.test/graphql"
+LINEAR_FULLWIDTH = f"https://u:{SECRET}＠linear.example.test/graphql"
 
 
 def _chain(exc: BaseException) -> list[BaseException]:
@@ -65,6 +69,7 @@ def _assert_no_secret_anywhere(exc: BaseException) -> None:
 
 @pytest.mark.parametrize("url", [
     *GITHUB_WITH_USERINFO,
+    UPPERCASE_WITH_USERINFO,
     "https://@h.example.test/x",
     "  https://u:p@h.example.test  ",
     f"\x00https://u:{SECRET}@h.example.test/g",
@@ -106,10 +111,27 @@ def test_redaction_removes_userinfo_from_every_url_in_a_message() -> None:
     (f"for url 'https://u:pa'{SECRET}@h.example/g'", "for url 'https://[redacted]@h.example/g'"),
     (f"for url 'https://u:{SECRET}@[2001:db8::1]:8443/g'", "for url 'https://[redacted]@[2001:db8::1]:8443/g'"),
     (f"for url 'HTTPS://u:{SECRET}@h.example/g'", "for url 'HTTPS://[redacted]@h.example/g'"),
+    (f"for url 'https://u:{SECRET}\uff20h.example/g'", "for url 'https://[redacted]@h.example/g'"),
+    (f"for url 'https://u:{SECRET}\ufe6bh.example/g'", "for url 'https://[redacted]@h.example/g'"),
     ("for url 'https://h.example/g' by x@y", "for url 'https://h.example/g' by x@y"),
 ])
 def test_redaction_forms(text: str, expected: str) -> None:
     assert redact_userinfo(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "a" * 200_000,
+    "a+" * 100_000,
+    "a://" * 50_000,
+    "https://" + "x" * 200_000,
+    ("https://" + "x" * 1_000 + " ") * 200,
+], ids=["letters", "scheme-chars", "repeated-schemes", "one-long-authority", "many-authorities"])
+def test_redaction_is_linear_on_large_input(text: str) -> None:
+    import time
+
+    started = time.perf_counter()
+    redact_userinfo(text)
+    assert time.perf_counter() - started < 1.0
 
 
 # ------------------------------------------------------------ fail closed at config load
@@ -117,15 +139,48 @@ def test_redaction_forms(text: str, expected: str) -> None:
 
 @pytest.mark.parametrize("url", GITHUB_WITH_USERINFO)
 def test_require_https_api_url_refuses_userinfo_without_repeating_it(url: str) -> None:
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ValueError, match="must not contain a user name, password or token") as caught:
         require_https_api_url(url)
     assert SECRET not in str(caught.value)
-    if url.startswith("https://"):
-        assert "must not contain a user name, password or token" in str(caught.value)
-        assert "GITHUB_TOKEN" in str(caught.value)
+    assert "GITHUB_TOKEN" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-@pytest.mark.parametrize("url", [u for u in GITHUB_WITH_USERINFO if u.startswith("https://")])
+def test_an_uppercase_scheme_is_refused_by_the_userinfo_check() -> None:
+    # require_https_api_url refuses "HTTPS://" for its scheme first, so go
+    # through the checks that accept any scheme case: the userinfo rule must
+    # catch it on its own.
+    from harbor.url_credentials import reject_userinfo
+
+    with pytest.raises(ValueError, match="must not contain a user name, password or token"):
+        reject_userinfo(UPPERCASE_WITH_USERINFO, "GitHub API", "GITHUB_TOKEN")
+    for field in ("linear_api_url", "github_api_url"):
+        with pytest.raises(ValueError, match="must not contain a user name, password or token") as caught:
+            ProjectConfig(name="SampleProject", linear_project_slug="sample", **{field: UPPERCASE_WITH_USERINFO})
+        assert SECRET not in str(caught.value)
+
+
+@pytest.mark.parametrize("url", [
+    "https://hé.example.test/graphql",
+    "https://h.example.test／u/graphql",
+])
+def test_a_non_ascii_authority_is_refused(url: str) -> None:
+    from harbor.url_credentials import reject_userinfo
+
+    with pytest.raises(ValueError, match="host must be ASCII"):
+        reject_userinfo(url, "Linear API", "LINEAR_API_KEY")
+
+
+def test_a_url_urlsplit_refuses_raises_without_its_message_or_chain() -> None:
+    with pytest.raises(ValueError, match="the GitHub API URL must name a host") as caught:
+        require_https_api_url("https://[bad/graphql")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    with pytest.raises(ValueError, match="must be a URL with a host name") as caught:
+        github_web_host("https://[bad/graphql")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("url", GITHUB_WITH_USERINFO)
 def test_the_builder_rest_helper_refuses_userinfo(url: str) -> None:
     with pytest.raises(ValueError, match="must not contain") as caught:
         rest_base_url(url)
@@ -136,6 +191,7 @@ def test_the_builder_rest_helper_refuses_userinfo(url: str) -> None:
 
 @pytest.mark.parametrize("url", [
     LINEAR_WITH_USERINFO,
+    LINEAR_FULLWIDTH,
     f"HTTP://u:{SECRET}@127.0.0.1:8765/graphql",
     f"http://u:{SECRET}@[::1]:8765/graphql",
 ])
@@ -174,11 +230,11 @@ def test_project_config_still_accepts_plain_endpoints() -> None:
     assert config.linear_api_url == "http://127.0.0.1:8765/graphql"
 
 
-@pytest.mark.parametrize("url", [GITHUB_WITH_USERINFO[0], f"http://u:{SECRET}@[::1]/api/graphql"])
+@pytest.mark.parametrize("url", [*GITHUB_WITH_USERINFO, f"http://u:{SECRET}@[::1]/api/graphql"])
 def test_the_poller_web_host_uses_the_same_userinfo_rule(url: str) -> None:
     with pytest.raises(ValueError, match="must be a URL with a host name") as caught:
         github_web_host(url)
-    assert SECRET not in str(caught.value)
+    _assert_no_secret_anywhere(caught.value)
 
 
 # ------------------------------------------------------------ harbor doctor and harbor start
@@ -213,7 +269,9 @@ def test_doctor_fails_closed_on_a_registry_github_url_with_userinfo(tmp_path: Pa
     assert result.returncode == 2
 
 
-def _start(tmp_path: Path, pipeline_extra: str) -> subprocess.CompletedProcess[str]:
+def _cli(tmp_path: Path, pipeline_extra: str, *command: str) -> subprocess.CompletedProcess[str]:
+    """Run the real CLI on a throwaway registry, so the project goes through ProjectConfig."""
+
     from workflow_support import materialize
 
     repo = tmp_path / "repo"
@@ -231,24 +289,35 @@ def _start(tmp_path: Path, pipeline_extra: str) -> subprocess.CompletedProcess[s
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"), GITHUB_TOKEN="dummy")
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
-                             "start", "SampleProject", "--once"], env=env, capture_output=True, text=True, timeout=60)
+                             *command], env=env, capture_output=True, text=True, timeout=60)
     assert SECRET not in result.stdout + result.stderr, result.stdout + result.stderr
     assert "Traceback" not in result.stderr, result.stderr
     assert result.returncode == 2, result.stdout + result.stderr
     return result
 
 
-def test_start_refuses_a_pipeline_github_url_with_userinfo(tmp_path: Path) -> None:
-    result = _start(tmp_path, f"github_api_url: {GITHUB_WITH_USERINFO[0]}\n")
-    assert result.stderr.strip() == (
-        "Harbor: the GitHub API URL must not contain a user name, password or token (the part before '@'); "
-        "remove it and supply the credential through GITHUB_TOKEN, GH_TOKEN or the variable named by github_token_env"
-    )
+GITHUB_REFUSAL = (
+    "Harbor: the GitHub API URL must not contain a user name, password or token (the part before '@'); "
+    "remove it and supply the credential through GITHUB_TOKEN, GH_TOKEN or the variable named by github_token_env"
+)
+START = ("start", "SampleProject", "--once")
+FACTS = ("facts", "SampleProject")
+DOCTOR = ("doctor", "SampleProject")
 
 
-def test_start_refuses_a_pipeline_linear_url_with_userinfo(tmp_path: Path) -> None:
-    result = _start(tmp_path, f"linear_api_url: {LINEAR_WITH_USERINFO}\n")
+@pytest.mark.parametrize("command", [START, FACTS], ids=["start", "facts"])
+@pytest.mark.parametrize("url", [GITHUB_WITH_USERINFO[0], GITHUB_WITH_USERINFO[-2]], ids=["ascii-at", "fullwidth-at"])
+def test_start_and_facts_refuse_a_pipeline_github_url_with_userinfo(tmp_path: Path, command, url: str) -> None:
+    result = _cli(tmp_path, f"github_api_url: {url}\n", *command)
+    assert result.stderr.strip() == GITHUB_REFUSAL, result.stderr
+
+
+@pytest.mark.parametrize("command", [START, FACTS, DOCTOR], ids=["start", "facts", "doctor"])
+@pytest.mark.parametrize("url", [LINEAR_WITH_USERINFO, LINEAR_FULLWIDTH], ids=["ascii-at", "fullwidth-at"])
+def test_every_command_refuses_a_pipeline_linear_url_with_userinfo(tmp_path: Path, command, url: str) -> None:
+    result = _cli(tmp_path, f"linear_api_url: {url}\n", *command)
     assert result.stderr.strip().startswith("Harbor: the Linear API URL must not contain a user name"), result.stderr
+    assert len(result.stderr.strip().splitlines()) == 1, result.stderr
 
 
 # ------------------------------------------------------------ harbor workflow check
@@ -378,6 +447,23 @@ def test_a_linear_http_error_never_repeats_userinfo(endpoint: str, handler) -> N
     assert caught.value.__cause__ is None and caught.value.__context__ is None
     if handler is _bad_gateway:
         assert "for url 'https://[redacted]@linear.example.test/graphql'" in str(caught.value), str(caught.value)
+
+
+def test_an_invalid_url_error_never_repeats_userinfo() -> None:
+    # httpx reads "u:SECRET＠host" as host "u" with port "SECRET＠host" and
+    # raises InvalidURL (not an HTTPError) naming that "port".
+    github = GitHubClient(token="dummy-token", endpoint=GITHUB_WITH_USERINFO[-2],
+                          http_client=httpx.AsyncClient(transport=httpx.MockTransport(_bad_gateway)))
+    with pytest.raises(GitHubError, match="the GitHub API URL is not a valid URL") as caught:
+        asyncio.run(github.query("query { viewer { login } }"))
+    _assert_no_secret_anywhere(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+    linear = LinearClient(token="dummy-key", endpoint=LINEAR_FULLWIDTH, transport=httpx.MockTransport(_bad_gateway))
+    with pytest.raises(LinearClientError, match="the Linear API URL is not a valid URL") as caught_linear:
+        asyncio.run(linear._post("query { viewer { id } }"))
+    _assert_no_secret_anywhere(caught_linear.value)
+    assert caught_linear.value.__cause__ is None and caught_linear.value.__context__ is None
 
 
 def test_an_error_without_userinfo_keeps_its_cause() -> None:

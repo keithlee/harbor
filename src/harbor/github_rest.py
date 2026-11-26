@@ -72,7 +72,13 @@ def require_https_api_url(graphql_url: str | None) -> str:
     if not url.startswith("https://"):
         raise ValueError("the GitHub API URL must use https")
     reject_userinfo(url, "GitHub API", TOKEN_HINT)
-    if not urlsplit(url).hostname:
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        # urlsplit's message repeats the netloc, which may hold a credential;
+        # raise outside the handler so the original is not chained either.
+        host = None
+    if not host:
         raise ValueError("the GitHub API URL must name a host")
     return url
 
