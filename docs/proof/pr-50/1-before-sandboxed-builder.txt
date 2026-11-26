@@ -1,0 +1,20 @@
+=== host (outside sandbox) 02:10:55: macOS 27.2.1, 2.1.332 (Claude Code), gh version 2.87.3 (2026-02-23)
+=== claude --print (sandbox settings: {"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"autoAllowBashIfSandboxed":true,"network":{"allowedDomains":["api.github.com","github.com"]}}})
+--- in-sandbox probe start 02:10:57
+GH_TOKEN=unset
+GITHUB_TOKEN=unset
+curl https://api.github.com/zen -> http 200
+curl exit=0 at 02:10:57
+starting: gh pr view 42 --repo keithlee/harbor  at 02:10:57
+gh pid=83600
+The probe did not finish within the 120s timeout. It was moved to the background as task b9h9zkzop and is still running, with no output so far. I did not start a second copy. I will be notified when it exits, and the output will be in the task's output file.
+
+I'm not replying DONE, since the command has not completed yet.
+=== claude exit=142 at 02:13:25 (142 = killed by the 150 s outer limit)
+=== host check of gh pid 83600 at 02:13:25:
+  PID STARTED                      ELAPSED COMMAND
+83600 Thu Nov 26 02:10:57 2026       02:28 gh pr view 42 --repo keithlee/harbor
+=== killed still-hung gh pid 83600 with SIGKILL
+<scratch>/probe.sh: line 14: 83600 Killed: 9               gh pr view 42 --repo keithlee/harbor < /dev/null > /dev/null 2>&1
+gh exit=137 at 02:13:25
+--- in-sandbox probe end

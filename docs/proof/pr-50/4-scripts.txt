@@ -1,0 +1,174 @@
+===== before.sh =====
+#!/bin/sh
+# BEFORE the fix: a Claude Code builder with Harbor's sandbox settings and no
+# exported token does what the old prompt allowed: try gh. Outer limit 150 s.
+cd "$(dirname "$0")"
+: > before.out
+unset GITHUB_TOKEN GH_TOKEN
+echo "=== host (outside sandbox) $(date +%T): $(sw_vers -productName) $(sw_vers -productVersion), $(claude --version 2>/dev/null), $(gh --version | head -1)" >> before.out
+SETTINGS='{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"autoAllowBashIfSandboxed":true,"network":{"allowedDomains":["api.github.com","github.com"]}}}'
+echo "=== claude --print (sandbox settings: $SETTINGS)" >> before.out
+perl -e 'alarm 150; exec @ARGV' claude --print --model haiku --permission-mode dontAsk --tools Bash \
+  --setting-sources "" --strict-mcp-config --settings "$SETTINGS" \
+  "Run exactly this one Bash command with a 120000 ms timeout: sh $(pwd)/probe.sh  -- then reply DONE." >> before.out 2>&1
+echo "=== claude exit=$? at $(date +%T) (142 = killed by the 150 s outer limit)" >> before.out
+PID=$(sed -n 's/^gh pid=//p' before.out | tail -1)
+echo "=== host check of gh pid $PID at $(date +%T):" >> before.out
+ps -o pid,lstart,etime,command -p "$PID" >> before.out 2>&1 || echo "gh pid $PID not running" >> before.out
+kill -9 "$PID" 2>/dev/null && echo "=== killed still-hung gh pid $PID with SIGKILL" >> before.out
+
+===== probe.sh =====
+#!/bin/sh
+# Runs INSIDE the sandboxed Claude Code builder. Prints no secret values.
+# Appends to before.out next to this script.
+cd "$(dirname "$0")"
+exec >> before.out 2>&1
+echo "--- in-sandbox probe start $(date +%T)"
+if printenv GH_TOKEN >/dev/null; then echo GH_TOKEN=set; else echo GH_TOKEN=unset; fi
+if printenv GITHUB_TOKEN >/dev/null; then echo GITHUB_TOKEN=set; else echo GITHUB_TOKEN=unset; fi
+curl -s --max-time 20 -o /dev/null -w 'curl https://api.github.com/zen -> http %{http_code}\n' https://api.github.com/zen
+echo "curl exit=$? at $(date +%T)"
+echo "starting: gh pr view 42 --repo keithlee/harbor  at $(date +%T)"
+gh pr view 42 --repo keithlee/harbor </dev/null >/dev/null 2>&1 &
+echo "gh pid=$!"
+wait $!
+echo "gh exit=$? at $(date +%T)"
+echo "--- in-sandbox probe end"
+
+===== after.py =====
+"""AFTER the fix: Harbor-side adoption via harbor.cli._adopt_github_token, then a
+sandboxed Claude Code builder runs the REST helper. Writes after.out. Prints no
+token value."""
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+from harbor.cli import _adopt_github_token
+from harbor.wake import github_transport_fact
+
+here = Path(__file__).resolve().parent
+out = here / "after.out"
+log = open(out, "w")
+
+
+def say(line: str = "") -> None:
+    log.write(line + "\n")
+    log.flush()
+
+
+for name in ("GITHUB_TOKEN", "GH_TOKEN"):
+    os.environ.pop(name, None)
+say(f"=== host {time.strftime('%T')}: GITHUB_TOKEN/GH_TOKEN unset before launch")
+
+linear_only = SimpleNamespace(github_token_env="GITHUB_TOKEN", github_api_url=None,
+                              repository_owner="", repository_name="")
+r = _adopt_github_token(linear_only)
+say(f"Linear-only project: resolution={r.source.value} · GH_TOKEN now {'set' if os.environ.get('GH_TOKEN') else 'unset'}")
+say("Linear-only builder prompt: " + github_transport_fact(helper="python -m harbor.github_rest", repository="",
+                                                            token_available=False))
+
+github = SimpleNamespace(github_token_env="GITHUB_TOKEN", github_api_url="https://api.github.com/graphql",
+                         repository_owner="keithlee", repository_name="harbor")
+r = _adopt_github_token(github)
+say(f"GitHub project: resolution={r.source.value} · env_name={r.env_name} · gh host={r.hostname} · "
+    f"GH_TOKEN now {'set' if os.environ.get('GH_TOKEN') else 'unset'} (value not shown)")
+
+env = dict(os.environ, HARBOR_GITHUB_API_URL="https://api.github.com",
+           HARBOR_GITHUB_REPOSITORY="keithlee/harbor", HARBOR_GITHUB_TOKEN_ENV="GH_TOKEN")
+helper_out = here / "after-helper.out"
+helper_out.unlink(missing_ok=True)
+cmd = (f"cd {here} && echo start $(date +%T) > after-helper.out && "
+       f"{sys.executable} -m harbor.github_rest pr-view 42 >> after-helper.out 2>&1; "
+       f"echo helper_exit=$? at $(date +%T) >> after-helper.out")
+settings = ('{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,'
+            '"autoAllowBashIfSandboxed":true,"filesystem":{"allowWrite":["%s"]},'
+            '"network":{"allowedDomains":["api.github.com","github.com"]}}}' % here)
+say(f"=== claude --print (sandbox settings: {settings})")
+say(f"builder Bash command: {cmd}")
+started = time.monotonic()
+result = subprocess.run(
+    ["claude", "--print", "--model", "haiku", "--permission-mode", "dontAsk", "--tools", "Bash",
+     "--setting-sources", "", "--strict-mcp-config", "--settings", settings,
+     f"Run exactly this one Bash command, then reply DONE: {cmd}"],
+    env=env, cwd=here, capture_output=True, text=True, timeout=280,
+)
+say(f"claude exit={result.returncode} after {time.monotonic() - started:.0f}s · reply: {result.stdout.strip()[:200]}")
+text = helper_out.read_text() if helper_out.exists() else "(no helper output)"
+lines = [l for l in text.splitlines() if '"body"' not in l]  # drop the long PR body
+say("=== in-sandbox REST helper output (PR body line omitted):")
+say("\n".join(lines))
+token = os.environ.get("GH_TOKEN", "")
+leak = bool(token) and token in (text + result.stdout + result.stderr + out.read_text())
+say(f"token value present in any of this output: {leak}")
+
+===== doctor_proof.sh =====
+#!/bin/sh
+# Throwaway config/registry/db: harbor init, then doctor and start --once with
+# (a) the gh login reused and (b) no token anywhere. Prints no token value.
+HARBOR_SRC="$1"
+D="$(cd "$(dirname "$0")" && pwd)/throwaway-$$"
+mkdir -p "$D/repo"
+git -C "$D/repo" init -q -b main
+git -C "$D/repo" commit -q --allow-empty -m init
+cd "$HARBOR_SRC" || exit 1
+export HARBOR_DB_PATH="$D/harbor.db" HARBOR_WORKTREE_ROOT="$D/wt" HARBOR_PROJECTS_FILE="$D/projects.md"
+unset GITHUB_TOKEN GH_TOKEN LINEAR_API_KEY HARBOR_LINEAR_API_KEY
+echo '$ harbor init SampleProject ...'
+uv run harbor init SampleProject --repo "$D/repo" --registry "$D/projects.md" \
+  --linear-project sample --linear-team SAMPLE --github-repository owner/sample \
+  --model claude-sonnet-5-5 --install-command none 2>&1 | tail -3
+echo "builder_provider: claude" >> "$D/repo/.harbor/pipeline.md"
+echo
+echo '=== (a) no GITHUB_TOKEN/GH_TOKEN exported, gh logged in ==='
+echo '$ harbor doctor SampleProject'
+uv run harbor doctor SampleProject > "$D/doctor-a.txt" 2>&1; code=$?
+grep -E "GitHub transport|Builder sandbox" "$D/doctor-a.txt"
+echo "doctor exit=$code (nonzero only because this throwaway has no Linear key)"
+# Release hold in the throwaway so start builds the builder dispatcher; there are no
+# tickets (no Linear key, fake repository), so nothing can be dispatched.
+sed -i '' 's/^hold: true$/hold: false/' "$D/repo/.harbor/pipeline.md"
+echo '$ harbor start SampleProject --once  (GitHub token lines)'
+perl -e 'alarm 60; exec @ARGV' uv run harbor start SampleProject --once > "$D/start-a.txt" 2>&1
+echo "start exit=$?"
+grep -cE "GitHub token" "$D/start-a.txt" | sed 's/^/GitHub token warning lines: /'
+echo
+echo '=== (b) no token exported and no gh login (HARBOR_GH_EXECUTABLE points at nothing) ==='
+echo '$ harbor doctor SampleProject'
+HARBOR_GH_EXECUTABLE="$D/no-gh" uv run harbor doctor SampleProject > "$D/doctor-b.txt" 2>&1; code=$?
+grep -E "GitHub transport|Project:" "$D/doctor-b.txt"
+echo "doctor exit=$code"
+echo '$ harbor start SampleProject --once  (GitHub token lines)'
+HARBOR_GH_EXECUTABLE="$D/no-gh" perl -e 'alarm 60; exec @ARGV' uv run harbor start SampleProject --once > "$D/start-b.txt" 2>&1
+echo "start exit=$?"
+grep -E "GitHub token" "$D/start-b.txt" | head -5
+echo
+echo '=== (c) Linear-only project (github_repository removed), gh "logged in" via a logging stand-in ==='
+sed -i '' '/^github_repository:/d' "$D/repo/.harbor/pipeline.md"
+grep -q github_repository "$D/projects.md" && sed -i '' '/github_repository/d' "$D/projects.md"
+printf '#!/bin/sh\necho "gh was called: $*" >> "%s/gh-calls.log"\necho gho_STANDIN_NOT_A_REAL_TOKEN\n' "$D" > "$D/gh-standin"
+chmod +x "$D/gh-standin"
+echo '$ harbor doctor SampleProject'
+HARBOR_GH_EXECUTABLE="$D/gh-standin" uv run harbor doctor SampleProject > "$D/doctor-c.txt" 2>&1
+grep -E "GitHub transport" "$D/doctor-c.txt"
+echo '$ harbor start SampleProject --once  (GitHub token lines)'
+HARBOR_GH_EXECUTABLE="$D/gh-standin" perl -e 'alarm 60; exec @ARGV' uv run harbor start SampleProject --once > "$D/start-c.txt" 2>&1
+grep -cE "GitHub token" "$D/start-c.txt" | sed 's/^/GitHub token warning lines: /'
+if [ -f "$D/gh-calls.log" ]; then cat "$D/gh-calls.log"; else echo "gh was never called"; fi
+
+===== leakcheck.py =====
+"""Search every proof artifact for the real gh token; print only file names and a verdict."""
+import subprocess
+import sys
+from pathlib import Path
+
+token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip().encode()
+root = Path(sys.argv[1])
+hits = [p for p in root.rglob("*") if p.is_file() and token in p.read_bytes()]
+checked = sum(1 for p in root.rglob("*") if p.is_file())
+print(f"files checked: {checked} · files containing the token: {len(hits)}")
+for p in hits:
+    print(f"LEAK: {p}")
+
