@@ -79,6 +79,9 @@ def obsolete_instruction(provider: str = "") -> str:
     )
 
 
+# Trigger recorded when Harbor replaces a session whose provider was never
+# recorded, so no re-engagement could resume it (see unrecorded_identity_handoff).
+UNRECORDED_IDENTITY_TRIGGER = "unrecorded_identity"
 SENSITIVE = re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
 
 
@@ -374,7 +377,7 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         if action not in {"resume", "retry", "fresh_session"}:
             return {"action": "resume" if case.status == "blocked" else "retry", "instruction": obsolete_instruction(case.provider),
                     "reason": f"obsolete Harbor bookkeeping blocker (First Mate proposed {action or 'nothing'})"}
-    if case.kind in HUMAN_KINDS or SENSITIVE.search(json.dumps(case.blocker)):
+    if needs_human(case.blocker):
         return escalate(f"{case.kind or 'sensitive'} blockers need a human or cited authority")
     if case.attempts >= int(settings.get("max_recoveries", 3)):
         return escalate(f"recovery budget exhausted after {case.attempts} attempts")
@@ -394,6 +397,54 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         return {"action": "wait", "instruction": "", "reason": "builder is still running; only a fresh session can replace it"} \
             if case.trigger != "stalled" else escalate("stalled run needs a fresh session, which is not available")
     return {"action": action, "instruction": instruction[:4000], "reason": reason[:1000]}
+
+
+def needs_human(blocker: Mapping[str, Any] | None) -> bool:
+    """A blocker only a human or cited authority may answer."""
+    blocker = blocker if isinstance(blocker, Mapping) else {}
+    return str(blocker.get("kind") or "").strip() in HUMAN_KINDS or bool(SENSITIVE.search(json.dumps(blocker, default=str)))
+
+
+def fresh_sessions_used(connection, run_id: str) -> int:
+    initialize(connection)
+    row = connection.execute(
+        "SELECT COUNT(*) FROM first_mate_recoveries WHERE run_id=? AND action='fresh_session'", (run_id,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def record_fresh_session(connection, *, project: str, ticket: str, run_id: str, trigger: str,
+                         instruction: str, reason: str, old_session_id: str | None) -> None:
+    """Record a fresh session Harbor started outside a First Mate case."""
+    initialize(connection)
+    with connection:
+        connection.execute(
+            "INSERT INTO first_mate_recoveries(project,ticket,run_id,trigger,action,instruction,reason,old_session_id,at) "
+            "VALUES (?,?,?,?,'fresh_session',?,?,?,?)",
+            (project, ticket, run_id, trigger, instruction, reason, old_session_id, time.time()),
+        )
+
+
+def unrecorded_identity_handoff(ticket: str, blocker: Mapping[str, Any] | None, summary: str,
+                                undelivered: Iterable[str]) -> str:
+    """Hand-off for a fresh session that replaces a session nothing could resume.
+
+    The blocker question and every re-engagement the old session could not
+    receive are carried verbatim, so nothing is lost with the session.
+    """
+    lines = [
+        f"Harbor started a fresh builder session for {ticket}: it has no record of which provider ran the "
+        "previous session, so that session could not be resumed. The retained worktree, branch, ticket and any "
+        "PR are unchanged; re-read Linear, GitHub and the worktree to reconstruct state.",
+        f"Previous summary: {summary[:1500] or 'none'}",
+    ]
+    if isinstance(blocker, Mapping) and blocker:
+        lines.append(f"The previous session was blocked ({blocker.get('kind') or 'blocker'}) on this question, "
+                     f"verbatim: {blocker.get('question') or json.dumps(blocker, default=str)}")
+    for text in undelivered:
+        if text:
+            lines.append(f"Undelivered re-engagement, verbatim:\n{text}")
+    return "\n\n".join(lines)
 
 
 def record(connection, case: Case, decision: Mapping[str, Any]) -> None:

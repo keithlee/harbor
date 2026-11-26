@@ -10,6 +10,7 @@ instead of a generic "could not resume" / "cannot attach its worktree".
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -925,7 +926,7 @@ def test_fresh_session_factory_failure_beside_the_retained_builder_keeps_its_cau
 
         stuck = StuckRunner()
         dispatcher.runners["SAMPLE-42"] = stuck
-        with pytest.raises(RuntimeError, match="cannot be attached"):
+        with pytest.raises(RuntimeError, match=f"cannot start a fresh session for SAMPLE-42: {re.escape(REASON)}"):
             await dispatcher.fresh_session("SAMPLE-42", "Take over from the stuck session.")
         print(f"Stored cause: {dispatcher.resume_unavailable_reason('SAMPLE-42')!r}")
         assert dispatcher.runners.get("SAMPLE-42") is stuck

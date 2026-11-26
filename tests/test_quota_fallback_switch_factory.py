@@ -121,7 +121,7 @@ def test_failed_switch_leaves_run_waiting_for_reset(tmp_path, monkeypatch, prima
         monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", str(tmp_path / "missing"))
     else:
         monkeypatch.setattr(CodexRunner, "__init__", lambda *a, **k: (_ for _ in ()).throw(ValueError("codex gone")))
-    with pytest.raises(RuntimeError, match="cannot be attached"):
+    with pytest.raises(RuntimeError, match="cannot start a fresh session for MOCK-1: (Claude Code executable unavailable|codex gone)"):
         switch(config, db, policy)
     assert state(db) == before
     assert before[0] == ("failed", "native-1", "usage_limit_exceeded") and before[2] == (primary,)

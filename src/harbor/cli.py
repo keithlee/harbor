@@ -27,7 +27,7 @@ from harbor.poll.github_poller import GitHubPoller
 from harbor.poll.linear_poller import LinearPoller
 from harbor.pr_events import PREventProcessor
 from harbor.runner.codex import CodexRunner
-from harbor.supervisor import Supervisor, WorktreeDispatcher
+from harbor.supervisor import UNRECORDED_IDENTITY, Supervisor, WorktreeDispatcher
 from harbor.wake import TicketScope
 from harbor.worktree import DEFAULT_DISK_FLOOR_GB, WorktreeManager, free_disk_gb
 
@@ -287,21 +287,29 @@ def build_production_dispatcher(
             ticket = str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
             path = getattr(worktree, "path", worktree)
             from harbor.workflow_store import bind
+            identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
+            if identity is None and getattr(wake, "action", None) == "reengage":
+                # A retained session belongs to whichever provider started it.
+                # Without that record, fail closed rather than guess one. A
+                # "fresh_session" wake (FRESH_SESSION_ACTION) resumes nothing, so
+                # it starts like a new ticket and records its identity. Refuse
+                # before binding the workflow so a refused poll writes nothing.
+                raise ValueError(UNRECORDED_IDENTITY)
             # Adopt edits to .harbor/workflow on the next turn instead of failing.
             current = dispatcher.workflow = dispatcher.workflow.reload()
             if wake.run_id:
                 bind(db.connection, config.name, ticket, wake.run_id, current)
-            identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
-            provider = identity[0] if identity else ("codex" if getattr(wake, "action", None) == "reengage" else builder_provider)
+            provider = identity[0] if identity else builder_provider
             controller = current.config["roles"]["controller"]
             model = str(controller["model"])
             effort = str(controller.get("reasoning_effort") or getattr(config, "builder_effort", "high"))
             fallbacks = tuple(controller.get("fallback_models", ()))
-            if provider != builder_provider:
-                model, effort = (identity[1], identity[2]) if identity else ("gpt-5.6-luna", "xhigh")
+            if identity is not None and provider != builder_provider:
+                model, effort = identity[1], identity[2]
                 fallbacks = ()
             if identity is None and quota_policy is not None and getattr(wake, "action", None) != "reengage":
-                # A new ticket never starts on a provider known to be out of usage.
+                # A new ticket (or a fresh session with no recorded identity)
+                # never starts on a provider known to be out of usage.
                 import time
                 start = quota_policy.starting_builder_profile(db.connection, time.time())
                 if start is not None:
