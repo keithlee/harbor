@@ -8,6 +8,8 @@ from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
 
+from harbor.url_credentials import redact_http_error
+
 DEFAULT_LINEAR_API_URL = "https://api.linear.app/graphql"
 
 
@@ -289,6 +291,7 @@ class LinearClient:
             # Refuse before any request is built, outside any ``except``, so
             # the error has no cause or context that could carry the key.
             raise LinearClientError(_UNSENDABLE_KEY)
+        failure: LinearClientError | None = None
         try:
             response = await self._client.post(
                 self.endpoint,
@@ -297,9 +300,23 @@ class LinearClient:
             )
             response.raise_for_status()
             body = response.json()
+        except httpx.InvalidURL:
+            # Not an HTTPError, and its message repeats part of the URL (for
+            # example "Invalid port: '<password>＠host'"), so say nothing of it.
+            failure = LinearClientError("Linear request failed: the Linear API URL is not a valid URL")
         except (httpx.HTTPError, ValueError) as exc:
+            # The chained request must not carry the key, and httpx repeats
+            # the request URL in its messages, so userinfo must not either.
             _redact_authorization(exc)
-            raise LinearClientError(f"Linear request failed: {exc}") from exc
+            message, carries_userinfo = redact_http_error(str(exc), self.endpoint)
+            failure = LinearClientError(f"Linear request failed: {message}")
+            if not carries_userinfo:
+                raise failure from exc
+        if failure is not None:
+            # Raised outside the ``except`` block, so neither ``__cause__`` nor
+            # ``__context__`` holds the httpx error, whose message and
+            # ``request.url`` carry the endpoint's userinfo.
+            raise failure
         if not isinstance(body, dict):
             raise LinearClientError("Linear returned a non-object response")
         errors = body.get("errors")

@@ -637,7 +637,10 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
                              "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
     assert "dummy-token-value" not in result.stdout + result.stderr
-    assert f" at {worktree_root.resolve()} " in result.stdout, result.stdout
+    # Exit 2 means doctor refused the project config and stopped before its
+    # disk check, so there is no worktree root line to look for.
+    if result.returncode != 2:
+        assert f" at {worktree_root.resolve()} " in result.stdout, result.stdout
     return result
 
 
