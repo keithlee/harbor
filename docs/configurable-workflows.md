@@ -515,6 +515,24 @@ Codex builders need neither: their
 Verified on macOS with Claude Code 2.1.332 by running the generated command
 against a throwaway repository and worktree; not run on Linux.
 
+**Builder access to git metadata.** A ticket worktree's commits are stored in
+the project repository's git directory, outside the worktree. Builders of both
+providers can write only the parts a commit, fetch and push need: `objects/`,
+`refs/`, `logs/`, `packed-refs` (and `shallow`), and the worktree's own
+`worktrees/<name>/` directory. The shared `config`, `hooks/`, `info/` and
+`modules/` stay read-only, because Harbor and you run git in that repository
+outside the sandbox, and a builder that could edit them could make git run its
+code there (a hook, `core.fsmonitor`, `core.sshCommand`, a credential helper or
+a filter driver). One visible effect: `git push -u` from a builder pushes but
+cannot record the upstream in the shared config, and git prints an error for
+that part. Harbor's own git commands also run with repository hooks and
+`core.fsmonitor` turned off (`-c core.hooksPath=/dev/null -c
+core.fsmonitor=false`), so a hook you installed in the project repository does
+not run when Harbor creates, checks or removes a ticket worktree. No setup is
+needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
+against a throwaway repository; the Claude sandbox and Linux were checked
+through the generated settings only.
+
 ## Verification map
 
 | Area | Primary files | Scenario tests |
