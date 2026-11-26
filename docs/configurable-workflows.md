@@ -329,7 +329,17 @@ both providers:
   fixes to the same implementor), a Claude builder spawns a fresh child for
   that role and hands it the earlier child's report and the current ticket, PR
   and review state. Harbor does not give the Claude builder `SendMessage`, so
-  its tool set and its children's stay unchanged.
+  its tool set and its children's stay unchanged. Every `Agent` call runs in
+  the foreground: a background child would still be running when the builder's
+  `--print` turn ends, and its result would be lost. The fresh child replaces
+  the earlier one, so a ticket keeps one child per role. A new session with no
+  earlier child report hands the child the PR and its review comments instead.
+- Both providers count failed review rounds from the reviewer's verdict
+  comments on the PR, so the three-round limit holds across a fresh session.
+
+The launch prompt says that these rules override the child-agent steps in the
+workflow's skills. An existing `.harbor/workflow` install keeps its own skill
+copies, which may be older.
 
 Harbor does not register or verify child identities.
 
@@ -360,6 +370,13 @@ Guardrails:
 - Each run gets `max_recoveries` attempts, re-checked every `recheck_minutes`.
   Only a model usage limit backs off exponentially (30, then 60 minutes).
 - A spent budget escalates once and never loops.
+- Recovery instructions match the run's builder provider (from
+  `runner_identity`). A Codex builder is told to list agents, close stale
+  children and respawn them under new names. A Claude builder is told to spawn
+  fresh children with foreground `Agent` calls and the ticket, PR and review
+  comments, because it cannot list or close children. When the provider is
+  unknown, the instruction gives both sets of steps, each labelled with its
+  runtime.
 
 - Watchdog flags get the same eligibility checks: a held or closed ticket is
   never restarted (cleaning up a merged ticket is the one exception).

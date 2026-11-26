@@ -90,12 +90,19 @@ def _db_path() -> Path:
 CHILD_AGENT_INSTRUCTIONS = (
     "Child agents: use your own runtime's child-agent tools; never shell out to another agent CLI "
     "(such as `codex exec` or `claude -p`) for children. "
+    # An installed workflow keeps its own (possibly older) skill copies, so say which rules win.
+    "These launch child-agent rules override any child-agent steps in the workflow's skills. "
     "Codex: use the native collaboration tools (spawn, list, wait, resume, close). "
-    "Claude Code: spawn each child with the `Agent` tool; a foreground call waits and returns the child's "
+    "Claude Code: spawn each child with the `Agent` tool in the foreground and never set `run_in_background`: "
+    "a background child's result is lost when your turn ends. A foreground call waits and returns the child's "
     "result, and a finished child needs no close. Claude Code has no list, resume, message or close, so track "
     "the children you started in this session yourself. Wherever the workflow says to resume, message or "
     "return work to an existing child (for example review fixes to the same implementor), spawn a fresh child "
-    "for that role instead and give it the earlier child's report plus the current ticket, PR and review state."
+    "for that role instead and give it the earlier child's report plus the current ticket, PR and review state. "
+    "The fresh child replaces the earlier one, so the ticket still has one child per role. In a new session "
+    "with no earlier child report, give it the PR and its review comments instead. "
+    "Either runtime: count failed review rounds from the reviewer's verdict comments on the PR, not from memory, "
+    "so the three-round limit holds across a fresh session."
 )
 
 
