@@ -54,6 +54,7 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text, pr_url=PR_URL):
         return httpx.Response(200, json={"data": {"repository": {"pr_1": {
             "number": 1,
             "headRefOid": "abc",
+            "body": "## Risk Analysis\nRisk tier: low\n<!-- harbor:risk-sha:abc -->\n",
             "url": pr_url,
             "merged": False,
             "mergeable": "MERGEABLE",

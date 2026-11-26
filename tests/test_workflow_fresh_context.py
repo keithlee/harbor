@@ -23,7 +23,7 @@ def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
         def from_profile(cls,profile,**kwargs):return cls(**kwargs)
         async def close(self):pass
         async def fetch_pull_requests(self,*args,**kwargs):
-            return {'pr_1':{'number':1,'headRefOid':'abc','url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE','comments':{'nodes':[]}}}
+            return {'pr_1':{'number':1,'headRefOid':'abc','body':'## Risk Analysis\nRisk tier: low\n<!-- harbor:risk-sha:abc -->','url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE','comments':{'nodes':[]}}}
     monkeypatch.setattr('harbor.clients.linear.LinearClient',Linear)
     monkeypatch.setattr('harbor.clients.github.GitHubClient',GitHub)
     cfg=SimpleNamespace(name='A',linear_api_url='https://linear.invalid',linear_project_scope=('canonical',),github_repository='example/repo',required_checks=(),workflow_path=str(config(tmp_path)))
@@ -68,6 +68,7 @@ def test_pre_merge_checks_fresh_linear_state(tmp_path, monkeypatch, capsys, stat
             return {"pr_1": {
                 "number": 1,
                 "headRefOid": "abc",
+                "body": "## Risk Analysis\nRisk tier: low\n<!-- harbor:risk-sha:abc -->\n",
                 "url": pr_url,
                 "merged": False,
                 "mergeable": "MERGEABLE",
