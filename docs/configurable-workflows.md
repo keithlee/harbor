@@ -495,15 +495,23 @@ builder process (and every child agent it starts) inherits it:
   project argument still wins; with neither, the command fails and says so.
 - `HARBOR_PROJECTS_FILE` and `HARBOR_DB_PATH`: the absolute registry and
   ledger this start uses.
-- `PATH`, with a Harbor-owned directory first: `<ledger dir>/bin/<id>/harbor`,
-  a small `sh` script that runs this exact Harbor install (its Python with
-  `-P`, so a `harbor` package in the worktree cannot shadow it) with that
-  registry and ledger. Harbor rewrites it before each builder starts, so an
-  edited shim does not survive.
-- The GitHub token variable: the one named by `github_token_env`, then
-  `GITHUB_TOKEN` / `GH_TOKEN`, copied from Harbor's own environment at start.
-  Its value is held in memory and handed only to the builder process; it is
-  never written to the shim, config, ledger, prompt or logs.
+- `PATH`, with a Harbor-owned directory first:
+  `$XDG_STATE_HOME/harbor/builder-bin/<id>/harbor` (default
+  `~/.local/state/...`), a small `sh` script that runs this exact Harbor
+  install (its Python with `-P`, so a `harbor` package in the worktree cannot
+  shadow it) with that registry and ledger. Harbor refuses to start if that
+  directory is inside one a builder can write (the ledger directory, the
+  worktree root or the repository's `.git`); set `XDG_STATE_HOME` elsewhere.
+  Harbor rewrites the shim before each builder starts.
+- `HARBOR_BIN`: the shim's absolute path.
+- The GitHub token variables (`github_token_env`, then `GITHUB_TOKEN` /
+  `GH_TOKEN`), pinned to their values at start and removed for builders when
+  unset then. Values are held in memory and handed only to the builder
+  process; they are never written to the shim, config, ledger, prompt or logs.
+
+Harbor launches `codex` / `claude` by the absolute path it finds on its own
+`PATH`, never through the builder's `PATH`, so nothing placed on the builder's
+`PATH` can stand in for the builder CLI.
 
 Changing Harbor's shell environment after start does not reach builders;
 restart Harbor to pick up a new registry, ledger or token. Without a registry,
@@ -513,12 +521,24 @@ argument, and the worktree is the builder's working directory. The prompt
 names none of these paths. The native sandbox includes the ledger directory
 for operational receipts; the registry remains read-only.
 
+**Shell startup files.** A login or interactive shell can reorder or replace
+`PATH` after Harbor sets it (macOS `path_helper` in `/etc/zprofile`, your
+`.zprofile` or `.zshrc`). Codex runs builder commands through a login shell,
+and Claude Code runs Bash from a snapshot of a login, interactive shell. So the
+prompt tells builders to compare `command -v harbor` with `printenv HARBOR_BIN`
+and, when they differ, to run the absolute shim path written out. A command
+that expands `"$HARBOR_BIN"` is refused by Claude Code's `dontAsk` mode, while
+the written-out path is allowed (checked live with Claude Code 2.1.332).
+
 `harbor doctor <project>` prints the settings (names and paths, never a token
 value) as `Builder environment:` and `Builder PATH:`, writes the same shim, and
-checks that `harbor` resolves to it and runs Harbor in `/bin/sh` and in your
-`$SHELL`. It fails with `Builder harbor: not resolved (...)` when a shell
-startup file (for example a `.zshenv` that sets `PATH` outright) hides the
-shim; prepend to `PATH` there instead of replacing it.
+checks that `harbor` resolves to it and runs Harbor in `/bin/sh -c` and in your
+`$SHELL` with `-c`, `-lc` and `-ic`. It fails with
+`Builder harbor: not resolved (...)` when a startup file puts another `harbor`
+first or drops the shim; prepend to `PATH` there instead of replacing it, or
+remove the other `harbor`. Old `builder-bin/<id>` directories from earlier
+registries or installs are not cleaned up; they are small and safe to delete
+while Harbor is stopped.
 
 **Claude builder permissions.** Claude builders run in Claude Code's
 `dontAsk` permission mode, which refuses any tool call that is not
@@ -536,8 +556,11 @@ Claude project, and fails if the package path contains a wildcard (`*`, `?`,
 `[`, `]`) or a line break, which a rule cannot match literally; rename that
 directory. Codex builders need neither: their
 `workspace-write` sandbox reads anywhere and has no per-command approval.
-Verified on macOS (doctor and the shim in `sh`, `bash` and `zsh`); not run on
-Linux, and not run against a live Claude Code or Codex session.
+Verified on macOS: doctor, the shim in `sh`, `bash` and `zsh` (plain, login,
+interactive), and a live Claude Code 2.1.332 `dontAsk` run with Harbor's
+generated settings in which `harbor workflow inspect` and
+`harbor workflow check` were allowed. Not run on Linux, and not against a live
+Codex session.
 
 ## Verification map
 

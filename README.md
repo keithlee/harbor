@@ -122,10 +122,12 @@ eligible builder dispatch in the background so the prompt remains usable
 while an agent works.
 
 `start` also settles the builder environment once: every builder inherits the
-project, registry and ledger paths, the GitHub token variable, and a Harbor
-`harbor` shim first on `PATH`, so builders run plain
+project, registry and ledger paths, the GitHub token variables, and a Harbor
+`harbor` shim first on `PATH` (kept under `~/.local/state/harbor`, outside
+anything a builder can write), so builders run plain
 `harbor workflow check --ticket <ID> --event ...`. `doctor` prints these
-settings (never a token value) and checks that `harbor` resolves to the shim.
+settings (never a token value) and checks that `harbor` resolves to the shim in
+plain, login and interactive shells.
 See [Delivery runtime binding](docs/configurable-workflows.md#delivery-runtime-binding).
 
 Linear and GitHub API credentials are external-service credentials, not model
