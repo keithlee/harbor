@@ -225,6 +225,15 @@ variable the token comes from, and fails when GitHub is configured with no token
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 
+**Claude builder child agents.** The delivery skill spawns planner,
+implementor and reviewer children. A Claude builder does this with Claude
+Code's `Agent` tool, which Harbor always enables; there is nothing to
+configure. Children run inside the builder's own Claude Code process, so they
+get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
+`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
+writable paths and the same network allowlist below. They cannot use a tool or
+reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
+
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:
 `github.com`, `api.github.com`, `api.linear.app` and `registry.npmjs.org`, plus
@@ -444,6 +453,29 @@ resolved project registry, the operational ledger, the Python interpreter and
 the Harbor import path. Workflow commands and child agents use that invocation
 with the supplied project and ticket. The native sandbox includes the ledger
 directory for operational receipts; the registry remains read-only.
+
+**Claude builder permissions.** Claude builders run in Claude Code's
+`dontAsk` permission mode, which refuses any tool call that is not
+pre-approved. Sandboxed Bash is approved automatically, except a command that
+sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
+(directly or through `/usr/bin/env`), which is exactly what the runtime
+invocation does; Read, Glob and Grep only reach the ticket worktree,
+and the workflow package lives in your clone outside it. So Harbor pre-approves
+two things, and nothing else:
+
+- Bash commands that start with the exact runtime invocation from the prompt
+  (`Bash(<invocation>:*)`). They still run inside the OS sandbox, with the same
+  writable directories and network allowlist.
+- Reading the project's workflow package (`Read(//<repo>/.harbor/workflow/**)`),
+  so the builder can open `skills/*/SKILL.md`, `scripts/` and `config.toml`.
+
+No setup is needed. `harbor doctor` prints them as `Builder permissions:` for a
+Claude project, and fails if a path contains a wildcard (`*`, `?`, `[`, `]`) or
+a line break, which a rule cannot match literally; rename that directory.
+Codex builders need neither: their
+`workspace-write` sandbox reads anywhere and has no per-command approval.
+Verified on macOS with Claude Code 2.1.332 by running the generated command
+against a throwaway repository and worktree; not run on Linux.
 
 ## Verification map
 

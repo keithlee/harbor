@@ -149,6 +149,34 @@ def build_pull_requests_query(owner: str, repo: str, numbers: Iterable[int]) -> 
 }}"""
 
 
+def _is_header_safe(token: str) -> bool:
+    """True when ``token`` is visible ASCII, the only thing a bearer header carries."""
+
+    return all("!" <= char <= "~" for char in token)
+
+
+def _one_line(exc: BaseException) -> str:
+    """An exception's message on one line (httpx status errors span several)."""
+
+    return " ".join(str(exc).split()) or type(exc).__name__
+
+
+def _redact_authorization(exc: httpx.HTTPError) -> None:
+    """Strip the bearer token from the request a chained httpx error carries.
+
+    ``httpx`` masks it in ``repr`` but keeps the real value in
+    ``exc.request.headers``; anything that walks the cause chain (a logger, a
+    traceback formatter with locals) could otherwise print it.
+    """
+
+    try:
+        request = exc.request
+    except RuntimeError:  # a RequestError raised before a request was attached
+        return
+    if "Authorization" in request.headers:
+        request.headers["Authorization"] = "bearer [redacted]"
+
+
 _QUERY_START = re.compile(r"^\s*(?:query(?:\s|\{|\()|\{)", re.IGNORECASE)
 
 
@@ -199,28 +227,57 @@ class GitHubClient:
         payload = {"query": document, "variables": dict(variables or {})}
         headers = {"Accept": "application/vnd.github+json"}
         if self.token:
+            if not _is_header_safe(self.token):
+                # httpx would raise UnicodeEncodeError while building the
+                # request, and that exception's ``object`` holds the whole
+                # header value.  Refuse first, naming no part of the token.
+                raise ValueError(
+                    "the configured GitHub token contains characters that cannot be sent in an "
+                    "HTTP header; re-export GITHUB_TOKEN/GH_TOKEN (or the github_token_env variable)"
+                )
             headers["Authorization"] = f"bearer {self.token}"
 
         if self._client is not None:
-            try:
-                response = await self._client.post(self.endpoint, json=payload, headers=headers)
-                response.raise_for_status()
-                result = response.json()
-            except (httpx.HTTPError, ValueError) as exc:
-                raise GitHubError(f"GitHub request failed: {exc}") from exc
+            result = await self._post_json(self._client, payload, headers)
         elif self.transport is not None:
             result = await self._transport_call(payload, headers)
         else:
+            # The production default, wrapped the same way as an injected
+            # client: transport failures, HTTP error statuses and non-JSON
+            # bodies become GitHubError.
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.endpoint, json=payload, headers=headers)
-                response.raise_for_status()
-                result = response.json()
+                result = await self._post_json(client, payload, headers)
         if not isinstance(result, Mapping):
             raise GitHubError("GitHub response was not a JSON object")
         errors = result.get("errors")
         if errors:
             raise GitHubGraphQLError(f"GitHub GraphQL errors: {errors!r}")
         return result
+
+    async def _post_json(
+        self,
+        client: httpx.AsyncClient,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+    ) -> Any:
+        """POST ``payload`` and decode the JSON body, wrapping GitHub-side failures.
+
+        Building the request stays outside the ``try``: a payload that cannot
+        be serialized is a caller bug, not a GitHub outage, and must surface
+        as itself.
+        """
+
+        request = client.build_request("POST", self.endpoint, json=payload, headers=headers)
+        try:
+            response = await client.send(request)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            _redact_authorization(exc)
+            raise GitHubError(f"GitHub request failed: {_one_line(exc)}") from exc
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise GitHubError(f"GitHub returned a response that is not JSON: {_one_line(exc)}") from exc
 
     async def close(self) -> None:
         if self._owns_client and self._client is not None:

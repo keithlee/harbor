@@ -126,7 +126,7 @@
   "--permission-mode",
   "dontAsk",
   "--tools",
-  "Bash,Read,Glob,Grep,Skill",
+  "Bash,Read,Glob,Grep,Skill,Agent",
   "--setting-sources",
   "",
   "--strict-mcp-config",
