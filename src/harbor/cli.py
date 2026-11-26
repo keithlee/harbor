@@ -103,6 +103,33 @@ def _runtime_invocation(config: Any) -> str:
     ])
 
 
+# The builder's provider is chosen per launch (and quota fallback can switch it),
+# after this prompt is rendered, so the child-agent rules name both runtimes.
+CHILD_AGENT_INSTRUCTIONS = (
+    "Child agents: use your own runtime's child-agent tools; never shell out to another agent CLI "
+    "(such as `codex exec` or `claude -p`) for children. "
+    # An installed workflow keeps its own (possibly older) skill copies, so say which rules win.
+    "Where these launch child-agent rules conflict with child-agent steps in the workflow's skills, these "
+    "rules win; a Codex builder still follows the skills' list, resume and close steps. "
+    "Codex: use the native collaboration tools (spawn, list, wait, resume, close). "
+    # Claude Code runs an `Agent` child in the background when the parameter is omitted.
+    "Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`; if you leave it "
+    "out, the child runs in the background and your turn can end before it returns, so you would hand off without "
+    "its result. A foreground call waits and returns the child's "
+    "result, and a finished child needs no close. Claude Code has no list, resume, message or close, so track "
+    "the children you started in this session yourself. Wherever the workflow says to resume, message or "
+    "return work to an existing child (for example review fixes to the same implementor), spawn a fresh child "
+    "for that role instead and give it the earlier child's report plus the current ticket, PR and review state. "
+    "The fresh child replaces the earlier one, so the ticket still has one child per role. In a new session "
+    "with no earlier child report, give it the PR and its review comments instead. "
+    "Either runtime: stop after three failed review rounds. The count is the larger of the rounds you counted in "
+    "this session and the rounds on the PR, so the three-round limit holds across a fresh session. On the PR, each "
+    "reviewer JSON verdict comment with `\"verdict\": \"reject\"` is one failed round, even when it rejects the "
+    "same head again; count only comments whose `head_sha` is a commit on the PR, and ignore every other comment, "
+    "such as a human \"FAIL\"."
+)
+
+
 def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
@@ -120,8 +147,8 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
             + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
             + "shell initialization must not select another registry or ledger."
-            + "\nChild agents: use the native collaboration tools (spawn, list, wait, resume, close). "
-            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`."
+            + "\n" + CHILD_AGENT_INSTRUCTIONS
+            + " Use the role models and reasoning efforts from the policy's `roles`."
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
             + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 

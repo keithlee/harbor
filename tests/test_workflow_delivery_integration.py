@@ -151,7 +151,7 @@ def test_delivery_prompt_pins_registry_ledger_and_runtime(tmp_path, monkeypatch)
     assert 'shadow Harbor loaded' not in result.stderr
     assert 'A calm project supervisor' in result.stdout
     assert "Replace PROJECT with 'Demo Project'" in prompt
-    assert "Do not shell out to codex exec for children" in prompt
+    assert "never shell out to another agent CLI" in prompt
     assert "overrides any merge or auto-merge policy" in prompt
     assert "Harbor setting wins" in prompt
     assert "roles" in prompt

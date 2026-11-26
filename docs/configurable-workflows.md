@@ -324,9 +324,42 @@ harbor workflow check Demo --ticket DEM-1 --event pre_merge
 ## Child agents
 
 The delivery skill spawns planner, implementor and reviewer children with the
-native collaboration tools. Before spawning a role it lists the existing
-agents. It resumes a live one; an interrupted or errored one is closed and the
-role is respawned under a fresh name. A name collision is never a blocker.
+builder's own child-agent tools, and the launch prompt gives the rules for
+both providers:
+
+- A Codex builder uses the native collaboration tools. Before spawning a role
+  it lists the existing agents. It resumes a live one; an interrupted or
+  errored one is closed and the role is respawned under a fresh name. A name
+  collision is never a blocker.
+- A Claude builder uses Claude Code's `Agent` tool and always passes
+  `run_in_background: false`. A foreground call waits and returns the child's
+  result. Claude Code has no list, resume, message or
+  close, so the builder tracks the children it started in the session itself.
+  Where Codex would resume or message a child (for example to return review
+  fixes to the same implementor), a Claude builder spawns a fresh child for
+  that role and hands it the earlier child's report and the current ticket, PR
+  and review state. Harbor does not give the Claude builder `SendMessage`, so
+  its tool set and its children's stay unchanged. The `false` must be explicit:
+  when the parameter is left out, Claude Code starts the child in the
+  background, and the builder's turn can end before the child returns. Claude
+  Code later runs a follow-up turn with the child's result, but by then the
+  builder has already reported its run result without it. The fresh child replaces
+  the earlier one, so a ticket keeps one child per role. A new session with no
+  earlier child report hands the child the PR and its review comments instead.
+- Both providers stop after three failed review rounds. The count is the
+  larger of the rounds the builder counted in its session and the rounds on
+  the PR, so the limit holds across a fresh session. The review skill posts
+  its exact JSON verdict object as a PR comment. Each such comment with
+  `"verdict": "reject"` is one failed round, even when it rejects the same
+  head again (for example after a fix failed to push). Only comments whose
+  `head_sha` is a commit on the PR count. Other comments, such as a human
+  "FAIL", do not count.
+
+The launch prompt says that where these rules conflict with the child-agent
+steps in the workflow's skills, the launch rules win. A Codex builder still
+follows the skills' list, resume and close steps. An existing `.harbor/workflow`
+install keeps its own skill copies, which may be older.
+
 Harbor does not register or verify child identities.
 
 ## First Mate: monitor and recover
@@ -356,6 +389,15 @@ Guardrails:
 - Each run gets `max_recoveries` attempts, re-checked every `recheck_minutes`.
   Only a model usage limit backs off exponentially (30, then 60 minutes).
 - A spent budget escalates once and never loops.
+- Recovery instructions match the run's builder provider (from
+  `runner_identity`). A Codex builder is told to list agents, close stale
+  children and respawn them under new names. A Claude builder is told to spawn
+  fresh children with `Agent` calls that pass `run_in_background: false`, and
+  to give each one the earlier child's report when it has one, plus the ticket,
+  the PR and its review comments, because it cannot list or close children.
+  When no provider is recorded, or the recorded value is not one Harbor knows,
+  the instruction gives both sets of steps, each labelled with its runtime. An
+  unrecognised value is passed to First Mate as recorded.
 
 - Watchdog flags get the same eligibility checks: a held or closed ticket is
   never restarted (cleaning up a merged ticket is the one exception).
