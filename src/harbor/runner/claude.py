@@ -108,12 +108,56 @@ def sandbox_domains(*extra: str) -> list[str]:
     return list(dict.fromkeys((*DEFAULT_SANDBOX_DOMAINS, *(_domain(host) for host in extra))))
 
 
+# Wildcards would widen a rule past the one path; a line break would end it.
+_RULE_UNSAFE = "*?[]\n\r"
+
+
+def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
+    """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
+
+    Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
+    or assigns a variable in front of an absolute executable path (directly or
+    through ``/usr/bin/env``), which is exactly what Harbor's runtime
+    invocation does, so that one prefix is approved literally. Read, Glob and
+    Grep are limited to the working directory, and the workflow package lives
+    outside the ticket worktree, so it is approved read-only. Both still run
+    inside the OS sandbox: nothing becomes writable or reachable that was not
+    already. A value a rule cannot express raises instead of being widened.
+    """
+
+    allow: list[str] = []
+    invocation = invocation.strip()
+    if invocation:
+        if any(char in invocation for char in _RULE_UNSAFE):
+            raise ValueError("the Harbor runtime invocation contains a character a permission rule cannot express")
+        allow.append(f"Bash({invocation}:*)")
+    if package is not None:
+        resolved = Path(package).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"the workflow package {resolved} is not a directory")
+        if any(char in str(resolved) for char in _RULE_UNSAFE):
+            raise ValueError(f"the workflow package path {resolved} contains a character a permission rule cannot express")
+        # A leading ``//`` anchors the rule at the filesystem root, not the settings file.
+        allow.append(f"Read(/{resolved}/**)")
+    return allow
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
     provider = "claude"
     # Extra hosts derived from the project's configured endpoints (see sandbox_hosts).
     sandbox_hosts: tuple[str, ...] = ()
+    # The exact ``harbor`` runtime prefix the builder prompt tells it to use.
+    harbor_invocation: str = ""
+    # The project's workflow package, which lives outside the ticket worktree.
+    workflow_package: Path | None = None
+
+    def _workflow_permissions(self) -> list[str]:
+        try:
+            return workflow_permissions(self.harbor_invocation, self.workflow_package)
+        except ValueError as exc:
+            raise RunnerError(f"refusing a builder permission: {exc}") from exc
 
     def command(self, instruction: str, *, run_id: str, resume: bool = False) -> list[str]:
         del instruction
@@ -131,10 +175,13 @@ class ClaudeRunner(CodexRunner):
                 "network": {"allowedDomains": domains},
             },
         }
+        allow = self._workflow_permissions()
         mcp = github_mcp_config(getattr(self, "github_mcp", None))
         if mcp:
             # Pre-approve only the GitHub server's tools; dontAsk refuses everything else.
-            settings["permissions"] = {"allow": ["mcp__github"]}
+            allow.append("mcp__github")
+        if allow:
+            settings["permissions"] = {"allow": allow}
         if attribution_off():
             # Empty strings hide the commit trailer and the PR text; they supersede the deprecated includeCoAuthoredBy.
             settings["attribution"] = {"commit": "", "pr": ""}
@@ -143,11 +190,13 @@ class ClaudeRunner(CodexRunner):
         # uses the shared subset of keywords from both drafts.
         schema.pop("$schema", None)
         schema.pop("$id", None)
+        # Agent lets the delivery skill spawn its planner/implementor/reviewer children. They
+        # run in this process, so they get the same tools, dontAsk mode and sandbox as the builder.
         command = [
             self.executable, "--print", "--verbose", "--output-format", "stream-json",
             "--json-schema", json.dumps(schema),
             "--model", self.model, "--effort", self.reasoning_effort,
-            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill",
+            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
         if mcp:

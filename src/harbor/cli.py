@@ -13,7 +13,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from harbor.clients.github import GitHubClient
+from harbor.clients.github import GitHubClient, GitHubError
 from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
@@ -85,6 +85,24 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
+def _runtime_invocation(config: Any) -> str:
+    """The exact shell prefix builders must use in place of ``harbor``.
+
+    It pins the registry, ledger and Harbor source so shell initialization in
+    the builder cannot select another one.
+    """
+
+    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
+    if not registry or not Path(registry).expanduser().is_file():
+        raise ValueError("workflow delivery requires its authoritative project registry")
+    return shlex.join([
+        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
+        f"HARBOR_DB_PATH={_db_path().resolve()}",
+        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
+        sys.executable, "-P", "-m", "harbor.cli",
+    ])
+
+
 def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
@@ -92,15 +110,7 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """
 
     from harbor.config.workflow import load_workflow
-    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
-    if not registry or not Path(registry).expanduser().is_file():
-        raise ValueError("workflow delivery requires its authoritative project registry")
-    runtime = shlex.join([
-        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
-        f"HARBOR_DB_PATH={_db_path().resolve()}",
-        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
-        sys.executable, "-P", "-m", "harbor.cli",
-    ])
+    runtime = _runtime_invocation(config)
     workflow = workflow or load_workflow(Path(config.workflow_path))
     return (workflow.prompt()
             + "\nAuthoritative runtime invocation: " + runtime
@@ -303,6 +313,18 @@ def build_production_dispatcher(
                         config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
                     )
                 runner.sandbox_hosts = hosts
+                # dontAsk refuses the runtime invocation and reads outside the
+                # worktree unless they are pre-approved; approve exactly these.
+                # Without the registry a builder (new or resumed) could not run
+                # a single workflow check, so refuse to build it and say why.
+                try:
+                    runner.harbor_invocation = _runtime_invocation(config)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"the Claude builder for {ticket} cannot be approved to run harbor: {exc}; "
+                        "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
+                    ) from exc
+                runner.workflow_package = current.package
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -509,6 +531,14 @@ async def _doctor(project_name: str) -> int:
         if github["sandbox_hosts"] is not None:
             from harbor.runner.claude import sandbox_domains
             print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
+            from harbor.runner.claude import workflow_permissions
+            try:
+                workflow_permissions(_runtime_invocation(config), workflow.package)
+            except ValueError as exc:
+                print(f"Builder permissions: invalid ({exc}); a Claude builder could not run harbor or read the workflow")
+                scope_ok = False
+            else:
+                print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
     if config.install_command is None:
@@ -1017,7 +1047,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         db = HarborDB(_db_path())
         try:
             return await execute(args, get_project(args.project), db)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, GitHubError) as exc:
+            # A GitHub outage or bad response fails closed with one line, as a
+            # configuration error does; never a traceback with exit 1.
             print(f"Harbor: {exc}", file=sys.stderr)
             return 2
         finally:
