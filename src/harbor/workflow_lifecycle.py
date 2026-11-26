@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
+from harbor.safe_git import git_argv
 
 
 async def handoff(supervisor,wake,result):
@@ -52,7 +53,7 @@ async def cleanup_allowed(supervisor,wake,result,target,run_id):
     context = await handoff(supervisor,wake,result)
     if not context['facts'].get('merged') or not context.get('terminal'):
         return False
-    head = subprocess.run(['git','-C',str(target),'rev-parse','HEAD'],check=True,capture_output=True,text=True).stdout.strip()
+    head = subprocess.run(git_argv('-C',str(target),'rev-parse','HEAD'),check=True,capture_output=True,text=True).stdout.strip()
     if head != context['head_sha']:
         return False
     receipts = await execute_event(workflow,'pre_cleanup',context,cwd=target)

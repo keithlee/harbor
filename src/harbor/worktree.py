@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from harbor.safe_git import git_argv
+
 
 DEFAULT_DISK_FLOOR_GB = 5.0
 # pnpm hardlinks from its global store, so this is cheap rather than a
@@ -98,7 +100,7 @@ def free_disk_gb(path: str | Path = ".") -> float:
 
 def _common_git_dir(repo: Path) -> Path:
     result = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--git-common-dir"],
+        git_argv("-C", str(repo), "rev-parse", "--git-common-dir"),
         check=True,
         capture_output=True,
         text=True,
@@ -132,7 +134,7 @@ def git_lock(repo: str | Path) -> Iterator[Path]:
 def _run_git(repo: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            git_argv("-C", str(repo), *args),
             check=True,
             capture_output=True,
             text=True,

@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 
+from harbor.safe_git import git_argv
+
 
 def add_command(commands):
     cmd = commands.add_parser("init", help="configure a project with a copy of the work-pipeline")
@@ -36,7 +38,7 @@ def initialize(args):
     if not args.project or any(c in args.project for c in ('\n','\r','|','#')):
         raise ValueError("invalid project name")
     repo, registry = args.repo.expanduser().resolve(), args.registry.expanduser().resolve()
-    check = subprocess.run(["git","-C",str(repo),"rev-parse","--show-toplevel"],capture_output=True,text=True)
+    check = subprocess.run(git_argv("-C",str(repo),"rev-parse","--show-toplevel"),capture_output=True,text=True)
     if check.returncode or Path(check.stdout.strip()).resolve() != repo:
         raise ValueError("repo must be a Git checkout root")
     folder = repo / ".harbor"

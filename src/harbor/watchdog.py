@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from harbor.safe_git import git_argv
+
 ACTIVE = ("running", "waiting", "starting")
 REPEAT_LIMIT = 3
 
@@ -34,7 +36,7 @@ def initialize(connection) -> None:
 def _head(worktree: str | None) -> str:
     if not worktree or not Path(worktree).is_dir():
         return ""
-    result = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True)
+    result = subprocess.run(git_argv("-C", worktree, "rev-parse", "HEAD"), capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else ""
 
 

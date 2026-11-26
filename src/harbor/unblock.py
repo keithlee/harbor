@@ -26,6 +26,7 @@ from typing import Any, Literal
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
+from harbor.safe_git import git_argv
 from harbor.wake import apply_phase3_migration
 
 
@@ -1220,19 +1221,19 @@ class UnblockLadder:
 
         if authority_repo is not None and (authority_repo / ".git").exists():
             # Use observed changes, not only the builder's path claims.
-            paths = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            paths += subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
+            paths = subprocess.run(git_argv("diff", "--name-only", "HEAD"), cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
+            paths += subprocess.run(git_argv("ls-files", "--others", "--exclude-standard"), cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
             # Linked worktrees are created from the configured remote branch;
             # a matching local branch need not exist and may be stale.
             base_sha = None
             for ref in (f"refs/remotes/origin/{self.base_branch}", f"refs/heads/{self.base_branch}"):
-                resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
+                resolved = subprocess.run(git_argv("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"), cwd=authority_repo, capture_output=True, text=True, timeout=5)
                 if resolved.returncode == 0:
                     base_sha = resolved.stdout.strip()
                     break
             if base_sha is None:
                 raise ValueError("cannot inspect changed paths against configured base branch")
-            branch_diff = subprocess.run(["git", "diff", "--name-only", f"{base_sha}...HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
+            branch_diff = subprocess.run(git_argv("diff", "--name-only", f"{base_sha}...HEAD"), cwd=authority_repo, capture_output=True, text=True, timeout=5)
             if branch_diff.returncode != 0:
                 raise ValueError("cannot inspect changed paths against configured base branch")
             paths += branch_diff.stdout.splitlines()
