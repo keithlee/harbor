@@ -72,7 +72,7 @@ protocol = "json"
 timeout_seconds = 15
 
 # Optional repository checks the delivery skill can run with
-# `harbor workflow checks PROJECT --ticket ID --parallel`.
+# `harbor workflow checks --ticket ID --parallel`.
 # [checks.tests]
 # command = ["pnpm", "test"]
 # required = true
