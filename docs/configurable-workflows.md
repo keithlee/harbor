@@ -290,6 +290,9 @@ get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
 `Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
 writable paths and the same network allowlist below. They cannot use a tool or
 reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
+They also share the builder's environment, so they use the project's GitHub
+token (the variable `HARBOR_GITHUB_TOKEN_ENV` names) through the same REST
+helper; see **The project's GitHub token** above.
 
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:

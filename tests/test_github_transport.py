@@ -212,13 +212,13 @@ def test_mcp_transport_configures_the_server_with_a_token_reference(tmp_path: Pa
 def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path) -> None:
     github = builder_github(project(tmp_path), workflow(), "claude", env={})
     assert github["token_env"] is None and "HARBOR_GITHUB_TOKEN_ENV" not in github["env"]
-    assert "no GitHub token" in github["fact"] and "blocker" in github["fact"]
+    assert "GitHub token is not available" in github["fact"] and "blocker" in github["fact"]
     # Regression: this used to say "If the gh CLI works in your sandbox you may
     # use it", and a Claude builder on macOS then hung on `gh pr view` until its
-    # time limit. Keychain-only gh users are covered by `gh auth token` at launch.
+    # time limit.
     assert "may use it" not in github["fact"]
     assert "Do not try the gh CLI" in github["fact"] and "hangs" in github["fact"]
-    assert "gh auth login --hostname github.com" in github["missing_token"]
+    assert "github_token_env" in github["missing_token"] and "gh " not in github["missing_token"]
 
 
 # --------------------------------------------------------------- builder view
@@ -253,7 +253,7 @@ def test_mcp_on_github_enterprise_requires_an_explicit_endpoint(tmp_path: Path) 
 # ------------------------------------------------- production wiring (HAN-87)
 
 def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model",
-               repository: str = "owner/repo", token: str | None = None):
+               repository: str = "owner/repo", token: str | None = None, token_env: str = ""):
     import subprocess
     from harbor.cli import build_production_dispatcher
     from harbor.config.projects import ProjectConfig
@@ -266,9 +266,13 @@ def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = 
     monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
                            workflow_path=str(path), install_command="none", github_repository=repository,
-                           builder_provider=provider, builder_model=model)
+                           builder_provider=provider, builder_model=model, github_token_env=token_env)
     db = HarborDB(tmp_path / "state.db")
-    dispatcher, _, factory = build_production_dispatcher(config, db)
+    try:
+        dispatcher, _, factory = build_production_dispatcher(config, db)
+    except BaseException:
+        db.close()
+        raise
     return dispatcher, factory, db
 
 
@@ -597,7 +601,7 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
 
 def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
                linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None,
-               github_env: dict[str, str] | None = None):
+               github_env: dict[str, str] | None = None, pipeline_extra: str = ""):
     import os
     import subprocess
     import sys
@@ -610,7 +614,8 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
                         f"builder_provider: {provider}\nlinear_api_url: {linear_api_url}\n"
-                        + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else ""))
+                        + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else "")
+                        + pipeline_extra)
     extra = registry or {}
     projects = tmp_path / "projects.md"
     projects.write_text(
@@ -621,7 +626,7 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
         + "".join(f" {value} |" for value in extra.values()) + "\n"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
-    env = {k: v for k, v in env.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+    env = {k: v for k, v in env.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN", "HARBOR_GITHUB_TOKEN_ENV")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
                HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
                HARBOR_CODEX_EXECUTABLE="/bin/echo", HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
