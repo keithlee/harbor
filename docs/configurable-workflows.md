@@ -163,6 +163,35 @@ receipts for them, and a human still merges by default.
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
 
+### Merge risk (`auto_merge_risks`)
+
+With `merge_mode = "workflow_checked"`, `pre_merge` readiness also requires
+the ticket's effective risk to be listed in `auto_merge_risks`. The effective
+risk is the higher of two tiers:
+
+- the **Linear floor**: a `risk:low|medium|high` label, or a `Risk: <tier>`
+  (or `Risk tier: <tier>`) line in the ticket description; and
+- the **PR analysis tier**: a line that is exactly `Risk tier: low`,
+  `Risk tier: medium` or `Risk tier: high` inside the PR body's
+  `## Risk Analysis` section, where that same section also carries
+  `<!-- harbor:risk-sha:<current head SHA> -->`.
+
+```markdown
+## Risk Analysis
+Risk tier: low
+Rationale: documentation-only change; reverting is one commit.
+<!-- harbor:risk-sha:0123456789abcdef0123456789abcdef01234567 -->
+```
+
+The analysis can only raise the Linear floor, never lower it, and Harbor keeps
+the highest tier it has seen for the run, so a later edit cannot drop it. If
+the analysis is missing, its marker names another commit, or it has no exact
+`Risk tier:` line, the effective risk is unknown and the automatic merge fails
+closed. Harbor does not interpret free text. The builder writes the analysis,
+so list only the tiers you are willing to merge on the builder's own
+assessment; the default `auto_merge_risks = []` and `merge_mode = "human"`
+never auto-merge.
+
 ### GitHub transport (`[github]`)
 
 The builder needs GitHub to open, update, comment on, check and (when the
