@@ -13,7 +13,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from harbor.clients.github import GitHubClient
+from harbor.clients.github import GitHubClient, GitHubError
 from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
@@ -998,7 +998,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         db = HarborDB(_db_path())
         try:
             return await execute(args, get_project(args.project), db)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, GitHubError) as exc:
+            # A GitHub outage or bad response fails closed with one line, as a
+            # configuration error does; never a traceback with exit 1.
             print(f"Harbor: {exc}", file=sys.stderr)
             return 2
         finally:
