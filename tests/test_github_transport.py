@@ -252,7 +252,8 @@ def test_mcp_on_github_enterprise_requires_an_explicit_endpoint(tmp_path: Path) 
 
 # ------------------------------------------------- production wiring (HAN-87)
 
-def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model"):
+def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model",
+               repository: str = "owner/repo", token: str | None = None):
     import subprocess
     from harbor.cli import build_production_dispatcher
     from harbor.config.projects import ProjectConfig
@@ -261,10 +262,10 @@ def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = 
 
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
     path = materialize(tmp_path, extra=extra, models={"controller": {"model": model, "reasoning_effort": "medium"}})
-    monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("GITHUB_TOKEN", TOKEN if token is None else token)
     monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
-                           workflow_path=str(path), install_command="none", github_repository="owner/repo",
+                           workflow_path=str(path), install_command="none", github_repository=repository,
                            builder_provider=provider, builder_model=model)
     db = HarborDB(tmp_path / "state.db")
     dispatcher, _, factory = build_production_dispatcher(config, db)

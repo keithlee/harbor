@@ -98,9 +98,12 @@ export LINEAR_API_KEY="<linear-api-key>"
 export GH_TOKEN="<github-token>" # only when GitHub facts are configured
 ```
 
-If you use the GitHub CLI and have run `gh auth login`, you can skip `GH_TOKEN`:
-when no GitHub token is exported, Harbor runs `gh auth token` once at launch and
-keeps the result in its own process environment only (see
+If you use the GitHub CLI and have run `gh auth login`, you can skip `GH_TOKEN`
+while trying Harbor out. For a project with a `github_repository` and no exported
+token, Harbor runs `gh auth token` once at launch and keeps the result in its own
+process environment only. That token usually covers all of your repositories and
+scopes, and builders, install commands and hooks can see it, so for regular use
+export a fine-grained token for the one repository instead (see
 [GitHub transport](docs/configurable-workflows.md#github-transport-github)).
 
 Each named project has separate repository, pipeline, Linear scope, GitHub

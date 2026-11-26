@@ -200,6 +200,7 @@ def build_production_dispatcher(
     builder_prompt: str = "",
     ticket_scope: TicketScope | str | None = None,
     quota_policy: Any | None = None,
+    token_resolution: Any | None = None,
 ) -> tuple[Any, Any, Any]:
     """Construct the real worktree manager, runner factory and dispatcher.
 
@@ -231,8 +232,8 @@ def build_production_dispatcher(
         from harbor.runner.quota import runner_identity
 
         builder_provider = getattr(config, "builder_provider", "codex")
-        github = builder_github(config, workflow, builder_provider)
-        if not github["token_env"]:
+        github = builder_github(config, workflow, builder_provider, token_resolution=token_resolution)
+        if not github["token_env"] and github["repository"]:
             print(f"Harbor: warning: {github['missing_token']}", file=sys.stderr)
         if github["linear_sandbox_warning"]:
             print(f"Harbor: warning: {github['linear_sandbox_warning']}; {LINEAR_URL_RESTART}", file=sys.stderr)
@@ -397,19 +398,22 @@ def _require_github_api_url(profile: Any) -> None:
     require_https_api_url(profile.github_api_url)
 
 
-def _adopt_github_token(config: Any) -> str | None:
-    """Reuse ``gh auth token`` (in memory only) when no GitHub token is exported.
+def _adopt_github_token(profile: PipelineProfile) -> Any:
+    """Reuse ``gh auth token`` (in memory only) for a GitHub project that exports no token.
 
     Harbor runs outside the builder sandbox, where ``gh`` can still read the
-    keychain; a builder inside Claude Code's macOS sandbox cannot.
+    keychain; a builder inside Claude Code's macOS sandbox cannot. A project
+    with no ``github_repository`` is left alone.
     """
 
     from harbor.github_token import adopt_for_profile
 
-    return adopt_for_profile(PipelineProfile.from_project(config))
+    return adopt_for_profile(profile)
 
 
-def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -> dict[str, Any]:
+def builder_github(
+    config: Any, workflow: Any, provider: str, env: Any = None, *, token_resolution: Any = None,
+) -> dict[str, Any]:
     """Resolve the builder's GitHub transport: REST helper by default, MCP opt-in.
 
     Fails closed on a combination Harbor cannot honour: Codex runs
@@ -457,6 +461,8 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "missing_token": (
             f"no GitHub token for builders: {missing_token_help(token_names, profile.github_api_url)}; "
             "until then builders report a delivery-transport blocker instead of reaching GitHub"
+            if repository else
+            "no token (none needed: no github_repository is configured, so builders get no GitHub API access)"
         ),
         "env": child_env,
         "mcp": mcp,
@@ -465,6 +471,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "repository": repository,
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
+            gh_checked=bool(getattr(token_resolution, "gh_checked", False)),
         ),
     }
 
@@ -497,9 +504,11 @@ async def _doctor(project_name: str) -> int:
     print(f"Workflow: {workflow.package} · {workflow.digest}")
     print(f"Models: {workflow.models_path} · controller {controller['model']} · First Mate {workflow.config['first_mate']['model']}")
     print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
-    token_source = _adopt_github_token(config)
+    from harbor.github_token import TokenSource
+    resolution = _adopt_github_token(PipelineProfile.from_project(config))
     try:
-        github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"))
+        github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"),
+                                token_resolution=resolution)
     except ValueError as exc:
         print(f"GitHub transport: invalid ({exc})")
         scope_ok = False
@@ -507,7 +516,7 @@ async def _doctor(project_name: str) -> int:
         where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (python -m harbor.github_rest)"
         if github["token_env"]:
             source = github["token_env"]
-            if token_source == "gh auth token":
+            if resolution.source is TokenSource.GH_CLI:
                 source = f"{source}, reused from `gh auth token` at launch (held in memory only)"
             print(f"GitHub transport: {github['transport']} · {where} · token from {source}")
         else:
@@ -607,7 +616,7 @@ async def _start(
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
     profile = PipelineProfile.from_project(config)
-    _adopt_github_token(config)
+    token_resolution = _adopt_github_token(profile)
     if github_poller is None and profile.repository_owner and profile.repository_name:
         try:
             _require_github_api_url(profile)
@@ -660,6 +669,7 @@ async def _start(
                 builder_prompt=builder_prompt,
                 ticket_scope=invocation_scope,
                 quota_policy=quota_policy,
+                token_resolution=token_resolution,
             )
         except ValueError as exc:
             # Configuration errors are for the operator, not a traceback.
@@ -818,7 +828,7 @@ async def _facts(project_name: str, *, as_json: bool = True) -> int:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
     profile = PipelineProfile.from_project(config)
-    _adopt_github_token(config)
+    _adopt_github_token(profile)
     if profile.repository_owner and profile.repository_name:
         try:
             _require_github_api_url(profile)
@@ -887,7 +897,7 @@ async def _answer(escalation_id: str, text: str, *, project_name: str | None = N
                 print(f"Harbor: {exc}", file=sys.stderr)
                 return 2
         if config is not None:
-            _adopt_github_token(config)
+            token_resolution = _adopt_github_token(PipelineProfile.from_project(config))
             client = LinearClient(endpoint=config.linear_api_url)
             poller = LinearPoller(client, config, db=db)
         else:
@@ -900,7 +910,7 @@ async def _answer(escalation_id: str, text: str, *, project_name: str | None = N
         # hydrate the retained builder from the ledger and continue the SAME
         # session, which is the whole point of answering an escalation.
         dispatcher, _, _ = build_production_dispatcher(
-            config, db, builder_prompt=_pipeline_text(config)
+            config, db, builder_prompt=_pipeline_text(config), token_resolution=token_resolution,
         )
         supervisor = Supervisor(poller, db=db, dispatcher=dispatcher, shadow=True)
         try:

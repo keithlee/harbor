@@ -28,11 +28,16 @@ GITHUB_TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
 
 
 def _github_token_from_environment(preferred: str) -> str | None:
-    """Read the configured token name, then GitHub's two standard aliases."""
+    """Read the configured token name, then GitHub's two standard aliases.
+
+    A whitespace-only value counts as unset, exactly as the builder's REST
+    helper (``harbor.github_rest.token_env_name``) treats it, so the poller and
+    the builder always pick the same variable.
+    """
 
     names = tuple(dict.fromkeys(name for name in (preferred, *GITHUB_TOKEN_ENV_VARS) if name))
     for name in names:
-        value = os.environ.get(name)
+        value = (os.environ.get(name) or "").strip()
         if value:
             return value
     return None

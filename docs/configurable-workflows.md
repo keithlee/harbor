@@ -225,16 +225,29 @@ variable the token comes from, and fails when GitHub is configured with no token
 
 **No token exported? Harbor reuses your `gh` login.** `gh auth login` keeps its
 token in the OS keychain, so many machines have no `GITHUB_TOKEN`/`GH_TOKEN`
-exported. When none of `github_token_env`, `GITHUB_TOKEN` and `GH_TOKEN` is set,
-`harbor start`, `doctor`, `answer` and `facts` run `gh auth token --hostname HOST`
-once at launch (10 second timeout; `HOST` is `github.com`, or your GitHub
-Enterprise Server host) and hold the result as `GH_TOKEN` in Harbor's own process
-environment. Harbor's poller and the builder's REST helper then use it exactly
+exported. For a project that sets `github_repository`, when none of
+`github_token_env`, `GITHUB_TOKEN` and `GH_TOKEN` is set (a whitespace-only value
+counts as unset), `harbor start`, `doctor`, `answer` and `facts` run
+`gh auth token --hostname HOST` once at launch. `HOST` is `github.com` for
+GitHub.com, `acme.ghe.com` for GHE.com data residency (`api.acme.ghe.com`), or
+your GitHub Enterprise Server host and port. The call has a 10 second timeout,
+after which `gh` and every process it started are killed. A GitHub URL Harbor
+cannot parse skips the lookup. Harbor holds the result as `GH_TOKEN` in its own
+process environment. Its poller and the builder's REST helper then use it exactly
 as they would an exported token. It is never written to config, the ledger,
 logs, prompts or PR text; `doctor` says only that the token was "reused from
 `gh auth token`". Set `HARBOR_GH_EXECUTABLE` to use a `gh` that is not on `PATH`.
-The token has whatever scopes your `gh` login has; export a narrower token to
-use that instead, since an exported token always wins.
+A project without `github_repository` (for example Linear-only) never gets a
+token this way.
+
+Know what that token can do before relying on it. A `gh` login token is usually
+an OAuth token covering **every repository and organisation your account can
+reach**, with scopes such as `repo`, `read:org`, `gist` and often `workflow`. Like
+an exported token, it is in the environment of everything Harbor starts: builders,
+the project's `install_command`, hooks and notifier commands. The convenience is
+for trying Harbor out. For regular use, export a fine-grained token limited to
+the project's repository with the scopes listed above. An exported token always
+wins, and `gh` is not asked.
 
 Builders never fall back to `gh` themselves. Inside Claude Code's sandbox on
 macOS, `gh` cannot reach the keychain or complete TLS, so `gh pr view` and
