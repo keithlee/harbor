@@ -1,6 +1,7 @@
 """Public workflow operations using fresh scoped external evidence."""
 import json
 import hashlib
+import sqlite3
 from pathlib import Path
 
 from harbor.config.workflow import load_workflow
@@ -23,7 +24,7 @@ def add_commands(commands):
 
 
 async def fresh_context(config, db, ticket_id, run, event):
-    from harbor.clients.linear import LinearClient
+    from harbor.clients.linear import LinearClient, LinearClientError
     from harbor.clients.github import GitHubClient
     from harbor.poll.linear_poller import normalize_issue
     from harbor.poll.github_poller import GitHubPoller
@@ -39,10 +40,18 @@ async def fresh_context(config, db, ticket_id, run, event):
     github = GitHubClient.from_profile(profile)
     linear = LinearClient(endpoint=config.linear_api_url)
     try:
-        raw = await linear.fetch_blocker_context(ticket_id)
-        if raw.get("identifier") != ticket_id:
-            raise ValueError("Linear ticket identity mismatch")
-        await require_scope(linear, config.linear_project_scope, raw.get("project", {}))
+        try:
+            raw = await linear.fetch_blocker_context(ticket_id)
+            if raw.get("identifier") != ticket_id:
+                raise ValueError("Linear ticket identity mismatch")
+            await require_scope(linear, config.linear_project_scope, raw.get("project", {}))
+        except LinearClientError as exc:
+            # Builders run this non-interactively: fail closed with one
+            # actionable line instead of a traceback.
+            raise ValueError(
+                f"Linear could not provide ticket {ticket_id} ({exc}); "
+                "check the ticket identifier and that the Linear API key can read it"
+            ) from exc
         retained = next((t for t in db.tickets(config.name) if t["identifier"] == ticket_id), None)
         if retained is None or not retained.get("owned"):
             raise ValueError("ticket has no custody in this project")
@@ -85,7 +94,17 @@ async def execute(args, config, db):
     if args.workflow_command == "inspect":
         print(json.dumps({"effective":workflow.config,"package":str(workflow.package),"models":str(workflow.models_path),"digest":workflow.digest,"enforcement":"workflow_checked"},indent=2))
         return 0
-    row = db.connection.execute("SELECT * FROM runs WHERE ticket=? ORDER BY started_at DESC LIMIT 1", (args.ticket,)).fetchone()
+    try:
+        row = db.connection.execute("SELECT * FROM runs WHERE ticket=? ORDER BY started_at DESC LIMIT 1", (args.ticket,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith("no such table"):
+            raise
+        # `harbor start` creates the runs table when it first supervises the
+        # project, so an empty or unmigrated ledger has no run to check.
+        raise ValueError(
+            f"the Harbor ledger has no run records ({exc}); "
+            f"run `harbor start {config.name}` so Harbor takes custody of {args.ticket} before workflow checks"
+        ) from exc
     ticket = next((t for t in db.tickets(config.name) if t["identifier"] == args.ticket), None)
     if row is None or ticket is None or not ticket.get("owned"):
         raise ValueError("no retained run for ticket in this project")
