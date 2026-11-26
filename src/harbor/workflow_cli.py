@@ -1,11 +1,72 @@
 """Public workflow operations using fresh scoped external evidence."""
 import json
 import hashlib
+import sqlite3
+import subprocess
 from pathlib import Path
+
+import httpx
 
 from harbor.config.workflow import load_workflow
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
+
+
+def _one_line(exc):
+    """An exception's message on one line (httpx status errors span several)."""
+    return " ".join(str(exc).split()) or type(exc).__name__
+
+
+_LINEAR_NOT_FOUND = ("not found", "cannot verify")
+_LINEAR_DENIED = ("authenticat", "unauthorized", "forbidden", "permission", "access denied")
+
+
+def _linear_failure(ticket, exc):
+    """One accurate line for a LinearClientError, by what actually went wrong.
+
+    Only a missing ticket or a refused key earns the identifier/API-key hint;
+    a timeout, 5xx or malformed/partial page is a Linear-side failure to retry,
+    and saying otherwise sends the operator (and the supervisor's escalation
+    summary, via workflow_lifecycle.handoff) after the wrong fix.
+    """
+    detail = _one_line(exc)
+    lowered = detail.casefold()
+    cause = exc.__cause__
+    status = cause.response.status_code if isinstance(cause, httpx.HTTPStatusError) else None
+    if status in {401, 403} or any(word in lowered for word in _LINEAR_DENIED):
+        hint = "check that the Linear API key (LINEAR_API_KEY or HARBOR_LINEAR_API_KEY) is valid and can read it"
+    elif status == 404 or (status is None and any(word in lowered for word in _LINEAR_NOT_FOUND)):
+        hint = "check the ticket identifier and that the Linear API key can read it"
+    elif isinstance(cause, httpx.HTTPError):
+        hint = "Linear is unreachable or returned an error; retry once Linear responds"
+    else:
+        hint = "Linear returned incomplete or malformed ticket context; retry, and report it if it persists"
+    return f"Linear could not provide ticket {ticket} ({detail}); {hint}"
+
+
+def _attach_retained_worktree(config, db, ticket):
+    """Attach the ticket's retained worktree and read its HEAD, or fail closed."""
+    from harbor.cli import _worktree_root
+    from harbor.worktree import WorktreeError, WorktreeManager
+    try:
+        manager = WorktreeManager(config.repo_path,root=_worktree_root(config),repo_name=config.name,custody=db.connection,install_command="none")
+        worktree = manager.attach(ticket)
+    except WorktreeError as exc:
+        # Covers WorktreeConfinementError: a run Harbor never gave a worktree,
+        # or one outside its root, must not be checked in some other checkout.
+        raise ValueError(
+            f"{ticket} has no retained Harbor worktree to check ({_one_line(exc)}); "
+            f"run `harbor start {config.name}` so Harbor creates and records the ticket's worktree, "
+            "then run workflow checks from it"
+        ) from exc
+    try:
+        head = subprocess.run(["git","-C",str(worktree.path),"rev-parse","--verify","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            f"the retained worktree for {ticket} has no readable HEAD commit "
+            f"({_one_line(exc.stderr or exc)}); commit the work in {worktree.path} before running workflow checks"
+        ) from exc
+    return worktree, head
 
 
 def add_commands(commands):
@@ -23,8 +84,8 @@ def add_commands(commands):
 
 
 async def fresh_context(config, db, ticket_id, run, event):
-    from harbor.clients.linear import LinearClient
-    from harbor.clients.github import GitHubClient
+    from harbor.clients.linear import LinearClient, LinearClientError
+    from harbor.clients.github import GitHubClient, GitHubError
     from harbor.poll.linear_poller import normalize_issue
     from harbor.poll.github_poller import GitHubPoller
     from harbor.pr_events import PREventProcessor
@@ -39,10 +100,15 @@ async def fresh_context(config, db, ticket_id, run, event):
     github = GitHubClient.from_profile(profile)
     linear = LinearClient(endpoint=config.linear_api_url)
     try:
-        raw = await linear.fetch_blocker_context(ticket_id)
-        if raw.get("identifier") != ticket_id:
-            raise ValueError("Linear ticket identity mismatch")
-        await require_scope(linear, config.linear_project_scope, raw.get("project", {}))
+        try:
+            raw = await linear.fetch_blocker_context(ticket_id)
+            if raw.get("identifier") != ticket_id:
+                raise ValueError("Linear ticket identity mismatch")
+            await require_scope(linear, config.linear_project_scope, raw.get("project", {}))
+        except LinearClientError as exc:
+            # Builders run this non-interactively: fail closed with one
+            # actionable line instead of a traceback.
+            raise ValueError(_linear_failure(ticket_id, exc)) from exc
         retained = next((t for t in db.tickets(config.name) if t["identifier"] == ticket_id), None)
         if retained is None or not retained.get("owned"):
             raise ValueError("ticket has no custody in this project")
@@ -54,7 +120,16 @@ async def fresh_context(config, db, ticket_id, run, event):
         # repository and required checks.
         processor = PREventProcessor(db, project=config.name, profile=profile)
         poller = GitHubPoller(github, profile=profile, db=db, project=config.name, event_processor=processor)
-        facts = await poller.poll([ticket])
+        try:
+            facts = await poller.poll([ticket])
+        except (GitHubError, httpx.HTTPError) as exc:
+            # The default client lets transport failures through as httpx
+            # errors, so both are a GitHub outage, never a "blocked" verdict.
+            raise ValueError(
+                f"GitHub could not provide the linked PR for {ticket_id} ({_one_line(exc)}); "
+                f"check github_api_url, network access, and that the token in {profile.github_token_env} "
+                f"can read {profile.repository_owner}/{profile.repository_name}"
+            ) from exc
         matches = [f for f in facts if f.get("url") == run.get("pr_url")] if run.get("pr_url") else facts
         if len(matches) != 1:
             raise ValueError("expected one unambiguous linked PR")
@@ -85,7 +160,17 @@ async def execute(args, config, db):
     if args.workflow_command == "inspect":
         print(json.dumps({"effective":workflow.config,"package":str(workflow.package),"models":str(workflow.models_path),"digest":workflow.digest,"enforcement":"workflow_checked"},indent=2))
         return 0
-    row = db.connection.execute("SELECT * FROM runs WHERE ticket=? ORDER BY started_at DESC LIMIT 1", (args.ticket,)).fetchone()
+    try:
+        row = db.connection.execute("SELECT * FROM runs WHERE ticket=? ORDER BY started_at DESC LIMIT 1", (args.ticket,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if not str(exc).startswith("no such table"):
+            raise
+        # `harbor start` creates the runs table when it first supervises the
+        # project, so an empty or unmigrated ledger has no run to check.
+        raise ValueError(
+            f"the Harbor ledger has no run records ({exc}); "
+            f"run `harbor start {config.name}` so Harbor takes custody of {args.ticket} before workflow checks"
+        ) from exc
     ticket = next((t for t in db.tickets(config.name) if t["identifier"] == args.ticket), None)
     if row is None or ticket is None or not ticket.get("owned"):
         raise ValueError("no retained run for ticket in this project")
@@ -93,12 +178,7 @@ async def execute(args, config, db):
     bind(db.connection,config.name,args.ticket,run["id"],workflow)
     if args.workflow_command == "checks":
         from harbor.checks import run_checks
-        from harbor.worktree import WorktreeManager
-        from harbor.cli import _worktree_root
-        import subprocess
-        manager = WorktreeManager(config.repo_path,root=_worktree_root(config),repo_name=config.name,custody=db.connection,install_command="none")
-        worktree = manager.attach(args.ticket)
-        head = subprocess.run(["git","-C",str(worktree.path),"rev-parse","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+        worktree, head = _attach_retained_worktree(config, db, args.ticket)
         result = await run_checks(workflow,{"project":config.name,"ticket":args.ticket,"run_id":run["id"],"head_sha":head},cwd=worktree.path,parallel=args.parallel)
         for receipt in result["checks"].values():
             if "project" in receipt:

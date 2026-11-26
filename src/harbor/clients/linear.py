@@ -138,6 +138,40 @@ class LinearClientError(RuntimeError):
     """A network, HTTP, or GraphQL failure."""
 
 
+def _is_header_safe(token: str) -> bool:
+    """True when ``token`` is visible ASCII, the only thing the header may carry.
+
+    Anything else (a trailing space or ``\\r`` from a CRLF ``.env``, a newline,
+    a non-ASCII character) makes httpx/h11 raise an error that echoes the whole
+    header value: ``LocalProtocolError("Illegal header value b'...'")`` or a
+    ``UnicodeEncodeError`` whose ``object`` is the key.
+    """
+
+    return all("!" <= char <= "~" for char in token)
+
+
+_UNSENDABLE_KEY = (
+    "the configured Linear API key contains characters that cannot be sent in an HTTP header "
+    "(often trailing whitespace or a carriage return from a CRLF .env file, or a non-ASCII "
+    "character); re-export LINEAR_API_KEY or HARBOR_LINEAR_API_KEY without them"
+)
+
+
+def _redact_authorization(exc: BaseException) -> None:
+    """Drop the key from the request an httpx error carries on the chain.
+
+    ``httpx`` keeps the real header value in ``exc.request.headers``; a logger
+    or traceback formatter walking ``__cause__`` could otherwise print it.
+    """
+
+    try:
+        request = getattr(exc, "request", None)
+    except RuntimeError:  # a RequestError raised before a request was attached
+        return
+    if request is not None and "Authorization" in request.headers:
+        request.headers["Authorization"] = "[redacted]"
+
+
 def resolve_token(explicit: str | None = None) -> str | None:
     """Resolve a token without ever logging or persisting it."""
 
@@ -251,6 +285,10 @@ class LinearClient:
         return issue
 
     async def _post(self, query: str, variables: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if self.token and not _is_header_safe(self.token):
+            # Refuse before any request is built, outside any ``except``, so
+            # the error has no cause or context that could carry the key.
+            raise LinearClientError(_UNSENDABLE_KEY)
         try:
             response = await self._client.post(
                 self.endpoint,
@@ -260,6 +298,7 @@ class LinearClient:
             response.raise_for_status()
             body = response.json()
         except (httpx.HTTPError, ValueError) as exc:
+            _redact_authorization(exc)
             raise LinearClientError(f"Linear request failed: {exc}") from exc
         if not isinstance(body, dict):
             raise LinearClientError("Linear returned a non-object response")

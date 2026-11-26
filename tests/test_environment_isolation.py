@@ -22,9 +22,19 @@ from env_isolation import ISOLATED_ENV_VARS, REAL_HOME, UV_DIRS, is_isolated_env
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def assert_isolated_registry(value: str | None) -> None:
+    # conftest's _isolated_registry points HARBOR_PROJECTS_FILE at an empty temp
+    # registry after the isolation fixture runs; anything else is a leak.
+    assert value, "HARBOR_PROJECTS_FILE must point at the isolated empty registry"
+    registry = Path(value)
+    assert registry.is_file() and registry.read_text(encoding="utf-8") == ""
+    assert not registry.resolve().is_relative_to(REAL_HOME)
+
+
 def test_no_harbor_or_credential_variable_reaches_a_test() -> None:
-    leaked = sorted(name for name in os.environ if is_isolated_env_var(name))
+    leaked = sorted(name for name in os.environ if is_isolated_env_var(name) and name != "HARBOR_PROJECTS_FILE")
     assert leaked == [], f"developer environment leaked into the suite: {leaked}"
+    assert_isolated_registry(os.environ.get("HARBOR_PROJECTS_FILE"))
 
 
 def test_home_and_harbor_defaults_resolve_outside_the_real_home() -> None:
@@ -44,13 +54,16 @@ def test_home_and_harbor_defaults_resolve_outside_the_real_home() -> None:
 def test_a_subprocess_inherits_the_sealed_environment() -> None:
     probe = ("import json, os, pathlib, sys; "
              "names = set(json.loads(sys.argv[1])); "
-             "print(json.dumps(sorted(k for k in os.environ if (k.startswith('HARBOR_') and k != 'HARBOR_UPDATE_GOLDEN') "
+             "print(json.dumps(sorted(k for k in os.environ if (k.startswith('HARBOR_') "
+             "and k not in ('HARBOR_UPDATE_GOLDEN', 'HARBOR_PROJECTS_FILE')) "
              "or k in names or k.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))))); "
-             "print(pathlib.Path.home().resolve())")
+             "print(pathlib.Path.home().resolve()); "
+             "print(os.environ.get('HARBOR_PROJECTS_FILE', ''))")
     out = subprocess.run([sys.executable, "-c", probe, json.dumps(list(ISOLATED_ENV_VARS))],
                          capture_output=True, text=True, check=True).stdout.splitlines()
     assert json.loads(out[0]) == []
     assert not Path(out[1]).is_relative_to(REAL_HOME)
+    assert_isolated_registry(out[2] if len(out) > 2 else None)
 
 
 def test_git_uses_a_test_identity_that_a_command_can_still_override(tmp_path: Path) -> None:
@@ -101,7 +114,7 @@ def test_suite_result_does_not_depend_on_exported_harbor_variables(tmp_path: Pat
     dummy = tmp_path / "dummy"
     env = {**os.environ,
            "HARBOR_PROJECTS_FILE": str(dummy / "projects.md"), "HARBOR_DB_PATH": str(dummy / "harbor.db"),
-           "HARBOR_WORKTREE_ROOT": str(dummy / "wt"), "HARBOR_CLAUDE_ATTRIBUTION": "off",
+           "HARBOR_CLAUDE_ATTRIBUTION": "off",
            "HARBOR_CLAUDE_EXECUTABLE": "/nonexistent/claude", "HARBOR_GITHUB_TOKEN_ENV": "GH_TOKEN",
            "HARBOR_GITHUB_API_URL": "https://ghe.dummy.invalid/api/v3", "LINEAR_API_KEY": "dummy-linear",
            "GITHUB_TOKEN": "dummy-github", "GH_TOKEN": "dummy-gh"}
