@@ -201,7 +201,7 @@ def test_operator_runs_the_blocked_command_and_resumes_the_builder_with_its_outp
     (worktree / "app").mkdir()
     fake, linear, resumed, notified = FakeClaude(), LinearFake(), [], []
     result = handle(ladder(db, operator=operator(fake), linear=linear, resumed=resumed, notified=notified),
-                    worktree, blocker("printf 'hello' > out.txt && cat out.txt", "ls missing-file", cwd="app"))
+                    worktree, blocker("printf 'hello' > out.txt && cat out.txt", "cat missing-file", cwd="app"))
     # It runs in the requested directory, once, and resumes the same session.
     assert len(fake.calls) == 1 and fake.calls[0]["cwd"] == (worktree / "app").resolve()
     assert (worktree / "app" / "out.txt").read_text() == "hello"
@@ -210,7 +210,7 @@ def test_operator_runs_the_blocked_command_and_resumes_the_builder_with_its_outp
     run_id, prompt = resumed[0]
     assert run_id == "builder-session"
     assert "$ printf 'hello' > out.txt && cat out.txt\nexit code: 0\nstdout:\nhello" in prompt
-    assert "$ ls missing-file\nexit code: 1" in prompt and "No such file" in prompt
+    assert "$ cat missing-file\nexit code: 1" in prompt and "No such file" in prompt
     assert "do not load the skill again" in prompt
     receipt = dict(db.connection.execute("SELECT * FROM permission_delegations").fetchone())
     assert receipt["status"] == "ran" and receipt["ticket"] == "SAMPLE-7" and receipt["model"] == "claude-haiku-5-5"
