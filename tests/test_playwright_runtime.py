@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 from harbor.config.projects import ProjectConfig
-from harbor.runner.codex import CodexRunner
+from harbor.runner.codex import SHARED_GIT_WRITABLE, CodexRunner
 from harbor.runner.playwright import BrowserUnavailable, ENDPOINT_ENV, REQUIRED_ENV, browser_endpoint
 
 
@@ -84,7 +84,10 @@ def test_linked_worktree_profile_grants_exact_git_index_directory(tmp_path):
     (worktree / ".git").write_text(f"gitdir: {admin}\n")
     runner = CodexRunner(worktree, playwright_browser_image=IMAGE)
     command = runner.command("capture", run_id="existing", resume=True)
-    assert f'permissions.harbor-playwright.filesystem={{"{common_git}"="write", "{admin}"="write"}}' in command
+    granted = [*(common_git / name for name in SHARED_GIT_WRITABLE), admin]
+    writable = ", ".join(f'"{path}"="write"' for path in granted)
+    assert f"permissions.harbor-playwright.filesystem={{{writable}}}" in command
+    assert f'"{common_git}"="write"' not in " ".join(command)
     assert f'"{worktree / ".git"}"' not in " ".join(command)
 
 

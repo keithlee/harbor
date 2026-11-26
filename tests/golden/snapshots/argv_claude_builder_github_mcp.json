@@ -145,7 +145,14 @@
       "filesystem": {
         "allowWrite": [
           "<tmp>/state",
-          "<tmp>/repo/.git"
+          "<tmp>/repo/.git/objects",
+          "<tmp>/repo/.git/refs",
+          "<tmp>/repo/.git/logs",
+          "<tmp>/repo/.git/packed-refs",
+          "<tmp>/repo/.git/packed-refs.lock",
+          "<tmp>/repo/.git/shallow",
+          "<tmp>/repo/.git/shallow.lock",
+          "<tmp>/repo/.git/worktrees/wt"
         ]
       },
       "network": {

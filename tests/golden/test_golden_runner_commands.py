@@ -95,8 +95,10 @@ def test_claude_builder_sandbox_can_write_the_linked_git_admin_dir(tmp_path: Pat
     argv = claude_runner(tmp_path).command("x", run_id="r")
     settings = json.loads(argv[argv.index("--settings") + 1])
     allowed = settings["sandbox"]["filesystem"]["allowWrite"]
-    assert str((tmp_path / "repo" / ".git").resolve()) in allowed
-    assert str((tmp_path / "repo").resolve()) not in allowed  # the operator checkout stays read-only
+    assert str((tmp_path / "repo" / ".git" / "worktrees" / "wt").resolve()) in allowed
+    # The operator checkout, and the shared git config and hooks it runs, stay read-only.
+    assert str((tmp_path / "repo").resolve()) not in allowed
+    assert str((tmp_path / "repo" / ".git").resolve()) not in allowed
 
 
 def test_first_mate_claude_read_only_command(golden) -> None:

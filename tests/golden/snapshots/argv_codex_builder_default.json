@@ -10,7 +10,7 @@
   "-c",
   "model_reasoning_effort=xhigh",
   "-c",
-  "sandbox_workspace_write.writable_roots=[\"<tmp>/state\", \"<tmp>/repo/.git\"]",
+  "sandbox_workspace_write.writable_roots=[\"<tmp>/state\", \"<tmp>/repo/.git/objects\", \"<tmp>/repo/.git/refs\", \"<tmp>/repo/.git/logs\", \"<tmp>/repo/.git/packed-refs\", \"<tmp>/repo/.git/packed-refs.lock\", \"<tmp>/repo/.git/shallow\", \"<tmp>/repo/.git/shallow.lock\", \"<tmp>/repo/.git/worktrees/wt\"]",
   "-c",
   "sandbox_workspace_write.network_access=true",
   "--output-schema",
