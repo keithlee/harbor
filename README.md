@@ -98,6 +98,11 @@ export LINEAR_API_KEY="<linear-api-key>"
 export GH_TOKEN="<github-token>" # only when GitHub facts are configured
 ```
 
+If you use the GitHub CLI and have run `gh auth login`, you can skip `GH_TOKEN`:
+when no GitHub token is exported, Harbor runs `gh auth token` once at launch and
+keeps the result in its own process environment only (see
+[GitHub transport](docs/configurable-workflows.md#github-transport-github)).
+
 Each named project has separate repository, pipeline, Linear scope, GitHub
 facts, worktree root, and SQLite custody. `linear_projects` widens one named
 project's Linear scope; it is not a way to combine unrelated repositories or

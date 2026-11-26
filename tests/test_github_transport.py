@@ -213,7 +213,12 @@ def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path)
     github = builder_github(project(tmp_path), workflow(), "claude", env={})
     assert github["token_env"] is None and "HARBOR_GITHUB_TOKEN_ENV" not in github["env"]
     assert "no GitHub token" in github["fact"] and "blocker" in github["fact"]
-    assert "If the gh CLI works" in github["fact"]  # keychain-only gh users are not stranded
+    # Regression: this used to say "If the gh CLI works in your sandbox you may
+    # use it", and a Claude builder on macOS then hung on `gh pr view` until its
+    # time limit. Keychain-only gh users are covered by `gh auth token` at launch.
+    assert "may use it" not in github["fact"]
+    assert "Do not try the gh CLI" in github["fact"] and "hangs" in github["fact"]
+    assert "gh auth login --hostname github.com" in github["missing_token"]
 
 
 # --------------------------------------------------------------- builder view
@@ -590,7 +595,8 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
 
 
 def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
-               linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None):
+               linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None,
+               github_env: dict[str, str] | None = None):
     import os
     import subprocess
     import sys
@@ -614,9 +620,11 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
         + "".join(f" {value} |" for value in extra.values()) + "\n"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
+    env = {k: v for k, v in env.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
-               GITHUB_TOKEN="dummy-token-value", HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
+               HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
                HARBOR_CODEX_EXECUTABLE="/bin/echo", HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
+    env.update({"GITHUB_TOKEN": "dummy-token-value"} if github_env is None else github_env)
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
                              "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
     assert "dummy-token-value" not in result.stdout + result.stderr

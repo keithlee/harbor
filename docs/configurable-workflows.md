@@ -222,6 +222,26 @@ Token scopes: the builder pushes branches and edits PRs, so a fine-grained token
 needs repository **Contents** and **Pull requests** read/write, plus **Checks**
 and **Commit statuses** read. `harbor doctor` prints the transport and which
 variable the token comes from, and fails when GitHub is configured with no token.
+
+**No token exported? Harbor reuses your `gh` login.** `gh auth login` keeps its
+token in the OS keychain, so many machines have no `GITHUB_TOKEN`/`GH_TOKEN`
+exported. When none of `github_token_env`, `GITHUB_TOKEN` and `GH_TOKEN` is set,
+`harbor start`, `doctor`, `answer` and `facts` run `gh auth token --hostname HOST`
+once at launch (10 second timeout; `HOST` is `github.com`, or your GitHub
+Enterprise Server host) and hold the result as `GH_TOKEN` in Harbor's own process
+environment. Harbor's poller and the builder's REST helper then use it exactly
+as they would an exported token. It is never written to config, the ledger,
+logs, prompts or PR text; `doctor` says only that the token was "reused from
+`gh auth token`". Set `HARBOR_GH_EXECUTABLE` to use a `gh` that is not on `PATH`.
+The token has whatever scopes your `gh` login has; export a narrower token to
+use that instead, since an exported token always wins.
+
+Builders never fall back to `gh` themselves. Inside Claude Code's sandbox on
+macOS, `gh` cannot reach the keychain or complete TLS, so `gh pr view` and
+`gh pr list` hang until the run's time limit instead of failing. If no token
+can be found at all, `harbor start` prints a warning naming the fix, `doctor`
+fails for a project with a `github_repository`, and the builder is told to
+report a delivery-transport blocker rather than try `gh`.
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 

@@ -861,10 +861,15 @@ def github_transport_fact(
     )
     rest = f"`{helper} <op>`{target} ({ops}). It prints JSON."
     if not token_available:
+        # Harbor already asked `gh auth token` at launch, so there is no gh
+        # login to fall back on here; and inside Claude Code's macOS sandbox gh
+        # hangs rather than failing. Fail fast instead.
         return (
-            "GitHub transport: no GitHub token is set in this run's environment, so the REST helper "
-            f"`{helper}` cannot authenticate. If the gh CLI works in your sandbox you may use it; "
-            "if it fails or hangs, report a delivery-transport blocker. Do not use MCP or gh-axi."
+            "GitHub transport: no GitHub token is available to this run (none exported, and "
+            f"`gh auth token` had none at launch), so the REST helper `{helper}` cannot authenticate. "
+            "Do not try the gh CLI: it has no login here, and inside Claude Code's sandbox on macOS it "
+            "hangs instead of failing. Do your local work, then report a delivery-transport blocker "
+            "saying a GitHub token is missing. `git push` may still work. Do not use MCP or gh-axi."
         )
     common = (
         "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
