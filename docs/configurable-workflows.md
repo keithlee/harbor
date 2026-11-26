@@ -231,7 +231,8 @@ that need approval. The REST helper stays available as a fallback.
 one GitHub API token for all of its GitHub work: Harbor's GitHub poller, the
 builder, the builder's child agents (planner, implementor and reviewer, which run
 inside the builder and inherit its environment), the builder's REST helper,
-`harbor workflow check` and First Mate. Create a fine-grained personal access
+`harbor workflow check`, and the check Harbor runs when a builder reports a GitHub
+transport blocker (First Mate does no GitHub work). Create a fine-grained personal access
 token limited to the project's repository, with these permissions:
 
 - **Contents:** read and write (push branches)
@@ -281,7 +282,18 @@ project's token. Builders are also told never to fall back to `gh`: inside Claud
 Code's sandbox on macOS, `gh` cannot reach the keychain or complete TLS, so
 `gh pr view` and `gh pr list` hang until the run's time limit instead of failing.
 If the project's token is missing, the builder is told to report a
-delivery-transport blocker.
+delivery-transport blocker. Harbor then checks the project's token itself, and
+never consults `gh`:
+
+- The variable is unset or blank: Harbor escalates to you with the same fix
+  `doctor` prints.
+- It is set: Harbor makes one read-only request through the REST helper (the
+  project's repository, or `/rate_limit` when none is configured). If GitHub
+  accepts the token, Harbor resumes the same builder session and tells it to use
+  the REST helper. If GitHub rejects it, Harbor escalates with the fix.
+
+Only the variable's name appears in that command; the value stays in the
+environment.
 
 `harbor workflow check` reads the same token. Inside a builder it uses the
 variable `harbor start` named. From a terminal, export the variable named by

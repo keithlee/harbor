@@ -476,7 +476,8 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     # The same resolved repository the GitHub poller reads, so the builder
     # never acts on a different repository than Harbor observes.
     repository = profile.repository if profile.repository_owner else ""
-    helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
+    from harbor.github_rest import helper_invocation
+    helper = helper_invocation()
     child_env = {"HARBOR_GITHUB_API_URL": rest_url}
     if repository:
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
@@ -783,6 +784,7 @@ async def _start(
             policy=config.blocker_policy,
             base_branch=config.base_branch,
             linear_projects=config.linear_project_scope,
+            github_profile=profile,
         )
     workflow = getattr(production_dispatcher, "workflow", None)
     if workflow is not None:
