@@ -23,8 +23,14 @@ def validate_claude(executable: str, model: str, effort: str | None) -> None:
 
 
 def claude_read_only(executable: str, model: str, effort: str | None) -> list[str]:
+    """First Mate's answer and triage invocation: no tools at all, in Harbor's one permission mode.
+
+    The empty ``--tools`` keeps an answer read-only; the mode only matches
+    every other Claude Code process Harbor launches.
+    """
     command = [
         executable, "--print", "--verbose", "--output-format", "stream-json", "--model", model,
+        "--permission-mode", BUILDER_PERMISSION_MODE,
         "--no-session-persistence", "--tools", "", "--strict-mcp-config",
         "--setting-sources", "", "--disable-slash-commands",
     ]
@@ -142,7 +148,9 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
     return allow
 
 
-# Every Claude builder (and the children it spawns) runs in ``auto`` mode:
+# Every Claude Code process Harbor launches runs in ``auto`` mode: builders
+# (and the children they spawn), First Mate's tool-less answers and triage,
+# and First Mate's operator run for permission blockers. For builders,
 # Claude Code's classifier approves routine actions such as test, build and
 # git commands, where ``dontAsk`` refused every call without a pre-approval
 # and stalled tickets on permission escalations. The OS sandbox still bounds

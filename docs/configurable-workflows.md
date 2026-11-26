@@ -296,7 +296,7 @@ implementor and reviewer children. A Claude builder does this with Claude
 Code's `Agent` tool, which Harbor always enables; there is nothing to
 configure. Children run inside the builder's own Claude Code process, so they
 get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
-`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
+`Agent`), its `auto` permission mode and the same Bash sandbox: the same
 writable paths and the same network allowlist below. They cannot use a tool or
 reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
 
@@ -549,9 +549,13 @@ the Harbor import path. Workflow commands and child agents use that invocation
 with the supplied project and ticket. The native sandbox includes the ledger
 directory for operational receipts; the registry remains read-only.
 
-**Claude builder permissions.** Claude builders run in Claude Code's
-`dontAsk` permission mode, which refuses any tool call that is not
-pre-approved. Sandboxed Bash is approved automatically, except a command that
+**Claude builder permissions.** Every Claude Code process Harbor launches runs
+in Claude Code's `auto` permission mode: builders and their children, First
+Mate's answers and triage (which still get no tools at all). In `auto` mode Claude Code's classifier approves routine
+actions and refuses risky ones, instead of `dontAsk` refusing everything that
+is not pre-approved. Builders keep their OS sandbox, and Harbor still
+pre-approves the rules below so they never depend on the classifier.
+Sandboxed Bash is approved automatically, except a command that
 sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
 (directly or through `/usr/bin/env`), which is exactly what the runtime
 invocation does; Read, Glob and Grep only reach the ticket worktree,
