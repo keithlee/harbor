@@ -19,6 +19,7 @@ from harbor.config.workflow import load_workflow
 from harbor.db import HarborDB, apply_phase9_migration
 from harbor.poll.linear_poller import LinearPoller, PollResult
 from harbor.runner.base import apply_phase4_migration
+from harbor.runner.quota import bind_runner_identity
 from harbor.supervisor import Supervisor, WorktreeDispatcher
 from harbor.wake import Wake, apply_phase3_migration
 from workflow_support import config
@@ -51,6 +52,8 @@ def ledger(tmp_path, *, status="blocked", final=HAN86, finished=15, activity=Non
         (f"run-{ticket}", ticket, status, "native-1", str(worktree), json.dumps(final), iso(60),
          iso(finished) if finished is not None else None, iso(activity) if activity is not None else None),
     )
+    # The real runner records its identity before it writes the run row.
+    bind_runner_identity(db.connection, f"run-{ticket}", "codex", "gpt-sample", "high")
     db.connection.commit()
     return db
 
@@ -178,6 +181,7 @@ def add_ticket(db, tmp_path, ticket, *, status="blocked", final=HAN86, finished=
         "INSERT INTO runs(id,ticket,status,session_id,worktree,final_json,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?)",
         (f"run-{ticket}", ticket, status, "native-2", str(worktree), json.dumps(final), iso(60), iso(finished)),
     )
+    bind_runner_identity(db.connection, f"run-{ticket}", "codex", "gpt-sample", "high")
     db.connection.commit()
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,6 +46,15 @@ OBSOLETE_INSTRUCTION = (
     "that blocker is obsolete. List agents, close any interrupted or unknown children (for example "
     "/root/planner), spawn fresh planner/implementor/reviewer children under new names (planner-2, ...) "
     "with the models in config.toml, and continue delivering the ticket from where it stopped."
+)
+# A retained run with no runner_identity row cannot be resumed (the factory will
+# not guess its provider), so First Mate routes it to a fresh session without
+# asking the model. Deliberate stops (terminated) and live runs are left alone.
+UNRECORDED_IDENTITY_TRIGGER = "unrecorded_identity"
+UNRECORDED_IDENTITY_STATUSES = frozenset({"waiting", "parked", "blocked", "failed", "orphaned"})
+UNRECORDED_IDENTITY_INSTRUCTION = (
+    "Harbor has no record of which provider ran the previous session, so it could not be resumed. "
+    "Continue delivering the ticket from the retained worktree, branch and any PR."
 )
 SENSITIVE = re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
 
@@ -166,22 +176,28 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     stall = float(settings.get("stall_minutes", 30)) * 60
     rows = connection.execute(
         """SELECT r.id, r.ticket, r.status, r.final_json, r.session_id, r.finished_at, r.last_activity_at,
-                  r.started_at, t.linear_id, t.title, t.hold, t.state_type, t.state
+                  r.started_at, t.linear_id, t.title, t.hold, t.state_type, t.state, r.worktree
            FROM runs r JOIN tickets t ON t.identifier = r.ticket
            WHERE t.project = ? AND r.id = (SELECT r2.id FROM runs r2 WHERE r2.ticket = r.ticket
                  ORDER BY COALESCE(r2.finished_at, r2.started_at, r2.id) DESC, r2.id DESC LIMIT 1)""",
         (project,),
     ).fetchall()
+    identified = _identified_runs(connection)
     cases: dict[str, Case] = {}
     for row in rows:
-        run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold, state_type, state = row
+        (run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold,
+         state_type, state, worktree) = row
         if stopped(hold, state, state_type):
             continue
         status = str(status or "").casefold()
         final = _final(final_json)
         blocker = final.get("blocker") if isinstance(final.get("blocker"), dict) else {}
         trigger = None
-        if status == "blocked" and (now - (_ts(finished) or now)) >= recheck:
+        if status in UNRECORDED_IDENTITY_STATUSES and worktree and run_id not in identified:
+            # Nothing can resume this run: the runner factory will not guess
+            # which provider owns its session. Only a fresh session recovers it.
+            trigger = UNRECORDED_IDENTITY_TRIGGER
+        elif status == "blocked" and (now - (_ts(finished) or now)) >= recheck:
             trigger = "blocked"
         elif status == "running" and (now - (_ts(activity) or _ts(started) or now)) >= stall:
             trigger = "stalled"
@@ -228,6 +244,14 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue
         ready.append(case)
     return ready
+
+
+def _identified_runs(connection) -> set[str]:
+    """Run ids with a recorded runner identity (none when the table does not exist yet)."""
+    try:
+        return {str(row[0]) for row in connection.execute("SELECT run_id FROM runner_identity")}
+    except sqlite3.OperationalError:
+        return set()
 
 
 def _retry_pending(connection, run_id: str, now: float) -> bool:
@@ -297,6 +321,15 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         return {"action": "escalate", "instruction": "", "reason": why}
 
     budget_left = case.attempts < int(settings.get("max_recoveries", 3))
+    if case.trigger == UNRECORDED_IDENTITY_TRIGGER:
+        # Deterministic, whatever the model proposed: resume, retry and an
+        # operator answer all need the retained session, which nothing can
+        # rebuild. A human blocker is re-raised by the fresh session itself.
+        if settings.get("allow_fresh_session", True) and not case.fresh_sessions and budget_left:
+            return {"action": "fresh_session", "instruction": UNRECORDED_IDENTITY_INSTRUCTION,
+                    "reason": "no recorded runner identity; only a fresh session can recover the run"}
+        return escalate("no recorded runner identity and no fresh session is available "
+                        "(first_mate.allow_fresh_session, one per run, within max_recoveries)")
     human_question = case.kind in HUMAN_KINDS - {"conflicting_instruction"} or SENSITIVE.search(json.dumps(case.blocker))
     if (not human_question and OBSOLETE.search(" ".join([json.dumps(case.blocker), case.summary]))
             and case.status != "running" and budget_left):

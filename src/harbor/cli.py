@@ -27,7 +27,7 @@ from harbor.poll.github_poller import GitHubPoller
 from harbor.poll.linear_poller import LinearPoller
 from harbor.pr_events import PREventProcessor
 from harbor.runner.codex import CodexRunner
-from harbor.supervisor import FRESH_SESSION_REASON, UNRECORDED_IDENTITY, Supervisor, WorktreeDispatcher
+from harbor.supervisor import UNRECORDED_IDENTITY, Supervisor, WorktreeDispatcher
 from harbor.wake import TicketScope
 from harbor.worktree import DEFAULT_DISK_FLOOR_GB, WorktreeManager, free_disk_gb
 
@@ -253,12 +253,11 @@ def build_production_dispatcher(
             path = getattr(worktree, "path", worktree)
             from harbor.workflow_store import bind
             identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
-            fresh = getattr(wake, "reason", None) == FRESH_SESSION_REASON
-            if identity is None and getattr(wake, "action", None) == "reengage" and not fresh:
+            if identity is None and getattr(wake, "action", None) == "reengage":
                 # A retained session belongs to whichever provider started it.
                 # Without that record, fail closed rather than guess one. A
-                # fresh session resumes nothing, so it may use the configured
-                # provider and records its identity when it launches. Refuse
+                # "fresh_session" wake (FRESH_SESSION_ACTION) resumes nothing, so
+                # it starts like a new ticket and records its identity. Refuse
                 # before binding the workflow so a refused poll writes nothing.
                 raise ValueError(UNRECORDED_IDENTITY)
             # Adopt edits to .harbor/workflow on the next turn instead of failing.
@@ -274,7 +273,8 @@ def build_production_dispatcher(
                 model, effort = identity[1], identity[2]
                 fallbacks = ()
             if identity is None and quota_policy is not None and getattr(wake, "action", None) != "reengage":
-                # A new ticket never starts on a provider known to be out of usage.
+                # A new ticket (or a fresh session with no recorded identity)
+                # never starts on a provider known to be out of usage.
                 import time
                 start = quota_policy.starting_builder_profile(db.connection, time.time())
                 if start is not None:

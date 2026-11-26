@@ -58,13 +58,15 @@ _MAX_NOTICE_CHARS = 300
 # follows it in a notice is not truncated out of _MAX_NOTICE_CHARS.
 _MAX_RESUME_REASON_CHARS = 160
 _RESUME_FAILURE_KEY = secrets.token_bytes(32)
-# Wake reason for a First Mate fresh session: same run and worktree, new native session.
-FRESH_SESSION_REASON = "first-mate-fresh-session"
+# Factory wake action for a First Mate fresh session: same run and worktree,
+# new native session, so nothing retained is resumed.
+FRESH_SESSION_ACTION = "fresh_session"
 # Why a retained run cannot be rebuilt when its provider was never recorded.
-# Kept within _MAX_RESUME_REASON_CHARS so the remedy is never truncated.
+# First Mate routes such runs to a fresh session (first_mate_recovery
+# UNRECORDED_IDENTITY_TRIGGER). Kept within _MAX_RESUME_REASON_CHARS.
 UNRECORDED_IDENTITY = (
     "no recorded runner identity, so Harbor will not guess its provider; "
-    "a First Mate fresh session (first_mate.allow_fresh_session) restarts it as configured"
+    "First Mate restarts it in a fresh session if first_mate.allow_fresh_session is on"
 )
 _LOG = logging.getLogger(__name__)
 # Receipt reason for a blocked run whose Linear blocker context was unprovable.
@@ -633,13 +635,12 @@ class WorktreeDispatcher:
         return runner
 
     async def _prepare_retained_runner(
-        self, identifier: str, row: Mapping[str, Any], *, reason: str | None = None,
+        self, identifier: str, row: Mapping[str, Any], *, fresh_session: bool = False,
     ) -> tuple[Any, Any] | None:
         """Attach and construct a runner without replacing the retained handle.
 
-        ``reason`` tells the runner factory why the handle is built; a fresh
-        session passes ``FRESH_SESSION_REASON`` because it resumes no native
-        session.
+        ``fresh_session`` builds the handle for a new native session; the
+        factory then sees ``FRESH_SESSION_ACTION`` instead of ``reengage``.
         """
 
         worktree_path = row.get("worktree")
@@ -654,9 +655,8 @@ class WorktreeDispatcher:
             return None
         wake = Wake(
             ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
-            action="reengage",
+            action=FRESH_SESSION_ACTION if fresh_session else "reengage",
             resume=row["id"],
-            reason=reason,
         )
         worktree = self.worktrees.get(identifier)
         if worktree is None:
@@ -747,7 +747,7 @@ class WorktreeDispatcher:
             rebind_runner_identity(connection, row["id"], switch.provider, switch.model, switch.effort or "")
         replaced = False
         try:
-            prepared = await self._prepare_retained_runner(identifier, row, reason=FRESH_SESSION_REASON)
+            prepared = await self._prepare_retained_runner(identifier, row, fresh_session=True)
             if prepared is None:
                 # Name the factory's reason when it refused; otherwise attachment failed.
                 cause = self.resume_unavailable_reason(identifier)
@@ -785,7 +785,7 @@ class WorktreeDispatcher:
                 action="reengage",
                 resume=row["id"],
                 instruction=f"{prompt}\n\n{instruction}" if prompt else instruction,
-                reason=FRESH_SESSION_REASON,
+                reason="first-mate-fresh-session",
             )
             if before_launch is None:
                 replace_session()
@@ -4670,7 +4670,9 @@ class Supervisor:
             self._recovery_tickets.add(case.ticket)
             try:
                 try:
-                    proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
+                    # validate() routes an unrecorded identity on its own; no model call.
+                    proposal = {} if case.trigger == recovery.UNRECORDED_IDENTITY_TRIGGER else recovery.parse(
+                        await mate.triage(recovery.build_prompt(case, settings)))
                 except FirstMateQuotaError as exc:
                     # The only case that backs off exponentially (see backoff_seconds).
                     proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}
@@ -4786,7 +4788,7 @@ class Supervisor:
                 case.ticket, recovery.fresh_session_instruction(case, instruction), before_launch=before_launch,
             )
             wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": case.run_id, "run_id": case.run_id},
-                        action="reengage", resume=case.run_id, reason=FRESH_SESSION_REASON)
+                        action="reengage", resume=case.run_id, reason="first-mate-fresh-session")
             await self._handle_runner_result(wake, result)
         elif action == "escalate":
             before_launch()

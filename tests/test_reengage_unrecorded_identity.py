@@ -3,21 +3,26 @@
 The production factory used to assume such a run belonged to Codex and resume
 it with a hard-coded Codex model, ignoring the project's configured provider
 and models. A Claude-only project then launched Codex. Now a resume refuses
-with a remedy, and a First Mate fresh session (which resumes no native
-session) starts on the configured provider and records its identity.
+with a remedy, First Mate routes the run to a fresh session without asking the
+model, and the fresh session (which resumes no native session) starts like a
+new ticket and records its identity.
 """
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+from harbor import first_mate_recovery as recovery
 from harbor.cli import build_production_dispatcher
+from harbor.config.projects import ProjectConfig
 from harbor.db import HarborDB
+from harbor.poll.linear_poller import PollResult
 from harbor.runner.base import apply_phase4_migration
 from harbor.runner.claude import ClaudeRunner
 from harbor.runner.codex import CodexRunner
 from harbor.runner.quota import bind_runner_identity, runner_identity
-from harbor.supervisor import _MAX_RESUME_REASON_CHARS, UNRECORDED_IDENTITY
+from harbor.supervisor import _MAX_RESUME_REASON_CHARS, UNRECORDED_IDENTITY, Supervisor
 from harbor.wake import Wake, apply_phase3_migration
 from workflow_support import materialize
 
@@ -41,19 +46,19 @@ def project(tmp_path, monkeypatch, provider):
                            registry_path=str(registry))
 
 
-def retained_run(tmp_path):
-    """A waiting run with a worktree and native session, but no runner_identity row."""
+def retained_run(tmp_path, status="waiting"):
+    """A retained run with a worktree and native session, but no runner_identity row."""
     db = HarborDB(tmp_path / "harbor.db")
     apply_phase3_migration(db)
     apply_phase4_migration(db)
-    db.replace_tickets("SampleProject", [{"identifier": "SAMPLE-1", "title": "t", "state": "In Progress"}],
-                       emit_events=False)
+    db.replace_tickets("SampleProject", [{"identifier": "SAMPLE-1", "title": "t", "state": "In Progress",
+                                          "owned": True, "hold": False}], emit_events=False)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     db.connection.execute(
         "INSERT INTO runs(id,ticket,status,session_id,worktree,deadline_seconds) "
-        "VALUES ('run-1','SAMPLE-1','waiting','native-1',?,600)",
-        (str(worktree),),
+        "VALUES ('run-1','SAMPLE-1',?,'native-1',?,600)",
+        (status, str(worktree)),
     )
     db.connection.commit()
     assert runner_identity(db.connection, "run-1") is None
@@ -113,37 +118,29 @@ def test_hydrating_a_run_without_identity_reports_the_reason(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-def test_fresh_session_without_identity_uses_configuration_and_records_it(tmp_path, monkeypatch, provider):
+def test_fresh_session_binds_identity_through_the_real_runner(tmp_path, monkeypatch, provider):
     config = project(tmp_path, monkeypatch, provider)
     db = retained_run(tmp_path)
     dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object())
-    built = []
-
-    async def runner_call(runner, wake, *, resume, before_spawn=None):
-        # The real runner binds its identity in _execute; mirror that seam here.
-        built.append((runner, wake, resume))
-        bind_runner_identity(db.connection, wake.run_id, getattr(runner, "provider", "codex"), runner.model, runner.reasoning_effort)
-        return {"status": "completed"}
-
-    dispatcher._runner_call = runner_call
+    # Nothing stubs the runner: /usr/bin/true exits at once, and the real
+    # _execute records the identity before the process spawns.
     asyncio.run(dispatcher.fresh_session("SAMPLE-1", "hand-off"))
-
-    runner, wake, resume = built[0]
+    runner = dispatcher.runners["SAMPLE-1"]
     assert type(runner) is RUNNERS[provider] and runner.model == CONFIGURED[provider]["model"]
-    assert resume is False and wake.run_id == "run-1"
     assert tuple(runner_identity(db.connection, "run-1")) == (provider, CONFIGURED[provider]["model"], "low")
-    # The next resume of the same run now rebuilds on the recorded identity.
-    assert dispatcher.resume_unavailable_reason("SAMPLE-1") is None
     db.close()
 
 
-def test_fresh_session_binds_identity_through_the_real_runner(tmp_path, monkeypatch):
-    config = project(tmp_path, monkeypatch, "codex")
+def test_fresh_session_without_identity_applies_the_quota_starting_profile(tmp_path, monkeypatch):
+    config = project(tmp_path, monkeypatch, "claude")
     db = retained_run(tmp_path)
-    dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object())
-    # /usr/bin/true exits at once; the identity is bound before the process spawns.
+    fallback = SimpleNamespace(provider="codex", model="gpt-sample-fallback", effort="high")
+    policy = SimpleNamespace(starting_builder_profile=lambda connection, now: fallback)
+    dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object(), quota_policy=policy)
+    # The configured provider is out of usage, so the fresh session starts on the fallback.
     asyncio.run(dispatcher.fresh_session("SAMPLE-1", "hand-off"))
-    assert tuple(runner_identity(db.connection, "run-1")) == ("codex", "gpt-sample-configured", "low")
+    assert type(dispatcher.runners["SAMPLE-1"]) is CodexRunner
+    assert tuple(runner_identity(db.connection, "run-1")) == ("codex", "gpt-sample-fallback", "high")
     db.close()
 
 
@@ -158,4 +155,96 @@ def test_fresh_session_names_the_factory_reason(tmp_path, monkeypatch):
                                                    runner_factory=refusing_factory)
     with pytest.raises(RuntimeError, match="cannot start a fresh session for SAMPLE-1: sample factory refusal"):
         asyncio.run(dispatcher.fresh_session("SAMPLE-1", "hand-off"))
+    db.close()
+
+
+SETTINGS = {"max_recoveries": 3, "allow_fresh_session": True, "recheck_minutes": 10, "stall_minutes": 30}
+
+
+@pytest.mark.parametrize("status", sorted(recovery.UNRECORDED_IDENTITY_STATUSES))
+def test_first_mate_finds_every_retained_run_without_identity(tmp_path, status):
+    db = retained_run(tmp_path, status)
+    cases = recovery.find_cases(db.connection, "SampleProject", SETTINGS)
+    assert [(c.run_id, c.trigger, c.status) for c in cases] == [("run-1", recovery.UNRECORDED_IDENTITY_TRIGGER, status)]
+    db.close()
+
+
+@pytest.mark.parametrize("status", ["running", "terminated", "completed"])
+def test_live_stopped_and_identified_runs_are_not_unrecorded_cases(tmp_path, status):
+    db = retained_run(tmp_path, status)
+    assert all(c.trigger != recovery.UNRECORDED_IDENTITY_TRIGGER
+               for c in recovery.find_cases(db.connection, "SampleProject", SETTINGS))
+    db.connection.execute("UPDATE runs SET status='waiting'")
+    bind_runner_identity(db.connection, "run-1", "codex", "gpt-sample-recorded", "high")
+    assert recovery.find_cases(db.connection, "SampleProject", SETTINGS) == []
+    db.close()
+
+
+def test_run_without_a_worktree_is_not_an_unrecorded_case(tmp_path):
+    db = retained_run(tmp_path)
+    db.connection.execute("UPDATE runs SET worktree=NULL")
+    db.connection.commit()
+    assert recovery.find_cases(db.connection, "SampleProject", SETTINGS) == []
+    db.close()
+
+
+def test_validate_routes_an_unrecorded_identity_to_one_fresh_session():
+    case = recovery.Case("SampleProject", "SAMPLE-1", "run-1", recovery.UNRECORDED_IDENTITY_TRIGGER, "waiting")
+    for proposal in ({}, {"action": "resume", "instruction": "continue", "reason": "r"}, {"action": "wait"}):
+        decision = recovery.validate(proposal, case, SETTINGS)
+        assert decision["action"] == "fresh_session"
+        assert decision["instruction"] == recovery.UNRECORDED_IDENTITY_INSTRUCTION
+    # An operator answer to a human blocker is a resume, which cannot be delivered either.
+    human = replace(case, blocker={"kind": "product_decision", "question": "Which copy?"})
+    assert recovery.validate({}, human, SETTINGS)["action"] == "fresh_session"
+    assert recovery.validate({}, case, {**SETTINGS, "allow_fresh_session": False})["action"] == "escalate"
+    assert recovery.validate({}, replace(case, history=[{"action": "fresh_session"}]), SETTINGS)["action"] == "escalate"
+    spent = replace(case, history=[{"action": "resume"}] * 3)
+    assert recovery.validate({}, spent, SETTINGS)["action"] == "escalate"
+    escalated = replace(case, history=[{"action": "fresh_session"}, {"action": "escalate"}])
+    assert recovery.validate({}, escalated, SETTINGS)["action"] == "wait"  # escalate once, never loop
+
+
+class Poller:
+    project_name = "SampleProject"
+    config = ProjectConfig(name="SampleProject", linear_project_slug="sample-project", heartbeat_seconds=1)
+
+    async def poll(self):
+        return PollResult((), "snapshot", False, ())
+
+
+class Mate:
+    def __init__(self):
+        self.prompts = []
+
+    async def triage(self, prompt):
+        self.prompts.append(prompt)
+        return '{"action": "resume", "instruction": "continue", "reason": "model guess"}'
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("status", ["waiting", "parked", "blocked", "failed"])
+def test_supervisor_loop_recovers_an_unrecorded_run_on_the_configured_provider(tmp_path, monkeypatch, provider, status):
+    """find_cases -> validate -> _apply_recovery -> fresh_session -> the real factory and runner."""
+    config = project(tmp_path, monkeypatch, provider)
+    db = retained_run(tmp_path, status)
+    dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object())
+    mate = Mate()
+    ladder = SimpleNamespace(first_mate=mate, linear=None, workflow=dispatcher.workflow)
+    supervisor = Supervisor(Poller(), db=db, dispatcher=dispatcher, unblock_ladder=ladder)
+
+    async def poll_once():
+        observation = PollResult(tuple(db.tickets("SampleProject")), "snapshot", True, ())
+        supervisor.last_result, supervisor.linear_healthy = observation, True
+        await supervisor._monitor_blocked(observation)
+        await supervisor._drain_recoveries()
+
+    asyncio.run(poll_once())
+    assert mate.prompts == []  # deterministic: the model is not asked
+    assert [r[0] for r in db.connection.execute("SELECT action FROM first_mate_recoveries")] == ["fresh_session"]
+    assert tuple(runner_identity(db.connection, "run-1")) == (provider, CONFIGURED[provider]["model"], "low")
+    assert type(dispatcher.runners["SAMPLE-1"]) is RUNNERS[provider]
+    # Now identified, the run is no longer an unrecorded case and resumes like any other.
+    assert all(c.trigger != recovery.UNRECORDED_IDENTITY_TRIGGER
+               for c in recovery.find_cases(db.connection, "SampleProject", SETTINGS))
     db.close()
