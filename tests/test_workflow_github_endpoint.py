@@ -16,7 +16,7 @@ from harbor.cli import build_parser
 from harbor.db import HarborDB
 from harbor.wake import apply_phase3_migration
 from harbor.workflow_cli import execute
-from workflow_support import config
+from workflow_support import ADVISORY_FEEDBACK, config, reviewed_pr
 
 # Harbor recognizes a PR link only on the configured GitHub host, so a GHES
 # project's Linear attachment uses the GHES form.
@@ -54,6 +54,7 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text, pr_url=PR_URL):
         return httpx.Response(200, json={"data": {"repository": {"pr_1": {
             "number": 1,
             "headRefOid": "abc",
+            **reviewed_pr("abc"),
             "url": pr_url,
             "merged": False,
             "mergeable": "MERGEABLE",
@@ -84,7 +85,7 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text, pr_url=PR_URL):
         github_repository="example/repo",
         required_checks=("tests",),
         pipeline_path=str(pipeline),
-        workflow_path=config(tmp_path, "autonomous"),
+        workflow_path=config(tmp_path, "autonomous", extra=ADVISORY_FEEDBACK),
     )
     args = build_parser().parse_args(["workflow", "check", "A", "--ticket", "A-1", "--event", "pre_merge"])
     db = HarborDB(":memory:")

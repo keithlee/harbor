@@ -6,7 +6,7 @@ from harbor.cli import build_parser
 from harbor.db import HarborDB
 from harbor.wake import apply_phase3_migration
 from harbor.workflow_cli import execute, fresh_context
-from workflow_support import config
+from workflow_support import ADVISORY_FEEDBACK, config, reviewed_pr
 
 
 def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
@@ -23,7 +23,7 @@ def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
         def from_profile(cls,profile,**kwargs):return cls(**kwargs)
         async def close(self):pass
         async def fetch_pull_requests(self,*args,**kwargs):
-            return {'pr_1':{'number':1,'headRefOid':'abc','url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE','comments':{'nodes':[]}}}
+            return {'pr_1':{'number':1,'headRefOid':'abc',**reviewed_pr('abc'),'url':'https://github.com/example/repo/pull/1','merged':False,'mergeable':'MERGEABLE'}}
     monkeypatch.setattr('harbor.clients.linear.LinearClient',Linear)
     monkeypatch.setattr('harbor.clients.github.GitHubClient',GitHub)
     cfg=SimpleNamespace(name='A',linear_api_url='https://linear.invalid',linear_project_scope=('canonical',),github_repository='example/repo',required_checks=(),workflow_path=str(config(tmp_path)))
@@ -68,6 +68,7 @@ def test_pre_merge_checks_fresh_linear_state(tmp_path, monkeypatch, capsys, stat
             return {"pr_1": {
                 "number": 1,
                 "headRefOid": "abc",
+                **reviewed_pr("abc"),
                 "url": pr_url,
                 "merged": False,
                 "mergeable": "MERGEABLE",
@@ -87,7 +88,7 @@ def test_pre_merge_checks_fresh_linear_state(tmp_path, monkeypatch, capsys, stat
         linear_project_scope=("canonical",),
         github_repository="example/repo",
         required_checks=("tests",),
-        workflow_path=config(tmp_path, "autonomous"),
+        workflow_path=config(tmp_path, "autonomous", extra=ADVISORY_FEEDBACK),
     )
     args = build_parser().parse_args(["workflow", "check", "A", "--ticket", "A-1", "--event", "pre_merge"])
     db = HarborDB(":memory:")

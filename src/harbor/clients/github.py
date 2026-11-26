@@ -76,6 +76,10 @@ def build_pull_requests_query(owner: str, repo: str, numbers: Iterable[int]) -> 
         mergeable
         createdAt
         headRefOid
+        author {{
+          login
+          __typename
+        }}
         comments(first: 100) {{
           nodes {{
             id

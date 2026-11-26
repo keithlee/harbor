@@ -163,6 +163,63 @@ receipts for them, and a human still merges by default.
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
 
+### Merge risk (`auto_merge_risks`)
+
+With `merge_mode = "workflow_checked"`, `pre_merge` readiness also requires
+the ticket's effective risk to be listed in `auto_merge_risks`. Three sources
+rate risk, and the effective risk is the **highest** of them:
+
+- the **Linear floor**, set by a person: a `risk:low|medium|high` label, or a
+  `Risk: <tier>` (or `Risk tier: <tier>`) line in the ticket description.
+  It is optional.
+- the **builder's tier** (`skills/risk`), which is required. It is a line that is
+  exactly `Risk tier: low`, `Risk tier: medium` or `Risk tier: high` inside the PR
+  body's `## Risk Analysis` section. That same section must also carry
+  `<!-- harbor:risk-sha:<current head SHA> -->`.
+- the **reviewer's rating** (`skills/review`), which is also required. The
+  reviewer child rates the diff on its own. It does not copy the builder's tier.
+  The rating is the `risk` field of the reviewer's JSON verdict comment.
+
+```markdown
+## Risk Analysis
+Risk tier: low
+Rationale: documentation-only change; reverting is one commit.
+<!-- harbor:risk-sha:0123456789abcdef0123456789abcdef01234567 -->
+```
+
+```json
+{"review":{"head_sha":"0123456789abcdef0123456789abcdef01234567","verdict":"approve","proof_verified":true,"feedback_digest":"…","risk":"low","risk_rationale":"docs only; one-commit revert"}}
+```
+
+Harbor counts a reviewer verdict only when all of these hold:
+
+- it is a PR conversation comment whose whole body is that JSON object;
+- its author is the GitHub login that opened the PR (the delivery identity);
+- its `head_sha` is the PR's current head.
+
+Comments from anyone else are ignored, so they can neither supply the rating
+nor lower or veto it. If any counted verdict for the current head is a
+`reject`, or has a `verdict` or `risk` that is not one of the exact lowercase
+values, the risk is unknown. The same applies to a `review` object with no
+`head_sha`. When several current-head approvals exist, the highest `risk` wins.
+
+No source can lower another. Harbor keeps the highest tier it has seen for the
+run, so a later push or edit cannot drop it. If the builder's tier is missing,
+stale or unparseable, or there is no current-head reviewer approval, the
+effective risk is unknown and the automatic merge fails closed. Harbor does not
+interpret free text.
+
+Limits to know:
+
+- The builder and its reviewer child post with the same GitHub identity. The
+  author check keeps out third parties, but it does not prove that a separate
+  reviewer wrote the verdict.
+- Harbor reads the first 100 PR comments.
+
+So list only the tiers you are willing to merge on the agents' own assessment.
+The defaults, `auto_merge_risks = []` and `merge_mode = "human"`, never
+auto-merge.
+
 ### GitHub transport (`[github]`)
 
 The builder needs GitHub to open, update, comment on, check and (when the
