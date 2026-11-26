@@ -103,6 +103,21 @@ def _runtime_invocation(config: Any) -> str:
     ])
 
 
+# An installed workflow keeps its own skill copy, so the launch prompt carries
+# the permission-blocker contract for every project.
+PERMISSION_BLOCKER_INSTRUCTIONS = (
+    "Permission blockers: when your permissions or sandbox deny a command or tool (for example `Operation not "
+    "permitted`, a write outside the allowed paths, a network host the sandbox blocks, `gh` failing TLS, or "
+    "`adb`/`xcrun simctl` unable to reach their service), do not ask a person to widen your permissions and do "
+    "not retry with other tricks. First finish everything else you can. Then return status `blocked` with "
+    "`blocker.kind = \"permission_blocker\"`, `blocker.commands` = the exact shell commands you need run, in "
+    "order, `blocker.cwd` = the directory to run them in (relative to the worktree, or null for its root), and "
+    "`blocker.evidence` = the literal denial. Keep the commands inside the ticket worktree (the system temp "
+    "directory is also allowed) and never put a credential in them. If the project allows it, Harbor has First "
+    "Mate run them outside your sandbox and resumes this session with their exit codes and output; otherwise a "
+    "person is asked. For every other blocker kind set `commands` and `cwd` to null."
+)
+
 # The builder's provider is chosen per launch (and quota fallback can switch it),
 # after this prompt is rendered, so the child-agent rules name both runtimes.
 CHILD_AGENT_INSTRUCTIONS = (
@@ -149,6 +164,7 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "shell initialization must not select another registry or ledger."
             + "\n" + CHILD_AGENT_INSTRUCTIONS
             + " Use the role models and reasoning efforts from the policy's `roles`."
+            + "\n" + PERMISSION_BLOCKER_INSTRUCTIONS
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
             + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 

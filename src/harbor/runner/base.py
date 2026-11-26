@@ -47,6 +47,9 @@ BLOCKER_KINDS = frozenset(
         "ambiguous_ac",
         "missing_proof_capability",
         "conflicting_instruction",
+        # A command or tool the builder's permissions or sandbox denied; the
+        # blocker names the exact ``commands`` and ``cwd`` for First Mate.
+        "permission_blocker",
     }
 )
 
@@ -107,6 +110,12 @@ def validate_result(payload: Any) -> list[str]:
         for key in ("kind", "question", "recommendation", "evidence"):
             if blocker.get(key) is not None and not isinstance(blocker[key], str):
                 errors.append(f"blocker.{key} must be a string")
+        if blocker.get("commands") is not None and (
+            not isinstance(blocker["commands"], list) or not all(isinstance(item, str) for item in blocker["commands"])
+        ):
+            errors.append("blocker.commands must be an array of strings or null")
+        if blocker.get("cwd") is not None and not isinstance(blocker["cwd"], str):
+            errors.append("blocker.cwd must be a string or null")
         if blocker.get("options") is not None and (
             not isinstance(blocker["options"], list) or not all(isinstance(item, str) for item in blocker["options"])
         ):

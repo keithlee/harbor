@@ -69,6 +69,14 @@ environment failure you cannot work around. Never block on Harbor bookkeeping, a
 model settings. Include concrete options and a recommendation. First Mate monitors blocked runs
 and may resume you with an instruction or start a fresh session.
 
+When your permissions or sandbox deny a command or tool, never ask a person to widen them. Finish
+everything else first, then report `kind = "permission_blocker"` with `commands` (the exact shell
+commands, in order), `cwd` (relative to the worktree, or null) and the literal denial as `evidence`.
+Keep the commands inside the worktree or the system temp directory, and never put a credential in
+them. When the project sets `decisions.delegate_permissions = true`, First Mate runs them outside
+your sandbox and resumes this session with their exit codes and output. Other blocker kinds set
+`commands` and `cwd` to null.
+
 Return the run-result schema with the actual PR URL, status, waiting_on and a concrete next_action.
 Stop child agents and commands before reporting completion. Harbor owns worktree cleanup; never force-remove it.
 Do not print credentials. Disabled requirements are not passes.

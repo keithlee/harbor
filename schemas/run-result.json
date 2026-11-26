@@ -38,7 +38,7 @@
     "blocker": {
       "type": ["object", "null"],
       "additionalProperties": false,
-      "required": ["kind", "question", "options", "recommendation", "evidence"],
+      "required": ["kind", "question", "options", "recommendation", "evidence", "commands", "cwd"],
       "properties": {
         "kind": {
           "type": "string",
@@ -48,13 +48,16 @@
             "github_transport",
             "ambiguous_ac",
             "missing_proof_capability",
-            "conflicting_instruction"
+            "conflicting_instruction",
+            "permission_blocker"
           ]
         },
         "question": {"type": "string"},
         "options": {"type": "array", "items": {"type": "string"}},
         "recommendation": {"type": ["string", "null"]},
-        "evidence": {"type": ["string", "null"]}
+        "evidence": {"type": ["string", "null"]},
+        "commands": {"type": ["array", "null"], "items": {"type": "string"}},
+        "cwd": {"type": ["string", "null"]}
       }
     }
   }

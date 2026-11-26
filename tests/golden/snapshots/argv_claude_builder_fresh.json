@@ -11,6 +11,21 @@
       "blocker": {
         "additionalProperties": false,
         "properties": {
+          "commands": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "evidence": {
             "type": [
               "string",
@@ -24,7 +39,8 @@
               "github_transport",
               "ambiguous_ac",
               "missing_proof_capability",
-              "conflicting_instruction"
+              "conflicting_instruction",
+              "permission_blocker"
             ],
             "type": "string"
           },
@@ -49,7 +65,9 @@
           "question",
           "options",
           "recommendation",
-          "evidence"
+          "evidence",
+          "commands",
+          "cwd"
         ],
         "type": [
           "object",
