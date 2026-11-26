@@ -24,6 +24,28 @@ def _isolate_developer_environment(monkeypatch: pytest.MonkeyPatch, _isolated_ho
     return _isolated_home
 
 
+@pytest.fixture(scope="session")
+def _builder_state_home() -> Path:
+    """Where the suite's builder shims go: in the checkout, not a system temp dir.
+
+    Harbor refuses a shim directory inside a temporary directory, because both
+    builder sandboxes can write there; the isolated HOME is one, so its
+    ``~/.local/state`` cannot hold the shims.
+    """
+
+    import shutil
+    import uuid
+    state = ROOT / ".test-state" / uuid.uuid4().hex[:12]
+    state.mkdir(parents=True)
+    yield state
+    shutil.rmtree(state, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _builder_state(monkeypatch: pytest.MonkeyPatch, _isolate_developer_environment, _builder_state_home: Path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(_builder_state_home))
+
+
 @pytest.fixture(autouse=True)
 def _isolated_registry(tmp_path_factory, monkeypatch, _isolate_developer_environment):
     """Never read the developer's own project registry.

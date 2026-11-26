@@ -41,7 +41,7 @@ the implementor.
 ## Flow
 1. Plan: the planner writes numbered acceptance criteria and a test plan to the Linear ticket (`skills/planning`).
 2. Implement: the implementor makes the smallest safe change and runs the repository's checks.
-   Use `harbor workflow checks PROJECT --ticket IDENTIFIER --parallel` when `[checks]` are configured.
+   Use `harbor workflow checks --ticket IDENTIFIER --parallel` when `[checks]` are configured.
 3. Review: a separate reviewer reviews the current head (`skills/review`) and posts its verdict on the PR.
    Return fixes to the same implementor (Claude Code: a fresh implementor given the reviewer's findings,
    the current PR head and the previous implementor's report); stop after three failed rounds and
@@ -50,10 +50,10 @@ the implementor.
    `"verdict": "reject"` is one failed round, even when it rejects the same head again. Count only
    comments whose `head_sha` is a commit on the PR, and ignore every other comment, such as a human "FAIL".
 4. Risk: add the `## Risk Analysis` section to the PR body (`skills/risk`).
-5. Hand off: run `harbor workflow check PROJECT --ticket IDENTIFIER --event pre_handoff`, reply to the
+5. Hand off: run `harbor workflow check --ticket IDENTIFIER --event pre_handoff`, reply to the
    `linear_feedback` it returns, then move the ticket to review.
 6. Merge only when `delivery.merge_mode = "workflow_checked"` and
-   `harbor workflow check PROJECT --ticket IDENTIFIER --event pre_merge` reports ready; use its head SHA.
+   `harbor workflow check --ticket IDENTIFIER --event pre_merge` reports ready; use its head SHA.
    Human mode never merges. Only after an observed merge may you set terminal Linear completion.
 
 ## Merge authority (Harbor setting wins)

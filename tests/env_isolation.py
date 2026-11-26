@@ -24,7 +24,9 @@ REAL_HOME = Path.home().resolve()
 # Variables Harbor reads (or hands to builders) that would otherwise leak from
 # the developer's shell into the suite: registry/ledger/worktree locations,
 # executables, GitHub/Linear endpoints and credentials.  Every ``HARBOR_*``
-# variable is cleared as well, whatever its name, except TEST_CONTROL_ENV_VARS.
+# variable is cleared as well, whatever its name, except TEST_CONTROL_ENV_VARS;
+# that includes ``HARBOR_PROJECT`` and ``HARBOR_BIN``, which ``harbor start``
+# sets for builders (so a suite run by a builder does not inherit them).
 ISOLATED_ENV_VARS = (
     "LINEAR_API_KEY",
     "GITHUB_TOKEN",

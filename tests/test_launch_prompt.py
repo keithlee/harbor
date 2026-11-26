@@ -75,10 +75,10 @@ def test_fresh_session_receives_full_delivery_prompt(tmp_path, monkeypatch):
     asyncio.run(dispatcher.fresh_session("DEM-1", "FIRST-MATE-HANDOFF: respawn all roles"))
     sent = runner.instructions[0]
     for marker in ("# Delivery workflow", "## Merge authority", '"merge_mode": "human"',
-                   "Authoritative runtime invocation", "Merge authority: the policy's delivery.merge_mode"):
+                   "Harbor commands: run `harbor` as written", "Merge authority: the policy's delivery.merge_mode"):
         assert marker in sent, marker
     # The hand-off follows the complete launch prompt.
-    assert sent.index("FIRST-MATE-HANDOFF") > sent.index("Authoritative runtime invocation")
+    assert sent.index("FIRST-MATE-HANDOFF") > sent.index("Harbor commands:")
     assert sent.rstrip().endswith("FIRST-MATE-HANDOFF: respawn all roles")
     db.close()
 

@@ -125,60 +125,18 @@ def test_production_start_supplies_worktree_custody(tmp_path,monkeypatch):
         asyncio.run(cli._start('Demo',linear_client=object()))
 
 
-def test_delivery_prompt_pins_registry_ledger_and_runtime(tmp_path, monkeypatch):
+def test_delivery_prompt_keeps_policy_lines_without_a_runtime_prefix(tmp_path, monkeypatch):
+    # The registry, ledger and Harbor install now reach builders through the
+    # environment harbor start resolves (tests/test_builder_environment.py).
     from harbor.cli import _pipeline_text
-    import shlex
-    registry = tmp_path / 'registry with spaces.md'
-    registry.write_text('# registry')
-    ledger = tmp_path / 'state' / 'ledger.db'
-    monkeypatch.setenv('HARBOR_PROJECTS_FILE', str(registry))
-    monkeypatch.setenv('HARBOR_DB_PATH', str(ledger))
     cfg = ProjectConfig(name='Demo Project', linear_project_slug='demo', workflow_path=str(config(tmp_path)))
     prompt = _pipeline_text(cfg)
-    line = next(line for line in prompt.splitlines() if line.startswith('Authoritative runtime invocation: '))
-    command = shlex.split(line.split(': ', 1)[1])
-    assert command[0] == '/usr/bin/env'
-    assert f'HARBOR_PROJECTS_FILE={registry.resolve()}' in command
-    assert f'HARBOR_DB_PATH={ledger.resolve()}' in command
-    assert command[-3:] == ['-P', '-m', 'harbor.cli']
-    shadow = tmp_path / 'harbor'
-    shadow.mkdir()
-    (shadow / '__init__.py').write_text('')
-    (shadow / 'cli.py').write_text("raise RuntimeError('shadow Harbor loaded')")
-    import subprocess
-    result = subprocess.run([*command, '--help'], cwd=tmp_path, capture_output=True, text=True)
-    assert result.returncode == 0
-    assert 'shadow Harbor loaded' not in result.stderr
-    assert 'A calm project supervisor' in result.stdout
-    assert "Replace PROJECT with 'Demo Project'" in prompt
+    assert '/usr/bin/env' not in prompt and 'HARBOR_PROJECTS_FILE=' not in prompt
+    assert "If a workflow command names PROJECT, use 'Demo Project'" in prompt
     assert "never shell out to another agent CLI" in prompt
     assert "overrides any merge or auto-merge policy" in prompt
     assert "Harbor setting wins" in prompt
     assert "roles" in prompt
-    monkeypatch.delenv('HARBOR_PROJECTS_FILE')
-    with pytest.raises(ValueError, match='authoritative project registry'):
-        _pipeline_text(cfg)
-
-
-@pytest.mark.parametrize("shell_name", ["sh", "bash", "zsh"])
-def test_runtime_prefers_resolved_registry_and_survives_login_shell(tmp_path, monkeypatch, shell_name):
-    import shlex, shutil, subprocess, sys
-    shell = shutil.which(shell_name)
-    if shell is None:
-        pytest.skip(f"optional login shell {shell_name} is unavailable")
-    from harbor import cli
-    registry = tmp_path / 'actual registry.md'
-    registry.write_text('# selected registry')
-    monkeypatch.setenv('HARBOR_PROJECTS_FILE', str(tmp_path / 'wrong.md'))
-    cfg = ProjectConfig(name='Demo', linear_project_slug='demo', registry_path=registry, workflow_path=str(config(tmp_path)))
-    prompt = cli._pipeline_text(cfg)
-    invocation = next(line.split(': ', 1)[1] for line in prompt.splitlines() if line.startswith('Authoritative runtime invocation: '))
-    command = shlex.split(invocation)
-    assert f'HARBOR_PROJECTS_FILE={registry.resolve()}' in command
-    assert f'PYTHONPATH={Path(cli.__file__).resolve().parent.parent}' in command
-    assert command[-4] == sys.executable
-    result = subprocess.run([shell, '-lc', invocation + ' --help'], cwd=tmp_path, capture_output=True, text=True)
-    assert result.returncode == 0 and 'A calm project supervisor' in result.stdout
 
 
 def test_factory_grants_operational_ledger_root(tmp_path, monkeypatch):
