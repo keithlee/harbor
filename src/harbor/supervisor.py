@@ -62,11 +62,11 @@ _RESUME_FAILURE_KEY = secrets.token_bytes(32)
 # new native session, so nothing retained is resumed.
 FRESH_SESSION_ACTION = "fresh_session"
 # Why a retained run cannot be rebuilt when its provider was never recorded.
-# First Mate routes such runs to a fresh session (first_mate_recovery
-# UNRECORDED_IDENTITY_TRIGGER). Kept within _MAX_RESUME_REASON_CHARS.
+# WorktreeDispatcher._fresh_session_if_unrecorded delivers the next real
+# re-engagement into a fresh session. Kept within _MAX_RESUME_REASON_CHARS.
 UNRECORDED_IDENTITY = (
     "no recorded runner identity, so Harbor will not guess its provider; "
-    "First Mate restarts it in a fresh session if first_mate.allow_fresh_session is on"
+    "its next re-engagement starts a fresh session (first_mate.allow_fresh_session)"
 )
 _LOG = logging.getLogger(__name__)
 # Receipt reason for a blocked run whose Linear blocker context was unprovable.
@@ -170,6 +170,28 @@ class SupervisorStatus:
             "escalations": list(self.escalations),
             "runs": list(self.runs),
         }
+
+
+def _human_answered(connection: Any, run_id: str) -> bool:
+    """True when a human answered this run's escalation and none is still open."""
+
+    try:
+        statuses = {str(row[0]) for row in connection.execute("SELECT status FROM escalations WHERE run_id=?", (run_id,))}
+    except sqlite3.OperationalError:
+        return False  # no escalations table: nothing was answered
+    return "answered" in statuses and "open" not in statuses
+
+
+def _queued_answers(connection: Any, run_id: str) -> list[tuple[str, str]]:
+    """Operator answers queued for this run but not yet delivered, oldest first."""
+
+    try:
+        rows = connection.execute(
+            "SELECT escalation, instruction FROM answer_queue WHERE run_id=? AND status='queued' ORDER BY rowid", (run_id,)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # no answer queue yet
+    return [(str(escalation), str(text or "")) for escalation, text in rows]
 
 
 def _switch_snapshot(connection: Any, run_id: str) -> Callable[[], None]:
@@ -799,6 +821,72 @@ class WorktreeDispatcher:
         await self._record_push_result(wake, result)
         return result
 
+    async def _fresh_session_if_unrecorded(
+        self, identifier: str, instruction: str | None, *, before_launch: Callable[[], None] | None = None,
+    ) -> Any | None:
+        """Deliver a re-engagement the factory refused only because the run has no recorded identity.
+
+        Called by the re-engagement paths (resume, PR events, retry) after a
+        refused rebuild, so an idle run is never relaunched. ``None`` leaves
+        the refusal standing: the cause was something else, there is nothing to
+        deliver, fresh sessions are off or already used for this run, or the
+        run is blocked on a human question that no one has answered yet. The
+        fresh session carries the blocker question, this re-engagement and any
+        queued operator answer verbatim, and is recorded in
+        ``first_mate_recoveries``.
+        """
+
+        from harbor import first_mate_recovery as recovery
+
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        row = self._persisted_run(identifier)
+        if connection is None or row is None or not instruction:
+            return None
+        run_id = str(row["id"])
+        failure = self.resume_failure(identifier, run_id)
+        if failure is None or failure.reason != UNRECORDED_IDENTITY:
+            return None
+        from harbor.runner.quota import runner_identity
+        if runner_identity(connection, run_id) is not None:
+            return None  # a stored reason from an earlier attempt; the run is identified now
+        workflow = getattr(self, "workflow", None)
+        settings = workflow.config.get("first_mate", {}) if workflow is not None else {}
+        if not settings.get("allow_fresh_session", True) or recovery.fresh_sessions_used(connection, run_id):
+            return None
+        final_row = connection.execute("SELECT final_json FROM runs WHERE id=?", (run_id,)).fetchone()
+        try:
+            final = json.loads(final_row[0]) if final_row and final_row[0] else {}
+        except (TypeError, ValueError):
+            final = {}
+        final = final if isinstance(final, Mapping) else {}
+        blocker = final.get("blocker") if isinstance(final.get("blocker"), Mapping) else {}
+        if recovery.needs_human(blocker) and not _human_answered(connection, run_id):
+            return None  # the escalation keeps waiting for the human
+        queued = _queued_answers(connection, run_id)
+        handoff = recovery.unrecorded_identity_handoff(
+            identifier, blocker, str(final.get("summary") or ""), [instruction, *(text for _, text in queued)],
+        )
+        recorded = False
+
+        def launch() -> None:
+            nonlocal recorded
+            if before_launch is not None:
+                before_launch()
+            if recorded:
+                return
+            recovery.record_fresh_session(
+                connection, project=self.project, ticket=identifier, run_id=run_id,
+                trigger=recovery.UNRECORDED_IDENTITY_TRIGGER, instruction=handoff, reason=UNRECORDED_IDENTITY,
+                old_session_id=row.get("session_id"),
+            )
+            if queued:
+                with connection:
+                    connection.executemany("UPDATE answer_queue SET status='delivered' WHERE escalation=? AND status='queued'",
+                                           [(escalation,) for escalation, _ in queued])
+            recorded = True
+
+        return await self.fresh_session(identifier, handoff, before_launch=launch)
+
     async def retry(
         self, identifier: str, instruction: str | None = None, *,
         before_launch: Callable[[], None] | None = None,
@@ -840,6 +928,14 @@ class WorktreeDispatcher:
             failure = self.resume_failure(identifier, run_id)
             # Each factory failure is a new record: cite only one this retry produced.
             if failure is not None and failure is not prior:
+                # A run with no recorded identity gets the retry in a fresh session.
+                result = await self._fresh_session_if_unrecorded(identifier, instruction or (
+                    f"Operator requested recovery of {identifier} after its builder process stopped. "
+                    "Re-read current Linear and GitHub facts, reconcile any interrupted work, and complete "
+                    "the configured gate."
+                ), before_launch=before_launch)
+                if result is not None:
+                    return result
                 raise RuntimeError(f"retained builder for {identifier} cannot be rebuilt: {failure.reason}")
             if self._live_runner_key(identifier) is not None:
                 # An overlapping retry rebuilt and resumed the builder first.
@@ -948,7 +1044,11 @@ class WorktreeDispatcher:
             if runner is None:
                 # Never create a fresh worktree or agent for a resume wake: same
                 # session recovery is fail-closed when the retained runner is gone.
-                return None
+                # The one exception is a run with no recorded identity, which no
+                # resume can ever rebuild: deliver this wake into a fresh session.
+                return await self._fresh_session_if_unrecorded(
+                    identifier, self._with_handoff_gate(identifier, wake.instruction or ""), before_launch=before_launch,
+                )
             if not wake.run_id:
                 # A wake decided from Linear/GitHub facts alone carries no run id.
                 # The retained runner knows which session this ticket owns, and
@@ -1013,7 +1113,11 @@ class WorktreeDispatcher:
                 )
             runner = self.runners.get(ticket) or await self.hydrate(ticket, expected_run_id=run_id)
             if runner is None:
-                raise PREventError(f"no retained builder for PR event ticket {ticket or '(unknown)'}")
+                # A run with no recorded identity gets this event in a fresh session.
+                result = await self._fresh_session_if_unrecorded(ticket, self._with_handoff_gate(ticket, instruction))
+                if result is None:
+                    raise PREventError(f"no retained builder for PR event ticket {ticket or '(unknown)'}")
+                return result
             run_id = str(run_id or getattr(runner, "default_run_id", "") or self._stable_run_id(
                 Wake(ticket={"identifier": ticket}, action="reengage")
             ))
@@ -4670,9 +4774,7 @@ class Supervisor:
             self._recovery_tickets.add(case.ticket)
             try:
                 try:
-                    # validate() routes an unrecorded identity on its own; no model call.
-                    proposal = {} if case.trigger == recovery.UNRECORDED_IDENTITY_TRIGGER else recovery.parse(
-                        await mate.triage(recovery.build_prompt(case, settings)))
+                    proposal = recovery.parse(await mate.triage(recovery.build_prompt(case, settings)))
                 except FirstMateQuotaError as exc:
                     # The only case that backs off exponentially (see backoff_seconds).
                     proposal = {"action": "wait", "reason": f"{recovery.USAGE_LIMIT} {exc}"}

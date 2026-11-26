@@ -2,17 +2,21 @@
 
 The production factory used to assume such a run belonged to Codex and resume
 it with a hard-coded Codex model, ignoring the project's configured provider
-and models. A Claude-only project then launched Codex. Now a resume refuses
-with a remedy, First Mate routes the run to a fresh session without asking the
-model, and the fresh session (which resumes no native session) starts like a
-new ticket and records its identity.
+and models. A Claude-only project then launched Codex. Now a resume refuses.
+Only a real re-engagement (a PR event, an operator answer, a retry or a
+recovery) is delivered into a fresh session, which carries the blocker
+question and every undelivered message verbatim, starts like a new ticket and
+records its identity. An idle run is left alone, and a human blocker waits for
+the human.
 """
 import asyncio
-from dataclasses import replace
+import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from harbor import answer_queue
 from harbor import first_mate_recovery as recovery
 from harbor.cli import build_production_dispatcher
 from harbor.config.projects import ProjectConfig
@@ -46,7 +50,7 @@ def project(tmp_path, monkeypatch, provider):
                            registry_path=str(registry))
 
 
-def retained_run(tmp_path, status="waiting"):
+def retained_run(tmp_path, status="waiting", final=None, finished_minutes_ago=None):
     """A retained run with a worktree and native session, but no runner_identity row."""
     db = HarborDB(tmp_path / "harbor.db")
     apply_phase3_migration(db)
@@ -55,10 +59,13 @@ def retained_run(tmp_path, status="waiting"):
                                           "owned": True, "hold": False}], emit_events=False)
     worktree = tmp_path / "worktree"
     worktree.mkdir()
+    finished = None
+    if finished_minutes_ago is not None:
+        finished = (datetime.now(timezone.utc) - timedelta(minutes=finished_minutes_ago)).isoformat(timespec="seconds")
     db.connection.execute(
-        "INSERT INTO runs(id,ticket,status,session_id,worktree,deadline_seconds) "
-        "VALUES ('run-1','SAMPLE-1',?,'native-1',?,600)",
-        (status, str(worktree)),
+        "INSERT INTO runs(id,ticket,status,session_id,worktree,deadline_seconds,final_json,finished_at) "
+        "VALUES ('run-1','SAMPLE-1',?,'native-1',?,600,?,?)",
+        (status, str(worktree), json.dumps(final) if final is not None else None, finished),
     )
     db.connection.commit()
     assert runner_identity(db.connection, "run-1") is None
@@ -158,51 +165,10 @@ def test_fresh_session_names_the_factory_reason(tmp_path, monkeypatch):
     db.close()
 
 
-SETTINGS = {"max_recoveries": 3, "allow_fresh_session": True, "recheck_minutes": 10, "stall_minutes": 30}
+# --- Only a real re-engagement starts a fresh session -------------------------
 
-
-@pytest.mark.parametrize("status", sorted(recovery.UNRECORDED_IDENTITY_STATUSES))
-def test_first_mate_finds_every_retained_run_without_identity(tmp_path, status):
-    db = retained_run(tmp_path, status)
-    cases = recovery.find_cases(db.connection, "SampleProject", SETTINGS)
-    assert [(c.run_id, c.trigger, c.status) for c in cases] == [("run-1", recovery.UNRECORDED_IDENTITY_TRIGGER, status)]
-    db.close()
-
-
-@pytest.mark.parametrize("status", ["running", "terminated", "completed"])
-def test_live_stopped_and_identified_runs_are_not_unrecorded_cases(tmp_path, status):
-    db = retained_run(tmp_path, status)
-    assert all(c.trigger != recovery.UNRECORDED_IDENTITY_TRIGGER
-               for c in recovery.find_cases(db.connection, "SampleProject", SETTINGS))
-    db.connection.execute("UPDATE runs SET status='waiting'")
-    bind_runner_identity(db.connection, "run-1", "codex", "gpt-sample-recorded", "high")
-    assert recovery.find_cases(db.connection, "SampleProject", SETTINGS) == []
-    db.close()
-
-
-def test_run_without_a_worktree_is_not_an_unrecorded_case(tmp_path):
-    db = retained_run(tmp_path)
-    db.connection.execute("UPDATE runs SET worktree=NULL")
-    db.connection.commit()
-    assert recovery.find_cases(db.connection, "SampleProject", SETTINGS) == []
-    db.close()
-
-
-def test_validate_routes_an_unrecorded_identity_to_one_fresh_session():
-    case = recovery.Case("SampleProject", "SAMPLE-1", "run-1", recovery.UNRECORDED_IDENTITY_TRIGGER, "waiting")
-    for proposal in ({}, {"action": "resume", "instruction": "continue", "reason": "r"}, {"action": "wait"}):
-        decision = recovery.validate(proposal, case, SETTINGS)
-        assert decision["action"] == "fresh_session"
-        assert decision["instruction"] == recovery.UNRECORDED_IDENTITY_INSTRUCTION
-    # An operator answer to a human blocker is a resume, which cannot be delivered either.
-    human = replace(case, blocker={"kind": "product_decision", "question": "Which copy?"})
-    assert recovery.validate({}, human, SETTINGS)["action"] == "fresh_session"
-    assert recovery.validate({}, case, {**SETTINGS, "allow_fresh_session": False})["action"] == "escalate"
-    assert recovery.validate({}, replace(case, history=[{"action": "fresh_session"}]), SETTINGS)["action"] == "escalate"
-    spent = replace(case, history=[{"action": "resume"}] * 3)
-    assert recovery.validate({}, spent, SETTINGS)["action"] == "escalate"
-    escalated = replace(case, history=[{"action": "fresh_session"}, {"action": "escalate"}])
-    assert recovery.validate({}, escalated, SETTINGS)["action"] == "wait"  # escalate once, never loop
+QUESTION = "Which onboarding copy should ship, A or B?"
+HUMAN_BLOCKER = {"summary": "needs a product decision", "blocker": {"kind": "product_decision", "question": QUESTION}}
 
 
 class Poller:
@@ -214,37 +180,167 @@ class Poller:
 
 
 class Mate:
+    """First Mate's model: always proposes a resume, and records each prompt."""
+
     def __init__(self):
         self.prompts = []
 
     async def triage(self, prompt):
         self.prompts.append(prompt)
-        return '{"action": "resume", "instruction": "continue", "reason": "model guess"}'
+        return json.dumps({"action": "resume", "instruction": "continue", "reason": "model guess"})
+
+
+def harbor_for(tmp_path, monkeypatch, provider="codex", **run):
+    """The production dispatcher and a supervisor over a throwaway ledger with one unrecorded run.
+
+    ``_runner_call`` is wrapped only to capture each instruction; the real
+    runner still runs (/usr/bin/true) and records its own identity.
+    """
+    config = project(tmp_path, monkeypatch, provider)
+    db = retained_run(tmp_path, **run)
+    dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object())
+    launched = []
+    real_call = dispatcher._runner_call
+
+    async def spy(runner, wake, **kwargs):
+        launched.append(wake.instruction)
+        return await real_call(runner, wake, **kwargs)
+
+    dispatcher._runner_call = spy
+    mate = Mate()
+    supervisor = Supervisor(Poller(), db=db, dispatcher=dispatcher,
+                            unblock_ladder=SimpleNamespace(first_mate=mate, linear=None, workflow=dispatcher.workflow))
+    return SimpleNamespace(db=db, dispatcher=dispatcher, supervisor=supervisor, mate=mate, launched=launched)
+
+
+def monitor_pass(harbor):
+    """One real First Mate monitor pass, then wait for any recovery it scheduled."""
+    async def run():
+        observation = PollResult(tuple(harbor.db.tickets("SampleProject")), "snapshot", True, ())
+        harbor.supervisor.last_result, harbor.supervisor.linear_healthy = observation, True
+        await harbor.supervisor._monitor_blocked(observation)
+        await harbor.supervisor._drain_recoveries()
+    asyncio.run(run())
+
+
+def fresh_sessions(db):
+    recovery.initialize(db.connection)
+    return [tuple(r) for r in db.connection.execute(
+        "SELECT trigger, action FROM first_mate_recoveries WHERE action='fresh_session'")]
+
+
+@pytest.mark.parametrize("status", ["parked", "waiting"])
+def test_an_idle_run_without_identity_is_left_alone(tmp_path, monkeypatch, status):
+    # For example a merge-ready hand-off parked in Human Review, with nothing pending.
+    harbor = harbor_for(tmp_path, monkeypatch, status=status, final={"outcome": "parked", "summary": "merge-ready"})
+    monitor_pass(harbor)
+    asyncio.run(harbor.dispatcher.hydrate("SAMPLE-1"))  # a restart rebuilds handles, nothing more
+    assert harbor.launched == [] and harbor.mate.prompts == []
+    assert fresh_sessions(harbor.db) == []
+    assert runner_identity(harbor.db.connection, "run-1") is None
+    assert harbor.dispatcher.resume_unavailable_reason("SAMPLE-1") == UNRECORDED_IDENTITY
+    harbor.db.close()
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-@pytest.mark.parametrize("status", ["waiting", "parked", "blocked", "failed"])
-def test_supervisor_loop_recovers_an_unrecorded_run_on_the_configured_provider(tmp_path, monkeypatch, provider, status):
-    """find_cases -> validate -> _apply_recovery -> fresh_session -> the real factory and runner."""
-    config = project(tmp_path, monkeypatch, provider)
-    db = retained_run(tmp_path, status)
-    dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object())
-    mate = Mate()
-    ladder = SimpleNamespace(first_mate=mate, linear=None, workflow=dispatcher.workflow)
-    supervisor = Supervisor(Poller(), db=db, dispatcher=dispatcher, unblock_ladder=ladder)
+def test_a_pr_event_on_an_unrecorded_waiting_run_starts_one_fresh_session_carrying_it(tmp_path, monkeypatch, provider):
+    harbor = harbor_for(tmp_path, monkeypatch, provider)
+    event = {"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "Review comment on src/app.py:12: rename helper()"}
+    asyncio.run(harbor.dispatcher.handle_pr_event(event))
+    assert len(harbor.launched) == 1 and event["instruction"] in harbor.launched[0]
+    assert fresh_sessions(harbor.db) == [(recovery.UNRECORDED_IDENTITY_TRIGGER, "fresh_session")]
+    assert tuple(runner_identity(harbor.db.connection, "run-1")) == (provider, CONFIGURED[provider]["model"], "low")
+    # The next event resumes the now-identified session; no second fresh session.
+    harbor.db.connection.execute("UPDATE runs SET status='waiting', session_id='native-2' WHERE id='run-1'")
+    harbor.db.connection.commit()
+    asyncio.run(harbor.dispatcher.handle_pr_event({**event, "instruction": "CI failed: lint"}))
+    assert len(fresh_sessions(harbor.db)) == 1
+    assert harbor.launched[-1].startswith("CI failed: lint")
+    harbor.db.close()
 
-    async def poll_once():
-        observation = PollResult(tuple(db.tickets("SampleProject")), "snapshot", True, ())
-        supervisor.last_result, supervisor.linear_healthy = observation, True
-        await supervisor._monitor_blocked(observation)
-        await supervisor._drain_recoveries()
 
-    asyncio.run(poll_once())
-    assert mate.prompts == []  # deterministic: the model is not asked
-    assert [r[0] for r in db.connection.execute("SELECT action FROM first_mate_recoveries")] == ["fresh_session"]
-    assert tuple(runner_identity(db.connection, "run-1")) == (provider, CONFIGURED[provider]["model"], "low")
-    assert type(dispatcher.runners["SAMPLE-1"]) is RUNNERS[provider]
-    # Now identified, the run is no longer an unrecorded case and resumes like any other.
-    assert all(c.trigger != recovery.UNRECORDED_IDENTITY_TRIGGER
-               for c in recovery.find_cases(db.connection, "SampleProject", SETTINGS))
-    db.close()
+def test_a_reengage_wake_on_an_unrecorded_run_is_delivered_into_a_fresh_session(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch, "claude")
+    wake = Wake({"identifier": "SAMPLE-1"}, "reengage", resume="run-1", instruction="CI failed on main: test_login")
+    assert asyncio.run(harbor.dispatcher.resume(wake)) is not None
+    assert len(harbor.launched) == 1 and "CI failed on main: test_login" in harbor.launched[0]
+    assert tuple(runner_identity(harbor.db.connection, "run-1"))[0] == "claude"
+    harbor.db.close()
+
+
+def test_fresh_sessions_off_keeps_the_refusal(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch)
+    harbor.dispatcher.workflow.config["first_mate"]["allow_fresh_session"] = False
+    with pytest.raises(Exception, match="no retained builder"):
+        asyncio.run(harbor.dispatcher.handle_pr_event({"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "x"}))
+    assert harbor.launched == [] and runner_identity(harbor.db.connection, "run-1") is None
+    harbor.db.close()
+
+
+def test_a_product_decision_escalates_and_is_never_fresh_sessioned_before_the_answer(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch, status="blocked", final=HUMAN_BLOCKER, finished_minutes_ago=15)
+    monitor_pass(harbor)
+    actions = [r[0] for r in harbor.db.connection.execute("SELECT action FROM first_mate_recoveries")]
+    assert actions == ["escalate"]  # the human-blocker guard, at its normal recheck cadence
+    # A PR event before the human answers does not route around the question.
+    with pytest.raises(Exception, match="no retained builder"):
+        asyncio.run(harbor.dispatcher.handle_pr_event({"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "x"}))
+    assert harbor.launched == [] and fresh_sessions(harbor.db) == []
+    assert runner_identity(harbor.db.connection, "run-1") is None
+    harbor.db.close()
+
+
+def answered_escalation(db, answer):
+    escalation = db.record_escalation("SAMPLE-1", "run-1", "product_decision", QUESTION, 2, status="open")
+    db.update_escalation(escalation["id"], status="answered")
+    instruction = f"Operator answer for escalation {escalation['id']}: {answer}\nAuthority citation: operator"
+    assert answer_queue.enqueue(db.connection, escalation["id"], "SampleProject", "SAMPLE-1", "run-1", instruction) == "queued"
+    return escalation["id"], instruction
+
+
+def test_a_queued_answer_is_replayed_into_the_fresh_session(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch, "claude", status="blocked", final=HUMAN_BLOCKER)
+    escalation, instruction = answered_escalation(harbor.db, "Ship copy B.")
+    assert asyncio.run(answer_queue.deliver(harbor.supervisor, escalation, "run-1", instruction)) is True
+    status = harbor.db.connection.execute("SELECT status FROM answer_queue WHERE escalation=?", (str(escalation),)).fetchone()[0]
+    assert status == "delivered"
+    handoff = harbor.launched[0]
+    assert instruction in handoff and QUESTION in handoff  # both verbatim
+    assert fresh_sessions(harbor.db) == [(recovery.UNRECORDED_IDENTITY_TRIGGER, "fresh_session")]
+    assert tuple(runner_identity(harbor.db.connection, "run-1")) == ("claude", "claude-sonnet-5-5", "low")
+    harbor.db.close()
+
+
+def test_an_answer_still_queued_rides_along_with_the_event_that_starts_the_session(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch, status="blocked", final=HUMAN_BLOCKER)
+    escalation, instruction = answered_escalation(harbor.db, "Ship copy A.")
+    asyncio.run(harbor.dispatcher.handle_pr_event({"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "Rebase on main"}))
+    handoff = harbor.launched[0]
+    assert "Rebase on main" in handoff and instruction in handoff and QUESTION in handoff
+    status = harbor.db.connection.execute("SELECT status FROM answer_queue WHERE escalation=?", (str(escalation),)).fetchone()[0]
+    assert status == "delivered"  # not left to be refused and marked failed later
+    harbor.db.close()
+
+
+def test_a_failed_run_retry_is_delivered_into_a_fresh_session(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch, "codex", status="failed")
+    asyncio.run(harbor.dispatcher.retry("SAMPLE-1", "Operator: retry after the flaky network"))
+    assert len(harbor.launched) == 1 and "Operator: retry after the flaky network" in harbor.launched[0]
+    assert tuple(runner_identity(harbor.db.connection, "run-1"))[0] == "codex"
+    harbor.db.close()
+
+
+def test_first_mate_recovery_resume_is_delivered_into_a_fresh_session(tmp_path, monkeypatch):
+    """find_cases -> First Mate -> validate -> _apply_recovery -> resume refused -> fresh session."""
+    final = {"summary": "tests flaky", "blocker": {"kind": "env_blocker", "question": "builder stuck on a flaky test"}}
+    harbor = harbor_for(tmp_path, monkeypatch, "claude", status="blocked", final=final, finished_minutes_ago=15)
+    monitor_pass(harbor)
+    assert len(harbor.mate.prompts) == 1  # an ordinary case: the model chose resume
+    assert len(harbor.launched) == 1
+    assert "continue" in harbor.launched[0] and "builder stuck on a flaky test" in harbor.launched[0]
+    actions = [r[0] for r in harbor.db.connection.execute("SELECT action FROM first_mate_recoveries ORDER BY id")]
+    assert actions == ["resume", "fresh_session"]
+    assert tuple(runner_identity(harbor.db.connection, "run-1"))[0] == "claude"
+    harbor.db.close()
+
+

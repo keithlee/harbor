@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,15 +46,9 @@ OBSOLETE_INSTRUCTION = (
     "/root/planner), spawn fresh planner/implementor/reviewer children under new names (planner-2, ...) "
     "with the models in config.toml, and continue delivering the ticket from where it stopped."
 )
-# A retained run with no runner_identity row cannot be resumed (the factory will
-# not guess its provider), so First Mate routes it to a fresh session without
-# asking the model. Deliberate stops (terminated) and live runs are left alone.
+# Trigger recorded when Harbor replaces a session whose provider was never
+# recorded, so no re-engagement could resume it (see unrecorded_identity_handoff).
 UNRECORDED_IDENTITY_TRIGGER = "unrecorded_identity"
-UNRECORDED_IDENTITY_STATUSES = frozenset({"waiting", "parked", "blocked", "failed", "orphaned"})
-UNRECORDED_IDENTITY_INSTRUCTION = (
-    "Harbor has no record of which provider ran the previous session, so it could not be resumed. "
-    "Continue delivering the ticket from the retained worktree, branch and any PR."
-)
 SENSITIVE = re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
 
 
@@ -176,28 +169,22 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
     stall = float(settings.get("stall_minutes", 30)) * 60
     rows = connection.execute(
         """SELECT r.id, r.ticket, r.status, r.final_json, r.session_id, r.finished_at, r.last_activity_at,
-                  r.started_at, t.linear_id, t.title, t.hold, t.state_type, t.state, r.worktree
+                  r.started_at, t.linear_id, t.title, t.hold, t.state_type, t.state
            FROM runs r JOIN tickets t ON t.identifier = r.ticket
            WHERE t.project = ? AND r.id = (SELECT r2.id FROM runs r2 WHERE r2.ticket = r.ticket
                  ORDER BY COALESCE(r2.finished_at, r2.started_at, r2.id) DESC, r2.id DESC LIMIT 1)""",
         (project,),
     ).fetchall()
-    identified = _identified_runs(connection)
     cases: dict[str, Case] = {}
     for row in rows:
-        (run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold,
-         state_type, state, worktree) = row
+        run_id, ticket, status, final_json, session, finished, activity, started, linear_id, title, hold, state_type, state = row
         if stopped(hold, state, state_type):
             continue
         status = str(status or "").casefold()
         final = _final(final_json)
         blocker = final.get("blocker") if isinstance(final.get("blocker"), dict) else {}
         trigger = None
-        if status in UNRECORDED_IDENTITY_STATUSES and worktree and run_id not in identified:
-            # Nothing can resume this run: the runner factory will not guess
-            # which provider owns its session. Only a fresh session recovers it.
-            trigger = UNRECORDED_IDENTITY_TRIGGER
-        elif status == "blocked" and (now - (_ts(finished) or now)) >= recheck:
+        if status == "blocked" and (now - (_ts(finished) or now)) >= recheck:
             trigger = "blocked"
         elif status == "running" and (now - (_ts(activity) or _ts(started) or now)) >= stall:
             trigger = "stalled"
@@ -244,14 +231,6 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue
         ready.append(case)
     return ready
-
-
-def _identified_runs(connection) -> set[str]:
-    """Run ids with a recorded runner identity (none when the table does not exist yet)."""
-    try:
-        return {str(row[0]) for row in connection.execute("SELECT run_id FROM runner_identity")}
-    except sqlite3.OperationalError:
-        return set()
 
 
 def _retry_pending(connection, run_id: str, now: float) -> bool:
@@ -321,15 +300,6 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         return {"action": "escalate", "instruction": "", "reason": why}
 
     budget_left = case.attempts < int(settings.get("max_recoveries", 3))
-    if case.trigger == UNRECORDED_IDENTITY_TRIGGER:
-        # Deterministic, whatever the model proposed: resume, retry and an
-        # operator answer all need the retained session, which nothing can
-        # rebuild. A human blocker is re-raised by the fresh session itself.
-        if settings.get("allow_fresh_session", True) and not case.fresh_sessions and budget_left:
-            return {"action": "fresh_session", "instruction": UNRECORDED_IDENTITY_INSTRUCTION,
-                    "reason": "no recorded runner identity; only a fresh session can recover the run"}
-        return escalate("no recorded runner identity and no fresh session is available "
-                        "(first_mate.allow_fresh_session, one per run, within max_recoveries)")
     human_question = case.kind in HUMAN_KINDS - {"conflicting_instruction"} or SENSITIVE.search(json.dumps(case.blocker))
     if (not human_question and OBSOLETE.search(" ".join([json.dumps(case.blocker), case.summary]))
             and case.status != "running" and budget_left):
@@ -344,7 +314,7 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         if action not in {"resume", "retry", "fresh_session"}:
             return {"action": "resume" if case.status == "blocked" else "retry", "instruction": OBSOLETE_INSTRUCTION,
                     "reason": f"obsolete Harbor bookkeeping blocker (First Mate proposed {action or 'nothing'})"}
-    if case.kind in HUMAN_KINDS or SENSITIVE.search(json.dumps(case.blocker)):
+    if needs_human(case.blocker):
         return escalate(f"{case.kind or 'sensitive'} blockers need a human or cited authority")
     if case.attempts >= int(settings.get("max_recoveries", 3)):
         return escalate(f"recovery budget exhausted after {case.attempts} attempts")
@@ -364,6 +334,54 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
         return {"action": "wait", "instruction": "", "reason": "builder is still running; only a fresh session can replace it"} \
             if case.trigger != "stalled" else escalate("stalled run needs a fresh session, which is not available")
     return {"action": action, "instruction": instruction[:4000], "reason": reason[:1000]}
+
+
+def needs_human(blocker: Mapping[str, Any] | None) -> bool:
+    """A blocker only a human or cited authority may answer."""
+    blocker = blocker if isinstance(blocker, Mapping) else {}
+    return str(blocker.get("kind") or "").strip() in HUMAN_KINDS or bool(SENSITIVE.search(json.dumps(blocker, default=str)))
+
+
+def fresh_sessions_used(connection, run_id: str) -> int:
+    initialize(connection)
+    row = connection.execute(
+        "SELECT COUNT(*) FROM first_mate_recoveries WHERE run_id=? AND action='fresh_session'", (run_id,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def record_fresh_session(connection, *, project: str, ticket: str, run_id: str, trigger: str,
+                         instruction: str, reason: str, old_session_id: str | None) -> None:
+    """Record a fresh session Harbor started outside a First Mate case."""
+    initialize(connection)
+    with connection:
+        connection.execute(
+            "INSERT INTO first_mate_recoveries(project,ticket,run_id,trigger,action,instruction,reason,old_session_id,at) "
+            "VALUES (?,?,?,?,'fresh_session',?,?,?,?)",
+            (project, ticket, run_id, trigger, instruction, reason, old_session_id, time.time()),
+        )
+
+
+def unrecorded_identity_handoff(ticket: str, blocker: Mapping[str, Any] | None, summary: str,
+                                undelivered: Iterable[str]) -> str:
+    """Hand-off for a fresh session that replaces a session nothing could resume.
+
+    The blocker question and every re-engagement the old session could not
+    receive are carried verbatim, so nothing is lost with the session.
+    """
+    lines = [
+        f"Harbor started a fresh builder session for {ticket}: it has no record of which provider ran the "
+        "previous session, so that session could not be resumed. The retained worktree, branch, ticket and any "
+        "PR are unchanged; re-read Linear, GitHub and the worktree to reconstruct state.",
+        f"Previous summary: {summary[:1500] or 'none'}",
+    ]
+    if isinstance(blocker, Mapping) and blocker:
+        lines.append(f"The previous session was blocked ({blocker.get('kind') or 'blocker'}) on this question, "
+                     f"verbatim: {blocker.get('question') or json.dumps(blocker, default=str)}")
+    for text in undelivered:
+        if text:
+            lines.append(f"Undelivered re-engagement, verbatim:\n{text}")
+    return "\n\n".join(lines)
 
 
 def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
