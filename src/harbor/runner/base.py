@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import time
@@ -49,6 +50,23 @@ BLOCKER_KINDS = frozenset(
         "conflicting_instruction",
     }
 )
+
+
+def resolve_executable(name: str) -> str:
+    """The builder CLI's absolute path, found on Harbor's own PATH.
+
+    Given an ``env``, ``subprocess`` looks a bare name up on that env's PATH,
+    and the builder environment puts a Harbor directory first there. Resolve it
+    here, against the PATH Harbor itself runs with, so nothing placed on the
+    builder's PATH can stand in for ``codex`` or ``claude``.
+    """
+
+    if os.sep in name:
+        return name
+    resolved = shutil.which(name, path=os.environ.get("PATH") or os.defpath)
+    if resolved is None:
+        raise FileNotFoundError(f"{name} is not on Harbor's PATH")
+    return str(Path(resolved).absolute())
 
 
 class RunnerError(RuntimeError):
@@ -786,7 +804,12 @@ class BaseRunner:
         # The environment ``harbor start`` resolved once for this project
         # (registry, ledger, project, the harbor shim first on PATH, and the
         # GitHub token variable); it wins over Harbor's spawn-time environment.
-        env.update(dict(getattr(self, "builder_env", None) or {}))
+        # A ``None`` value removes the variable (a token unset at start).
+        for name, value in dict(getattr(self, "builder_env", None) or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
         # GitHub transport settings for harbor.github_rest (names only; the
         # token stays in whichever variable the operator already set).
         env.update(dict(getattr(self, "github_env", None) or {}))
@@ -987,6 +1010,7 @@ class BaseRunner:
         self._queue_transition(context, "dispatched")
         try:
             command = self.command(instruction, run_id=context.session_id or context.run_id, resume=resume)
+            command = [resolve_executable(command[0]), *command[1:]]
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(context.worktree),
