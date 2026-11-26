@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from harbor.url_credentials import redact_http_error
+
 
 class GitHubError(RuntimeError):
     """Base error for a failed GitHub read."""
@@ -267,13 +269,29 @@ class GitHubClient:
         as itself.
         """
 
-        request = client.build_request("POST", self.endpoint, json=payload, headers=headers)
+        failure: GitHubError | None = None
+        try:
+            request = client.build_request("POST", self.endpoint, json=payload, headers=headers)
+        except httpx.InvalidURL:
+            # Its message repeats part of the URL (for example "Invalid port:
+            # '<password>＠host'"), so it is neither shown nor chained.
+            failure = GitHubError("GitHub request failed: the GitHub API URL is not a valid URL")
+        if failure is not None:
+            raise failure
         try:
             response = await client.send(request)
             response.raise_for_status()
         except httpx.HTTPError as exc:
             _redact_authorization(exc)
-            raise GitHubError(f"GitHub request failed: {_one_line(exc)}") from exc
+            message, carries_userinfo = redact_http_error(_one_line(exc), self.endpoint)
+            failure = GitHubError(f"GitHub request failed: {message}")
+            if not carries_userinfo:
+                raise failure from exc
+        if failure is not None:
+            # Raised outside the ``except`` block, so neither ``__cause__`` nor
+            # ``__context__`` holds the httpx error, whose message and
+            # ``request.url`` carry the endpoint's userinfo.
+            raise failure
         try:
             return response.json()
         except ValueError as exc:
