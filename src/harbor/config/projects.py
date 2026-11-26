@@ -244,6 +244,12 @@ class ProjectConfig:
     def __post_init__(self) -> None:
         from harbor.runner.playwright import validate_image
         validate_image(self.playwright_browser_image)
+        # Credentials come from the environment, never from an endpoint's
+        # userinfo, which httpx would repeat in every request error.
+        from harbor.github_rest import TOKEN_HINT
+        from harbor.url_credentials import reject_userinfo
+        reject_userinfo(self.linear_api_url, "Linear API", "LINEAR_API_KEY or HARBOR_LINEAR_API_KEY")
+        reject_userinfo(self.github_api_url, "GitHub API", TOKEN_HINT)
         configured = self.hold_all if self.hold is None else bool(self.hold)
         object.__setattr__(self, "hold_all", configured)
         object.__setattr__(self, "hold", configured)

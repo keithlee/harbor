@@ -25,8 +25,12 @@ import sys
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from harbor.url_credentials import reject_userinfo
+
 DEFAULT_REST_URL = "https://api.github.com"
 TOKEN_FALLBACKS = ("GITHUB_TOKEN", "GH_TOKEN")
+# Where a GitHub credential belongs instead of the API URL's userinfo.
+TOKEN_HINT = "GITHUB_TOKEN, GH_TOKEN or the variable named by github_token_env"
 API_VERSION = "2022-11-28"
 
 
@@ -46,6 +50,7 @@ def rest_base_url(graphql_url: str | None) -> str:
         return DEFAULT_REST_URL
     if not url.startswith("https://"):
         raise ValueError("the GitHub API URL must use https")
+    reject_userinfo(url, "GitHub API", TOKEN_HINT)
     if url.endswith("/api/graphql"):
         return url[: -len("/graphql")] + "/v3"
     if url.endswith("/graphql"):
@@ -57,13 +62,16 @@ def require_https_api_url(graphql_url: str | None) -> str:
     """Return the GraphQL endpoint if Harbor may send a GitHub token to it.
 
     The same rule ``rest_base_url`` applies to the builder: https only, plus a
-    host. Callers check this before building a GitHub client, so a plain-http
-    or scheme-less endpoint fails closed without sending a request.
+    host, and no userinfo (``user:secret@``), which httpx would repeat in its
+    error messages; the token comes from the environment instead. Callers
+    check this before building a GitHub client, so a plain-http, scheme-less
+    or credential-bearing endpoint fails closed without sending a request.
     """
 
     url = (graphql_url or "").strip()
     if not url.startswith("https://"):
         raise ValueError("the GitHub API URL must use https")
+    reject_userinfo(url, "GitHub API", TOKEN_HINT)
     if not urlsplit(url).hostname:
         raise ValueError("the GitHub API URL must name a host")
     return url
