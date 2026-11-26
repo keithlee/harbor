@@ -850,6 +850,13 @@ class WorktreeDispatcher:
         if runner_identity(connection, run_id) is not None:
             return None  # a stored reason from an earlier attempt; the run is identified now
         workflow = getattr(self, "workflow", None)
+        if workflow is not None:
+            # The factory refused before its own reload, so adopt the operator's
+            # current policy here. An unreadable workflow authorizes nothing.
+            try:
+                workflow = self.workflow = workflow.reload()
+            except (OSError, ValueError):
+                return None
         settings = workflow.config.get("first_mate", {}) if workflow is not None else {}
         if not settings.get("allow_fresh_session", True) or recovery.fresh_sessions_used(connection, run_id):
             return None

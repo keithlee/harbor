@@ -82,7 +82,7 @@ def obsolete_instruction(provider: str = "") -> str:
 # Trigger recorded when Harbor replaces a session whose provider was never
 # recorded, so no re-engagement could resume it (see unrecorded_identity_handoff).
 UNRECORDED_IDENTITY_TRIGGER = "unrecorded_identity"
-SENSITIVE =re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
+SENSITIVE = re.compile(r"\b(security|secret|credential|auth|billing|payment|privacy|delete|migration|schema|irreversible)\b", re.I)
 
 
 def initialize(connection) -> None:

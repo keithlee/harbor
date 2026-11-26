@@ -11,6 +11,7 @@ the human.
 """
 import asyncio
 import json
+import tomllib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -28,7 +29,7 @@ from harbor.runner.codex import CodexRunner
 from harbor.runner.quota import bind_runner_identity, runner_identity
 from harbor.supervisor import _MAX_RESUME_REASON_CHARS, UNRECORDED_IDENTITY, Supervisor
 from harbor.wake import Wake, apply_phase3_migration
-from workflow_support import materialize
+from workflow_support import dumps, materialize
 
 CONFIGURED = {
     "claude": {"model": "claude-sonnet-5-5", "reasoning_effort": "low"},
@@ -268,9 +269,24 @@ def test_a_reengage_wake_on_an_unrecorded_run_is_delivered_into_a_fresh_session(
     harbor.db.close()
 
 
-def test_fresh_sessions_off_keeps_the_refusal(tmp_path, monkeypatch):
+def test_turning_fresh_sessions_off_in_config_toml_while_running_keeps_the_refusal(tmp_path, monkeypatch):
     harbor = harbor_for(tmp_path, monkeypatch)
-    harbor.dispatcher.workflow.config["first_mate"]["allow_fresh_session"] = False
+    assert harbor.dispatcher.workflow.config["first_mate"]["allow_fresh_session"] is True  # loaded at start
+    # The operator edits the project's config.toml while Harbor runs; nothing touches the in-memory copy.
+    models = harbor.dispatcher.workflow.models_path
+    data = tomllib.loads(models.read_text())
+    data.setdefault("first_mate", {})["allow_fresh_session"] = False
+    models.write_text(dumps(data))
+    with pytest.raises(Exception, match="no retained builder"):
+        asyncio.run(harbor.dispatcher.handle_pr_event({"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "x"}))
+    assert harbor.launched == [] and fresh_sessions(harbor.db) == []
+    assert runner_identity(harbor.db.connection, "run-1") is None
+    harbor.db.close()
+
+
+def test_an_unreadable_workflow_authorizes_no_fresh_session(tmp_path, monkeypatch):
+    harbor = harbor_for(tmp_path, monkeypatch)
+    harbor.dispatcher.workflow.models_path.write_text("[first_mate\n")  # invalid TOML
     with pytest.raises(Exception, match="no retained builder"):
         asyncio.run(harbor.dispatcher.handle_pr_event({"ticket": "SAMPLE-1", "run_id": "run-1", "instruction": "x"}))
     assert harbor.launched == [] and runner_identity(harbor.db.connection, "run-1") is None
