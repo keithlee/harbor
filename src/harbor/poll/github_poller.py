@@ -14,6 +14,7 @@ from harbor.config.profile import PipelineProfile
 from harbor.facts.ci import classify_ci
 from harbor.facts.threads import parse_comment_surfaces, parse_threads
 from harbor.pr_events import PREventProcessor
+from harbor.url_credentials import has_userinfo
 
 
 DEFAULT_WEB_HOST = "github.com"
@@ -45,7 +46,7 @@ def github_web_host(api_url: str | None) -> str:
         raise ValueError("the GitHub API URL must be a URL with a host name") from exc
     if host.endswith("."):
         host = host[:-1]
-    if parts.scheme not in {"http", "https"} or not host or "@" in parts.netloc:
+    if parts.scheme not in {"http", "https"} or not host or has_userinfo(text):
         raise ValueError("the GitHub API URL must be a URL with a host name")
     if not host.isascii():
         raise ValueError("the GitHub API URL host must be ASCII; give an internationalized name in its xn-- form")
