@@ -13,29 +13,43 @@ from __future__ import annotations
 import re
 
 # The authority of a URL runs from ``//`` to the first ``/``, ``?`` or ``#``;
-# userinfo is everything in it up to the last ``@``.
+# userinfo is everything in it up to the last ``@``. Anything else before
+# that ``@`` (a backslash, a quote) is treated as userinfo too: refusing too
+# much is safe, refusing too little is not.
 _USERINFO = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://[^/?#]*@")
-# The same shape anywhere in free text, such as an exception message. Quotes
-# and whitespace end the match so a quoted URL is redacted on its own.
-_USERINFO_IN_TEXT = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s'\"<>]*@")
+# The same shape anywhere in free text, such as an exception message. Only
+# whitespace ends it early: httpx leaves quotes and other punctuation in
+# userinfo unencoded, so a quote is no evidence that the userinfo has ended.
+_USERINFO_IN_TEXT = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s]*@")
+# ASCII control characters (C0 and DEL). ``str.strip`` leaves NUL and most of
+# these in place, and URL parsers disagree on whether to drop them, so a URL
+# with one could look host-only to one check and carry userinfo to another.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 REDACTED = "[redacted]"
 
 
 def has_userinfo(url: str | None) -> bool:
-    """True if ``url`` names a user, password or token before its host."""
+    """True if ``url`` names a user, password or token before its host.
 
-    return bool(_USERINFO.match(str(url or "").strip()))
+    Control characters are removed first, so ``"\\x00https://u:p@h"`` is
+    still recognized.
+    """
+
+    return bool(_USERINFO.match(_CONTROL.sub("", str(url or "")).strip()))
 
 
 def reject_userinfo(url: str | None, label: str, token_hint: str) -> None:
-    """Fail closed on a URL with userinfo, without repeating the URL.
+    """Fail closed on a URL with control characters or userinfo, without repeating it.
 
     ``token_hint`` names where the credential belongs instead, for example
     ``"LINEAR_API_KEY or HARBOR_LINEAR_API_KEY"``.
     """
 
-    if has_userinfo(url):
+    text = str(url or "").strip()
+    if _CONTROL.search(text):
+        raise ValueError(f"the {label} URL must not contain control characters")
+    if has_userinfo(text):
         raise ValueError(
             f"the {label} URL must not contain a user name, password or token (the part before '@'); "
             f"remove it and supply the credential through {token_hint}"
@@ -46,3 +60,16 @@ def redact_userinfo(text: object) -> str:
     """``text`` with the userinfo of every URL in it replaced by ``[redacted]``."""
 
     return _USERINFO_IN_TEXT.sub(rf"\1{REDACTED}@", str(text))
+
+
+def redact_http_error(message: str, endpoint: object) -> tuple[str, bool]:
+    """``message`` with userinfo redacted, and whether the original error must be dropped.
+
+    The second value is true when ``endpoint`` or ``message`` carried
+    userinfo. The httpx exception then still holds it (in its message and in
+    ``exc.request.url``), so the caller must raise its own error with neither
+    ``__cause__`` nor ``__context__`` pointing at it.
+    """
+
+    redacted = redact_userinfo(message)
+    return redacted, redacted != message or has_userinfo(str(endpoint or ""))

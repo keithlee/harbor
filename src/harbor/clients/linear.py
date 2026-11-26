@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import httpx
 
-from harbor.url_credentials import redact_userinfo
+from harbor.url_credentials import redact_http_error
 
 DEFAULT_LINEAR_API_URL = "https://api.linear.app/graphql"
 
@@ -253,6 +253,7 @@ class LinearClient:
         return issue
 
     async def _post(self, query: str, variables: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        failure: LinearClientError | None = None
         try:
             response = await self._client.post(
                 self.endpoint,
@@ -263,13 +264,16 @@ class LinearClient:
             body = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             # httpx repeats the request URL in its messages; never let
-            # userinfo in it reach a log line, and drop the original
-            # exception from the chain when it carried one.
-            message = redact_userinfo(exc)
-            error = LinearClientError(f"Linear request failed: {message}")
-            if message != str(exc):
-                raise error from None
-            raise error from exc
+            # userinfo in it reach a log line.
+            message, carries_userinfo = redact_http_error(str(exc), self.endpoint)
+            failure = LinearClientError(f"Linear request failed: {message}")
+            if not carries_userinfo:
+                raise failure from exc
+        if failure is not None:
+            # Raised outside the ``except`` block, so neither ``__cause__`` nor
+            # ``__context__`` holds the httpx error, whose message and
+            # ``request.url`` carry the endpoint's userinfo.
+            raise failure
         if not isinstance(body, dict):
             raise LinearClientError("Linear returned a non-object response")
         errors = body.get("errors")
