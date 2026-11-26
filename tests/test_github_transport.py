@@ -612,8 +612,12 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
     materialize(repo, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
     pipeline = tmp_path / "pipeline.md"
+    # HARBOR_WORKTREE_ROOT does not override a loaded config (worktree_root is "" not None),
+    # so set worktree_root in the pipeline to keep doctor's disk check out of the real home.
+    worktree_root = tmp_path / "wt"
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
                         f"builder_provider: {provider}\nlinear_api_url: {linear_api_url}\n"
+                        f"worktree_root: {worktree_root}\n"
                         + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else "")
                         + pipeline_extra)
     extra = registry or {}
@@ -628,12 +632,12 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
     env = {k: v for k, v in env.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN", "HARBOR_GITHUB_TOKEN_ENV")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
-               HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
-               HARBOR_CODEX_EXECUTABLE="/bin/echo", HARBOR_WORKTREE_ROOT=str(tmp_path / "wt"))
+               HARBOR_CLAUDE_EXECUTABLE="/bin/echo", HARBOR_CODEX_EXECUTABLE="/bin/echo")
     env.update({"GITHUB_TOKEN": "dummy-token-value"} if github_env is None else github_env)
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
                              "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
     assert "dummy-token-value" not in result.stdout + result.stderr
+    assert f" at {worktree_root.resolve()} " in result.stdout, result.stdout
     return result
 
 
