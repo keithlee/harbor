@@ -468,6 +468,38 @@ def test_an_invalid_url_error_never_repeats_userinfo() -> None:
     assert caught_linear.value.__cause__ is None and caught_linear.value.__context__ is None
 
 
+@pytest.mark.parametrize("endpoint", [LINEAR_WITH_USERINFO, LINEAR_FULLWIDTH, "https://linear.example.test/graphql"])
+def test_an_unsendable_key_is_refused_before_the_endpoint_is_used(endpoint: str) -> None:
+    def never(request):
+        raise AssertionError("no request may be sent with an unsendable key")
+
+    key = f"{SECRET}-key\r"  # a trailing CR, as from a CRLF .env file
+    client = LinearClient(token=key, endpoint=endpoint, transport=httpx.MockTransport(never))
+    with pytest.raises(LinearClientError, match="cannot be sent in an HTTP header") as caught:
+        asyncio.run(client._post("query { viewer { id } }"))
+    _assert_no_secret_anywhere(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+def test_a_userinfo_endpoint_never_reaches_the_chained_request() -> None:
+    # The plain-endpoint path keeps its cause, with the key redacted on the
+    # chained request (#55); a userinfo endpoint keeps no httpx error at all.
+    plain = LinearClient(token="dummy-key", endpoint="https://linear.example.test/graphql",
+                         transport=httpx.MockTransport(_bad_gateway))
+    with pytest.raises(LinearClientError) as caught_plain:
+        asyncio.run(plain._post("query { viewer { id } }"))
+    cause = caught_plain.value.__cause__
+    assert isinstance(cause, httpx.HTTPStatusError)
+    assert cause.request.headers["Authorization"] == "[redacted]"
+
+    secret_endpoint = LinearClient(token="dummy-key", endpoint=LINEAR_WITH_USERINFO,
+                                   transport=httpx.MockTransport(_bad_gateway))
+    with pytest.raises(LinearClientError) as caught:
+        asyncio.run(secret_endpoint._post("query { viewer { id } }"))
+    _assert_no_secret_anywhere(caught.value)
+    assert not any(hasattr(item, "request") for item in _chain(caught.value))
+
+
 def test_an_error_without_userinfo_keeps_its_cause() -> None:
     client = LinearClient(token="dummy-key", endpoint="https://linear.example.test/graphql",
                           transport=httpx.MockTransport(_bad_gateway))
