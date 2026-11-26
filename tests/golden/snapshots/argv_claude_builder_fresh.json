@@ -124,7 +124,7 @@
   "--effort",
   "high",
   "--permission-mode",
-  "dontAsk",
+  "auto",
   "--tools",
   "Bash,Read,Glob,Grep,Skill,Agent",
   "--setting-sources",

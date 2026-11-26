@@ -142,6 +142,14 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
     return allow
 
 
+# Every Claude builder (and the children it spawns) runs in ``auto`` mode:
+# Claude Code's classifier approves routine actions such as test, build and
+# git commands, where ``dontAsk`` refused every call without a pre-approval
+# and stalled tickets on permission escalations. The OS sandbox still bounds
+# what Bash can write and reach, and the rules below stay pre-approved.
+BUILDER_PERMISSION_MODE = "auto"
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
@@ -178,7 +186,7 @@ class ClaudeRunner(CodexRunner):
         allow = self._workflow_permissions()
         mcp = github_mcp_config(getattr(self, "github_mcp", None))
         if mcp:
-            # Pre-approve only the GitHub server's tools; dontAsk refuses everything else.
+            # Pre-approve the GitHub server's tools so they never depend on the auto classifier.
             allow.append("mcp__github")
         if allow:
             settings["permissions"] = {"allow": allow}
@@ -191,12 +199,12 @@ class ClaudeRunner(CodexRunner):
         schema.pop("$schema", None)
         schema.pop("$id", None)
         # Agent lets the delivery skill spawn its planner/implementor/reviewer children. They
-        # run in this process, so they get the same tools, dontAsk mode and sandbox as the builder.
+        # run in this process, so they get the same tools, permission mode and sandbox as the builder.
         command = [
             self.executable, "--print", "--verbose", "--output-format", "stream-json",
             "--json-schema", json.dumps(schema),
             "--model", self.model, "--effort", self.reasoning_effort,
-            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
+            "--permission-mode", BUILDER_PERMISSION_MODE, "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
         if mcp:

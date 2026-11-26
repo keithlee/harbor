@@ -32,7 +32,7 @@ def test_claude_builder_can_spawn_child_agents_within_the_same_sandbox(tmp_path:
     assert "Agent" in _tools(argv)
     # Children inherit this exact set: no file-writing, web or MCP tool is added with Agent.
     assert sorted(_tools(argv)) == ["Agent", "Bash", "Glob", "Grep", "Read", "Skill"]
-    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
     sandbox = json.loads(argv[argv.index("--settings") + 1])["sandbox"]
     assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True
     assert sandbox["allowUnsandboxedCommands"] is False
