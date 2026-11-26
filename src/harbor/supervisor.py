@@ -1251,6 +1251,10 @@ class Supervisor:
         # A process-local marker for a merge receipt obtained from an
         # observed PR fact.  Builder JSON alone never enters this set.
         self._verified_merge_runs: set[str] = set()
+        # Per unverified ``outcome=merged`` run id: (Linear PR-link refreshes
+        # made by normal reconciliation, monotonic time of the latest one).
+        # Bounds the extra Linear reads; see ``_should_refresh_pr_links``.
+        self._pr_link_refreshes: dict[str, tuple[int, float]] = {}
         # Process-local keys of operator notifications already sent, so a
         # per-poll retry of the same failure pages the operator once.
         self._operator_notices: set[str] = set()
@@ -1938,6 +1942,39 @@ class Supervisor:
             )
         return True
 
+    # A builder that merges in a single turn attaches its PR to Linear after
+    # Harbor's last poll recorded the ticket, then moves it to Done, which
+    # takes it out of the poll.  Normal reconciliation re-reads that ticket's
+    # PR links from Linear a bounded number of times, spaced apart so a late
+    # Linear integration attachment still gets a later chance.
+    PR_LINK_REFRESH_ATTEMPTS = 3
+    PR_LINK_REFRESH_SPACING_SECONDS = 60.0
+
+    def _should_refresh_pr_links(self, run_id: str, merge_verified: Any, payload: Mapping[str, Any]) -> bool:
+        """Claim one bounded Linear PR-link refresh for an unverified merged run.
+
+        Only a completed ``outcome=merged`` run that Harbor has not verified,
+        with a GitHub read model to verify it against, qualifies.  Each run
+        gets at most ``PR_LINK_REFRESH_ATTEMPTS`` refreshes per supervisor
+        process, at least ``PR_LINK_REFRESH_SPACING_SECONDS`` apart, so a
+        claim that Linear never confirms cannot add a Linear call every poll.
+        """
+
+        import time
+
+        if merge_verified == 1 or self.github_poller is None:
+            return False
+        if str(payload.get("outcome", "")).casefold() != "merged":
+            return False
+        attempts, last = self._pr_link_refreshes.get(run_id, (0, 0.0))
+        now = time.monotonic()
+        if attempts >= self.PR_LINK_REFRESH_ATTEMPTS:
+            return False
+        if attempts and now - last < self.PR_LINK_REFRESH_SPACING_SECONDS:
+            return False
+        self._pr_link_refreshes[run_id] = (attempts + 1, now)
+        return True
+
     async def _reconcile_completed_merges(self, only: str | None = None, *, refresh: bool = False) -> None:
         """Recover merge receipts that arrived just after a builder exited.
 
@@ -1947,7 +1984,10 @@ class Supervisor:
         completed run and its worktree forever.  Reconciliation is scoped to
         persisted ``completed/outcome=merged`` rows and queries only the PR
         URL already present in the final artifact and independently retained
-        from the Linear ticket attachment.
+        from the Linear ticket attachment.  When that attachment is not yet
+        retained (a single-turn merge attaches it after Harbor's last poll),
+        the ticket's links are re-read from Linear: always when ``refresh`` is
+        set, otherwise within the bound of ``_should_refresh_pr_links``.
         """
 
         connection = getattr(self.db, "connection", None) if self.db is not None else None
@@ -1976,7 +2016,9 @@ class Supervisor:
             if not isinstance(pr_url, str) or not pr_url.strip():
                 continue
             ticket = self._authoritative_ticket({"identifier": identifier})
-            if not self._ticket_has_pr_url(ticket, pr_url) and refresh:
+            if not self._ticket_has_pr_url(ticket, pr_url) and (
+                refresh or self._should_refresh_pr_links(run_id, row[4], payload)
+            ):
                 if await self._refresh_ticket_pr_links(identifier):
                     ticket = self._authoritative_ticket({"identifier": identifier})
             if not self._ticket_has_pr_url(ticket, pr_url):

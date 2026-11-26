@@ -277,6 +277,14 @@ port) for GitHub Enterprise Server's `https://<host>/api/graphql`. A link to any
 other host is ignored, so Harbor never queries or acts on it. Nothing new to
 configure.
 
+A builder can open, attach and merge its PR and move the ticket to `Done` in
+one turn. The ticket then leaves the Linear poll before Harbor has seen the
+attachment. For a completed `outcome=merged` run that Harbor has not yet
+verified, normal supervision re-reads that ticket's attachments from Linear, so
+it can still verify the merge on GitHub and remove the worktree. This read
+happens at most 3 times per run in each supervisor process, at least 60 seconds
+apart. The builder's `pr_url` counts only if Linear lists it as an attachment.
+
 ### Editing mid-run
 
 Editing `.harbor/workflow/` while a ticket is in flight never blocks it. The
