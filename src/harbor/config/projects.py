@@ -466,7 +466,7 @@ def _parse_registry_values(name: str, overrides: dict[str, object]) -> None:
     string.  Rules, matching the pipeline parser and the endpoint/GitHub
     columns: an empty cell is dropped (the pipeline's value, then the default,
     applies); a non-empty cell wins over the pipeline.  ``hold`` beats
-    ``hold_all`` when both are set, as in the pipeline.  A value that cannot
+    ``hold_all``, which beats ``shadow_hold``, as in the pipeline.  A value that cannot
     be parsed is an error, so an unreadable ``hold`` never releases hold.
     """
 
@@ -476,13 +476,13 @@ def _parse_registry_values(name: str, overrides: dict[str, object]) -> None:
     for key in [key for key, value in overrides.items() if isinstance(value, str) and not value.strip()]:
         del overrides[key]
     holds = {}
-    for key in ("hold", "hold_all"):
+    for key in ("hold", "hold_all", "shadow_hold"):
         if key in overrides:
             holds[key] = _as_bool(str(overrides[key]), None)  # type: ignore[arg-type]
             if holds[key] is None:
                 raise fail(key, "true or false (yes/no, on/off, 1/0)", overrides[key])
     if holds:
-        overrides["hold"] = overrides["hold_all"] = holds.get("hold", holds.get("hold_all"))
+        overrides["hold"] = overrides["hold_all"] = next(iter(holds.values()))
     for key in ("poll_states", "dispatch_states", "linear_projects"):
         if key in overrides:
             overrides[key] = _split_list(overrides[key])  # type: ignore[arg-type]
