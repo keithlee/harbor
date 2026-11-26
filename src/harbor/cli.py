@@ -15,6 +15,7 @@ from typing import Any
 
 from harbor.clients.github import GitHubClient, GitHubError
 from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
+from harbor.builder_env import BuilderEnvironment
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
 from harbor.config.projects import get_project
@@ -85,16 +86,24 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
-def _builder_environment(config: Any, token_env: str | None = None) -> Any:
+def _builder_environment(config: Any) -> BuilderEnvironment:
     """The builder environment for ``config``, resolved from Harbor's environment now.
 
     ``harbor start`` calls this once (through ``build_production_dispatcher``)
     and every builder process inherits the result; see ``harbor.builder_env``.
+    The shim must stay outside every directory a builder can write: the ledger
+    directory, the worktree root and the repository's git directory.
     """
 
     from harbor.builder_env import resolve_builder_environment
+    from harbor.clients.github import GITHUB_TOKEN_ENV_VARS
+    profile = PipelineProfile.from_project(config)
+    repo = getattr(config, "repo_path", None)
+    roots = [_worktree_root(config), *([Path(repo).expanduser() / ".git"] if repo else [])]
     return resolve_builder_environment(
-        config, db_path=_db_path(), token_names=(token_env,) if token_env else (),
+        config, db_path=_db_path(),
+        token_names=(profile.github_token_env, *GITHUB_TOKEN_ENV_VARS),
+        writable_roots=roots,
     )
 
 
@@ -133,13 +142,15 @@ HARBOR_COMMAND_INSTRUCTIONS = (
     "Harbor commands: run `harbor` as written, for example "
     "`harbor workflow check --ticket IDENTIFIER --event pre_handoff`. "
     "Harbor set up this builder's environment when it started: the `harbor` it put first on PATH is this "
-    "project's Harbor, with its registry, ledger and project ({project}) already selected, and `$HARBOR_BIN` "
-    "holds that `harbor`'s absolute path. If `command -v harbor` prints anything other than `$HARBOR_BIN` "
-    "(a shell startup file changed PATH), run `\"$HARBOR_BIN\"` in place of `harbor`, for example "
-    "`\"$HARBOR_BIN\" workflow check --ticket IDENTIFIER --event pre_handoff`. "
+    "project's Harbor, with its registry, ledger and project ({project}) already selected, and the "
+    "`HARBOR_BIN` environment variable holds that `harbor`'s absolute path. If `command -v harbor` prints "
+    "anything other than the path `printenv HARBOR_BIN` prints (a shell startup file changed PATH), run that "
+    "absolute path, written out, in place of `harbor`, for example "
+    "`/absolute/path/from/HARBOR_BIN workflow check --ticket IDENTIFIER --event pre_handoff`; "
+    "do not write `$HARBOR_BIN` in the command, because Claude Code's dontAsk mode refuses commands that expand it. "
     "IDENTIFIER is the supplied ticket identifier; run from the ticket's worktree (your working directory). "
     "If a workflow command names PROJECT, use {project}. "
-    "Do not prefix `harbor` with environment assignments, `env` or another path. "
+    "Do not prefix `harbor` with environment assignments or `env`. "
     "Child agents inherit this environment, so give them only the project and ticket, "
     "including reviewers with clean context."
 )
@@ -279,7 +290,7 @@ def build_production_dispatcher(
         github = builder_github(config, workflow, builder_provider)
         # Settled once for this start: later changes to Harbor's own shell
         # environment do not reach builders. Fails closed without a registry.
-        builder = _builder_environment(config, github["token_env"])
+        builder = _builder_environment(config)
         builder.ensure_shim()
         if github["linear_sandbox_warning"]:
             print(f"Harbor: warning: {github['linear_sandbox_warning']}; {LINEAR_URL_RESTART}", file=sys.stderr)
@@ -566,7 +577,7 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: {allowed[0]} (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
-    if not _doctor_builder_environment(config, None if github is None else github["token_env"]):
+    if not _doctor_builder_environment(config):
         scope_ok = False
     if config.install_command is None:
         print("Installation: missing explicit command or none")
@@ -593,7 +604,7 @@ async def _doctor(project_name: str) -> int:
     return 0 if healthy and scope_ok else 1
 
 
-def _doctor_builder_environment(config: Any, token_env: str | None) -> bool:
+def _doctor_builder_environment(config: Any) -> bool:
     """Print the environment ``harbor start`` would give builders, and whether ``harbor`` resolves in it.
 
     Names and paths only: a token's value is never printed. Writes the same
@@ -602,9 +613,9 @@ def _doctor_builder_environment(config: Any, token_env: str | None) -> bool:
 
     from harbor.builder_env import check_resolution
     try:
-        builder = _builder_environment(config, token_env)
+        builder = _builder_environment(config)
     except ValueError as exc:
-        print(f"Builder environment: invalid ({exc}); set HARBOR_PROJECTS_FILE to the project registry")
+        print(f"Builder environment: invalid ({exc})")
         return False
     for line in builder.report():
         print(line)
@@ -615,8 +626,9 @@ def _doctor_builder_environment(config: Any, token_env: str | None) -> bool:
         return False
     problems = [f"{shell}: {problem}" for shell, problem in results if problem]
     if problems:
-        print(f"Builder harbor: not resolved ({'; '.join(problems)}); "
-              "a shell startup file that resets PATH hides Harbor's shim from builders")
+        print(f"Builder harbor: not resolved ({'; '.join(problems)}); a shell startup file changes PATH so "
+              "plain `harbor` is not Harbor's shim there (builders fall back to the HARBOR_BIN path); "
+              "prepend to PATH in that file instead of replacing or reordering it")
         return False
     shells = ", ".join(shell for shell, _ in results)
     print(f"Builder harbor: {builder.shim} · resolves in {shells}")

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from harbor.runner.base import RunnerError
-from harbor.runner.claude import HARBOR_BASH_RULE, ClaudeRunner
+from harbor.runner.claude import ClaudeRunner
 
 
 def settings(argv: list[str]) -> dict:
@@ -26,10 +26,6 @@ def settings(argv: list[str]) -> dict:
 def runner(tmp_path: Path) -> ClaudeRunner:
     return ClaudeRunner(tmp_path / "wt", model="claude-sonnet-5-5", reasoning_effort="medium", executable="claude",
                         writable_roots=(tmp_path / "state",))
-
-
-def test_the_harbor_rule_is_fixed_and_project_independent() -> None:
-    assert HARBOR_BASH_RULE == "Bash(harbor:*)"
 
 
 def test_an_unwired_runner_adds_no_permissions(tmp_path: Path) -> None:

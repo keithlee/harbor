@@ -111,7 +111,7 @@ def test_launch_prompt_gives_each_provider_followable_child_agent_rules(tmp_path
     prompt = _prompt(tmp_path, monkeypatch)
     # The whole launch prompt: the copied delivery skill and Harbor's own appended rules.
     _assert_provider_correct(prompt)
-    launch = prompt[prompt.index("Authoritative runtime invocation: "):]
+    launch = prompt[prompt.index("Harbor commands: "):]
     _assert_provider_correct(launch)
 
 
@@ -149,7 +149,7 @@ def test_review_fixes_and_planner_continuation_have_a_claude_path():
 def test_launch_rules_override_older_installed_skill_copies(tmp_path, monkeypatch):
     """An existing install keeps old skill copies; the prompt must say which child-agent rules win."""
     launch = _prompt(tmp_path, monkeypatch)
-    launch = launch[launch.index("Authoritative runtime invocation: "):]
+    launch = launch[launch.index("Harbor commands: "):]
     assert "conflict with child-agent steps in the workflow's skills, these rules win" in launch
     # Codex still follows the skill's own recovery steps.
     assert "Codex builder still follows the skills' list, resume and close steps" in launch
