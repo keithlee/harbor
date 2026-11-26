@@ -311,12 +311,15 @@ def build_production_dispatcher(
                 runner.sandbox_hosts = hosts
                 # dontAsk refuses the runtime invocation and reads outside the
                 # worktree unless they are pre-approved; approve exactly these.
-                # Without a registry there is no invocation to approve, and the
-                # builder prompt itself refuses to render, so nothing launches.
+                # Without the registry a builder (new or resumed) could not run
+                # a single workflow check, so refuse to build it and say why.
                 try:
                     runner.harbor_invocation = _runtime_invocation(config)
-                except ValueError:
-                    runner.harbor_invocation = ""
+                except ValueError as exc:
+                    raise ValueError(
+                        f"the Claude builder for {ticket} cannot be approved to run harbor: {exc}; "
+                        "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
+                    ) from exc
                 runner.workflow_package = current.package
             return runner
     dispatcher = WorktreeDispatcher(

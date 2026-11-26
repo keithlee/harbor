@@ -149,3 +149,50 @@ def test_parentheses_and_spaces_in_paths_are_approved_literally(tmp_path: Path) 
     wired.workflow_package = package
     assert settings(wired.command("x", run_id="run"))["permissions"]["allow"] == [
         "Bash(/usr/bin/env PYTHONPATH='/h (copy)/src' /h/python -P -m harbor.cli:*)", f"Read(/{package.resolve()}/**)"]
+
+
+def test_doctor_fails_closed_when_the_package_path_cannot_be_approved(tmp_path: Path) -> None:
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from test_github_transport import run_doctor
+
+    run_doctor(tmp_path, "claude", None)  # a clean registry path, with the checkout set up beside it
+    moved = tmp_path / "old*copy" / "repo"
+    moved.parent.mkdir()
+    shutil.copytree(tmp_path / "repo", moved, symlinks=True)
+    projects = tmp_path / "projects.md"
+    projects.write_text(projects.read_text().replace(f"| {tmp_path / 'repo'} |", f"| {moved} |"))
+    env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
+    env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
+               GITHUB_TOKEN="dummy-token-value", HARBOR_CLAUDE_EXECUTABLE="/bin/echo")
+    result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
+                             "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
+    package = (moved / ".harbor" / "workflow").resolve()
+    assert (f"Builder permissions: invalid (the workflow package path {package} contains a character"
+            in result.stdout), result.stdout + result.stderr
+    assert result.returncode == 1
+
+
+def test_a_claude_builder_is_refused_when_its_registry_disappears(tmp_path: Path, monkeypatch) -> None:
+    # A retained Claude ticket whose registry was moved or deleted must not be
+    # resumed with only the Read rule: it would hit the dontAsk denial again.
+    from harbor.runner.quota import bind_runner_identity
+    from harbor.wake import Wake
+    from test_github_transport import claude_production
+
+    registry = tmp_path / "projects.md"
+    registry.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(registry))
+    (_, _, factory), db = claude_production(tmp_path, monkeypatch)
+    try:
+        bind_runner_identity(db.connection, "harbor-run-1", "claude", "claude-sonnet-5-5", "medium")
+        registry.unlink()
+        for wake in (Wake(ticket={"identifier": "SAMPLE-1"}, action="build"),
+                     Wake(ticket={"identifier": "SAMPLE-1"}, action="build", resume="harbor-run-1")):
+            with pytest.raises(ValueError, match="Claude builder for SAMPLE-1 cannot be approved to run harbor: "
+                                                 "workflow delivery requires its authoritative project registry"):
+                factory(tmp_path, wake)
+    finally:
+        db.close()
