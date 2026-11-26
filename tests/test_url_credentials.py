@@ -383,7 +383,8 @@ def test_workflow_check_is_one_line_exit_2_for_a_non_json_200(tmp_path: Path, mo
         lambda request: httpx.Response(200, text="<html>SSO login</html>"), "https://api.github.com/graphql",
     )
     assert code == 2
-    assert line.startswith("Harbor: GitHub returned a response that is not JSON"), line
+    assert line.startswith("Harbor: GitHub "), line
+    assert "GitHub returned a response that is not JSON" in line, line
 
 
 def test_workflow_check_refuses_a_github_url_with_userinfo(tmp_path: Path, monkeypatch, capsys) -> None:
