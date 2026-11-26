@@ -257,13 +257,20 @@ def build_production_dispatcher(
             if wake.run_id:
                 bind(db.connection, config.name, ticket, wake.run_id, current)
             identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
-            provider = identity[0] if identity else ("codex" if getattr(wake, "action", None) == "reengage" else builder_provider)
+            if identity is None and getattr(wake, "action", None) == "reengage":
+                # A retained session belongs to whichever provider started it.
+                # Without that record, fail closed rather than guess one.
+                raise ValueError(
+                    f"run {wake.run_id or '(none)'} for {ticket or '(unknown)'} has no recorded runner identity; "
+                    "Harbor will not guess which provider and model own its retained session"
+                )
+            provider = identity[0] if identity else builder_provider
             controller = current.config["roles"]["controller"]
             model = str(controller["model"])
             effort = str(controller.get("reasoning_effort") or getattr(config, "builder_effort", "high"))
             fallbacks = tuple(controller.get("fallback_models", ()))
-            if provider != builder_provider:
-                model, effort = (identity[1], identity[2]) if identity else ("gpt-5.6-luna", "xhigh")
+            if identity is not None and provider != builder_provider:
+                model, effort = identity[1], identity[2]
                 fallbacks = ()
             if identity is None and quota_policy is not None and getattr(wake, "action", None) != "reengage":
                 # A new ticket never starts on a provider known to be out of usage.
