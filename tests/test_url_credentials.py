@@ -256,9 +256,10 @@ def test_doctor_fails_closed_on_a_pipeline_linear_url_with_userinfo(tmp_path: Pa
     assert result.returncode == 2
 
 
+@pytest.mark.parametrize("url", [GITHUB_WITH_USERINFO[0], GITHUB_WITH_USERINFO[-2]], ids=["ascii-at", "fullwidth-at"])
 @pytest.mark.parametrize("provider", ["codex", "claude"])
-def test_doctor_fails_closed_on_a_pipeline_github_url_with_userinfo(tmp_path: Path, provider: str) -> None:
-    result = _doctor(tmp_path, provider, GITHUB_WITH_USERINFO[0])
+def test_doctor_fails_closed_on_a_pipeline_github_url_with_userinfo(tmp_path: Path, provider: str, url: str) -> None:
+    result = _doctor(tmp_path, provider, url)
     assert "GitHub transport: invalid (the GitHub API URL must not contain" in result.stdout, result.stdout
     assert result.returncode == 1
 
