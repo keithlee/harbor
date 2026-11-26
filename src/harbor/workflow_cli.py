@@ -74,7 +74,10 @@ def add_commands(commands):
     subs = workflow.add_subparsers(dest="workflow_command", required=True)
     for name in ("inspect", "check", "checks"):
         cmd = subs.add_parser(name)
-        cmd.add_argument("project")
+        # Builders inherit HARBOR_PROJECT from harbor start, so they run plain
+        # `harbor workflow check --ticket ID ...`; an explicit project wins.
+        cmd.add_argument("project", nargs="?", default=None,
+                         help="Harbor project (default: $HARBOR_PROJECT, set for builders by harbor start)")
         if name != "inspect":
             cmd.add_argument("--ticket", required=True)
         if name == "check":

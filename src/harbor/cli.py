@@ -85,22 +85,17 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
-def _runtime_invocation(config: Any) -> str:
-    """The exact shell prefix builders must use in place of ``harbor``.
+def _builder_environment(config: Any, token_env: str | None = None) -> Any:
+    """The builder environment for ``config``, resolved from Harbor's environment now.
 
-    It pins the registry, ledger and Harbor source so shell initialization in
-    the builder cannot select another one.
+    ``harbor start`` calls this once (through ``build_production_dispatcher``)
+    and every builder process inherits the result; see ``harbor.builder_env``.
     """
 
-    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
-    if not registry or not Path(registry).expanduser().is_file():
-        raise ValueError("workflow delivery requires its authoritative project registry")
-    return shlex.join([
-        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
-        f"HARBOR_DB_PATH={_db_path().resolve()}",
-        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
-        sys.executable, "-P", "-m", "harbor.cli",
-    ])
+    from harbor.builder_env import resolve_builder_environment
+    return resolve_builder_environment(
+        config, db_path=_db_path(), token_names=(token_env,) if token_env else (),
+    )
 
 
 # The builder's provider is chosen per launch (and quota fallback can switch it),
@@ -130,23 +125,38 @@ CHILD_AGENT_INSTRUCTIONS = (
 )
 
 
+# How builders run Harbor. ``harbor start`` puts the shim first on PATH and
+# sets HARBOR_BIN to its absolute path (see ``harbor.builder_env``). A login or
+# interactive shell's startup files can still reorder PATH, so the prompt
+# gives builders a check and the absolute fallback instead of assuming.
+HARBOR_COMMAND_INSTRUCTIONS = (
+    "Harbor commands: run `harbor` as written, for example "
+    "`harbor workflow check --ticket IDENTIFIER --event pre_handoff`. "
+    "Harbor set up this builder's environment when it started: the `harbor` it put first on PATH is this "
+    "project's Harbor, with its registry, ledger and project ({project}) already selected, and `$HARBOR_BIN` "
+    "holds that `harbor`'s absolute path. If `command -v harbor` prints anything other than `$HARBOR_BIN` "
+    "(a shell startup file changed PATH), run `\"$HARBOR_BIN\"` in place of `harbor`, for example "
+    "`\"$HARBOR_BIN\" workflow check --ticket IDENTIFIER --event pre_handoff`. "
+    "IDENTIFIER is the supplied ticket identifier; run from the ticket's worktree (your working directory). "
+    "If a workflow command names PROJECT, use {project}. "
+    "Do not prefix `harbor` with environment assignments, `env` or another path. "
+    "Child agents inherit this environment, so give them only the project and ticket, "
+    "including reviewers with clean context."
+)
+
+
 def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
     Pass the workflow snapshot a launch is bound to; otherwise it is loaded.
+    The registry, ledger and Harbor install are not in the prompt: they are in
+    the environment ``harbor start`` gives every builder.
     """
 
     from harbor.config.workflow import load_workflow
-    runtime = _runtime_invocation(config)
     workflow = workflow or load_workflow(Path(config.workflow_path))
     return (workflow.prompt()
-            + "\nAuthoritative runtime invocation: " + runtime
-            + "\nReplace every `harbor` executable in workflow commands with the invocation above. "
-            + "Replace PROJECT with " + shlex.quote(config.name)
-            + "; IDENTIFIER is the supplied ticket identifier. "
-            + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
-            + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
-            + "shell initialization must not select another registry or ledger."
+            + "\n" + HARBOR_COMMAND_INSTRUCTIONS.format(project=shlex.quote(config.name))
             + "\n" + CHILD_AGENT_INSTRUCTIONS
             + " Use the role models and reasoning efforts from the policy's `roles`."
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
@@ -267,6 +277,10 @@ def build_production_dispatcher(
 
         builder_provider = getattr(config, "builder_provider", "codex")
         github = builder_github(config, workflow, builder_provider)
+        # Settled once for this start: later changes to Harbor's own shell
+        # environment do not reach builders. Fails closed without a registry.
+        builder = _builder_environment(config, github["token_env"])
+        builder.ensure_shim()
         if github["linear_sandbox_warning"]:
             print(f"Harbor: warning: {github['linear_sandbox_warning']}; {LINEAR_URL_RESTART}", file=sys.stderr)
         claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
@@ -325,6 +339,14 @@ def build_production_dispatcher(
                 deadline_seconds=_deadline_seconds(config),
             )
             runner.workflow_project = config.name
+            if not builder.registry.is_file():
+                # No builder could run a single workflow check; refuse and say why.
+                raise ValueError(
+                    f"the builder for {ticket} cannot run harbor: the project registry {builder.registry} "
+                    "this harbor start resolved is gone; restore it (HARBOR_PROJECTS_FILE) and restart Harbor"
+                )
+            builder.ensure_shim()  # restore it if a builder edited it
+            runner.builder_env = builder.variables()
             runner.github_env = github["env"]
             runner.github_mcp = github["mcp"] if provider == "claude" else None
             if provider == "claude":
@@ -334,17 +356,9 @@ def build_production_dispatcher(
                         config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
                     )
                 runner.sandbox_hosts = hosts
-                # dontAsk refuses the runtime invocation and reads outside the
-                # worktree unless they are pre-approved; approve exactly these.
-                # Without the registry a builder (new or resumed) could not run
-                # a single workflow check, so refuse to build it and say why.
-                try:
-                    runner.harbor_invocation = _runtime_invocation(config)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"the Claude builder for {ticket} cannot be approved to run harbor: {exc}; "
-                        "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
-                    ) from exc
+                # dontAsk refuses reads outside the worktree unless they are
+                # pre-approved; approve the workflow package and plain harbor.
+                runner.allow_harbor = True
                 runner.workflow_package = current.package
             return runner
     dispatcher = WorktreeDispatcher(
@@ -525,6 +539,7 @@ async def _doctor(project_name: str) -> int:
     print(f"Workflow: {workflow.package} · {workflow.digest}")
     print(f"Models: {workflow.models_path} · controller {controller['model']} · First Mate {workflow.config['first_mate']['model']}")
     print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
+    github: dict[str, Any] | None = None
     try:
         github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"))
     except ValueError as exc:
@@ -543,14 +558,16 @@ async def _doctor(project_name: str) -> int:
             print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
             from harbor.runner.claude import workflow_permissions
             try:
-                workflow_permissions(_runtime_invocation(config), workflow.package)
+                allowed = workflow_permissions(workflow.package)
             except ValueError as exc:
-                print(f"Builder permissions: invalid ({exc}); a Claude builder could not run harbor or read the workflow")
+                print(f"Builder permissions: invalid ({exc}); a Claude builder could not read the workflow")
                 scope_ok = False
             else:
-                print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
+                print(f"Builder permissions: {allowed[0]} (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
+    if not _doctor_builder_environment(config, None if github is None else github["token_env"]):
+        scope_ok = False
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
@@ -574,6 +591,36 @@ async def _doctor(project_name: str) -> int:
     print(f"Disk floor: {floor:.2f} GB · free {free:.2f} GB at {root} · {verdict}")
     await client.close()
     return 0 if healthy and scope_ok else 1
+
+
+def _doctor_builder_environment(config: Any, token_env: str | None) -> bool:
+    """Print the environment ``harbor start`` would give builders, and whether ``harbor`` resolves in it.
+
+    Names and paths only: a token's value is never printed. Writes the same
+    ``harbor`` shim ``harbor start`` writes, so the check runs the real thing.
+    """
+
+    from harbor.builder_env import check_resolution
+    try:
+        builder = _builder_environment(config, token_env)
+    except ValueError as exc:
+        print(f"Builder environment: invalid ({exc}); set HARBOR_PROJECTS_FILE to the project registry")
+        return False
+    for line in builder.report():
+        print(line)
+    try:
+        results = check_resolution(builder)
+    except ValueError as exc:
+        print(f"Builder harbor: invalid ({exc})")
+        return False
+    problems = [f"{shell}: {problem}" for shell, problem in results if problem]
+    if problems:
+        print(f"Builder harbor: not resolved ({'; '.join(problems)}); "
+              "a shell startup file that resets PATH hides Harbor's shim from builders")
+        return False
+    shells = ", ".join(shell for shell, _ in results)
+    print(f"Builder harbor: {builder.shim} · resolves in {shells}")
+    return True
 
 
 async def _check_project_scope(client: Any, config: Any) -> bool:
@@ -1050,9 +1097,14 @@ async def _async_main(args: argparse.Namespace) -> int:
             return 2
     if args.command == "workflow":
         from harbor.workflow_cli import execute
+        project = args.project or os.environ.get("HARBOR_PROJECT", "").strip()
+        if not project:
+            print("Harbor: name the project, or run this inside a builder started by harbor start "
+                  "(which sets HARBOR_PROJECT)", file=sys.stderr)
+            return 2
         db = HarborDB(_db_path())
         try:
-            return await execute(args, get_project(args.project), db)
+            return await execute(args, get_project(project), db)
         except (ValueError, OSError, GitHubError) as exc:
             # A GitHub outage or bad response fails closed with one line, as a
             # configuration error does; never a traceback with exit 1.

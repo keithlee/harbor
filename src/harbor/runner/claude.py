@@ -111,26 +111,22 @@ def sandbox_domains(*extra: str) -> list[str]:
 # Wildcards would widen a rule past the one path; a line break would end it.
 _RULE_UNSAFE = "*?[]\n\r"
 
+# Builders run plain ``harbor``: the shim ``harbor start`` puts first on PATH
+# (see ``harbor.builder_env``). One fixed rule, the same for every project.
+HARBOR_BASH_RULE = "Bash(harbor:*)"
 
-def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
+
+def workflow_permissions(package: str | Path | None, *, harbor: bool = True) -> list[str]:
     """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
 
-    Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
-    or assigns a variable in front of an absolute executable path (directly or
-    through ``/usr/bin/env``), which is exactly what Harbor's runtime
-    invocation does, so that one prefix is approved literally. Read, Glob and
-    Grep are limited to the working directory, and the workflow package lives
+    ``harbor`` approves the fixed ``Bash(harbor:*)`` rule. Read, Glob and Grep
+    are limited to the working directory, and the workflow package lives
     outside the ticket worktree, so it is approved read-only. Both still run
     inside the OS sandbox: nothing becomes writable or reachable that was not
-    already. A value a rule cannot express raises instead of being widened.
+    already. A path a rule cannot express raises instead of being widened.
     """
 
-    allow: list[str] = []
-    invocation = invocation.strip()
-    if invocation:
-        if any(char in invocation for char in _RULE_UNSAFE):
-            raise ValueError("the Harbor runtime invocation contains a character a permission rule cannot express")
-        allow.append(f"Bash({invocation}:*)")
+    allow: list[str] = [HARBOR_BASH_RULE] if harbor else []
     if package is not None:
         resolved = Path(package).expanduser().resolve()
         if not resolved.is_dir():
@@ -148,14 +144,14 @@ class ClaudeRunner(CodexRunner):
     provider = "claude"
     # Extra hosts derived from the project's configured endpoints (see sandbox_hosts).
     sandbox_hosts: tuple[str, ...] = ()
-    # The exact ``harbor`` runtime prefix the builder prompt tells it to use.
-    harbor_invocation: str = ""
+    # Approve plain ``harbor`` (Harbor wires this for every production builder).
+    allow_harbor: bool = False
     # The project's workflow package, which lives outside the ticket worktree.
     workflow_package: Path | None = None
 
     def _workflow_permissions(self) -> list[str]:
         try:
-            return workflow_permissions(self.harbor_invocation, self.workflow_package)
+            return workflow_permissions(self.workflow_package, harbor=self.allow_harbor)
         except ValueError as exc:
             raise RunnerError(f"refusing a builder permission: {exc}") from exc
 

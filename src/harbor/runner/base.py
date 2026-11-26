@@ -783,6 +783,10 @@ class BaseRunner:
                 "PWD": str(self.worktree),
             }
         )
+        # The environment ``harbor start`` resolved once for this project
+        # (registry, ledger, project, the harbor shim first on PATH, and the
+        # GitHub token variable); it wins over Harbor's spawn-time environment.
+        env.update(dict(getattr(self, "builder_env", None) or {}))
         # GitHub transport settings for harbor.github_rest (names only; the
         # token stays in whichever variable the operator already set).
         env.update(dict(getattr(self, "github_env", None) or {}))

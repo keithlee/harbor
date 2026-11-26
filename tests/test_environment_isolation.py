@@ -86,6 +86,8 @@ def test_uv_keeps_the_developer_cache_and_managed_pythons() -> None:
 def test_test_control_variables_are_not_isolated() -> None:
     assert not is_isolated_env_var("HARBOR_UPDATE_GOLDEN")
     assert is_isolated_env_var("HARBOR_PROJECTS_FILE")
+    # The builder variables harbor start sets: a builder-run test must not inherit them.
+    assert is_isolated_env_var("HARBOR_PROJECT") and is_isolated_env_var("HARBOR_BIN")
     assert is_isolated_env_var("GIT_DIR") and is_isolated_env_var("GIT_CONFIG_KEY_0")
 
 
