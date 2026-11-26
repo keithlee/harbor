@@ -22,3 +22,17 @@ def _isolated_registry(tmp_path_factory, monkeypatch):
     registry = tmp_path_factory.mktemp("registry") / "projects.md"
     registry.write_text("", encoding="utf-8")
     monkeypatch.setenv("HARBOR_PROJECTS_FILE", str(registry))
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_github_project(monkeypatch):
+    """Never let the CI runner's own repository leak into a test project.
+
+    GitHub Actions exports GITHUB_REPOSITORY (and a developer may export a
+    token). A test project without a repository would then silently become a
+    GitHub project, and builders refuse to start for a GitHub project without
+    its token. Tests that need these set them themselves.
+    """
+
+    for name in ("GITHUB_REPOSITORY", "GITHUB_OWNER", "GITHUB_TOKEN", "GH_TOKEN", "HARBOR_GITHUB_TOKEN_ENV"):
+        monkeypatch.delenv(name, raising=False)
