@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from harbor.runner.quota import runner_identity
 from harbor.ticket_states import is_stopped
 
 # A shelved or closed ticket is never recovered: ``is_stopped`` is shared with
@@ -47,10 +49,13 @@ CODEX_CHILD_RECOVERY = (
     "List agents, close any interrupted or unknown children (for example /root/planner), spawn fresh "
     "planner/implementor/reviewer children under new names (planner-2, ...) with the models in config.toml"
 )
+# Claude Code's ``Agent`` tool runs a child in the background when
+# ``run_in_background`` is omitted, so the rule asks for an explicit ``false``.
 CLAUDE_CHILD_RECOVERY = (
     "Do not try to list, close or resume earlier children: Claude Code has no tool for that. Spawn fresh "
-    "planner/implementor/reviewer children with foreground `Agent` calls (never `run_in_background`) and the "
-    "models in config.toml, and give each one the ticket, the PR and its review comments"
+    "planner/implementor/reviewer children with `Agent` calls that always pass `run_in_background: false`, "
+    "with the models in config.toml, and give each one the earlier child's report when you have it, plus "
+    "the ticket, the PR and its review comments"
 )
 
 
@@ -60,7 +65,7 @@ def child_recovery(provider: str) -> str:
         return CODEX_CHILD_RECOVERY
     if provider == "claude":
         return CLAUDE_CHILD_RECOVERY
-    # Unknown provider: name both, each scoped to its runtime.
+    # Unknown or unrecognised provider: name both, each scoped to its runtime.
     return (f"If you are a Codex builder: {CODEX_CHILD_RECOVERY}. "
             f"If you are a Claude Code builder: {CLAUDE_CHILD_RECOVERY}")
 
@@ -69,7 +74,7 @@ def obsolete_instruction(provider: str = "") -> str:
     """The hand-off for an obsolete-bookkeeping blocker, followable by *provider*'s builder."""
     return (
         "Harbor no longer registers or verifies child agents, and policy edits no longer need reconcile; "
-        f"that blocker is obsolete. {child_recovery(provider)}; then continue delivering the ticket from where "
+        f"that blocker is obsolete. {child_recovery(provider)}, and continue delivering the ticket from where "
         "it stopped."
     )
 
@@ -111,7 +116,7 @@ class Case:
     detail: str = ""
     flag_id: int | None = None
     flag_ids: list = field(default_factory=list)  # every pending watchdog flag folded into this case
-    provider: str = ""  # the run's builder provider ("codex" | "claude"); "" when unknown
+    provider: str = ""  # the run's recorded builder provider (normally "codex" or "claude"); "" when unknown
 
     @property
     def attempts(self) -> int:
@@ -152,13 +157,16 @@ def _final(raw: Any) -> dict:
 
 
 def builder_provider(connection, run_id: str) -> str:
-    """The provider the run's builder session runs on, from ``runner_identity``; "" when unknown."""
+    """The provider recorded for the run's builder session; "" when none is recorded.
+
+    An unrecognised value is returned as recorded, so First Mate sees it; the
+    instruction wording then falls back to both runtimes' steps.
+    """
     try:
-        row = connection.execute("SELECT provider FROM runner_identity WHERE run_id=?", (run_id,)).fetchone()
-    except Exception:  # no runner_identity table yet
+        identity = runner_identity(connection, run_id)
+    except sqlite3.OperationalError:  # an unreadable or older runner_identity table
         return ""
-    provider = str(row[0] or "").strip().casefold() if row else ""
-    return provider if provider in {"codex", "claude"} else ""
+    return str(identity[0] or "").strip().casefold() if identity else ""
 
 
 def history(connection, run_id: str) -> list[dict]:
@@ -300,13 +308,14 @@ def build_prompt(case: Case, settings: Mapping[str, Any]) -> str:
         children = ("The builder runs on Codex: its child-agent tools are spawn, list, wait, resume and close. "
                     f"For stale children tell it: {CODEX_CHILD_RECOVERY}.")
     elif case.provider == "claude":
-        example = "spawn a fresh planner with a foreground `Agent` call and give it the plan already on the ticket"
+        example = ("spawn a fresh planner with an `Agent` call that passes `run_in_background: false`, and give it "
+                   "the ticket, the PR and its review comments")
         children = ("The builder runs on Claude Code: its only child-agent tool is `Agent`, with no list, resume, "
                     "message, wait or close. Never tell it to list, close, resume or message children. "
                     f"For stale children tell it: {CLAUDE_CHILD_RECOVERY}.")
     else:
         example = "replace the stale planner child and continue"
-        children = ("The builder's provider is unknown, so give child-agent steps for both runtimes: "
+        children = ("The builder's provider is unknown or unrecognised, so give child-agent steps for both runtimes: "
                     f"{child_recovery('')}.")
     return (
         "You are First Mate, Harbor's read-only recovery officer. A delivery run is stuck. "

@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from harbor.cli import _pipeline_text
 from harbor.config.projects import ProjectConfig
 from workflow_support import config
@@ -19,6 +21,34 @@ from workflow_support import config
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / "workflows" / "work-pipeline" / "skills" / "delivery" / "SKILL.md"
 CODEX_ONLY_TOOLS = "native collaboration tools (spawn, list, wait, resume, close)"
+# Any mention of the parameter other than an explicit `false`.
+LOOSE_BACKGROUND = re.compile(r"run_in_background(?!`?: false\b)")
+
+
+def assert_explicit_foreground(text: str) -> None:
+    """Claude Code backgrounds an `Agent` child when `run_in_background` is omitted.
+
+    So "never set it" or "use it" is wrong; the rule must ask for an explicit `false`.
+    """
+    assert "always pass `run_in_background: false`" in text, text
+    loose = [text[max(0, m.start() - 40):m.end() + 20] for m in LOOSE_BACKGROUND.finditer(text)]
+    assert not loose, f"run_in_background mentioned without an explicit false: {loose}"
+
+
+def assert_round_count_rule(text: str) -> None:
+    """Failed rounds are distinct rejected head SHAs in reviewer JSON verdicts, nothing else."""
+    assert "distinct `head_sha`" in text and '`"verdict": "reject"`' in text, text
+    assert "JSON verdict comment" in text and "human" in text
+
+
+@pytest.mark.parametrize("wrong", [
+    "spawn each child with the `Agent` tool and use `run_in_background` for long reviews",
+    "spawn each child with the `Agent` tool in the foreground; never set `run_in_background`",
+    "spawn each child with the `Agent` tool in the foreground",
+])
+def test_foreground_rule_rejects_wording_that_yields_a_background_child(wrong):
+    with pytest.raises(AssertionError):
+        assert_explicit_foreground(wrong)
 
 
 def _assert_provider_correct(text: str) -> None:
@@ -31,7 +61,7 @@ def _assert_provider_correct(text: str) -> None:
     assert "no list, resume, message or close" in claude
     assert "spawn a fresh child for that role" in claude
     # A background child outlives the builder's --print turn and its verdict is lost.
-    assert "foreground" in claude and "never set `run_in_background`" in claude
+    assert_explicit_foreground(claude)
     # A fresh session has no earlier child report to hand over.
     assert "no earlier child report" in claude and "review comments" in claude
     # A respawned child replaces the old one; it does not break "one per role".
@@ -80,7 +110,8 @@ def test_review_fixes_and_planner_continuation_have_a_claude_path():
     assert "resume the existing planner" in planning
     assert "Claude Code cannot" in planning and "spawns a fresh planner" in planning
     # The three-round limit is counted from durable PR state, not session memory.
-    assert "three failed rounds" in review_step and "verdict comments on the PR" in review_step
+    assert "three failed rounds" in review_step
+    assert_round_count_rule(review_step)
     review = (SKILL.parent.parent / "review" / "SKILL.md").read_text(encoding="utf-8")
     assert "retained implementor (Codex)" in review and "fresh implementor" in review and "(Claude Code)" in review
 
@@ -89,5 +120,8 @@ def test_launch_rules_override_older_installed_skill_copies(tmp_path, monkeypatc
     """An existing install keeps old skill copies; the prompt must say which child-agent rules win."""
     launch = _prompt(tmp_path, monkeypatch)
     launch = launch[launch.index("Authoritative runtime invocation: "):]
-    assert "override any child-agent steps in the workflow's skills" in launch
-    assert "verdict comments on the PR" in launch and "three-round limit" in launch
+    assert "conflict with child-agent steps in the workflow's skills, these rules win" in launch
+    # Codex still follows the skill's own recovery steps.
+    assert "Codex builder still follows the skills' list, resume and close steps" in launch
+    assert "three-round limit" in launch
+    assert_round_count_rule(launch)

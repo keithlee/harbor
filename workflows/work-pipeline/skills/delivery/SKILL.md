@@ -26,8 +26,8 @@ Codex: use the native collaboration tools (spawn, list, wait, resume, close).
    name (for example `planner-2`). A name collision is never a blocker.
 4. Before ending any turn, close children you no longer need; never leave an interrupted child behind.
 
-Claude Code: spawn each child with the `Agent` tool in the foreground; never set `run_in_background`,
-because a background child's result is lost when your turn ends. A foreground call waits and returns the
+Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`. Leaving it
+out starts a background child whose result is lost when your turn ends. A foreground call waits and returns the
 child's result, and a finished child needs no close. There is no list, resume, message or close: track the
 children you started in this session yourself. Wherever this workflow says to resume, message or return
 work to an existing child, spawn a fresh child for that role instead and give it the earlier child's
@@ -45,8 +45,9 @@ the implementor.
 3. Review: a separate reviewer reviews the current head (`skills/review`) and posts its verdict on the PR.
    Return fixes to the same implementor (Claude Code: a fresh implementor given the reviewer's findings,
    the current PR head and the previous implementor's report); stop after three failed rounds and
-   report a blocker. Count the rounds from the reviewer's verdict comments on the PR, so the count
-   survives a fresh session.
+   report a blocker. Count the rounds from the PR, so the count survives a fresh session: a failed
+   round is a distinct `head_sha` with `"verdict": "reject"` in a reviewer's JSON verdict comment.
+   Ignore every other comment, such as a human "FAIL".
 4. Risk: add the `## Risk Analysis` section to the PR body (`skills/risk`).
 5. Hand off: run `harbor workflow check PROJECT --ticket IDENTIFIER --event pre_handoff`, reply to the
    `linear_feedback` it returns, then move the ticket to review.
