@@ -189,7 +189,9 @@ class GitHubClient:
         # A ProjectConfig carries github_api_url = "" when the registry does
         # not set it; never post to an empty URL.
         endpoint = getattr(profile, "github_api_url", "") or "https://api.github.com/graphql"
-        token_env = getattr(profile, "github_token_env", "GITHUB_TOKEN")
+        # A caller may name the variable to read first (for example the
+        # GH_ENTERPRISE_TOKEN Harbor adopted from gh for an Enterprise host).
+        token_env = kwargs.pop("token_env", None) or getattr(profile, "github_token_env", "GITHUB_TOKEN")
         return cls(endpoint=endpoint, token_env=token_env, **kwargs)
 
     async def query(

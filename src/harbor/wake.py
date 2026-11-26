@@ -838,7 +838,7 @@ def github_transport_fact(
     helper: str = "",
     repository: str = "",
     token_available: bool = True,
-    gh_checked: bool = False,
+    gh_result: str = "",
 ) -> str:
     """Tell the builder which GitHub transport this run actually has.
 
@@ -875,7 +875,12 @@ def github_transport_fact(
                 "(a PR, a comment, a merge), report a delivery-transport blocker saying the project has "
                 "no GitHub repository configured. " + no_gh
             )
-        checked = " (none exported, and `gh auth token` had none at launch)" if gh_checked else " (none exported)"
+        # gh_result is what Harbor's own launch-time `gh auth token` returned:
+        # "none" (no login), "timed out", or "" when Harbor did not ask.
+        checked = {
+            "none": " (none exported, and `gh auth token` had none at launch)",
+            "timed out": " (none exported, and `gh auth token` did not answer at launch)",
+        }.get(gh_result, " (none exported)")
         return (
             f"GitHub transport: no GitHub token is available to this run{checked}, so the REST helper "
             f"`{helper}`{target} cannot authenticate. Do your local work, then report a "

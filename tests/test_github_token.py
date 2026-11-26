@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 from harbor.github_token import (
-    TokenSource, adopt_for_profile, adopt_gh_token, gh_hostname, missing_token_help, token_from_gh,
+    TokenResolution, TokenSource, adopt_for_profile, adopt_gh_token, gh_hostname, gh_lookup, missing_token_help,
 )
 from test_github_transport import project, run_doctor, workflow
 
@@ -138,7 +138,7 @@ def test_a_hanging_gh_and_everything_it_started_are_killed(tmp_path: Path) -> No
         "time.sleep(60)"
     )
     started = time.monotonic()
-    assert token_from_gh("github.com", executable=str(fake_gh(tmp_path, body)), timeout=1.5) is None
+    assert gh_lookup("github.com", executable=str(fake_gh(tmp_path, body)), timeout=1.5) == (TokenSource.TIMED_OUT, None)
     assert time.monotonic() - started < 10
     gh_pid, child_pid, group = json.loads(pids.read_text())
     assert group == gh_pid  # gh ran in its own session
@@ -155,6 +155,8 @@ def test_a_hanging_gh_and_everything_it_started_are_killed(tmp_path: Path) -> No
     ("https://api.github.com/graphql", "github.com"),
     ("https://ghe.example.test/api/graphql", "ghe.example.test"),
     ("https://ghe.example.test:8443/api/graphql", "ghe.example.test:8443"),
+    ("https://ghe.example.test:443/api/graphql", "ghe.example.test"),
+    ("https://api.github.com:443/graphql", "github.com"),
     ("https://api.acme.ghe.com/graphql", "acme.ghe.com"),
     ("http://ghe.example.test/api/graphql", None),
     ("https:///graphql", None),
@@ -178,14 +180,17 @@ def test_an_unparseable_endpoint_never_asks_gh(tmp_path: Path) -> None:
 def test_the_no_token_prompt_says_only_what_harbor_checked() -> None:
     from harbor.wake import github_transport_fact
     helper = "python -m harbor.github_rest"
-    checked = github_transport_fact(helper=helper, repository="o/r", token_available=False, gh_checked=True)
+    checked = github_transport_fact(helper=helper, repository="o/r", token_available=False, gh_result="none")
+    timed_out = github_transport_fact(helper=helper, repository="o/r", token_available=False, gh_result="timed out")
     unchecked = github_transport_fact(helper=helper, repository="o/r", token_available=False)
     linear_only = github_transport_fact(helper=helper, repository="", token_available=False)
     assert "`gh auth token` had none at launch" in checked
+    assert "`gh auth token` did not answer at launch" in timed_out
     assert "gh auth token" not in unchecked and "(none exported)" in unchecked
-    assert "a GitHub token is missing" in checked and "a GitHub token is missing" in unchecked
+    for fact in (checked, timed_out, unchecked):
+        assert "a GitHub token is missing" in fact
     assert "no github_repository" in linear_only and "token is missing" not in linear_only
-    for fact in (checked, unchecked, linear_only):
+    for fact in (checked, timed_out, unchecked, linear_only):
         assert "Do not try the gh CLI" in fact and "may use it" not in fact
 
 
@@ -259,11 +264,12 @@ def cli_project(tmp_path: Path, monkeypatch, *, repository: str = "owner/repo") 
     return gh_dir
 
 
-def _run(coroutine) -> None:
-    try:
-        asyncio.run(coroutine)
-    except Exception:  # Linear is unreachable on purpose; adoption happens first.
-        pass
+def _run(coroutine) -> int:
+    """Run a CLI coroutine; it must return an exit code, never raise."""
+
+    code = asyncio.run(coroutine)
+    assert isinstance(code, int), code
+    return code
 
 
 @pytest.mark.parametrize("command", ["facts", "answer"])
@@ -285,3 +291,221 @@ def test_facts_and_answer_leave_a_project_without_github_alone(tmp_path: Path, m
     _run(cli._facts("SampleProject") if command == "facts"
          else cli._answer("esc-unknown", "an answer", project_name="SampleProject"))
     assert argv(gh_dir) is None and os.environ["GH_TOKEN"] == ""
+
+
+# ------------------------------------------- GitHub Enterprise Server (finding 5)
+
+def test_a_ghes_login_is_held_as_gh_enterprise_token_never_gh_token(tmp_path: Path) -> None:
+    # A child `gh` sends GH_TOKEN to github.com; an Enterprise token must not be there.
+    env: dict[str, str] = {}
+    resolution = adopt_gh_token("GITHUB_TOKEN", "https://ghe.example.test/api/graphql",
+                                environ=env, executable=str(logged_in(tmp_path)))
+    assert resolution == TokenResolution(TokenSource.GH_CLI, "GH_ENTERPRISE_TOKEN", "ghe.example.test")
+    assert env == {"GH_ENTERPRISE_TOKEN": TOKEN}
+    assert argv(tmp_path) == ["auth", "token", "--hostname", "ghe.example.test"]
+
+
+def test_a_ghe_com_login_is_held_as_gh_token(tmp_path: Path) -> None:
+    env: dict[str, str] = {}
+    resolution = adopt_gh_token(None, "https://api.acme.ghe.com/graphql", environ=env,
+                                executable=str(logged_in(tmp_path)))
+    assert resolution.env_name == "GH_TOKEN" and env == {"GH_TOKEN": TOKEN}
+
+
+def test_an_exported_gh_enterprise_token_is_used_not_replaced(tmp_path: Path) -> None:
+    env = {"GH_ENTERPRISE_TOKEN": "exported"}
+    resolution = adopt_gh_token(None, "https://ghe.example.test/api/graphql", environ=env,
+                                executable=str(logged_in(tmp_path)))
+    assert resolution.source is TokenSource.EXPORTED and resolution.env_name == "GH_ENTERPRISE_TOKEN"
+    assert env == {"GH_ENTERPRISE_TOKEN": "exported"} and argv(tmp_path) is None
+
+
+def test_harbor_clients_read_an_adopted_gh_enterprise_token(tmp_path: Path, monkeypatch) -> None:
+    from harbor.cli import builder_github
+    from harbor.clients.github import GitHubClient
+    from harbor.github_rest import Client
+    from harbor.github_token import preferred_token_env
+    for name in ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(name, "")
+    monkeypatch.delenv("HARBOR_GITHUB_TOKEN_ENV", raising=False)
+    ghes = project(tmp_path)
+    ghes.github_api_url = "https://ghe.example.test/api/graphql"
+    profile = SimpleNamespace(github_token_env="GITHUB_TOKEN", github_api_url=ghes.github_api_url,
+                              repository_owner="owner", repository_name="repo")
+    resolution = adopt_for_profile(profile, executable=str(logged_in(tmp_path)))
+    # The poller.
+    assert GitHubClient.from_profile(profile, token_env=resolution.env_name).token == TOKEN
+    # The builder: Harbor names the variable, and the REST helper reads it.
+    github = builder_github(ghes, workflow(), "codex", token_resolution=resolution)
+    assert github["env"]["HARBOR_GITHUB_TOKEN_ENV"] == "GH_ENTERPRISE_TOKEN"
+    child = dict(os.environ, **github["env"])
+    assert Client(child)._token == TOKEN
+    # `harbor workflow check` inside that builder.
+    monkeypatch.setenv("HARBOR_GITHUB_TOKEN_ENV", "GH_ENTERPRISE_TOKEN")
+    assert GitHubClient.from_profile(profile, token_env=preferred_token_env(profile)).token == TOKEN
+    assert os.environ["GH_TOKEN"] == ""  # never placed where gh would send it to github.com
+
+
+# ------------------------------------------------------- gh timeout (finding 7)
+
+def test_a_gh_timeout_gets_its_own_source_and_advice(tmp_path: Path) -> None:
+    from harbor.cli import builder_github
+    env: dict[str, str] = {}
+    resolution = adopt_gh_token(None, None, environ=env, executable=str(fake_gh(tmp_path, "time.sleep(30)")),
+                                timeout=0.5)
+    assert resolution.source is TokenSource.TIMED_OUT and env == {}
+    advice = missing_token_help("GITHUB_TOKEN or GH_TOKEN", None, resolution)
+    assert "did not answer within 10 s" in advice and "gh auth login" not in advice
+    github = builder_github(project(tmp_path), workflow(), "claude", env=env, token_resolution=resolution)
+    assert "did not answer within" in github["missing_token"] and "gh auth login" not in github["missing_token"]
+    assert "`gh auth token` did not answer at launch" in github["fact"]
+
+
+# ------------------------------------------------- the opt-in seam (finding 1)
+
+def test_switching_gh_reuse_off_in_its_one_place_stops_the_lookup(tmp_path: Path, monkeypatch) -> None:
+    import harbor.github_token as github_token
+    monkeypatch.setattr(github_token, "gh_reuse_enabled", lambda profile: False)
+    env: dict[str, str] = {}
+    resolution = adopt_for_profile(github_profile(), environ=env, executable=str(logged_in(tmp_path)))
+    assert resolution.source is TokenSource.REUSE_OFF and env == {} and argv(tmp_path) is None
+    assert "gh auth login" not in missing_token_help("GITHUB_TOKEN", None, resolution)
+
+
+# ------------------------------------------------ `harbor start` itself (finding 2)
+
+def _start_with_recorded_github(tmp_path: Path, monkeypatch, endpoint: str, pr_url: str):
+    """Run a real shadow ``_start`` once; return (exit code, GitHub requests, gh argv)."""
+
+    import httpx
+    import harbor.cli as cli
+    import harbor.clients.github as github_module
+    from harbor.config.projects import ProjectConfig
+
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"data": {"repository": {}}})
+
+    class Recording(github_module.GitHubClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    class OneTicketLinear:
+        async def fetch_issues(self, projects, states):
+            return [{"id": "linear-id-1", "identifier": "A-1", "title": "A ticket",
+                     "state": {"name": "In Progress", "type": "started"},
+                     "attachments": {"nodes": [{"sourceType": "github", "url": pr_url}]},
+                     "comments": {"nodes": []}, "inverseRelations": {"nodes": []}}]
+
+        async def close(self):
+            pass
+
+    for name in ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"):
+        monkeypatch.setenv(name, "")
+    gh_dir = tmp_path / "gh-home"
+    gh_dir.mkdir()
+    monkeypatch.setenv("HARBOR_GH_EXECUTABLE", str(logged_in(gh_dir)))
+    monkeypatch.setattr(cli, "GitHubClient", Recording)
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text(f"```yaml\nrepo: example/repo\ngithub_api_url: {endpoint}\n```\n", encoding="utf-8")
+    cfg = ProjectConfig(name="A", linear_project_slug="a", repo_path=tmp_path, pipeline_path=pipeline)
+    monkeypatch.setattr(cli, "get_project", lambda _: cfg)
+    monkeypatch.setattr(cli, "_db_path", lambda: tmp_path / "harbor.db")
+    code = asyncio.run(cli._start("A", once=True, shadow=True, read_only=True, linear_client=OneTicketLinear(),
+                                  first_mate=object(), notifier=object(), unblock_ladder=object()))
+    return code, sent, argv(gh_dir)
+
+
+def test_start_adopts_the_gh_login_for_its_github_poller(tmp_path: Path, monkeypatch, capsys) -> None:
+    code, sent, gh_argv = _start_with_recorded_github(
+        tmp_path, monkeypatch, "https://api.github.com/graphql", "https://github.com/example/repo/pull/1")
+    out = capsys.readouterr()
+    assert code == 0, out
+    assert gh_argv == ["auth", "token", "--hostname", "github.com"]
+    assert sent, "start sent no GitHub request"
+    assert all(r.headers["Authorization"] == f"bearer {TOKEN}" for r in sent)
+    assert os.environ["GH_TOKEN"] == TOKEN
+    assert TOKEN not in out.out + out.err
+
+
+def test_start_on_ghes_sends_the_adopted_enterprise_token_only_to_its_host(tmp_path: Path, monkeypatch, capsys) -> None:
+    code, sent, gh_argv = _start_with_recorded_github(
+        tmp_path, monkeypatch, "https://ghe.example.test/api/graphql", "https://ghe.example.test/example/repo/pull/1")
+    assert code == 0, capsys.readouterr()
+    assert gh_argv == ["auth", "token", "--hostname", "ghe.example.test"]
+    assert sent and all(r.url.host == "ghe.example.test" for r in sent)
+    assert all(r.headers["Authorization"] == f"bearer {TOKEN}" for r in sent)
+    assert os.environ["GH_ENTERPRISE_TOKEN"] == TOKEN and os.environ["GH_TOKEN"] == ""
+
+
+# ------------------------------------------------ `harbor workflow check` (finding 4)
+
+def _workflow_check(tmp_path: Path, monkeypatch, status: int, token: str):
+    import httpx
+    import harbor.cli as cli
+    import harbor.clients.github as github_module
+    from harbor.cli import build_parser
+    from harbor.db import HarborDB
+    from harbor.wake import apply_phase3_migration
+    from test_workflow_github_endpoint import Linear, PR_URL
+    from workflow_support import config
+
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(status, json={"message": "Bad credentials"})
+
+    class Recording(github_module.GitHubClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("harbor.clients.github.GitHubClient", Recording)
+    monkeypatch.setattr("harbor.clients.linear.LinearClient", Linear)
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setenv("GH_TOKEN", "")
+    monkeypatch.delenv("HARBOR_GITHUB_TOKEN_ENV", raising=False)
+    pipeline = tmp_path / "pipeline.md"
+    pipeline.write_text("```yaml\nrepo: example/repo\n```\n", encoding="utf-8")
+    cfg = SimpleNamespace(name="A", linear_api_url="https://linear.invalid", linear_project_scope=("canonical",),
+                          github_repository="example/repo", required_checks=("tests",),
+                          pipeline_path=str(pipeline), workflow_path=config(tmp_path, "autonomous"))
+    db_path = tmp_path / "harbor.db"
+    db = HarborDB(db_path)
+    try:
+        apply_phase3_migration(db)
+        db.replace_tickets("A", [{"identifier": "A-1", "state": "In Progress", "owned": True, "hold": False}])
+        with db.connection:
+            db.connection.execute("INSERT INTO runs (id, ticket, worktree, status) VALUES (?, ?, ?, ?)",
+                                  ("run", "A-1", str(tmp_path), "running"))
+    finally:
+        db.close()
+    monkeypatch.setattr(cli, "get_project", lambda _: cfg)
+    monkeypatch.setattr(cli, "_db_path", lambda: db_path)
+    args = build_parser().parse_args(["workflow", "check", "A", "--ticket", "A-1", "--event", "pre_merge"])
+    return asyncio.run(cli._async_main(args)), sent
+
+
+def test_workflow_check_without_a_token_says_how_to_fix_it_and_never_asks_gh(tmp_path: Path, monkeypatch, capsys) -> None:
+    gh_dir = tmp_path / "gh-home"
+    gh_dir.mkdir()
+    monkeypatch.setenv("HARBOR_GH_EXECUTABLE", str(logged_in(gh_dir)))
+    code, sent = _workflow_check(tmp_path, monkeypatch, 401, "")
+    err = capsys.readouterr().err
+    assert code == 2 and sent and "Authorization" not in sent[0].headers, err
+    assert "401 Unauthorized (the token is missing" in err and "export GITHUB_TOKEN or GH_TOKEN" in err, err
+    assert "does not reuse `gh auth token`" in err
+    assert argv(gh_dir) is None  # it runs inside the sandbox, where gh hangs
+
+
+def test_workflow_check_points_a_401_at_the_fix(tmp_path: Path, monkeypatch, capsys) -> None:
+    code, sent = _workflow_check(tmp_path, monkeypatch, 401, "stale-not-a-real-token")
+    err = capsys.readouterr().err
+    assert code == 2 and sent, err
+    assert sent[0].headers["Authorization"] == "bearer stale-not-a-real-token"
+    assert "401 Unauthorized" in err and "export GITHUB_TOKEN or GH_TOKEN" in err, err
+    assert "stale-not-a-real-token" not in err

@@ -193,7 +193,7 @@ def test_workflow_check_polls_the_resolved_repository(tmp_path: Path, monkeypatc
             pass
 
         @classmethod
-        def from_profile(cls, profile):
+        def from_profile(cls, profile, **kwargs):
             return cls()
 
         async def fetch_pull_requests(self, owner, repo, *args, **kwargs):

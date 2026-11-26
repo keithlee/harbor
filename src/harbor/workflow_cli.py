@@ -7,6 +7,13 @@ from harbor.config.workflow import load_workflow
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
 
+WORKFLOW_CHECK_TOKEN_HELP = (
+    "workflow check cannot read GitHub: {problem}. This command does not reuse `gh auth token` "
+    "(it also runs inside the builder sandbox, where gh hangs). Inside a builder it uses the token "
+    "harbor start passed in; from a terminal, export GITHUB_TOKEN or GH_TOKEN (or the variable "
+    "named by github_token_env) with access to the project's repository, then run it again."
+)
+
 
 def add_commands(commands):
     workflow = commands.add_parser("workflow", help="inspect and validate configured workflows")
@@ -34,9 +41,14 @@ async def fresh_context(config, db, ticket_id, run, event):
     # Build the GitHub client from the project's profile, as every other
     # consumer does, so the token only goes to the configured GitHub host,
     # and refuse a non-https endpoint before any request is made.
+    from harbor.clients.github import GitHubError
+    from harbor.github_token import preferred_token_env
     profile = PipelineProfile.from_project(config)
     require_https_api_url(profile.github_api_url)
-    github = GitHubClient.from_profile(profile)
+    # This command also runs inside the builder sandbox, where gh hangs, so it
+    # never asks gh: it reads the token Harbor put in the builder environment
+    # (HARBOR_GITHUB_TOKEN_ENV names it), or one the operator exported.
+    github = GitHubClient.from_profile(profile, token_env=preferred_token_env(profile))
     linear = LinearClient(endpoint=config.linear_api_url)
     try:
         raw = await linear.fetch_blocker_context(ticket_id)
@@ -54,7 +66,13 @@ async def fresh_context(config, db, ticket_id, run, event):
         # repository and required checks.
         processor = PREventProcessor(db, project=config.name, profile=profile)
         poller = GitHubPoller(github, profile=profile, db=db, project=config.name, event_processor=processor)
-        facts = await poller.poll([ticket])
+        try:
+            facts = await poller.poll([ticket])
+        except GitHubError as exc:
+            if "401" in str(exc):
+                raise ValueError(WORKFLOW_CHECK_TOKEN_HELP.format(
+                    problem="GitHub answered 401 Unauthorized (the token is missing, expired or revoked)")) from exc
+            raise
         matches = [f for f in facts if f.get("url") == run.get("pr_url")] if run.get("pr_url") else facts
         if len(matches) != 1:
             raise ValueError("expected one unambiguous linked PR")

@@ -424,7 +424,7 @@ def builder_github(
     import shlex
     from harbor.config.workflow import github_settings
     from harbor.github_rest import rest_base_url, token_env_name
-    from harbor.github_token import missing_token_help
+    from harbor.github_token import TokenSource, missing_token_help, preferred_token_env
 
     environ = os.environ if env is None else env
     settings = github_settings(workflow.config)
@@ -436,8 +436,8 @@ def builder_github(
     if settings["transport"] == "mcp" and rest_url != "https://api.github.com" and not explicit_mcp_url:
         # The default hosted MCP server is GitHub.com only; never send an Enterprise token there.
         raise ValueError("github.mcp_url is required for GitHub Enterprise Server; the default MCP server serves GitHub.com only")
-    token_env = token_env_name(environ, profile.github_token_env)
-    token_names = " or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
+    token_env = token_env_name(environ, preferred_token_env(profile, token_resolution, environ))
+    token_names =" or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
     # The same resolved repository the GitHub poller reads, so the builder
     # never acts on a different repository than Harbor observes.
     repository = profile.repository if profile.repository_owner else ""
@@ -459,7 +459,8 @@ def builder_github(
         "token_env": token_env,
         "token_names": token_names,
         "missing_token": (
-            f"no GitHub token for builders: {missing_token_help(token_names, profile.github_api_url)}; "
+            f"no GitHub token for builders: "
+            f"{missing_token_help(token_names, profile.github_api_url, token_resolution)}; "
             "until then builders report a delivery-transport blocker instead of reaching GitHub"
             if repository else
             "no token (none needed: no github_repository is configured, so builders get no GitHub API access)"
@@ -471,7 +472,8 @@ def builder_github(
         "repository": repository,
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
-            gh_checked=bool(getattr(token_resolution, "gh_checked", False)),
+            gh_result={TokenSource.NOT_FOUND: "none", TokenSource.TIMED_OUT: "timed out"}.get(
+                getattr(token_resolution, "source", None), ""),
         ),
     }
 
@@ -633,7 +635,7 @@ async def _start(
     )
     github_client: GitHubClient | None = None
     if github_poller is None and profile.repository_owner and profile.repository_name:
-        github_client = GitHubClient.from_profile(profile)
+        github_client = GitHubClient.from_profile(profile, token_env=token_resolution.env_name)
         github_poller = GitHubPoller(
             github_client,
             profile,
@@ -828,7 +830,7 @@ async def _facts(project_name: str, *, as_json: bool = True) -> int:
         print(f"Harbor: {exc}", file=sys.stderr)
         return 2
     profile = PipelineProfile.from_project(config)
-    _adopt_github_token(profile)
+    token_resolution = _adopt_github_token(profile)
     if profile.repository_owner and profile.repository_name:
         try:
             _require_github_api_url(profile)
@@ -840,7 +842,7 @@ async def _facts(project_name: str, *, as_json: bool = True) -> int:
     github_client: GitHubClient | None = None
     github_poller = None
     if profile.repository_owner and profile.repository_name:
-        github_client = GitHubClient.from_profile(profile)
+        github_client = GitHubClient.from_profile(profile, token_env=token_resolution.env_name)
         github_poller = GitHubPoller(github_client, profile, project=config.name)
     supervisor = Supervisor(
         LinearPoller(client, config, db=db),

@@ -230,11 +230,16 @@ exported. For a project that sets `github_repository`, when none of
 counts as unset), `harbor start`, `doctor`, `answer` and `facts` run
 `gh auth token --hostname HOST` once at launch. `HOST` is `github.com` for
 GitHub.com, `acme.ghe.com` for GHE.com data residency (`api.acme.ghe.com`), or
-your GitHub Enterprise Server host and port. The call has a 10 second timeout,
-after which `gh` and every process it started are killed. A GitHub URL Harbor
-cannot parse skips the lookup. Harbor holds the result as `GH_TOKEN` in its own
-process environment. Its poller and the builder's REST helper then use it exactly
-as they would an exported token. It is never written to config, the ledger,
+your GitHub Enterprise Server host (with its port, unless that is 443). The call
+has a 10 second timeout, after which `gh` and every process it started are killed,
+and `doctor` and `start` then say that `gh` did not answer rather than asking you
+to log in again. A GitHub URL Harbor cannot parse skips the lookup. Harbor holds
+the result in its own process environment under the name `gh` itself reads for
+that host: `GH_TOKEN` for GitHub.com and GHE.com, `GH_ENTERPRISE_TOKEN` for GitHub
+Enterprise Server, so a `gh` call a builder makes never sends an Enterprise token
+to github.com. An exported `GH_ENTERPRISE_TOKEN` is used as it is. Its poller and
+the builder's REST helper then use the token exactly as they would an exported
+one. It is never written to config, the ledger,
 logs, prompts or PR text; `doctor` says only that the token was "reused from
 `gh auth token`". Set `HARBOR_GH_EXECUTABLE` to use a `gh` that is not on `PATH`.
 A project without `github_repository` (for example Linear-only) never gets a
@@ -255,6 +260,13 @@ macOS, `gh` cannot reach the keychain or complete TLS, so `gh pr view` and
 can be found at all, `harbor start` prints a warning naming the fix, `doctor`
 fails for a project with a `github_repository`, and the builder is told to
 report a delivery-transport blocker rather than try `gh`.
+
+`harbor workflow check` never asks `gh`, because it also runs inside the builder
+sandbox. Inside a builder it uses the token `harbor start` passed in. When you
+run it from a terminal, export `GITHUB_TOKEN` or `GH_TOKEN` (or the variable named
+by `github_token_env`) first. Without one, GitHub answers 401, and the command
+says so and names this fix. `harbor workflow checks` runs repository commands
+only and needs no GitHub token.
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 
