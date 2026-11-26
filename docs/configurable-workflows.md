@@ -225,6 +225,15 @@ variable the token comes from, and fails when GitHub is configured with no token
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 
+**Claude builder child agents.** The delivery skill spawns planner,
+implementor and reviewer children. A Claude builder does this with Claude
+Code's `Agent` tool, which Harbor always enables; there is nothing to
+configure. Children run inside the builder's own Claude Code process, so they
+get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
+`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
+writable paths and the same network allowlist below. They cannot use a tool or
+reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
+
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:
 `github.com`, `api.github.com`, `api.linear.app` and `registry.npmjs.org`, plus

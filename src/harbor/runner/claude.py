@@ -143,11 +143,13 @@ class ClaudeRunner(CodexRunner):
         # uses the shared subset of keywords from both drafts.
         schema.pop("$schema", None)
         schema.pop("$id", None)
+        # Agent lets the delivery skill spawn its planner/implementor/reviewer children. They
+        # run in this process, so they get the same tools, dontAsk mode and sandbox as the builder.
         command = [
             self.executable, "--print", "--verbose", "--output-format", "stream-json",
             "--json-schema", json.dumps(schema),
             "--model", self.model, "--effort", self.reasoning_effort,
-            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill",
+            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
         if mcp:
