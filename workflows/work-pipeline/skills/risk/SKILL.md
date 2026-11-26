@@ -12,7 +12,9 @@ State the tier on its own line inside that section, in exactly this form:
 
 (`low`, `medium` or `high`; no bold, bullets or other text on the line). Harbor
 reads only that line, and only when the section carries the current head's marker.
-At `pre_merge` the effective risk is the higher of the ticket's Linear floor and
-this tier; a missing, stale or unparseable tier leaves the risk unknown and the
+The reviewer rates risk independently in its verdict (`skills/review`). At `pre_merge`
+the effective risk is the highest of the ticket's Linear floor, this tier and the
+reviewer's current-head rating; none of them can lower another. A missing, stale or
+unparseable tier, or a missing reviewer rating, leaves the risk unknown and the
 automatic merge fails closed.
 A wording decision cannot downgrade delivery risk. Reassess after every push.
