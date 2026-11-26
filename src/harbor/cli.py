@@ -13,7 +13,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from harbor.clients.github import GitHubClient
+from harbor.clients.github import GitHubClient, GitHubError
 from harbor.clients.linear import DEFAULT_LINEAR_API_URL, LinearClient, LinearClientError
 from harbor.config.profile import PipelineProfile
 from harbor.wake import github_transport_fact
@@ -85,6 +85,51 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
+def _runtime_invocation(config: Any) -> str:
+    """The exact shell prefix builders must use in place of ``harbor``.
+
+    It pins the registry, ledger and Harbor source so shell initialization in
+    the builder cannot select another one.
+    """
+
+    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
+    if not registry or not Path(registry).expanduser().is_file():
+        raise ValueError("workflow delivery requires its authoritative project registry")
+    return shlex.join([
+        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
+        f"HARBOR_DB_PATH={_db_path().resolve()}",
+        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
+        sys.executable, "-P", "-m", "harbor.cli",
+    ])
+
+
+# The builder's provider is chosen per launch (and quota fallback can switch it),
+# after this prompt is rendered, so the child-agent rules name both runtimes.
+CHILD_AGENT_INSTRUCTIONS = (
+    "Child agents: use your own runtime's child-agent tools; never shell out to another agent CLI "
+    "(such as `codex exec` or `claude -p`) for children. "
+    # An installed workflow keeps its own (possibly older) skill copies, so say which rules win.
+    "Where these launch child-agent rules conflict with child-agent steps in the workflow's skills, these "
+    "rules win; a Codex builder still follows the skills' list, resume and close steps. "
+    "Codex: use the native collaboration tools (spawn, list, wait, resume, close). "
+    # Claude Code runs an `Agent` child in the background when the parameter is omitted.
+    "Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`; if you leave it "
+    "out, the child runs in the background and your turn can end before it returns, so you would hand off without "
+    "its result. A foreground call waits and returns the child's "
+    "result, and a finished child needs no close. Claude Code has no list, resume, message or close, so track "
+    "the children you started in this session yourself. Wherever the workflow says to resume, message or "
+    "return work to an existing child (for example review fixes to the same implementor), spawn a fresh child "
+    "for that role instead and give it the earlier child's report plus the current ticket, PR and review state. "
+    "The fresh child replaces the earlier one, so the ticket still has one child per role. In a new session "
+    "with no earlier child report, give it the PR and its review comments instead. "
+    "Either runtime: stop after three failed review rounds. The count is the larger of the rounds you counted in "
+    "this session and the rounds on the PR, so the three-round limit holds across a fresh session. On the PR, each "
+    "reviewer JSON verdict comment with `\"verdict\": \"reject\"` is one failed round, even when it rejects the "
+    "same head again; count only comments whose `head_sha` is a commit on the PR, and ignore every other comment, "
+    "such as a human \"FAIL\"."
+)
+
+
 def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
@@ -92,15 +137,7 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """
 
     from harbor.config.workflow import load_workflow
-    registry = getattr(config, "registry_path", None) or os.environ.get("HARBOR_PROJECTS_FILE")
-    if not registry or not Path(registry).expanduser().is_file():
-        raise ValueError("workflow delivery requires its authoritative project registry")
-    runtime = shlex.join([
-        "/usr/bin/env", f"HARBOR_PROJECTS_FILE={Path(registry).expanduser().resolve()}",
-        f"HARBOR_DB_PATH={_db_path().resolve()}",
-        f"PYTHONPATH={Path(__file__).resolve().parent.parent}",
-        sys.executable, "-P", "-m", "harbor.cli",
-    ])
+    runtime = _runtime_invocation(config)
     workflow = workflow or load_workflow(Path(config.workflow_path))
     return (workflow.prompt()
             + "\nAuthoritative runtime invocation: " + runtime
@@ -110,8 +147,8 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
             + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
             + "shell initialization must not select another registry or ledger."
-            + "\nChild agents: use the native collaboration tools (spawn, list, wait, resume, close). "
-            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`."
+            + "\n" + CHILD_AGENT_INSTRUCTIONS
+            + " Use the role models and reasoning efforts from the policy's `roles`."
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
             + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 
@@ -136,8 +173,6 @@ def _deadline_seconds(config: Any, default_minutes: float = 90.0) -> float:
 
 def _worktree_root(config: Any) -> Path:
     configured = getattr(config, "worktree_root", None)
-    if configured is None:
-        configured = os.environ.get("HARBOR_WORKTREE_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".harbor" / "wt" / str(getattr(config, "name", "project"))).resolve()
@@ -307,6 +342,18 @@ def build_production_dispatcher(
                         config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
                     )
                 runner.sandbox_hosts = hosts
+                # dontAsk refuses the runtime invocation and reads outside the
+                # worktree unless they are pre-approved; approve exactly these.
+                # Without the registry a builder (new or resumed) could not run
+                # a single workflow check, so refuse to build it and say why.
+                try:
+                    runner.harbor_invocation = _runtime_invocation(config)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"the Claude builder for {ticket} cannot be approved to run harbor: {exc}; "
+                        "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
+                    ) from exc
+                runner.workflow_package = current.package
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -502,6 +549,14 @@ async def _doctor(project_name: str) -> int:
         if github["sandbox_hosts"] is not None:
             from harbor.runner.claude import sandbox_domains
             print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
+            from harbor.runner.claude import workflow_permissions
+            try:
+                workflow_permissions(_runtime_invocation(config), workflow.package)
+            except ValueError as exc:
+                print(f"Builder permissions: invalid ({exc}); a Claude builder could not run harbor or read the workflow")
+                scope_ok = False
+            else:
+                print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
     if config.install_command is None:
@@ -1006,7 +1061,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         db = HarborDB(_db_path())
         try:
             return await execute(args, get_project(args.project), db)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, GitHubError) as exc:
+            # A GitHub outage or bad response fails closed with one line, as a
+            # configuration error does; never a traceback with exit 1.
             print(f"Harbor: {exc}", file=sys.stderr)
             return 2
         finally:

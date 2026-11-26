@@ -198,6 +198,15 @@ Harbor uses `https://api.github.com/graphql`. A registry value goes through the
 same checks as a pipeline value, so a malformed one stops `harbor start` and
 fails `harbor doctor` for a Claude builder.
 
+Neither `github_api_url` nor `linear_api_url` may carry credentials. A URL with
+userinfo, such as `https://user:secret@host/api/graphql`, is refused when the
+project is loaded or by `harbor doctor`, for every builder, because HTTP
+errors would repeat the full URL in logs. Look-alike `@` signs (`＠`, `﹫`)
+count as `@`, and a host with any non-ASCII character is refused too (give an
+internationalized name in its `xn--` form). Supply the GitHub token through
+`GITHUB_TOKEN`, `GH_TOKEN` or the variable named by `github_token_env`, and
+the Linear key through `LINEAR_API_KEY` or `HARBOR_LINEAR_API_KEY`.
+
 `github_repository`, `required_checks` and `bot_rework_cap` use the same
 precedence: registry, then `.harbor/pipeline.md`, then the default, with an
 empty registry column ignored (a bare registry repository name keeps the
@@ -224,6 +233,15 @@ and **Commit statuses** read. `harbor doctor` prints the transport and which
 variable the token comes from, and fails when GitHub is configured with no token.
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
+
+**Claude builder child agents.** The delivery skill spawns planner,
+implementor and reviewer children. A Claude builder does this with Claude
+Code's `Agent` tool, which Harbor always enables; there is nothing to
+configure. Children run inside the builder's own Claude Code process, so they
+get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
+`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
+writable paths and the same network allowlist below. They cannot use a tool or
+reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
 
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:
@@ -315,9 +333,42 @@ harbor workflow check Demo --ticket DEM-1 --event pre_merge
 ## Child agents
 
 The delivery skill spawns planner, implementor and reviewer children with the
-native collaboration tools. Before spawning a role it lists the existing
-agents. It resumes a live one; an interrupted or errored one is closed and the
-role is respawned under a fresh name. A name collision is never a blocker.
+builder's own child-agent tools, and the launch prompt gives the rules for
+both providers:
+
+- A Codex builder uses the native collaboration tools. Before spawning a role
+  it lists the existing agents. It resumes a live one; an interrupted or
+  errored one is closed and the role is respawned under a fresh name. A name
+  collision is never a blocker.
+- A Claude builder uses Claude Code's `Agent` tool and always passes
+  `run_in_background: false`. A foreground call waits and returns the child's
+  result. Claude Code has no list, resume, message or
+  close, so the builder tracks the children it started in the session itself.
+  Where Codex would resume or message a child (for example to return review
+  fixes to the same implementor), a Claude builder spawns a fresh child for
+  that role and hands it the earlier child's report and the current ticket, PR
+  and review state. Harbor does not give the Claude builder `SendMessage`, so
+  its tool set and its children's stay unchanged. The `false` must be explicit:
+  when the parameter is left out, Claude Code starts the child in the
+  background, and the builder's turn can end before the child returns. Claude
+  Code later runs a follow-up turn with the child's result, but by then the
+  builder has already reported its run result without it. The fresh child replaces
+  the earlier one, so a ticket keeps one child per role. A new session with no
+  earlier child report hands the child the PR and its review comments instead.
+- Both providers stop after three failed review rounds. The count is the
+  larger of the rounds the builder counted in its session and the rounds on
+  the PR, so the limit holds across a fresh session. The review skill posts
+  its exact JSON verdict object as a PR comment. Each such comment with
+  `"verdict": "reject"` is one failed round, even when it rejects the same
+  head again (for example after a fix failed to push). Only comments whose
+  `head_sha` is a commit on the PR count. Other comments, such as a human
+  "FAIL", do not count.
+
+The launch prompt says that where these rules conflict with the child-agent
+steps in the workflow's skills, the launch rules win. A Codex builder still
+follows the skills' list, resume and close steps. An existing `.harbor/workflow`
+install keeps its own skill copies, which may be older.
+
 Harbor does not register or verify child identities.
 
 ## First Mate: monitor and recover
@@ -347,6 +398,15 @@ Guardrails:
 - Each run gets `max_recoveries` attempts, re-checked every `recheck_minutes`.
   Only a model usage limit backs off exponentially (30, then 60 minutes).
 - A spent budget escalates once and never loops.
+- Recovery instructions match the run's builder provider (from
+  `runner_identity`). A Codex builder is told to list agents, close stale
+  children and respawn them under new names. A Claude builder is told to spawn
+  fresh children with `Agent` calls that pass `run_in_background: false`, and
+  to give each one the earlier child's report when it has one, plus the ticket,
+  the PR and its review comments, because it cannot list or close children.
+  When no provider is recorded, or the recorded value is not one Harbor knows,
+  the instruction gives both sets of steps, each labelled with its runtime. An
+  unrecognised value is passed to First Mate as recorded.
 
 - Watchdog flags get the same eligibility checks: a held or closed ticket is
   never restarted (cleaning up a merged ticket is the one exception).
@@ -431,6 +491,29 @@ resolved project registry, the operational ledger, the Python interpreter and
 the Harbor import path. Workflow commands and child agents use that invocation
 with the supplied project and ticket. The native sandbox includes the ledger
 directory for operational receipts; the registry remains read-only.
+
+**Claude builder permissions.** Claude builders run in Claude Code's
+`dontAsk` permission mode, which refuses any tool call that is not
+pre-approved. Sandboxed Bash is approved automatically, except a command that
+sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
+(directly or through `/usr/bin/env`), which is exactly what the runtime
+invocation does; Read, Glob and Grep only reach the ticket worktree,
+and the workflow package lives in your clone outside it. So Harbor pre-approves
+two things, and nothing else:
+
+- Bash commands that start with the exact runtime invocation from the prompt
+  (`Bash(<invocation>:*)`). They still run inside the OS sandbox, with the same
+  writable directories and network allowlist.
+- Reading the project's workflow package (`Read(//<repo>/.harbor/workflow/**)`),
+  so the builder can open `skills/*/SKILL.md`, `scripts/` and `config.toml`.
+
+No setup is needed. `harbor doctor` prints them as `Builder permissions:` for a
+Claude project, and fails if a path contains a wildcard (`*`, `?`, `[`, `]`) or
+a line break, which a rule cannot match literally; rename that directory.
+Codex builders need neither: their
+`workspace-write` sandbox reads anywhere and has no per-command approval.
+Verified on macOS with Claude Code 2.1.332 by running the generated command
+against a throwaway repository and worktree; not run on Linux.
 
 ## Verification map
 

@@ -1,0 +1,5 @@
+You are a Harbor delivery builder (Claude Code) for the toy ticket SAMPLE-1 (title: 'Add a greeting'). There is no PR yet and no review comments. First Mate resumed you with this instruction:
+
+Harbor no longer registers or verifies child agents, and policy edits no longer need reconcile; that blocker is obsolete. Do not try to list, close or resume earlier children: Claude Code has no tool for that. Spawn fresh planner/implementor/reviewer children with foreground `Agent` calls (never `run_in_background`) and the models in config.toml, and give each one the ticket, the PR and its review comments; then continue delivering the ticket from where it stopped.
+
+For this proof, spawn ONLY the planner child (skip implementor and reviewer). The planner's whole task: reply with exactly the line 'PLAN SAMPLE-1: print hello'. Use the default model. After it returns, output: the planner's result, and the line 'IMPOSSIBLE STEPS: <list or none>' naming any step of the instruction you could not perform with your tools.
