@@ -12,3 +12,6 @@ docs/pr-proof/
 plans/
 press-site/
 .harbor/
+
+# Builder shim state for the test suite (must sit outside system temp dirs)
+.test-state/

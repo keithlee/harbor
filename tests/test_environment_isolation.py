@@ -31,10 +31,19 @@ def assert_isolated_registry(value: str | None) -> None:
     assert not registry.resolve().is_relative_to(REAL_HOME)
 
 
+# Set by conftest after isolation: the suite's builder-shim state, in the checkout.
+SET_BY_CONFTEST = ("HARBOR_PROJECTS_FILE", "XDG_STATE_HOME")
+
+
+def assert_suite_state_home(value: str | None) -> None:
+    assert value and Path(value).resolve().is_relative_to(ROOT / ".test-state"), value
+
+
 def test_no_harbor_or_credential_variable_reaches_a_test() -> None:
-    leaked = sorted(name for name in os.environ if is_isolated_env_var(name) and name != "HARBOR_PROJECTS_FILE")
+    leaked = sorted(name for name in os.environ if is_isolated_env_var(name) and name not in SET_BY_CONFTEST)
     assert leaked == [], f"developer environment leaked into the suite: {leaked}"
     assert_isolated_registry(os.environ.get("HARBOR_PROJECTS_FILE"))
+    assert_suite_state_home(os.environ.get("XDG_STATE_HOME"))
 
 
 def test_home_and_harbor_defaults_resolve_outside_the_real_home() -> None:
@@ -59,7 +68,8 @@ def test_a_subprocess_inherits_the_sealed_environment() -> None:
              "or k in names or k.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))))); "
              "print(pathlib.Path.home().resolve()); "
              "print(os.environ.get('HARBOR_PROJECTS_FILE', ''))")
-    out = subprocess.run([sys.executable, "-c", probe, json.dumps(list(ISOLATED_ENV_VARS))],
+    names = [name for name in ISOLATED_ENV_VARS if name not in SET_BY_CONFTEST]
+    out = subprocess.run([sys.executable, "-c", probe, json.dumps(names)],
                          capture_output=True, text=True, check=True).stdout.splitlines()
     assert json.loads(out[0]) == []
     assert not Path(out[1]).is_relative_to(REAL_HOME)

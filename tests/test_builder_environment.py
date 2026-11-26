@@ -239,8 +239,12 @@ def test_doctor_fails_closed_when_a_shell_resolves_another_harbor(tmp_path: Path
 def test_doctor_checks_login_and_interactive_shells() -> None:
     from harbor.builder_env import shell_modes
 
-    zsh = shutil.which("zsh") or "/bin/sh"
+    zsh = shutil.which("zsh")
+    if zsh is None:
+        pytest.skip("zsh is unavailable")
     assert shell_modes(zsh) == (("/bin/sh", ("-c",)), (zsh, ("-c",)), (zsh, ("-l", "-c")), (zsh, ("-i", "-c")))
+    # A $SHELL of /bin/sh adds its login and interactive modes, without repeating plain -c.
+    assert shell_modes("/bin/sh") == (("/bin/sh", ("-c",)), ("/bin/sh", ("-l", "-c")), ("/bin/sh", ("-i", "-c")))
 
 
 @pytest.mark.parametrize("shell_name", ["sh", "bash", "zsh"])
@@ -290,6 +294,67 @@ def test_the_shim_directory_must_be_outside_builder_writable_roots(tmp_path: Pat
     cfg, registry = _project(tmp_path)
     with pytest.raises(ValueError, match="which builders can write"):
         cli._builder_environment(cfg)
+
+
+@pytest.mark.parametrize("where", ["tmp", "tmpdir", "gettempdir"])
+def test_a_shim_directory_in_a_temporary_directory_is_refused(tmp_path: Path, monkeypatch, where: str) -> None:
+    # Codex's workspace-write and Claude's sandbox let builders write the
+    # temporary directories, so a shim there could get a ``git`` planted beside it.
+    import tempfile
+    base = {"tmp": Path("/tmp"), "tmpdir": tmp_path, "gettempdir": Path(tempfile.gettempdir())}[where]
+    if where == "tmpdir":
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(base / "harbor-test-state"))
+    cfg, registry = _project(tmp_path)
+    with pytest.raises(ValueError, match="which builders can write"):
+        cli._builder_environment(cfg)
+
+
+def test_a_relative_xdg_state_home_is_ignored(tmp_path: Path, monkeypatch) -> None:
+    from harbor.builder_env import shim_root
+    home = Path(os.environ["XDG_STATE_HOME"]) / "home"
+    assert shim_root({"XDG_STATE_HOME": "relative/state", "HOME": str(home)}) == (
+        home / ".local" / "state" / "harbor" / "builder-bin").resolve()
+
+
+def test_a_shim_directory_holding_anything_else_is_refused(tmp_path: Path, monkeypatch) -> None:
+    # Anything beside ``harbor`` (a planted ``git`` or ``node``) would run in
+    # place of the real command for every builder, and in doctor's shell checks.
+    cfg, registry, ledger, db, dispatcher, factory = _started(tmp_path, monkeypatch)
+    try:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        env = factory(worktree, Wake(ticket={"identifier": "SAMPLE-1"}, action="build")).environment()
+        planted = Path(env["HARBOR_BIN"]).parent / "git"
+        planted.write_text("#!/bin/sh\necho planted\n")
+        planted.chmod(0o755)
+        with pytest.raises(ValueError, match="holds git besides the harbor shim"):
+            factory(worktree, Wake(ticket={"identifier": "SAMPLE-2"}, action="build"))
+    finally:
+        db.close()
+
+
+def test_a_separate_git_dir_is_a_writable_root_the_shim_must_avoid(tmp_path: Path, monkeypatch) -> None:
+    # ``git init --separate-git-dir`` puts the real git directory (which Codex
+    # makes writable) outside the checkout; checking ``<repo>/.git`` missed it.
+    git_dir = Path(os.environ["XDG_STATE_HOME"]) / "separate.git"
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", f"--separate-git-dir={git_dir}", str(repo)], check=True)
+    monkeypatch.setenv("XDG_STATE_HOME", str(git_dir / "state"))
+    registry = tmp_path / "projects.md"
+    registry.write_text("# registry", encoding="utf-8")
+    cfg = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=repo,
+                        workflow_path=str(config(tmp_path)), install_command="none", registry_path=registry)
+    with pytest.raises(ValueError, match=f"inside {git_dir.resolve()}, which builders can write"):
+        cli._builder_environment(cfg)
+
+
+def test_a_runners_own_writable_roots_are_checked_for_every_builder(tmp_path: Path, monkeypatch) -> None:
+    cfg, registry = _project(tmp_path)
+    builder = cli._builder_environment(cfg)
+    builder.refuse_writable((tmp_path,))  # unrelated roots are fine
+    with pytest.raises(ValueError, match="which builders can write"):
+        builder.refuse_writable((builder.bin_dir.parent.parent,))
 
 
 def test_an_executable_planted_on_the_builder_path_is_not_launched(tmp_path: Path, monkeypatch) -> None:

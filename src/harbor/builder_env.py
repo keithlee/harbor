@@ -14,19 +14,21 @@ per-ticket shell prefix:
   replace ``PATH`` after Harbor sets it, so PATH order alone does not
   guarantee which ``harbor`` runs. ``harbor doctor`` checks plain, login and
   interactive shells, and the builder prompt tells builders to compare
-  ``command -v harbor`` with ``$HARBOR_BIN`` and use ``"$HARBOR_BIN"`` when
-  they differ.
+  ``command -v harbor`` with ``printenv HARBOR_BIN`` and, when they differ, to
+  run that absolute path written out (Claude Code's dontAsk mode refuses a
+  command that expands ``$HARBOR_BIN``).
 - The GitHub token variables (``github_token_env``, then ``GITHUB_TOKEN`` /
-  ``GH_TOKEN``): pinned to their values at start, and removed when unset
-  then, so a token exported into Harbor's shell later never reaches builders.
-  Values are held only in memory and handed to the builder process; they are
-  never written to the shim, config, ledger, prompt or logs.
+  ``GH_TOKEN``), set to the values Harbor had at start, and removed when
+  unset then. Values are held only in memory and handed to the builder
+  process; they are never written to the shim, config, ledger, prompt or logs.
 
 The shim lives under ``$XDG_STATE_HOME/harbor/builder-bin`` (default
-``~/.local/state``), and resolution fails closed if that is inside a
-directory builders can write (the ledger directory, worktree root or the
-repository's git directory), so a builder can neither edit the shim nor plant
-another executable in front of it.
+``~/.local/state``). Resolution fails closed if that is inside any directory a
+builder can write: the ledger directory, worktree root, the repository's real
+git directory, the system temporary directories (both sandboxes allow writes
+there), and each runner's own writable roots, checked again for every
+builder. A shim directory holding anything besides ``harbor`` is refused too,
+so a builder can neither edit the shim nor plant another executable beside it.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,8 +58,47 @@ def shim_root(environ: Mapping[str, str] | None = None) -> Path:
     """Where Harbor keeps builder shims: ``$XDG_STATE_HOME/harbor/builder-bin``."""
 
     env = os.environ if environ is None else environ
-    state = env.get("XDG_STATE_HOME") or str(Path(env.get("HOME") or Path.home()) / ".local" / "state")
+    state = env.get("XDG_STATE_HOME") or ""
+    # The XDG spec says to ignore a relative value.
+    if not Path(state).is_absolute():
+        state = str(Path(env.get("HOME") or Path.home()) / ".local" / "state")
     return Path(state).expanduser().resolve() / "harbor" / "builder-bin"
+
+
+def temporary_roots(environ: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """System temporary directories, which Codex's workspace-write and Claude's sandbox let builders write."""
+
+    env = os.environ if environ is None else environ
+    candidates = [tempfile.gettempdir(), env.get("TMPDIR") or "", "/tmp", "/private/tmp", "/var/tmp",
+                  "/private/var/tmp", "/var/folders", "/private/var/folders"]
+    return tuple(dict.fromkeys(Path(item).resolve() for item in candidates if item))
+
+
+def git_common_dir(repo: str | Path) -> Path | None:
+    """The repository's real git directory (it may sit outside the checkout)."""
+
+    try:
+        found = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = found.stdout.strip()
+    return Path(value).resolve() if found.returncode == 0 and value else None
+
+
+def refuse_inside(bin_dir: Path, roots: Sequence[str | Path]) -> None:
+    """Fail closed when ``bin_dir`` is inside any directory a builder can write."""
+
+    for root in roots:
+        resolved_root = Path(root).expanduser().resolve()
+        if bin_dir == resolved_root or bin_dir.is_relative_to(resolved_root):
+            raise ValueError(
+                f"the builders' harbor shim directory {bin_dir} is inside {resolved_root}, which builders can write; "
+                "set XDG_STATE_HOME to an absolute directory outside the ledger directory, worktree root, "
+                "repository and system temporary directories"
+            )
 
 
 def shim_text(registry: Path, db_path: Path, *, python: str | None = None, source: Path | None = None) -> str:
@@ -84,16 +126,27 @@ def write_shim(bin_dir: Path, text: str) -> Path:
     """Write the shim (idempotently) and return its path."""
 
     bin_dir.mkdir(parents=True, exist_ok=True)
+    # The directory is first on every builder's PATH: anything else in it
+    # (a planted ``git`` or ``node``) would run in place of the real tool.
+    extra = sorted(entry.name for entry in bin_dir.iterdir() if entry.name != SHIM_NAME)
+    if extra:
+        raise OSError(f"{bin_dir} holds {', '.join(extra)} besides the harbor shim; remove them, "
+                      "they would run in place of real commands for every builder")
     shim = bin_dir / SHIM_NAME
     try:
         current = shim.read_text(encoding="utf-8")
     except OSError:
         current = None
     if current != text:
-        temporary = bin_dir / f".{SHIM_NAME}.tmp"
-        temporary.write_text(text, encoding="utf-8")
-        temporary.chmod(0o755)
-        temporary.replace(shim)
+        handle, name = tempfile.mkstemp(dir=bin_dir, prefix=f".{SHIM_NAME}.", suffix=".tmp")
+        temporary = Path(name)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(text)
+            temporary.chmod(0o755)
+            temporary.replace(shim)
+        finally:
+            temporary.unlink(missing_ok=True)
     elif not os.access(shim, os.X_OK):
         shim.chmod(0o755)
     return shim
@@ -122,6 +175,11 @@ class BuilderEnvironment:
     def path(self) -> str:
         rest = [part for part in self.base_path.split(os.pathsep) if part and part != str(self.bin_dir)]
         return os.pathsep.join((str(self.bin_dir), *rest))
+
+    def refuse_writable(self, roots: Sequence[str | Path]) -> None:
+        """Fail closed when a runner's writable roots would reach the shim directory."""
+
+        refuse_inside(self.bin_dir, roots)
 
     def ensure_shim(self) -> Path:
         try:
@@ -165,7 +223,8 @@ def resolve_builder_environment(
     """Resolve the builder environment for ``config`` once.
 
     Fails closed without a registry, or when the shim directory would be
-    inside one of ``writable_roots`` (directories a builder can write).
+    inside one of ``writable_roots`` (directories a builder can write) or a
+    system temporary directory.
     ``token_names`` are the token variable names in preference order; each is
     pinned to its current value (or to unset), and the first one set is named
     in reports.
@@ -182,13 +241,7 @@ def resolve_builder_environment(
     # two Harbor installs) never overwrite each other's shim.
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     bin_dir = shim_root(env) / digest
-    for root in (ledger.parent, *writable_roots):
-        resolved_root = Path(root).expanduser().resolve()
-        if bin_dir == resolved_root or bin_dir.is_relative_to(resolved_root):
-            raise ValueError(
-                f"the builders' harbor shim directory {bin_dir} is inside {resolved_root}, which builders can write; "
-                "set XDG_STATE_HOME to a directory outside the ledger directory, worktree root and repository"
-            )
+    refuse_inside(bin_dir, (ledger.parent, *writable_roots, *temporary_roots(env)))
     names = tuple(dict.fromkeys(name for name in token_names if name))
     tokens = tuple((name, env.get(name) or None) for name in names)
     token_env = next((name for name, value in tokens if value), None)

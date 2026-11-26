@@ -95,11 +95,14 @@ def _builder_environment(config: Any) -> BuilderEnvironment:
     directory, the worktree root and the repository's git directory.
     """
 
-    from harbor.builder_env import resolve_builder_environment
+    from harbor.builder_env import git_common_dir, resolve_builder_environment
     from harbor.clients.github import GITHUB_TOKEN_ENV_VARS
     profile = PipelineProfile.from_project(config)
     repo = getattr(config, "repo_path", None)
-    roots = [_worktree_root(config), *([Path(repo).expanduser() / ".git"] if repo else [])]
+    roots: list[Path] = [_worktree_root(config)]
+    if repo:
+        # The real git directory, which --separate-git-dir can put outside the checkout.
+        roots.append(git_common_dir(repo) or Path(repo).expanduser() / ".git")
     return resolve_builder_environment(
         config, db_path=_db_path(),
         token_names=(profile.github_token_env, *GITHUB_TOKEN_ENV_VARS),
@@ -356,7 +359,10 @@ def build_production_dispatcher(
                     f"the builder for {ticket} cannot run harbor: the project registry {builder.registry} "
                     "this harbor start resolved is gone; restore it (HARBOR_PROJECTS_FILE) and restart Harbor"
                 )
-            builder.ensure_shim()  # restore it if a builder edited it
+            # This runner's real writable roots (its git directory comes from
+            # the worktree's .git pointer) must not reach the shim either.
+            builder.refuse_writable((*runner.writable_roots, runner.worktree))
+            builder.ensure_shim()
             runner.builder_env = builder.variables()
             runner.github_env = github["env"]
             runner.github_mcp = github["mcp"] if provider == "claude" else None
