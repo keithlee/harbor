@@ -27,7 +27,7 @@ from harbor.poll.github_poller import GitHubPoller
 from harbor.poll.linear_poller import LinearPoller
 from harbor.pr_events import PREventProcessor
 from harbor.runner.codex import CodexRunner
-from harbor.supervisor import Supervisor, WorktreeDispatcher
+from harbor.supervisor import FRESH_SESSION_REASON, UNRECORDED_IDENTITY, Supervisor, WorktreeDispatcher
 from harbor.wake import TicketScope
 from harbor.worktree import DEFAULT_DISK_FLOOR_GB, WorktreeManager, free_disk_gb
 
@@ -252,18 +252,19 @@ def build_production_dispatcher(
             ticket = str(wake.ticket.get("identifier") or wake.ticket.get("id") or "")
             path = getattr(worktree, "path", worktree)
             from harbor.workflow_store import bind
+            identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
+            fresh = getattr(wake, "reason", None) == FRESH_SESSION_REASON
+            if identity is None and getattr(wake, "action", None) == "reengage" and not fresh:
+                # A retained session belongs to whichever provider started it.
+                # Without that record, fail closed rather than guess one. A
+                # fresh session resumes nothing, so it may use the configured
+                # provider and records its identity when it launches. Refuse
+                # before binding the workflow so a refused poll writes nothing.
+                raise ValueError(UNRECORDED_IDENTITY)
             # Adopt edits to .harbor/workflow on the next turn instead of failing.
             current = dispatcher.workflow = dispatcher.workflow.reload()
             if wake.run_id:
                 bind(db.connection, config.name, ticket, wake.run_id, current)
-            identity = runner_identity(db.connection, wake.run_id) if wake.run_id else None
-            if identity is None and getattr(wake, "action", None) == "reengage":
-                # A retained session belongs to whichever provider started it.
-                # Without that record, fail closed rather than guess one.
-                raise ValueError(
-                    f"run {wake.run_id or '(none)'} for {ticket or '(unknown)'} has no recorded runner identity; "
-                    "Harbor will not guess which provider and model own its retained session"
-                )
             provider = identity[0] if identity else builder_provider
             controller = current.config["roles"]["controller"]
             model = str(controller["model"])

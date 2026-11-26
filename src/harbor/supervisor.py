@@ -58,6 +58,14 @@ _MAX_NOTICE_CHARS = 300
 # follows it in a notice is not truncated out of _MAX_NOTICE_CHARS.
 _MAX_RESUME_REASON_CHARS = 160
 _RESUME_FAILURE_KEY = secrets.token_bytes(32)
+# Wake reason for a First Mate fresh session: same run and worktree, new native session.
+FRESH_SESSION_REASON = "first-mate-fresh-session"
+# Why a retained run cannot be rebuilt when its provider was never recorded.
+# Kept within _MAX_RESUME_REASON_CHARS so the remedy is never truncated.
+UNRECORDED_IDENTITY = (
+    "no recorded runner identity, so Harbor will not guess its provider; "
+    "a First Mate fresh session (first_mate.allow_fresh_session) restarts it as configured"
+)
 _LOG = logging.getLogger(__name__)
 # Receipt reason for a blocked run whose Linear blocker context was unprovable.
 _LINEAR_CONTEXT_REASON = "Linear blocker context unavailable"
@@ -624,8 +632,15 @@ class WorktreeDispatcher:
         self.runners[identifier] = runner
         return runner
 
-    async def _prepare_retained_runner(self, identifier: str, row: Mapping[str, Any]) -> tuple[Any, Any] | None:
-        """Attach and construct a runner without replacing the retained handle."""
+    async def _prepare_retained_runner(
+        self, identifier: str, row: Mapping[str, Any], *, reason: str | None = None,
+    ) -> tuple[Any, Any] | None:
+        """Attach and construct a runner without replacing the retained handle.
+
+        ``reason`` tells the runner factory why the handle is built; a fresh
+        session passes ``FRESH_SESSION_REASON`` because it resumes no native
+        session.
+        """
 
         worktree_path = row.get("worktree")
         if not worktree_path:
@@ -641,6 +656,7 @@ class WorktreeDispatcher:
             ticket={"identifier": identifier, "builder_run_id": row["id"], "run_id": row["id"]},
             action="reengage",
             resume=row["id"],
+            reason=reason,
         )
         worktree = self.worktrees.get(identifier)
         if worktree is None:
@@ -731,9 +747,14 @@ class WorktreeDispatcher:
             rebind_runner_identity(connection, row["id"], switch.provider, switch.model, switch.effort or "")
         replaced = False
         try:
-            prepared = await self._prepare_retained_runner(identifier, row)
+            prepared = await self._prepare_retained_runner(identifier, row, reason=FRESH_SESSION_REASON)
             if prepared is None:
-                raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
+                # Name the factory's reason when it refused; otherwise attachment failed.
+                cause = self.resume_unavailable_reason(identifier)
+                raise RuntimeError(
+                    f"cannot start a fresh session for {identifier}: {cause}" if cause
+                    else f"retained worktree for {identifier} cannot be attached"
+                )
             worktree, runner = prepared
             prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
 
@@ -764,7 +785,7 @@ class WorktreeDispatcher:
                 action="reengage",
                 resume=row["id"],
                 instruction=f"{prompt}\n\n{instruction}" if prompt else instruction,
-                reason="first-mate-fresh-session",
+                reason=FRESH_SESSION_REASON,
             )
             if before_launch is None:
                 replace_session()
@@ -4765,7 +4786,7 @@ class Supervisor:
                 case.ticket, recovery.fresh_session_instruction(case, instruction), before_launch=before_launch,
             )
             wake = Wake(ticket={"identifier": case.ticket, "builder_run_id": case.run_id, "run_id": case.run_id},
-                        action="reengage", resume=case.run_id, reason="first-mate-fresh-session")
+                        action="reengage", resume=case.run_id, reason=FRESH_SESSION_REASON)
             await self._handle_runner_result(wake, result)
         elif action == "escalate":
             before_launch()
