@@ -131,6 +131,12 @@ def _author_fields(value: Any) -> tuple[str | None, bool]:
     return (str(login) if login is not None else None), is_bot
 
 
+def author_login(value: Any) -> str | None:
+    """The login of a GraphQL ``author`` node, or ``None`` when absent."""
+
+    return _author_fields(value)[0]
+
+
 def parse_comment(
     comment: Mapping[str, Any],
     *,

@@ -144,7 +144,7 @@ async def fresh_context(config, db, ticket_id, run, event):
         linear_feedback = pending(raw)
         from harbor.risk_evidence import merge_risk
         feedback_digest = hashlib.sha256(json.dumps([raw.get("comments"),fact.get("comments")],sort_keys=True).encode()).hexdigest()
-        risk = merge_risk(db.connection,config.name,ticket_id,run["id"],raw,fact.get("body"),fact.get("head_sha"))
+        risk = merge_risk(db.connection,config.name,ticket_id,run["id"],raw,fact)
         return {"project":config.name,"ticket":ticket_id,"run_id":run["id"],"head_sha":fact.get("head_sha"),
                 "event":event,"fresh":True,"terminal":ticket["state_type"] == "completed",
                 "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled"),
