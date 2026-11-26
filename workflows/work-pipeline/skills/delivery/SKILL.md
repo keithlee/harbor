@@ -17,20 +17,38 @@ A role without a model uses the controller's. Never block on a model setting: if
 model, retry the child with the controller model and note it in the run result.
 
 ## Child agents (recover, never collide)
-Use the native collaboration tools (spawn, list, wait, resume, close).
+Use your own runtime's child-agent tools; never shell out to another agent CLI for children.
+
+Codex: use the native collaboration tools (spawn, list, wait, resume, close).
 1. Before spawning any role, list the existing agents.
 2. If the role's agent exists and is running or idle, resume or message it instead of spawning.
 3. If it exists but is interrupted, errored or unknown, close it, then spawn a fresh child under a new
    name (for example `planner-2`). A name collision is never a blocker.
 4. Before ending any turn, close children you no longer need; never leave an interrupted child behind.
-Keep one planner, one implementor and one reviewer per ticket; the reviewer must not be the implementor.
+
+Claude Code: spawn each child with the `Agent` tool and always pass `run_in_background: false`. If you leave
+it out, the child runs in the background and your turn can end before it returns, so you would hand off
+without its result. A foreground call waits and returns the child's result, and a finished child needs no close. There is no list, resume, message or close: track the
+children you started in this session yourself. Wherever this workflow says to resume, message or return
+work to an existing child, spawn a fresh child for that role instead and give it the earlier child's
+report plus the current ticket, PR and review state. In a new session with no earlier child report, give
+it the PR and its review comments instead.
+
+Keep one planner, one implementor and one reviewer per ticket at a time; a respawned child (Codex
+`planner-2`, or a fresh Claude Code child) replaces the earlier one for its role. The reviewer must not be
+the implementor.
 
 ## Flow
 1. Plan: the planner writes numbered acceptance criteria and a test plan to the Linear ticket (`skills/planning`).
 2. Implement: the implementor makes the smallest safe change and runs the repository's checks.
    Use `harbor workflow checks PROJECT --ticket IDENTIFIER --parallel` when `[checks]` are configured.
 3. Review: a separate reviewer reviews the current head (`skills/review`) and posts its verdict on the PR.
-   Return fixes to the same implementor; stop after three failed rounds and report a blocker.
+   Return fixes to the same implementor (Claude Code: a fresh implementor given the reviewer's findings,
+   the current PR head and the previous implementor's report); stop after three failed rounds and
+   report a blocker. The count is the larger of the rounds you counted in this session and the
+   rounds on the PR, so it survives a fresh session. On the PR, each reviewer JSON verdict comment with
+   `"verdict": "reject"` is one failed round, even when it rejects the same head again. Count only
+   comments whose `head_sha` is a commit on the PR, and ignore every other comment, such as a human "FAIL".
 4. Risk: add the `## Risk Analysis` section to the PR body (`skills/risk`).
 5. Hand off: run `harbor workflow check PROJECT --ticket IDENTIFIER --event pre_handoff`, reply to the
    `linear_feedback` it returns, then move the ticket to review.
