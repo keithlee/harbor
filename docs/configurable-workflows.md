@@ -418,7 +418,7 @@ ticket, so polling and other tickets keep moving while a builder recovers. A
 stalled live builder is stopped through the normal cancel path (process group
 killed, run recorded as terminated) before its replacement starts. A fresh
 session receives the full launch prompt (delivery skill, current policy
-including merge authority, runtime invocation) followed by First Mate's
+including merge authority and how to run `harbor`) followed by First Mate's
 hand-off.
 
 Every action posts a `[First Mate recovery]` Linear comment, notifies the
@@ -486,34 +486,58 @@ Retained runs continue: the first turn after migration records a
 
 ## Delivery runtime binding
 
-Managed delivery prompts include a shell-quoted invocation that pins the
-resolved project registry, the operational ledger, the Python interpreter and
-the Harbor import path. Workflow commands and child agents use that invocation
-with the supplied project and ticket. The native sandbox includes the ledger
-directory for operational receipts; the registry remains read-only.
+`harbor start <project>` settles the builder environment once, and every
+builder process (and every child agent it starts) inherits it:
+
+- `HARBOR_PROJECT`: the project. `harbor workflow inspect|check|checks` use it
+  when no project is named, so builders run
+  `harbor workflow check --ticket <ID> --event pre_handoff`. An explicit
+  project argument still wins; with neither, the command fails and says so.
+- `HARBOR_PROJECTS_FILE` and `HARBOR_DB_PATH`: the absolute registry and
+  ledger this start uses.
+- `PATH`, with a Harbor-owned directory first: `<ledger dir>/bin/<id>/harbor`,
+  a small `sh` script that runs this exact Harbor install (its Python with
+  `-P`, so a `harbor` package in the worktree cannot shadow it) with that
+  registry and ledger. Harbor rewrites it before each builder starts, so an
+  edited shim does not survive.
+- The GitHub token variable: the one named by `github_token_env`, then
+  `GITHUB_TOKEN` / `GH_TOKEN`, copied from Harbor's own environment at start.
+  Its value is held in memory and handed only to the builder process; it is
+  never written to the shim, config, ledger, prompt or logs.
+
+Changing Harbor's shell environment after start does not reach builders;
+restart Harbor to pick up a new registry, ledger or token. Without a registry,
+`harbor start` fails closed, and a retained builder whose registry has since
+disappeared is refused with the reason. The ticket identifier stays a command
+argument, and the worktree is the builder's working directory. The prompt
+names none of these paths. The native sandbox includes the ledger directory
+for operational receipts; the registry remains read-only.
+
+`harbor doctor <project>` prints the settings (names and paths, never a token
+value) as `Builder environment:` and `Builder PATH:`, writes the same shim, and
+checks that `harbor` resolves to it and runs Harbor in `/bin/sh` and in your
+`$SHELL`. It fails with `Builder harbor: not resolved (...)` when a shell
+startup file (for example a `.zshenv` that sets `PATH` outright) hides the
+shim; prepend to `PATH` there instead of replacing it.
 
 **Claude builder permissions.** Claude builders run in Claude Code's
 `dontAsk` permission mode, which refuses any tool call that is not
-pre-approved. Sandboxed Bash is approved automatically, except a command that
-sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
-(directly or through `/usr/bin/env`), which is exactly what the runtime
-invocation does; Read, Glob and Grep only reach the ticket worktree,
-and the workflow package lives in your clone outside it. So Harbor pre-approves
-two things, and nothing else:
+pre-approved. Read, Glob and Grep only reach the ticket worktree, and the
+workflow package lives in your clone outside it. So Harbor pre-approves two
+things, the same for every project, and nothing else:
 
-- Bash commands that start with the exact runtime invocation from the prompt
-  (`Bash(<invocation>:*)`). They still run inside the OS sandbox, with the same
-  writable directories and network allowlist.
+- `Bash(harbor:*)`: plain `harbor` commands. They still run inside the OS
+  sandbox, with the same writable directories and network allowlist.
 - Reading the project's workflow package (`Read(//<repo>/.harbor/workflow/**)`),
   so the builder can open `skills/*/SKILL.md`, `scripts/` and `config.toml`.
 
 No setup is needed. `harbor doctor` prints them as `Builder permissions:` for a
-Claude project, and fails if a path contains a wildcard (`*`, `?`, `[`, `]`) or
-a line break, which a rule cannot match literally; rename that directory.
-Codex builders need neither: their
+Claude project, and fails if the package path contains a wildcard (`*`, `?`,
+`[`, `]`) or a line break, which a rule cannot match literally; rename that
+directory. Codex builders need neither: their
 `workspace-write` sandbox reads anywhere and has no per-command approval.
-Verified on macOS with Claude Code 2.1.332 by running the generated command
-against a throwaway repository and worktree; not run on Linux.
+Verified on macOS (doctor and the shim in `sh`, `bash` and `zsh`); not run on
+Linux, and not run against a live Claude Code or Codex session.
 
 ## Verification map
 
