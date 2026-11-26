@@ -85,6 +85,20 @@ def _db_path() -> Path:
     return Path(os.environ.get("HARBOR_DB_PATH", Path.home() / ".harbor" / "harbor.db")).expanduser()
 
 
+# The builder's provider is chosen per launch (and quota fallback can switch it),
+# after this prompt is rendered, so the child-agent rules name both runtimes.
+CHILD_AGENT_INSTRUCTIONS = (
+    "Child agents: use your own runtime's child-agent tools; never shell out to another agent CLI "
+    "(such as `codex exec` or `claude -p`) for children. "
+    "Codex: use the native collaboration tools (spawn, list, wait, resume, close). "
+    "Claude Code: spawn each child with the `Agent` tool; a foreground call waits and returns the child's "
+    "result, and a finished child needs no close. Claude Code has no list, resume, message or close, so track "
+    "the children you started in this session yourself. Wherever the workflow says to resume, message or "
+    "return work to an existing child (for example review fixes to the same implementor), spawn a fresh child "
+    "for that role instead and give it the earlier child's report plus the current ticket, PR and review state."
+)
+
+
 def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
     """The builder prompt: the project's work-pipeline delivery skill plus policy.
 
@@ -110,8 +124,8 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
             + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
             + "shell initialization must not select another registry or ledger."
-            + "\nChild agents: use the native collaboration tools (spawn, list, wait, resume, close). "
-            + "Do not shell out to codex exec for children. Use the role models and reasoning efforts from the policy's `roles`."
+            + "\n" + CHILD_AGENT_INSTRUCTIONS
+            + " Use the role models and reasoning efforts from the policy's `roles`."
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
             + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 

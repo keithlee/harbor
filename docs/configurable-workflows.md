@@ -315,9 +315,22 @@ harbor workflow check Demo --ticket DEM-1 --event pre_merge
 ## Child agents
 
 The delivery skill spawns planner, implementor and reviewer children with the
-native collaboration tools. Before spawning a role it lists the existing
-agents. It resumes a live one; an interrupted or errored one is closed and the
-role is respawned under a fresh name. A name collision is never a blocker.
+builder's own child-agent tools, and the launch prompt gives the rules for
+both providers:
+
+- A Codex builder uses the native collaboration tools. Before spawning a role
+  it lists the existing agents. It resumes a live one; an interrupted or
+  errored one is closed and the role is respawned under a fresh name. A name
+  collision is never a blocker.
+- A Claude builder uses Claude Code's `Agent` tool. A foreground call waits
+  and returns the child's result. Claude Code has no list, resume, message or
+  close, so the builder tracks the children it started in the session itself.
+  Where Codex would resume or message a child (for example to return review
+  fixes to the same implementor), a Claude builder spawns a fresh child for
+  that role and hands it the earlier child's report and the current ticket, PR
+  and review state. Harbor does not give the Claude builder `SendMessage`, so
+  its tool set and its children's stay unchanged.
+
 Harbor does not register or verify child identities.
 
 ## First Mate: monitor and recover
