@@ -390,11 +390,19 @@ def build_comment_instruction(
     )
     merge_requested = _is_merge_request(comment)
     if merge_approval:
+        from harbor.github_rest import helper_invocation
+        try:
+            pr = str(_pr_number(facts))
+        except ValueError:
+            pr = "N"
+        safe_head = head if re.fullmatch(r"[0-9a-fA-F]{7,64}", head) else "SHA"
         prefix += (
             f"Harbor verified a repository owner explicitly approved merging PR {_pr_url(facts)} "
             f"at head {head}. This releases the human-review hold for that head. "
             "Use the configured delivery workflow to verify all remaining merge gates. "
-            "If they pass, merge only with an expected-head check (gh pr merge --match-head-commit), then verify the merge "
+            "If they pass, merge only with the REST helper's head-pinned merge "
+            f"(`{helper_invocation()} pr-merge {pr} --sha {safe_head}`), which GitHub refuses if the head moved; "
+            "never the gh CLI. Then verify the merge "
             "and complete the linked Linear issue through that workflow. "
             "Reuse valid proof at this head. If a gate blocks delivery, report it explicitly.\n"
         )
@@ -1289,7 +1297,7 @@ class PREventProcessor:
     ) -> bool:
         """Whether *comment* was most likely posted by the builder itself.
 
-        The builder posts through the operator's own ``gh`` login, so authorship
+        The builder posts with the project's GitHub token, usually the operator's own account, so authorship
         cannot tell it from the human.  Timing can: a comment by that account
         that first appears after the previous poll, while the builder's process
         is running or had finished no longer than the clock skew ago, was made

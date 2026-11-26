@@ -32,8 +32,11 @@ def test_unverified_merge_request_instruction(golden) -> None:
 
 
 def test_verified_owner_merge_approval_instruction(golden) -> None:
+    from harbor.github_rest import helper_invocation
+    # The helper invocation names this machine's Python; keep the snapshot portable.
     golden.text("instruction_merge_approval_verified.txt",
-                build_comment_instruction(TICKET, FACTS, comment("LGTM, merge."), merge_approval=True))
+                build_comment_instruction(TICKET, FACTS, comment("LGTM, merge."), merge_approval=True)
+                .replace(helper_invocation(), "<python> -m harbor.github_rest"))
 
 
 def test_inline_review_comment_carries_path_and_line(golden) -> None:

@@ -7,8 +7,9 @@ Work only on the supplied ticket, repository and retained worktree. Linear and G
 On continuation reconcile partial edits, the existing PR and current comments; do not insist the ticket is still Todo.
 Do not create a separate ticket or select another Todo on resume.
 Read the project's AGENTS.md and Pipeline Profile. Never invent install, proof or project settings.
-For GitHub reads and writes use the transport named in your launch prompt ("GitHub transport: ...");
-prefer it over the `gh` CLI, which cannot reach GitHub from inside Claude Code's sandbox on macOS.
+For GitHub reads and writes use only the transport named in your launch prompt ("GitHub transport: ...",
+normally Harbor's REST helper, with the project's GitHub token); never the GitHub CLI, which hangs
+inside Claude Code's sandbox on macOS. Your child agents follow the same rule.
 
 ## Roles and models
 Models come from `config.toml` in this workflow package (mirrored in the policy's `roles`).
@@ -59,7 +60,7 @@ the implementor.
 ## Merge authority (Harbor setting wins)
 `delivery.merge_mode` in this workflow is the only merge authority. It overrides any merge or
 auto-merge policy in the repository's AGENTS.md, CLAUDE.md, Pipeline Profile or standing
-authorizations. With `merge_mode = "human"`: never run `gh pr merge`, never enable auto-merge,
+authorizations. With `merge_mode = "human"`: never merge the PR (no `pr-merge` with any tool), never enable auto-merge,
 never push to the base branch. Stop at the PR, move the ticket to review, and return
 `outcome = "parked"` with `waiting_on = "human"`.
 

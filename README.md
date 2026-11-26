@@ -111,7 +111,7 @@ github_token_env: SAMPLE_GITHUB_TOKEN
 
 Harbor's GitHub poller, the builder, the builder's child agents (planner,
 implementor, reviewer), the builder's REST helper, `harbor workflow check` and
-First Mate all use this one token. With `github_token_env` set, only that
+the blocker check that resumes a builder all use this one token. With `github_token_env` set, only that
 variable is read. Without it, Harbor reads `GITHUB_TOKEN`, then `GH_TOKEN`.
 Harbor never uses your `gh` login. `harbor doctor` fails, and `harbor start`
 refuses to start builders, for a GitHub project with no token, and both name the

@@ -83,6 +83,14 @@ def require_https_api_url(graphql_url: str | None) -> str:
     return url
 
 
+def helper_invocation() -> str:
+    """The exact command builders run for this helper (one source for every prompt)."""
+
+    import shlex
+
+    return shlex.join([sys.executable, "-m", "harbor.github_rest"])
+
+
 def token_env_name(env: Mapping[str, str], preferred: str | None = None) -> str | None:
     """Name of the first token variable that is set, without reading its value out."""
 
@@ -125,7 +133,11 @@ class Client:
         self.base = rest_base_url(self.env.get("HARBOR_GITHUB_API_URL") or DEFAULT_REST_URL)
         # Harbor names the project's token variable; then only that one is
         # used. Run by hand without it, GITHUB_TOKEN, then GH_TOKEN.
-        named = (self.env.get("HARBOR_GITHUB_TOKEN_ENV") or "").strip()
+        from harbor.github_token import validate_token_env
+        try:
+            named = validate_token_env(self.env.get("HARBOR_GITHUB_TOKEN_ENV"), where="HARBOR_GITHUB_TOKEN_ENV")
+        except ValueError as exc:  # the message never echoes the value
+            raise GitHubRestError(str(exc)) from None
         if named:
             name = named if self.env.get(named, "").strip() else None
         else:
