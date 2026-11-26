@@ -2,7 +2,8 @@
 
 Every GitHub-facing part of Harbor uses one token per project: the GitHub
 poller, the builder and its child agents (planner, implementor, reviewer),
-the builder's REST helper, ``harbor workflow check`` and First Mate. The
+the builder's REST helper, ``harbor workflow check`` and the rung-0 check of
+a ``github_transport`` blocker (``harbor.facts.remediation``). The
 project names the variable with ``github_token_env`` (registry row or
 ``.harbor/pipeline.md``); the secret itself stays in the environment and never
 appears in config, the ledger, logs, prompts or PR text.
@@ -29,24 +30,35 @@ DEFAULT_TOKEN_ENVS = ("GITHUB_TOKEN", "GH_TOKEN")
 # Fine-grained personal access token permissions on the project's repository.
 MINIMUM_SCOPES = "Contents: read and write, Pull requests: read and write, Checks: read, Commit statuses: read"
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
-# Prefixes of GitHub token values; a variable name never starts with one.
-_TOKEN_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+# GitHub token *shapes*: a prefix, an underscore and a long body (gh[pousr]_…,
+# github_pat_…), or a legacy 40-hex classic token. A genuine variable name such
+# as GHS_TOKEN or GH_PAT_NAME does not match.
+_TOKEN_SHAPES = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}", re.IGNORECASE),
+    re.compile(r"[0-9a-fA-F]{40}"),
+)
+
+
+def looks_like_token(value: str) -> bool:
+    return any(shape.fullmatch(value) for shape in _TOKEN_SHAPES)
 
 
 def validate_token_env(value: Any, *, where: str = "github_token_env") -> str:
     """Return a valid variable name ('' when unset); refuse anything that is not one.
 
-    ``github_token_env`` names a variable. A pasted token is refused without
-    echoing it.
+    ``github_token_env`` names a variable. A refused value is never echoed in
+    the error: it might be a token pasted into the wrong place.
     """
 
     name = str(value or "").strip()
     if not name:
         return ""
-    if name.lower().startswith(_TOKEN_PREFIXES):
+    if looks_like_token(name):
         raise ValueError(
-            f"{where} must name an environment variable, not hold a token; "
-            "move the token into an environment variable and put that variable's name here"
+            f"{where} looks like a GitHub token value, not a variable name; put the token in an "
+            "environment variable, put that variable's name here, and revoke the token if this "
+            "config file was shared"
         )
     if not _ENV_NAME.fullmatch(name):
         raise ValueError(f"{where} must be an environment variable name such as SAMPLE_GITHUB_TOKEN")
@@ -64,7 +76,7 @@ def project_token_env(profile: Any, environ: Mapping[str, str] | None = None) ->
     """Name of the variable holding the project's token, or ``None``. Never reads the value out."""
 
     env = os.environ if environ is None else environ
-    for name in token_env_candidates(getattr(profile, "github_token_env", "")):
+    for name in token_env_candidates(validate_token_env(getattr(profile, "github_token_env", ""))):
         if (env.get(name) or "").strip():
             return name
     return None
@@ -74,13 +86,18 @@ def preferred_token_env(profile: Any, environ: Mapping[str, str] | None = None) 
     """The variable a Harbor command should read: inside a builder, the one Harbor named."""
 
     env = os.environ if environ is None else environ
-    return (env.get("HARBOR_GITHUB_TOKEN_ENV") or "").strip() or str(getattr(profile, "github_token_env", "") or "")
+    named = validate_token_env(env.get("HARBOR_GITHUB_TOKEN_ENV"), where="HARBOR_GITHUB_TOKEN_ENV")
+    return named or validate_token_env(getattr(profile, "github_token_env", ""))
 
 
 def missing_token_help(profile: Any) -> str:
     """Exactly what to set when a GitHub project has no token. Names no secret, never suggests gh."""
 
-    configured = str(getattr(profile, "github_token_env", "") or "").strip()
+    try:
+        configured = validate_token_env(getattr(profile, "github_token_env", ""))
+    except ValueError:
+        # Never echo a value that failed validation (it may be a token).
+        configured = ""
     repository = str(getattr(profile, "repository", "") or "the project's repository")
     if configured:
         what = f"export {configured} (named by this project's github_token_env)"

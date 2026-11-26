@@ -16,11 +16,11 @@ names the variable), and builders, their child agents, the REST helper,
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
-import subprocess
-import sys
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,8 +53,10 @@ def clean_env(monkeypatch):
 
 # --------------------------------------------------------- the key itself
 
-@pytest.mark.parametrize("value", ["SAMPLE_GITHUB_TOKEN", " GITHUB_TOKEN ", "_x1"])
+@pytest.mark.parametrize("value", ["SAMPLE_GITHUB_TOKEN", " GITHUB_TOKEN ", "_x1", "GHS_TOKEN", "GHP_SECRET",
+                                   "GITHUB_PAT_NAME", "gho_token", "DEADBEEF"])
 def test_github_token_env_accepts_variable_names(value: str) -> None:
+    # Genuine names that merely start like a token prefix are fine.
     assert validate_token_env(value) == value.strip()
 
 
@@ -68,11 +70,44 @@ def test_github_token_env_refuses_what_is_not_a_variable_name(value: str) -> Non
         validate_token_env(value)
 
 
-@pytest.mark.parametrize("value", ["ghp_" + "a" * 36, "github_pat_" + "b" * 40, "gho_" + "c" * 36])
+CLASSIC_40_HEX = "0123456789abcdef0123456789abcdef01234567"
+TOKEN_SHAPES = ["ghp_" + "a1" * 18, "github_pat_" + "B2_" * 14, "gho_" + "c" * 36, "ghs_" + "D4" * 18,
+                CLASSIC_40_HEX, CLASSIC_40_HEX.upper()]
+
+
+@pytest.mark.parametrize("value", TOKEN_SHAPES)
 def test_a_pasted_token_is_refused_without_echoing_it(value: str) -> None:
     with pytest.raises(ValueError) as caught:
         validate_token_env(value)
-    assert value not in str(caught.value) and "not hold a token" in str(caught.value)
+    assert value not in str(caught.value) and "looks like a GitHub token value" in str(caught.value)
+
+
+def test_a_legacy_40_hex_token_never_reaches_any_message(tmp_path: Path) -> None:
+    # Regression: a 40-hex classic token passed as a variable name and was then
+    # echoed by the doctor/start fix, the builder prompt and HARBOR_GITHUB_TOKEN_ENV.
+    from harbor.cli import builder_github
+    from harbor.github_rest import Client, GitHubRestError
+    leaked = profile(CLASSIC_40_HEX)
+    assert CLASSIC_40_HEX not in missing_token_help(leaked)
+    with pytest.raises(ValueError) as caught:
+        project_token_env(leaked, {})
+    assert CLASSIC_40_HEX not in str(caught.value)
+    with pytest.raises(GitHubRestError) as rest:
+        Client({"HARBOR_GITHUB_TOKEN_ENV": CLASSIC_40_HEX})
+    assert CLASSIC_40_HEX not in str(rest.value)
+    with pytest.raises(ValueError) as prefer:
+        preferred_token_env(profile(), {"HARBOR_GITHUB_TOKEN_ENV": CLASSIC_40_HEX})
+    assert CLASSIC_40_HEX not in str(prefer.value)
+    config = configured_project(tmp_path, token_env=CLASSIC_40_HEX)
+    with pytest.raises(ValueError) as built:
+        builder_github(config, workflow(), "claude", env={})
+    assert CLASSIC_40_HEX not in str(built.value)
+
+
+def test_a_40_hex_github_token_env_in_config_fails_closed_without_echo(tmp_path: Path, monkeypatch) -> None:
+    with pytest.raises(ValueError) as caught:
+        registry_project(tmp_path, monkeypatch, pipeline=f"github_token_env: {CLASSIC_40_HEX}\n")
+    assert CLASSIC_40_HEX not in str(caught.value)
 
 
 # ------------------------------------------------- configuring it (end to end)
@@ -219,13 +254,6 @@ def test_a_claude_builder_and_its_agent_children_get_the_project_token(tmp_path:
         db.close()
 
 
-def test_first_mate_inherits_the_project_token(clean_env) -> None:
-    from harbor.first_mate import CodexExecRunner
-    clean_env.setenv("SAMPLE_GITHUB_TOKEN", TOKEN)
-    probe = [sys.executable, "-c", "import os; print('present' if os.environ.get('SAMPLE_GITHUB_TOKEN') else 'absent')"]
-    assert asyncio.run(CodexExecRunner()(probe, "")) == "present"
-
-
 # ------------------------------------------------- doctor, start, answer
 
 def test_doctor_reads_a_pipeline_github_token_env(tmp_path: Path) -> None:
@@ -347,6 +375,8 @@ def test_start_polls_github_with_the_configured_project_token(tmp_path: Path, mo
 def test_start_never_sends_a_broader_token_when_the_configured_one_is_missing(tmp_path: Path, monkeypatch, capsys, clean_env) -> None:
     clean_env.setenv("GITHUB_TOKEN", OTHER)
     code, sent = _start_with_recorded_github(tmp_path, monkeypatch, "github_token_env: SAMPLE_GITHUB_TOKEN\n")
+    assert code == 0, capsys.readouterr()  # shadow read-only start runs; it just has no token to send
+    assert sent, "the poller sent no request at all"
     assert all("Authorization" not in r.headers for r in sent), [r.headers.get("Authorization") for r in sent]
 
 
@@ -429,8 +459,47 @@ def test_the_no_token_prompt_never_steers_to_gh() -> None:
         assert "Do not try the gh CLI" in fact and "may use it" not in fact and "gh auth" not in fact
 
 
-def test_harbor_never_asks_gh_for_a_token() -> None:
-    # The owner's rule: Harbor never pulls the operator's gh login.
+GH_COMMAND = re.compile(r"\bgh\s+(auth|pr|api|issue|repo|run|release|workflow|secret|gist)\b")
+
+
+def _code_strings(path: Path) -> list[str]:
+    """Every string literal Harbor can send somewhere (docstrings excluded)."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = {
+        id(node.body[0].value) for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)
+    }
+    return [node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings]
+
+
+def test_harbor_never_runs_gh_or_tells_anyone_to() -> None:
+    # The owner's rule: Harbor never pulls the operator's gh login (no `gh auth`
+    # anything), and no builder-facing prompt, remediation answer, escalation
+    # or skill tells a builder or operator to run a gh command.
+    offenders = []
     for path in (ROOT / "src" / "harbor").rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        assert '"auth", "token"' not in text and "'auth', 'token'" not in text, path
+        for text in _code_strings(path):
+            if text == "gh" or GH_COMMAND.search(text):
+                offenders.append(f"{path.relative_to(ROOT)}: {text[:120]!r}")
+    for path in list((ROOT / "workflows").rglob("*.md")) + list((ROOT / "workflows").rglob("*.toml")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if GH_COMMAND.search(line):
+                offenders.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()[:120]}")
+    assert offenders == []
+
+
+def test_the_owner_approved_merge_prompt_uses_the_rest_helpers_head_pinned_merge() -> None:
+    from harbor.github_rest import helper_invocation
+    from harbor.pr_events import build_comment_instruction
+    head = "0123456789abcdef0123456789abcdef01234567"
+    text = build_comment_instruction(
+        {"identifier": "SAMPLE-1"},
+        {"number": 7, "url": "https://github.com/owner/repo/pull/7", "head_sha": head},
+        {"body": "approved, merge it", "id": "c1", "author": "owner"},
+        merge_approval=True,
+    )
+    assert f"`{helper_invocation()} pr-merge 7 --sha {head}`" in text
+    assert not GH_COMMAND.search(text) and "never the gh CLI" in text

@@ -19,6 +19,16 @@ WORKFLOW_CHECK_TOKEN_HELP = (
 )
 
 
+def _http_status(exc):
+    """The HTTP status of an httpx status error, directly or as a chained cause; else None."""
+    seen = 0
+    while exc is not None and seen < 5:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code
+        exc, seen = exc.__cause__, seen + 1
+    return None
+
+
 def _one_line(exc):
     """An exception's message on one line (httpx status errors span several)."""
     return " ".join(str(exc).split()) or type(exc).__name__
@@ -134,7 +144,7 @@ async def fresh_context(config, db, ticket_id, run, event):
         try:
             facts = await poller.poll([ticket])
         except (GitHubError, httpx.HTTPError) as exc:
-            if "401" in str(exc):
+            if _http_status(exc) == 401:
                 raise ValueError(WORKFLOW_CHECK_TOKEN_HELP.format(
                     problem="GitHub answered 401 Unauthorized (the token is missing, expired or revoked)")) from exc
             # The default client lets transport failures through as httpx
