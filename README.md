@@ -405,9 +405,12 @@ instructions automatically. Escalations include evidence, options,
 recommendation and prior attempts. When the builder recommends its first
 option, Harbor accepts it automatically and resumes the builder (on by default;
 `[decisions] auto_accept_first_option = false` or `mode = "human"` opts out).
-It never does so for secrets, credentials, money, data deletion, protected
-paths, merges or gate changes, or for a conditional recommendation, never twice
-for an equivalent question, and the answer never authorizes a merge; see
+It only does so for a pure product or acceptance-criteria decision whose
+`recommended_option_index` is 0 and whose option is plain prose. It never does
+so for secrets, credentials, money, data deletion, protected paths, merges or
+gate changes, or for a conditional recommendation, never twice for an
+equivalent question, and the answer never authorizes a merge. The filter is
+defense in depth, not a security boundary; see
 `docs/configurable-workflows.md`. Empty `decision_authors` accepts visible
 ticket participants; configure Linear user IDs to restrict comment authority.
 

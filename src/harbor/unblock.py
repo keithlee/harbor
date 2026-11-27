@@ -496,6 +496,36 @@ def touches_protected_paths(
     return False
 
 
+def _mentions_protected_path(
+    blocker: Mapping[str, Any], protected_paths: Iterable[str], repo_path: str | Path | None,
+) -> bool:
+    """Whether the question, options or recommendation MENTION a protected path.
+
+    A path the builder has not touched yet is still protected: "Edit
+    infra/deploy.yml" names it before any diff exists.  Matching is
+    case-folded, and a bare word equal to a protected pattern's leading
+    directory ("infra" for ``infra/**``) counts too.
+    """
+
+    from harbor.auto_accept import mentioned_paths
+
+    patterns = list(protected_paths)
+    if repo_path is not None:
+        patterns += list(_protected_from_agents(Path(repo_path)))
+    folded = [pattern.casefold() for pattern in _normalise_paths(patterns)]
+    if not folded:
+        return False
+    mentioned = mentioned_paths(blocker)
+    if touches_protected_paths({"touched_paths": mentioned}, protected_paths=folded):
+        return True
+    words = set(mentioned)
+    for pattern in folded:
+        head = pattern.split("/", 1)[0]
+        if "/" in pattern and head and not any(char in head for char in "*?[") and head in words:
+            return True
+    return False
+
+
 def is_product_decision(blocker: Mapping[str, Any]) -> bool:
     kind = _kind(blocker)
     if kind in {"product_decision", "new_product_decision", "product", "design_decision"}:
@@ -1444,12 +1474,11 @@ class UnblockLadder:
         # the answer and resume, unless a guardrail keeps it with a human.
         # Recompute protection here: triage can escalate (human decision mode,
         # conflicting instructions, the rung-1 cap) before its own check.
+        protected_patterns = list(self.protected_paths) + _paths(
+            _value(blocker_value, "protected_paths", "protectedPaths", default=None))
         protected_now = protected or triage_result.reason == "protected path" or touches_protected_paths(
-            blocker_value,
-            protected_paths=list(self.protected_paths) + _paths(
-                _value(blocker_value, "protected_paths", "protectedPaths", default=None)),
-            repo_path=authority_repo,
-        )
+            blocker_value, protected_paths=protected_patterns, repo_path=authority_repo,
+        ) or _mentions_protected_path(blocker_value, protected_patterns, authority_repo)
         human_decisions = self.policy.decision_mode == "human"
         auto_accept_policy.record_eligibility(
             self.db, escalation_id, blocker_value, protected=protected_now, human_decisions=human_decisions,

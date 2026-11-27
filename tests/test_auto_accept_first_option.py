@@ -113,6 +113,7 @@ def harness(tmp_path):
     blocker("I recommend option 1."),
     blocker("Choose the first option because it matches the design file"),
     blocker("Use the short wording from the design file"),  # exactly option 1
+    blocker("Take option 1 because it matches the ticket criteria"),  # allowlisted words only
 ])
 def test_first_option_recommendations_are_recognised(value):
     assert recommended_first_option(value).first
@@ -148,6 +149,14 @@ def test_first_option_recommendations_are_recognised(value):
     blocker("Option II"),
     blocker("Use 2"),
     blocker("Write the explanatory paragraph"),  # paraphrases option 2
+    # Review round 3, B3: the text veto is an allowlist (the reviewer's inputs).
+    blocker("Option 1 is incorrect"),
+    blocker("Option 1 is invalid"),
+    blocker("Option 1 is out of scope"),
+    blocker("Option 1 is blocked by legal"),
+    blocker("Skip option 1"),
+    blocker("Option 1 is overkill; go lightweight"),
+    blocker("~~Option 1~~"),
     blocker("Take the first option.", options=[]),
     # Review B3: conditions, hand-offs and letter labels are never a plain pick.
     blocker("Option 1 if the tests pass"),
@@ -254,9 +263,9 @@ def test_loop_guard_holds_when_the_builder_reblocks_inside_the_resumed_session(h
 def test_at_most_n_auto_accepts_per_run(tmp_path):
     harness = Harness(tmp_path, auto_accept=AutoAcceptPolicy(max_auto_accepts=2))
     try:
-        for number in range(3):
+        for number, layout in enumerate(("compact", "spacious", "centred")):
             harness.block(blocker("Option 1", question=f"Question {number} about layout {number * 7}",
-                                  options=[f"Use layout {number}", "Something else"]))
+                                  options=[f"Use the {layout} layout", "Something else"]))
         assert [len(harness.resumed), len(harness.receipts())] == [2, 2]
         assert harness.db.escalations()[-1]["status"] == "open"
         assert "limit of 2 auto-accepts per builder run" in harness.linear.comments[-1][1]
@@ -370,6 +379,81 @@ def test_merge_and_gate_lowering_options_are_never_auto_accepted(harness, questi
     result = harness.block(blocker("Take the first option.", question=question, options=[first_option, "Wait"]))
     assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
     assert "merging or lowering a gate" in harness.linear.comments[0][1]
+
+
+@pytest.mark.parametrize("first_option", [
+    # Review round 3, B1: the reviewer's end-to-end inputs.
+    "git push -f origin HEAD:main",
+    "rm -fr data/ and regenerate",
+    "Set STRIPE_KEY in the runner env",
+    "Upgrade the Vercel plan to Pro at $20/month",
+    "Land the PR now",
+    "Commit with --no-verify",
+    "Run git clean -fdx",
+    "Squash and land",
+    "Ship it straight to main",
+    "Deploy to production",
+    "Overwrite production data",
+    "Discard the uncommitted work",
+    "continue-on-error: true",
+    "Share the pass­word with the bot",  # soft hyphen
+    "Paste the sec​ret into the form",  # zero-width space
+    "Paste the sеcret into the form",  # Cyrillic e
+    "Use `make release`",
+    "Open https://example.test/settings",
+    "Bump the timeout to ninety seconds; it is fine",
+])
+def test_only_plain_prose_first_options_are_auto_accepted(harness, first_option):
+    result = harness.block(blocker("Option 1", question="How should Harbor proceed?", options=[first_option, "Wait"]))
+    assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
+    assert "Auto-accept of option 1 not applied" in harness.linear.comments[0][1]
+
+
+@pytest.mark.parametrize("recommendation", [
+    "Option 1 is incorrect", "Option 1 is invalid", "Option 1 is out of scope", "Option 1 is blocked by legal",
+    "Skip option 1", "Option 1 is overkill; go lightweight", "~~Option 1~~",
+])
+def test_negative_recommendations_with_index_zero_wait_for_a_human(harness, recommendation):
+    """Review round 3, B3: the reviewer's inputs, end to end."""
+
+    result = harness.block(blocker(recommendation))
+    assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
+
+
+@pytest.mark.parametrize("kind", ["env_blocker", "conflicting_instruction", "github_transport",
+                                  "missing_proof_capability", "access_request", "permission"])
+def test_only_pure_decision_kinds_are_auto_accepted(harness, kind):
+    result = harness.block(blocker("Option 1", kind=kind))
+    assert not result.resumed and harness.resumed == [] and harness.receipts() == []
+
+
+def test_first_mate_never_auto_accepts_a_non_decision_kind(tmp_path):
+    db = HarborDB(tmp_path / "harbor.db")
+    try:
+        case = _case(db, blocker("Option 1", kind="env_blocker"))
+        decision = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert decision["action"] == "escalate" and auto_accept.history(db, "SAMPLE-7") == []
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", [
+    # Review round 3, B2: the reviewer's repro -- the path is only mentioned.
+    blocker("Option 1", options=["Edit infra/deploy.yml to add FEATURE_FLAG", "Wait"]),
+    # Case-folded, and mentioned only in the question.
+    blocker("Option 1", question="Should Infra/Deploy.yml keep two replicas?", options=["Keep two replicas", "Wait"]),
+    # The protected directory named as a bare word.
+    blocker("Option 1", question="How should the manifests change?", options=["Update the infra manifests", "Wait"]),
+])
+def test_a_protected_path_that_is_only_mentioned_is_never_auto_accepted(tmp_path, value):
+    harness = Harness(tmp_path, protected_paths=("infra/**",))
+    try:
+        result = harness.block(value)
+        assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
+        escalation = harness.db.escalations()[-1]
+        assert auto_accept.eligibility(harness.db, escalation["id"])["protected"] is True
+    finally:
+        harness.db.close()
 
 
 def test_auto_accept_never_authorizes_a_merge(tmp_path):

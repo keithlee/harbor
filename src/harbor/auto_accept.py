@@ -14,6 +14,12 @@ decision is deterministic and fails closed:
    negative or conditional.
 3. Anything else stays with a human.
 
+Eligibility is decided by fail-closed allowlists: only pure decision kinds,
+only plain-prose option text, and only affirmative recommendation words.  The
+deny-lists below are an extra layer.  All of this is defense in depth, not a
+security boundary: the builder's sandbox and server-side branch protection
+are the boundary.
+
 Guardrails, each enforced here and covered by tests:
 
 * An answer never authorizes a merge.  The merge gate (``merge_mode`` and
@@ -96,6 +102,100 @@ _FILLER = frozenset(
     "accept adopt proceed recommend recommended recommendation suggest suggested propose option options first "
     "one 1 please just".split()
 )
+
+# --------------------------------------------------------------------------
+# Fail-closed allowlists.  The deny-lists in this module are an extra layer;
+# these decide.  This is defense in depth, NOT a security boundary: the
+# builder's sandbox and server-side branch protection are the boundary.
+# --------------------------------------------------------------------------
+
+# Only pure decision kinds are ever auto-accepted.  An environment, access,
+# transport, proof or conflicting-instruction blocker never is: answering an
+# access question cannot grant access, and the other kinds are not choices.
+ELIGIBLE_KINDS = frozenset({"product_decision", "ambiguous_ac", "design_decision", "new_product_decision"})
+
+# The only words, besides option 1's own words, a recommendation may use.
+AFFIRMATIVE_WORDS = frozenset(
+    "take choose pick go with recommend recommended recommendation suggest use the first option one 1 "
+    "because it its is simplest safest simple safe matches match fits fit ticket criteria acceptance "
+    "a an this that keep i we our to of for and as per best cleanest clearest smallest minimal "
+    "reversible within existing here please ahead".split()
+)
+
+# Plain prose: printable ASCII letters, spaces and light punctuation only.
+# Everything else -- digits, currency, backticks, ``| > < ; & $ = ~ * # / \\
+# _ [ ] { } % @ +`` and every non-ASCII character (homoglyphs, zero-width
+# characters, soft hyphens) -- makes the text ineligible.
+_PROSE_CHARS_RE = re.compile(r"^[A-Za-z ,.'\"!?()\-:]*$")
+# "option 1", "option #1", "option one" are the one exception in a
+# recommendation; they are removed before the plain-prose check.
+_OPTION_ONE_PHRASE_RE = re.compile(r"\boption\s*#?\s*(?:1|one)\b", re.IGNORECASE)
+# Verbs and nouns of delivery, release, destruction, money, credentials and
+# gates.  Matched against normalized words of option 1 and the
+# recommendation; any match keeps the question with a human.
+_ACTION_WORD_RE = re.compile(
+    r"\b(?:push\w*|merg\w*|land|lands|landed|landing|ship|ships|shipped|shipping|deploy\w*|releas\w*|"
+    r"rebas\w*|reset\w*|clean|cleans|cleaned|cleaning|forc\w*|squash\w*|revert\w*|delet\w*|drop\w*|"
+    r"remov\w*|wip(?:e|es|ed|ing)|purg\w*|discard\w*|overwrit\w*|truncat\w*|publish\w*|upgrad\w*|"
+    r"purchas\w*|pay|pays|paid|paying|payment\w*|buy\w*|subscri\w*|plan|plans|billing|production|prod|"
+    r"main|master|branch\w*|secret\w*|key|keys|token\w*|password\w*|passwd|credential\w*|creds?|"
+    r"cookie\w*|session\w*|jwt\w*|env|envs|ci|test|tests|tested|testing|check\w*|coverage|risk\w*|"
+    r"review\w*|protect\w*|codeowners?|hook\w*|verif\w*)\b"
+)
+
+
+def plain_prose_reason(text: Any, *, recommendation: bool = False) -> str | None:
+    """Why ``text`` is not plain prose (so never auto-accepted), or ``None``."""
+
+    raw = str(text or "")
+    value = unicodedata.normalize("NFKC", raw)
+    if recommendation:
+        # "Option 1: because ..." -- the colon right after the phrase is prose.
+        value = re.sub(r"^\s*:", " ", _OPTION_ONE_PHRASE_RE.sub(" ", value).strip())
+    if ":" in value:
+        return "it contains a colon (a key, setting, URL or code)"
+    if re.search(r"\w-\w+-\w", value):
+        return "it contains a hyphenated identifier"
+    if not _PROSE_CHARS_RE.match(value):
+        bad = next((char for char in value if not re.match(r"[A-Za-z ,.'\"!?()\-:]", char)), "")
+        return f"it is not plain prose (contains {bad!r})"
+    words = value.split()
+    if any(word.startswith("-") for word in words):
+        return "it contains a command-line flag"
+    if re.search(r":\S", value):
+        return "it contains a colon followed by a non-space (a key, URL or code)"
+    if any(re.fullmatch(r"[A-Z]{2,}[A-Za-z]*", word.strip(",.'\"!?():")) for word in words):
+        return "it contains an ALL_CAPS identifier"
+    if re.search(r"[A-Za-z]\.[A-Za-z]", value):
+        return "it contains a file name or dotted identifier"
+    match = _ACTION_WORD_RE.search(_norm(value))
+    if match is not None:
+        return f"it mentions {match.group(0)!r}, which Harbor never decides on its own"
+    return None
+
+
+# A path-like token: anything with a slash or backslash, or a name.ext.
+_PATH_TOKEN_RE = re.compile(r"[^\s`'\"()<>,;]*[/\\][^\s`'\"()<>,;]*|[\w.\-]+\.[A-Za-z0-9]{1,8}\b")
+
+
+def mentioned_paths(blocker: Mapping[str, Any]) -> list[str]:
+    """Path-like tokens and bare words in the question, options and recommendation, case-folded.
+
+    The ladder matches them against the protected patterns, so a protected
+    path that is only mentioned (not yet touched) still needs a human.
+    """
+
+    texts = [str(blocker.get("question") or ""), str(blocker.get("recommendation") or "")]
+    texts += [str(item) for item in blocker.get("options") or [] if isinstance(item, str)]
+    found: list[str] = []
+    for text in texts:
+        value = unicodedata.normalize("NFKC", text).casefold()
+        for token in _PATH_TOKEN_RE.findall(value):
+            token = token.replace("\\", "/").strip(".:")
+            if token:
+                found.append(token)
+        found.extend(word for word in re.findall(r"[\w.\-]+", value) if word)
+    return found
 # Options asking the human for secrets, credentials or money, or to approve
 # deleting data.  Matched against the question, the first option and the
 # recommendation; a match keeps the escalation open for a human.
@@ -229,10 +329,23 @@ def recommended_first_option(blocker: Mapping[str, Any]) -> Choice:
         return Choice(False, reason="recommended_option_index is not a valid option index")
     if index != 0:
         return Choice(False, reason=f"the recommendation is option {index + 1}")
-    text = _norm(blocker.get("recommendation"))
+    recommendation = str(blocker.get("recommendation") or "")
+    text = _norm(recommendation)
     normalized = [_norm(option) for option in options]
-    if not text or text == normalized[0]:
+    if not recommendation.strip():
         return Choice(True, method="structured")
+    prose = plain_prose_reason(recommendation, recommendation=True)
+    if prose:
+        return Choice(False, reason=f"the recommendation text is ineligible: {prose}")
+    if text == normalized[0]:
+        return Choice(True, method="structured")
+    # Allowlist: every word must be one of option 1's own words or a fixed
+    # affirmative word.  Anything else ("incorrect", "overkill", "skip",
+    # "out of scope") means the text may be saying something other than
+    # "take option 1", so a human decides.
+    unknown = sorted(set(text.split()) - set(normalized[0].split()) - AFFIRMATIVE_WORDS)
+    if unknown:
+        return Choice(False, reason=f"the recommendation text uses words Harbor cannot vouch for ({', '.join(unknown[:5])})")
     if any(text == other for other in normalized[1:]):
         return Choice(False, reason="the recommendation text is another option")
     if _digits_other_than_one(text) or _OTHER_OPTION_RE.search(text):
@@ -354,6 +467,9 @@ def assess(
         return Assessment("not_applicable", reason=f"auto-accept is off ({policy.disabled_by or SETTING})")
     if human_decisions:
         return Assessment("not_applicable", reason="the project's decision mode is human")
+    kind = " ".join(str(blocker.get("kind") or "").casefold().replace("-", "_").split())
+    if kind not in ELIGIBLE_KINDS:
+        return Assessment("not_applicable", reason=f"{kind or 'unknown'} blockers are never auto-accepted")
     choice = recommended_first_option(blocker)
     if not choice.first:
         return Assessment("not_applicable", reason=choice.reason)
@@ -370,6 +486,11 @@ def assess(
     sensitive = sensitive_reason(blocker)
     if sensitive:
         return Assessment("refused", option, choice.method, sensitive)
+    # The allowlist that decides; the deny-lists above only explain the
+    # common cases more precisely.
+    prose = plain_prose_reason(option)
+    if prose:
+        return Assessment("refused", option, choice.method, f"option 1 is ineligible: {prose}")
     if _connection(db) is None:
         # No durable ledger means no loop guard; fail closed.
         return Assessment("refused", option, choice.method, "no Harbor ledger is available to enforce the loop guard")

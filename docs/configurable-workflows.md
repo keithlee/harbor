@@ -181,10 +181,38 @@ max_auto_accepts = 2              # per builder run, 0-10
 `decisions.mode = "human"` (or `firstmate_decisions: human` in `pipeline.md`)
 turns auto-accept off: the project said humans decide.
 
+This filter is **defense in depth, not a security boundary**. The builder's
+sandbox and server-side branch protection are the boundary. Expect few
+auto-accepts: everything below is an allowlist, and anything it cannot vouch
+for goes to a human.
+
+Only pure decision blockers (`product_decision`, `ambiguous_ac`) are eligible.
+An `env_blocker`, `github_transport`, `missing_proof_capability`,
+`conflicting_instruction` or access/permission blocker is never auto-accepted:
+answering an access question cannot grant access.
+
+Option 1, and the recommendation, must be **plain prose**: printable ASCII
+letters, spaces and light punctuation after NFKC (this rejects homoglyphs,
+zero-width characters and soft hyphens). No digits or currency, no backticks,
+no shell syntax (`-flag`, `|`, `>`, `;`, `&&`, `$`, `=`), no colon, no
+ALL_CAPS, snake_case or hyphenated identifier, no path, file name or URL, and
+none of the delivery, money, credential or gate words (push, merge, land, ship,
+deploy, release, rebase, reset, clean, force, squash, revert, delete, drop,
+remove, wipe, purge, discard, overwrite, truncate, publish, upgrade, purchase,
+pay, buy, subscribe, plan, billing, production, prod, main, master, branch,
+secret, key, token, password, credential, cookie, session, jwt, env, ci, test,
+check, coverage, risk, review, protect, codeowners, hook, verify). A protected
+path that the question, an option or the recommendation merely mentions
+(case-folded, or the protected directory as a bare word) counts as touched.
+
 Harbor decides deterministically and fails closed. Only the structured
 `recommended_option_index = 0` counts: there is no free-text fallback, so a
 builder that leaves the index `null` always gets a human. The recommendation
-text can only veto the index. Harbor refuses when the text:
+text can only veto the index: it must be empty, equal option 1, or use only
+option 1's own words plus a fixed affirmative list (take, choose, pick, go,
+with, recommend, use, the, first, option, one, because, it, is, simplest,
+safest, matches, ticket, criteria, keep, ...). Any other word refuses. On top
+of that, Harbor refuses when the text:
 
 - refers to another option by number or digit (any digit but a lone "1",
   including full-width forms and "2nd"), number word, letter ("option B",
