@@ -15,6 +15,14 @@ auto_merge_risks = []
 # adds a GitHub MCP server; set mcp_url for GitHub Enterprise Server.
 transport = "rest"
 
+# Opt-in device and browser proof for Claude builders on macOS (off when absent).
+# Each platform widens the builder's Bash sandbox by exactly one rule; see
+# docs/configurable-workflows.md#device-and-browser-proof-builder before enabling.
+#   android: local ports (adb server)   ios: iOS Simulator services
+#   web: local ports (dev servers, Playwright)
+# [builder]
+# device_proof = ["android", "ios", "web"]
+
 [recovery]
 # Automatic retries after an unexpected builder exit.
 enabled = true

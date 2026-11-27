@@ -154,6 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
+| `[builder]` | absent (off) | opt-in `device_proof` platforms that widen a Claude builder's sandbox for emulator, simulator and browser proof |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -359,6 +360,93 @@ verified, normal supervision re-reads that ticket's attachments from Linear, so
 it can still verify the merge on GitHub and remove the worktree. This read
 happens at most 3 times per run in each supervisor process, at least 60 seconds
 apart. The builder's `pr_url` counts only if Linear lists it as an attachment.
+
+### Device and browser proof (`[builder]`)
+
+A project's own rules often require screenshots from an Android emulator, an
+iOS Simulator or a local web server. A Claude builder's Bash sandbox blocks all
+three by default:
+
+| Tool | Failure inside the default sandbox |
+| --- | --- |
+| `adb start-server`, `adb devices` | `could not install *smartsocket* listener: Operation not permitted` (the adb server cannot bind 127.0.0.1:5037) |
+| `xcrun simctl list`, `simctl io booted screenshot` | `CoreSimulatorService connection became invalid` (the XPC lookup is denied) |
+| `python3 -m http.server`, Metro, Expo, `next dev` | `PermissionError: [Errno 1] Operation not permitted` on `bind` |
+
+To allow them, list the platforms in your workflow copy:
+
+```toml
+[builder]
+device_proof = ["android", "ios", "web"]   # any subset; absent or [] means off
+```
+
+Each platform adds exactly one Claude Code sandbox rule:
+
+| Platform | Adds | What it allows |
+| --- | --- | --- |
+| `android` | `network.allowLocalBinding = true` | Bash commands may listen on and connect to local ports, so `adb` can start or reach its server |
+| `web` | `network.allowLocalBinding = true` | the same rule, for dev servers (`http.server`, Metro, Expo, Next) and clients such as `curl` that fetch them |
+| `ios` | `network.allowMachLookup = ["com.apple.CoreSimulator.*"]` | Bash commands may reach the iOS Simulator services, so `xcrun simctl` can list, boot and screenshot simulators |
+
+Nothing else changes. The sandbox stays on with `failIfUnavailable = true` and
+`allowUnsandboxedCommands = false`. The host allowlist, the writable paths and
+every other protection are the same as without the section. Harbor never adds
+`allowAppleEvents`, `allowUnixSockets`, `allowAllUnixSockets`,
+`excludedCommands` or `filesystem.disabled`. No extra writable path was
+needed: `simctl io booted screenshot <path>` writes inside the worktree, and
+adb reads its existing key in `~/.android`.
+
+**Security trade-off.** Read this before enabling a platform.
+
+- `allowLocalBinding` lets every Bash command, not only adb or the dev server,
+  open listening sockets and connect to any port on this machine's loopback
+  interface. That includes other local services, such as a database, a
+  dashboard or another tool's local API. Claude Code's rule is
+  `(local ip "*:*")`, so a server the builder starts may also be reachable from
+  your network if it binds `0.0.0.0` instead of `127.0.0.1`. External hosts
+  stay blocked.
+- `com.apple.CoreSimulator.*` lets Bash commands ask CoreSimulatorService to
+  act for them. The service runs outside the sandbox, so a builder can boot,
+  erase, install apps on or delete any simulator of the user running Harbor.
+- The builder edits the ticket worktree, not `.harbor/workflow` in your main
+  checkout, so it cannot grant these rules to itself. A change to
+  `[builder]` lands only through a merged PR you review.
+
+**Fail-closed.** An unknown platform (`"andriod"`), a repeated platform, a
+value that is not a list of strings, or another key in `[builder]` makes the
+workflow invalid. `harbor start` refuses the project, and `harbor doctor`
+exits 2 with the reason. Absent or empty, the generated `--settings` are
+byte-for-byte what they were before this option existed.
+
+**Doctor.** For a Claude project, `harbor doctor` prints
+`Device proof: off (...)`, or the enabled platforms and one `grants ...` line
+per rule. The section is read with the rest of the workflow on every builder
+launch, so an edit applies on the next turn.
+
+**Linux.** Claude Code documents `allowLocalBinding` and `allowMachLookup` as
+macOS-only, and Linux has no iOS Simulator. On Linux, `harbor doctor`
+adds `not effective on this host: ...`, and `harbor start` prints the same
+warning once, instead of silently doing nothing. Harbor has not been run on
+Linux with this option.
+
+**Codex builders.** `device_proof` does not change a Codex builder. Harbor
+already runs Codex with `workspace-write` and network access. Under that
+sandbox, `adb start-server`, `adb devices` and a `127.0.0.1` HTTP server plus
+`curl` worked without any change. Codex has no setting for Mach services, so
+`xcrun simctl` fails there (`CoreSimulatorService connection became invalid`)
+and cannot be enabled. With `[builder]` set on a Codex project,
+`harbor doctor` prints `Device proof: not applied (...)` and `harbor start`
+warns once.
+
+**Proof scope.** Verified on macOS with Claude Code 2.1.332 and Codex CLI
+0.170.0. Live haiku builder sessions used Harbor's exact builder argv, and
+`codex sandbox` used an equivalent permission profile. Not verified: Linux, or an attached Android
+emulator (none was running, so adb listed no devices). A Playwright browser
+inside the Claude sandbox is not covered either: loading `playwright-core`
+1.58 hung there with `web` enabled, so `web` grants only local ports and
+Harbor adds no Mach services for a browser. Until that is verified, take
+browser screenshots with Harbor's Codex `playwright_browser_image` or outside
+the builder.
 
 ### Editing mid-run
 
@@ -582,6 +670,7 @@ against a throwaway repository and worktree; not run on Linux.
 | Watchdog | watchdog.py, db.py | test_watchdog.py |
 | Bounded decisions | unblock.py, decision_policy.py, risk_evidence.py | test_decision_policy.py, test_blocker_recovery.py, test_workflow_evidence.py |
 | Cleanup | workflow_lifecycle.py, worktree.py | test_workflow_cleanup_policy.py, test_merge_cleanup.py |
+| Device and browser proof | config/workflow.py, runner/claude.py, cli.py | test_device_proof.py |
 
 Run `uv run pytest`, `uv run python -m compileall -q src tests` and `uv build`.
 The tests use mock external tickets and real local subprocesses and Git

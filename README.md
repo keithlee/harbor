@@ -496,6 +496,29 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
+### Emulator, simulator and local web proof for Claude builders
+
+A Claude builder's Bash sandbox blocks `adb`, `xcrun simctl` and local dev
+servers by default. To let it capture that proof on macOS, opt in per project
+in `<repo>/.harbor/workflow/workflow.toml`:
+
+```toml
+[builder]
+device_proof = ["android", "ios", "web"]   # any subset; absent means off
+```
+
+`android` and `web` let Bash commands bind and connect to local ports
+(`network.allowLocalBinding`). `ios` lets them reach the iOS Simulator
+services (`network.allowMachLookup = ["com.apple.CoreSimulator.*"]`). The
+sandbox stays on and the host allowlist and writable paths do not change. The
+trade-off is real: local binding opens every loopback port on the machine to
+the builder's commands, and the simulator services act outside the sandbox.
+An unknown platform fails closed. `harbor doctor` prints what is granted, and
+says when it does not apply: on Linux, where Claude Code ignores these keys,
+and for Codex builders, which already have local ports but cannot reach the
+simulator. See
+[Device and browser proof](docs/configurable-workflows.md#device-and-browser-proof-builder).
+
 heartbeat_seconds: 60
 poll_interval_seconds: 60
 deadline_minutes: 90
@@ -585,6 +608,9 @@ needs and keeps the delivery instructions opaque.
   local worktree. Unobserved claims remain fail-closed.
 - Pause stops new dispatch/resume and suspends deadlines; it does not erase
   the ledger or pretend the builder completed.
+- A Claude builder's sandbox reaches local ports or the iOS Simulator only
+  when the project lists them in `[builder] device_proof`. It is never turned
+  off or widened to other hosts.
 
 ## Test fixtures and external proof
 
