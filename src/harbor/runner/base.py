@@ -111,6 +111,9 @@ def validate_result(payload: Any) -> list[str]:
             not isinstance(blocker["options"], list) or not all(isinstance(item, str) for item in blocker["options"])
         ):
             errors.append("blocker.options must be an array of strings")
+        index = blocker.get("recommended_option_index")
+        if index is not None and (isinstance(index, bool) or not isinstance(index, int)):
+            errors.append("blocker.recommended_option_index must be an integer or null")
     return errors
 
 
