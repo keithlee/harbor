@@ -154,7 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
-| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; changes always need a human merge |
+| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; Harbor refuses to merge a change to it through its own merge paths (see below for a hard guarantee) |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -456,21 +456,59 @@ enable it on a shared workstation, on a machine with production credentials,
 or for repositories whose tickets come from people you do not trust to steer
 the builder.
 
-**A change to `[builder]` always needs a human merge.** The builder edits the
-ticket worktree, not `.harbor/workflow` in your main checkout, so it cannot
-grant itself these rules for its current run. It could open a PR that adds
-them. To stop that PR merging without you:
-- At `pre_merge`, Harbor compares `[builder]` in
-  `.harbor/workflow/workflow.toml` at the PR head with the merge base on
-  `origin/<base_branch>`.
-- If the table was added, changed or removed, the check fails with
-  `human merge required: the PR changes [builder] ...`, whatever
+**Harbor refuses to merge a `[builder]` change, but only through its own
+paths.** The builder edits the ticket worktree, not `.harbor/workflow` in your
+main checkout, so it cannot grant itself these rules for its current run. It
+could open a PR that adds them. Harbor refuses to merge that PR through its
+own readiness check and merge commands:
+- **What Harbor compares.** `[builder]` in `.harbor/workflow/workflow.toml`
+  at the PR head, against the merge base on `origin/<base>`. The file must be
+  a regular file (mode 100644 or 100755) reached through plain directories at
+  both ends.
+- **A changed table.** If `[builder]` was added, changed or removed, Harbor
+  refuses with `human merge required: the PR changes [builder] ...`, whatever
   `merge_mode` and `auto_merge_risks` say.
-- If Harbor cannot read the diff (no worktree, head or base it cannot resolve,
-  or a workflow it cannot parse), it fails with
-  `human merge required: Harbor could not read the PR diff ...`.
-- The check runs in the bundled readiness hook and again in
-  `harbor workflow check` itself, so replacing the hook does not remove it.
+- **A diff Harbor cannot read.** This covers:
+  - no worktree, or a head or base Harbor cannot resolve;
+  - a workflow.toml that is missing or cannot be parsed;
+  - a `.harbor`, `.harbor/workflow` or `workflow.toml` that is a symlink or a
+    submodule.
+
+  Harbor refuses with `human merge required: Harbor could not read the PR
+  diff ...`. A symlink would otherwise hide the file from git's tree listing,
+  while Harbor's runtime follows the link.
+- **Where it is checked:**
+  - the bundled readiness hook at `pre_merge`;
+  - `harbor workflow check` itself, so replacing the hook does not remove it;
+  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`;
+  - that helper's `api` escape hatch: `api PUT /repos/o/r/pulls/N/merge` gets
+    the same check, and `api POST /repos/o/r/merges` and GraphQL
+    `mergePullRequest` / `enablePullRequestAutoMerge` / `mergeBranch` are
+    refused.
+
+**That is not a hard guarantee.** A builder holds a GitHub token and has
+network access to GitHub. It could:
+- call the REST API with `curl` directly;
+- merge through the GitHub MCP server's merge tool when
+  `[github] transport = "mcp"`;
+- `git push` to the base branch.
+
+Harbor's checks do not see any of those. For a guarantee, enforce it on
+GitHub:
+- Protect the base branch.
+- Require a pull request with at least one approving review.
+- Turn on "Require review from Code Owners".
+- Give a person, not the token the builder uses, ownership of `.harbor/`.
+- Do not let that token bypass the protection.
+
+For example, in `.github/CODEOWNERS`:
+
+```text
+/.harbor/ @your-org/harbor-admins
+```
+
+Then a PR that touches `.harbor/` cannot merge until that owner approves it,
+however it is merged.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`

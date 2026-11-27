@@ -524,9 +524,12 @@ What each platform turns on:
   Docker TCP socket, databases.
 
 Enable it only on a machine or user account where the builder may have that
-reach. A PR that changes `[builder]` never merges automatically: Harbor
-requires a human merge, and also when it cannot read the diff. An unknown
-platform fails closed. `harbor doctor` prints what is granted to any Claude
+reach. Harbor's readiness check and its merge command (`harbor.github_rest
+pr-merge`) refuse a PR that changes `[builder]`, and also one whose diff they
+cannot read. A builder with a GitHub token could still merge through the API
+directly, so for a hard guarantee protect the base branch and require Code
+Owner review for `.harbor/` (for example `/.harbor/ @your-org/harbor-admins`
+in `.github/CODEOWNERS`). An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
 builder the project could run.
 
 Claude Code's documentation describes these settings as macOS-only. Harbor
@@ -626,8 +629,9 @@ needs and keeps the delivery instructions opaque.
   the ledger or pretend the builder completed.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
-  path out of the sandbox (adb and simctl reach any host). A PR that changes
-  `[builder]` always needs a human merge.
+  path out of the sandbox (adb and simctl reach any host). Harbor's readiness
+  check and merge command refuse a PR that changes `[builder]`. Only branch
+  protection with Code Owner review on `.harbor/` stops a direct API merge.
 
 ## Test fixtures and external proof
 
