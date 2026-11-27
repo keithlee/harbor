@@ -145,11 +145,17 @@ async def fresh_context(config, db, ticket_id, run, event):
         from harbor.risk_evidence import merge_risk
         feedback_digest = hashlib.sha256(json.dumps([raw.get("comments"),fact.get("comments")],sort_keys=True).encode()).hexdigest()
         risk = merge_risk(db.connection,config.name,ticket_id,run["id"],raw,fact)
+        sandbox_change = None
+        if event == "pre_merge":
+            from harbor.device_proof import builder_sandbox_change
+            base = str(getattr(config, "base_branch", "") or "main")
+            sandbox_change = builder_sandbox_change(run.get("worktree"), fact.get("head_sha"), f"origin/{base}")
         return {"project":config.name,"ticket":ticket_id,"run_id":run["id"],"head_sha":fact.get("head_sha"),
                 "event":event,"fresh":True,"terminal":ticket["state_type"] == "completed",
                 "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled"),
                 "facts":fact,"gaps":processor.handoff_gaps(ticket,fact["url"],head_sha=fact.get("head_sha")),
-                "linear_feedback":linear_feedback,"feedback_digest":feedback_digest,"risk":risk}
+                "linear_feedback":linear_feedback,"feedback_digest":feedback_digest,"risk":risk,
+                "builder_sandbox_change":sandbox_change}
     finally:
         await linear.close()
         await github.close()
@@ -192,5 +198,14 @@ async def execute(args, config, db):
     blocked = any(r["blocking"] for r in results)
     if args.event == "pre_merge" and workflow.config["delivery"]["merge_mode"] == "human":
         blocked = True
+    if args.event == "pre_merge":
+        # Enforced here as well as in harbor.readiness, so a project that replaces
+        # its readiness hook still cannot auto-merge a [builder] sandbox change.
+        from harbor.readiness import builder_sandbox_failures
+        reasons = builder_sandbox_failures(context)
+        if reasons:
+            blocked = True
+            results = [*results, {"hook": "builder_sandbox", "mode": "required", "head_sha": context.get("head_sha"),
+                                     "status": "fail", "blocking": True, "reason": reasons[0]}]
     print(json.dumps({"ready":not blocked,"event":args.event,"head_sha":context["head_sha"],"linear_feedback":context.get("linear_feedback",[]),"feedback_digest":context.get("feedback_digest"),"results":results,"enforcement":"workflow_checked"},indent=2))
     return int(blocked)

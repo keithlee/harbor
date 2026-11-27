@@ -35,11 +35,15 @@ def verdict(risk="low", *, verdict="approve", head=HEAD, author=DELIVERY, **extr
 
 
 def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None, auto_merge_risks=("low",),
-              pr_author=DELIVERY):
+              pr_author=DELIVERY, sandbox_change=False):
     """Run `harbor workflow check --event pre_merge` against mocked Linear/GitHub.
 
     ``comments`` defaults to one current-head low approval from the delivery identity.
+    ``sandbox_change`` stubs the PR's ``[builder]`` diff check (True, False or None
+    for unreadable); ``"real"`` runs the real check against ``tmp_path``.
     """
+    if sandbox_change != "real":
+        monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: sandbox_change)
     comments = [verdict("low")] if comments is None else comments
 
     class Linear:

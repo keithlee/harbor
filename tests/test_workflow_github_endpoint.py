@@ -75,6 +75,8 @@ def _run_workflow_check(tmp_path, monkeypatch, pipeline_text, pr_url=PR_URL):
     monkeypatch.setattr("harbor.clients.github.GitHubClient", MockTransportGitHubClient)
     monkeypatch.setenv("GITHUB_TOKEN", DUMMY_TOKEN)
     monkeypatch.delenv("GH_TOKEN", raising=False)
+    # The fake head is not a real commit; this test is about the GitHub host, so the [builder] diff is unchanged.
+    monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: False)
 
     pipeline = tmp_path / "pipeline.md"
     pipeline.write_text(pipeline_text, encoding="utf-8")

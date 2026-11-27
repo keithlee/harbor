@@ -28,9 +28,10 @@ def test_medium_ticket_choice_cannot_lower_merge_risk():
 
 def test_packaged_script_is_executed_and_fails_closed(tmp_path):
     workflow=load_workflow(config(tmp_path,'autonomous'))
-    base={'project':'A','ticket':'A-1','run_id':'r','event':'pre_merge','fresh':True,'hold':False,'risk':'low','gaps':{'risk':'valid'},'review_verified':True,'proof_verified':True,'facts':{'url':'https://example.test/pr/1','head_sha':'a','mergeable':'MERGEABLE','ci':'green'}}
+    base={'project':'A','ticket':'A-1','run_id':'r','event':'pre_merge','fresh':True,'hold':False,'risk':'low','gaps':{'risk':'valid'},'review_verified':True,'proof_verified':True,'builder_sandbox_change':False,'facts':{'url':'https://example.test/pr/1','head_sha':'a','mergeable':'MERGEABLE','ci':'green'}}
     async def check(ctx):
         return await execute_event(workflow,'pre_merge',ctx,cwd=tmp_path)
     assert not any(r['blocking'] for r in asyncio.run(check(base)))
-    for change in ({'risk':'medium'},{'hold':True},{'linear_feedback':[{'id':'new'}]},{'fresh':False}):
+    for change in ({'risk':'medium'},{'hold':True},{'linear_feedback':[{'id':'new'}]},{'fresh':False},
+                   {'builder_sandbox_change':True},{'builder_sandbox_change':None}):
         assert any(r['blocking'] for r in asyncio.run(check({**base,**change})))
