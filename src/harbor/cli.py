@@ -103,6 +103,23 @@ def _runtime_invocation(config: Any) -> str:
     ])
 
 
+# An installed workflow keeps its own skill copy, so the launch prompt carries
+# the permission-blocker contract for every project.
+PERMISSION_BLOCKER_INSTRUCTIONS = (
+    "Permission blockers: when your permissions or sandbox deny a command or tool (for example `Operation not "
+    "permitted`, a write outside the allowed paths, a network host the sandbox blocks, `gh` failing TLS, or "
+    "`adb`/`xcrun simctl` unable to reach their service), do not ask a person to widen your permissions and do "
+    "not retry with other tricks. First finish everything else you can. Then return status `blocked` with "
+    "`blocker.kind = \"permission_blocker\"`, `blocker.commands` = the exact shell commands you need run, in "
+    "order, `blocker.cwd` = the directory to run them in (relative to the worktree, or null for its root), and "
+    "`blocker.evidence` = the literal denial. Give plain commands: every path inside the ticket worktree, no "
+    "shell or interpreter inline code (`bash -c`, `python -c`), no `$` variables, globs or `~`, and never a "
+    "credential. Merges, reviews and pushes to the base branch are never delegated. If the project allows it, "
+    "Harbor has First "
+    "Mate run them outside your sandbox and resumes this session with their exit codes and output; otherwise a "
+    "person is asked. For every other blocker kind set `commands` and `cwd` to null."
+)
+
 # The builder's provider is chosen per launch (and quota fallback can switch it),
 # after this prompt is rendered, so the child-agent rules name both runtimes.
 CHILD_AGENT_INSTRUCTIONS = (
@@ -149,6 +166,7 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "shell initialization must not select another registry or ledger."
             + "\n" + CHILD_AGENT_INSTRUCTIONS
             + " Use the role models and reasoning efforts from the policy's `roles`."
+            + "\n" + PERMISSION_BLOCKER_INSTRUCTIONS
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
             + "repository's own instructions. When it is \"human\", never merge, enable auto-merge or push to the base branch.")
 
@@ -334,8 +352,8 @@ def build_production_dispatcher(
                         config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
                     )
                 runner.sandbox_hosts = hosts
-                # dontAsk refuses the runtime invocation and reads outside the
-                # worktree unless they are pre-approved; approve exactly these.
+                # Pre-approve the runtime invocation and the workflow package
+                # reads so they never depend on the auto-mode classifier.
                 # Without the registry a builder (new or resumed) could not run
                 # a single workflow check, so refuse to build it and say why.
                 try:
@@ -497,6 +515,45 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     }
 
 
+def permission_operator(config: Any, workflow: Any, env: Any = None) -> tuple[Any, str, bool]:
+    """First Mate's operator for permission blockers: (operator or None, report line, configuration ok).
+
+    Off unless ``[decisions] delegate_permissions = true``. When it is on but
+    cannot run (no Claude provider, no Claude Code executable), the line says
+    why and ``ok`` is False so ``harbor doctor`` fails closed; permission
+    blockers then escalate to a person as before.
+    """
+
+    import shutil
+    from harbor.permission_delegation import github_operator_env, operator_for
+
+    environ = os.environ if env is None else env
+    enabled = bool(((workflow.config or {}).get("decisions") or {}).get("delegate_permissions", False))
+    executable = environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
+    github_env: dict[str, str] = {}
+    secret_names: list[str] = []
+    if enabled:
+        github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"), env=environ)
+        github_env = github_operator_env(github["env"], environ)
+        secret_names = [name for name in (github["token_env"], getattr(PipelineProfile.from_project(config),
+                                                                        "github_token_env", None)) if name]
+    operator, line = operator_for(
+        enabled=enabled,
+        firstmate_provider=getattr(config, "firstmate_provider", "codex"),
+        firstmate_model=str(getattr(config, "firstmate_model", "") or ""),
+        firstmate_effort=getattr(config, "firstmate_effort", None),
+        builder_provider=getattr(config, "builder_provider", "codex"),
+        builder_model=str(getattr(config, "builder_model", "") or ""),
+        builder_effort=getattr(config, "builder_effort", None),
+        executable=executable,
+        env=github_env,
+        secret_names=secret_names,
+    )
+    if operator is not None and shutil.which(executable) is None:
+        return None, f"off: Claude Code executable {executable!r} unavailable", False
+    return operator, line, operator is not None or not enabled
+
+
 async def _doctor(project_name: str) -> int:
     try:
         config = get_project(project_name)
@@ -551,6 +608,13 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
+    try:
+        _, delegation_line, delegation_ok = permission_operator(config, workflow)
+    except ValueError as exc:
+        delegation_line, delegation_ok = f"invalid ({exc})", False
+    print(f"Permission delegation: {delegation_line}")
+    if not delegation_ok:
+        scope_ok = False
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
@@ -757,6 +821,16 @@ async def _start(
         # ladder silently degrades to rung 0 only.
         from harbor.unblock import UnblockLadder
 
+        operator = None
+        bound_workflow = getattr(production_dispatcher, "workflow", None)
+        if bound_workflow is not None and not read_only:
+            try:
+                operator, delegation_line, delegation_ok = permission_operator(config, bound_workflow)
+            except ValueError as exc:
+                operator, delegation_line, delegation_ok = None, f"invalid ({exc})", False
+            if not delegation_ok:
+                print(f"Harbor: warning: permission delegation {delegation_line}; permission blockers "
+                      "escalate to a person", file=sys.stderr)
         supervisor.unblock_ladder = UnblockLadder(
             db,
             linear=client,
@@ -768,6 +842,7 @@ async def _start(
             policy=config.blocker_policy,
             base_branch=config.base_branch,
             linear_projects=config.linear_project_scope,
+            operator=operator,
         )
     workflow = getattr(production_dispatcher, "workflow", None)
     if workflow is not None:

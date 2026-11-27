@@ -23,8 +23,14 @@ def validate_claude(executable: str, model: str, effort: str | None) -> None:
 
 
 def claude_read_only(executable: str, model: str, effort: str | None) -> list[str]:
+    """First Mate's answer and triage invocation: no tools at all, in Harbor's one permission mode.
+
+    The empty ``--tools`` keeps an answer read-only; the mode only matches
+    every other Claude Code process Harbor launches.
+    """
     command = [
         executable, "--print", "--verbose", "--output-format", "stream-json", "--model", model,
+        "--permission-mode", BUILDER_PERMISSION_MODE,
         "--no-session-persistence", "--tools", "", "--strict-mcp-config",
         "--setting-sources", "", "--disable-slash-commands",
     ]
@@ -113,7 +119,7 @@ _RULE_UNSAFE = "*?[]\n\r"
 
 
 def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
-    """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
+    """Pre-approvals for the delivery workflow, so these never depend on the ``auto`` classifier.
 
     Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
     or assigns a variable in front of an absolute executable path (directly or
@@ -140,6 +146,16 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
         # A leading ``//`` anchors the rule at the filesystem root, not the settings file.
         allow.append(f"Read(/{resolved}/**)")
     return allow
+
+
+# Every Claude Code process Harbor launches runs in ``auto`` mode: builders
+# (and the children they spawn), First Mate's tool-less answers and triage,
+# and First Mate's operator run for permission blockers. For builders,
+# Claude Code's classifier approves routine actions such as test, build and
+# git commands, where ``dontAsk`` refused every call without a pre-approval
+# and stalled tickets on permission escalations. The OS sandbox still bounds
+# what Bash can write and reach, and the rules below stay pre-approved.
+BUILDER_PERMISSION_MODE = "auto"
 
 
 class ClaudeRunner(CodexRunner):
@@ -178,7 +194,7 @@ class ClaudeRunner(CodexRunner):
         allow = self._workflow_permissions()
         mcp = github_mcp_config(getattr(self, "github_mcp", None))
         if mcp:
-            # Pre-approve only the GitHub server's tools; dontAsk refuses everything else.
+            # Pre-approve the GitHub server's tools so they never depend on the auto classifier.
             allow.append("mcp__github")
         if allow:
             settings["permissions"] = {"allow": allow}
@@ -191,12 +207,12 @@ class ClaudeRunner(CodexRunner):
         schema.pop("$schema", None)
         schema.pop("$id", None)
         # Agent lets the delivery skill spawn its planner/implementor/reviewer children. They
-        # run in this process, so they get the same tools, dontAsk mode and sandbox as the builder.
+        # run in this process, so they get the same tools, permission mode and sandbox as the builder.
         command = [
             self.executable, "--print", "--verbose", "--output-format", "stream-json",
             "--json-schema", json.dumps(schema),
             "--model", self.model, "--effort", self.reasoning_effort,
-            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
+            "--permission-mode", BUILDER_PERMISSION_MODE, "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
         if mcp:

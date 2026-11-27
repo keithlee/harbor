@@ -148,7 +148,7 @@ model = "gpt-6-luna"
 | --- | --- | --- |
 | `[delivery]` | `merge_mode = "human"` | `workflow_checked` allows merges for `auto_merge_risks` when `pre_merge` readiness passes |
 | `[recovery]` | enabled, 30/120/300 s, 3 attempts | crash retries after an unexpected builder exit |
-| `[decisions]` | `cite_only` | how First Mate answers blockers: `human`, `cite_only`, `bounded` |
+| `[decisions]` | `cite_only`, `delegate_permissions = false` | how First Mate answers blockers: `human`, `cite_only`, `bounded`; `delegate_permissions` lets First Mate run permission-blocked commands (below) |
 | `[evidence]` | `ci = "required"`, `feedback = "advisory"` | what readiness gates on |
 | `[cleanup]` | `after_merge` | worktree cleanup after an observed merge |
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
@@ -296,7 +296,7 @@ implementor and reviewer children. A Claude builder does this with Claude
 Code's `Agent` tool, which Harbor always enables; there is nothing to
 configure. Children run inside the builder's own Claude Code process, so they
 get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
-`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
+`Agent`), its `auto` permission mode and the same Bash sandbox: the same
 writable paths and the same network allowlist below. They cannot use a tool or
 reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
 
@@ -549,9 +549,14 @@ the Harbor import path. Workflow commands and child agents use that invocation
 with the supplied project and ticket. The native sandbox includes the ledger
 directory for operational receipts; the registry remains read-only.
 
-**Claude builder permissions.** Claude builders run in Claude Code's
-`dontAsk` permission mode, which refuses any tool call that is not
-pre-approved. Sandboxed Bash is approved automatically, except a command that
+**Claude builder permissions.** Every Claude Code process Harbor launches runs
+in Claude Code's `auto` permission mode: builders and their children, First
+Mate's answers and triage (which still get no tools at all), and First Mate's
+operator run below. In `auto` mode Claude Code's classifier approves routine
+actions and refuses risky ones, instead of `dontAsk` refusing everything that
+is not pre-approved. Builders keep their OS sandbox, and Harbor still
+pre-approves the rules below so they never depend on the classifier.
+Sandboxed Bash is approved automatically, except a command that
 sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
 (directly or through `/usr/bin/env`), which is exactly what the runtime
 invocation does; Read, Glob and Grep only reach the ticket worktree,
@@ -571,6 +576,93 @@ Codex builders need neither: their
 `workspace-write` sandbox reads anywhere and has no per-command approval.
 Verified on macOS with Claude Code 2.1.332 by running the generated command
 against a throwaway repository and worktree; not run on Linux.
+
+**Permission blockers (opt-in).** Some commands cannot work inside the
+builder's sandbox at all. On macOS, `gh` fails TLS there, `adb` and
+`xcrun simctl` cannot reach their services, and writes outside the allowed
+paths are denied. The builder reports such a command as a blocker with
+`kind = "permission_blocker"`, the exact `commands`, the `cwd` (relative to
+the worktree), and the denial as `evidence`. An `env_blocker` that names
+`commands` and whose question or evidence reports a permission or sandbox
+denial is treated the same way.
+
+With `[decisions] delegate_permissions = false` (the default), a person is
+asked, as before. With `true`, the unblock ladder first hands the commands to
+First Mate's *operator* run:
+
+- It runs Claude Code in `auto` permission mode with only the `Bash` tool and
+  **without the builder's sandbox**. The auto-mode classifier is the safety
+  gate for every command.
+- The working directory is the ticket worktree (or `cwd` inside it). The
+  environment is minimal, not Harbor's whole one: `PATH`, `HOME`, the user,
+  shell and locale variables, `ANDROID_HOME`/`ANDROID_SDK_ROOT`/`JAVA_HOME`/
+  `DEVELOPER_DIR`, Claude Code's own sign-in variables if you use them, the
+  `HARBOR_*` variables `harbor start` was launched with (except
+  `HARBOR_LINEAR_API_KEY`), and the GitHub token: the configured variable plus
+  `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` for GitHub Enterprise Server) for gh.
+  `GIT_CEILING_DIRECTORIES` keeps git inside the worktree, and `TMPDIR` is a
+  private per-ticket directory. Harbor redacts every token value it passes, and
+  any credential-looking value of its own environment, from the prompt, the
+  receipt, the builder's resume text and the Linear comment.
+- It uses First Mate's model when First Mate runs on Claude, otherwise the
+  controller's model when builders run on Claude. Codex has no equivalent of
+  `auto` mode between a read-only sandbox and full access, so with neither
+  provider on Claude the option stays off and `harbor doctor` fails.
+- Harbor records a receipt in the ledger table `permission_delegations`, with
+  the exit codes and output (each stream truncated to 4,000 characters). It
+  posts a short Linear comment and resumes the same builder session with the
+  results.
+
+Before anything runs, Harbor checks the commands deny-by-default
+(`src/harbor/operator_guard.py`). It runs them only when every check passes,
+and otherwise asks a person:
+
+- Plain argv-style commands only, joined by `;`, `&&`, `||` or `|`, with `>`,
+  `>>`, `<` and `2>&1` redirects. No `$` variables or command substitution, no
+  unquoted globs, braces or `~`, no subshells, background jobs, here-documents
+  or line breaks, and no `VAR=value` prefix.
+- No shells (`sh`, `bash`, `zsh` ...), no interpreter inline code
+  (`python -c`, `node -e`, `perl -e` ..., or an interpreter with no script),
+  and no program that runs other commands (`env`, `xargs`, `sudo`, `eval`,
+  `awk`, `ssh`, `find -exec`/`-delete`, `git -c`, ...). `ln` is refused too:
+  a link target is resolved from the link's directory, so Harbor cannot check
+  it.
+- Every word that could be a path, including the program, redirect targets,
+  `--flag=PATH`, `-oPATH`, `@FILE` and `.`, is resolved with symlinks followed.
+  It must stay inside the ticket worktree or the operator's per-ticket temp
+  directory. Only `http(s)` URLs pass as non-paths. Device-side `adb` paths
+  and `gh api` endpoints are not host paths.
+- No resolved path may overlap a protected path: a match, a file inside a
+  protected directory, or a directory that contains one (so `rm -rf schemas`,
+  `rm -rf .` and `git add .` are refused when `schemas/**` is protected).
+  `git clean`, `git reset --hard`, `git checkout .`, `git restore .`,
+  `git stash` and `git config` are always refused.
+- No merge authority. `gh` is limited to an allowlist (`pr create/list/view/
+  checks/diff/status/comment/edit/checkout`, issue and run reads, `repo view`,
+  `auth status`, release and search reads); `gh pr merge`, `gh pr review` and
+  everything else are refused. `gh api` is GET-only, `--admin` is refused
+  anywhere, and `git push` may not force, delete, mirror, skip hooks or target
+  the base branch.
+- No credential value inside a command.
+- At most 10 commands, each at most 2,000 characters.
+
+Harbor also asks a person when:
+
+- the same commands already ran for the ticket and the builder is blocked
+  again (redelivering the very same blocked result after a successful resume
+  is a no-op);
+- the ticket has already used its 3 operator runs;
+- First Mate refuses, the classifier denies a command, or the run fails.
+
+Commands that run code from the worktree (`./gradlew test`, `npm test`, a
+script) are allowed: that code is the ticket's own, and the auto-mode
+classifier remains the gate for what it does.
+
+**What a new user needs:** Claude Code on `PATH` (or `HARBOR_CLAUDE_EXECUTABLE`),
+First Mate or the builder on Claude, and `delegate_permissions = true`. Restart
+`harbor start` after changing the setting. `harbor doctor` prints the result as
+`Permission delegation:`. Verified on macOS with Claude Code 2.1.332; not run on
+Linux or against GitHub Enterprise Server.
 
 ## Verification map
 
