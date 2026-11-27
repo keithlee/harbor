@@ -510,12 +510,13 @@ and `harbor start` warns once.
 
 **Proof scope.** Verified on an Apple silicon Mac with Claude Code 2.1.332 and
 Codex CLI 0.170.0. Live haiku builder sessions used Harbor's exact builder
-argv. `codex sandbox` used an equivalent permission profile. Not verified:
+argv. `codex sandbox` used an equivalent permission profile. A sandboxed
+builder ran `adb -s emulator-5554 exec-out screencap -p` (a 1080 x 2400 PNG)
+and `simctl io booted screenshot` (1206 x 2622). Harbor's device check reused
+the running emulator and simulator. Not verified:
 - Linux;
 - an Intel Mac (the `SimLaunchHost-x86` name);
-- Harbor's emulator boot and `adb exec-out screencap` against a running
-  emulator (no emulator was running, and starting one was not permitted in
-  the verification session);
+- Harbor cold-booting an emulator or simulator (both were already running);
 - a Playwright browser inside the Claude sandbox. Loading `playwright-core`
   1.58 hung there with `web` enabled, so `web` grants only local ports. Until
   that is verified, take browser screenshots with Harbor's Codex
