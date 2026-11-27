@@ -1,12 +1,15 @@
 """Native headless Claude Code invocations."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import platform
 import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from harbor.runner.base import RunnerError
@@ -110,26 +113,46 @@ def sandbox_domains(*extra: str) -> list[str]:
 
 
 # Opt-in device and browser proof (``[builder] device_proof``). Each platform
-# adds only the sandbox keys its tools were seen to need on a live builder;
-# nothing here widens the host allowlist, adds writable paths or turns off a
-# protection. Keys are merged, so "android" plus "web" still asks for local
-# binding once.
+# adds only the sandbox keys its tools were seen to need on a live builder.
+# None of them is harmless: each gives Bash a path out of the sandbox (see
+# DEVICE_PROOF_GRANTS and docs/configurable-workflows.md). Keys are merged, so
+# "android" plus "web" still asks for local binding once.
+def ios_mach_services(machine: str | None = None) -> tuple[str, ...]:
+    """The exact Mach services simctl list, install, launch and io screenshot need on a booted simulator.
+
+    Found live in a sandboxed Claude builder: with CoreSimulatorService alone a
+    booted device shows "liblaunch_sim.dylib could not be opened" and simctl
+    says "No devices are booted"; adding the host-architecture SimLaunchHost made
+    install, launch and screenshot work. simdiskimaged, SimulatorTrampoline,
+    SimRenderingServices and SimAudioProcessorServices were not needed. Booting
+    is not granted: Harbor boots the simulator outside the sandbox
+    (harbor.device_boot). Only the arm64 name was verified live.
+    """
+
+    machine = platform.machine() if machine is None else machine
+    host = "x86" if machine in {"x86_64", "i386"} else "arm64"
+    return ("com.apple.CoreSimulator.CoreSimulatorService", f"com.apple.CoreSimulator.SimLaunchHost-{host}")
+
+
+IOS_MACH_SERVICES = ios_mach_services()
 DEVICE_PROOF_RULES: dict[str, dict[str, object]] = {
-    # adb starts its server on 127.0.0.1:5037 and the client connects to it.
+    # The adb client connects to the adb server on 127.0.0.1:5037, or starts it there.
     "android": {"allowLocalBinding": True},
-    # simctl talks to CoreSimulatorService (and simdiskimaged) over XPC.
-    "ios": {"allowMachLookup": ["com.apple.CoreSimulator.*"]},
+    # simctl asks CoreSimulatorService, which runs outside the sandbox, to act on a booted simulator.
+    "ios": {"allowMachLookup": list(IOS_MACH_SERVICES)},
     # Metro, Expo, Next and http.server bind a local port, and a client such as curl connects to it.
     "web": {"allowLocalBinding": True},
 }
 DEVICE_PROOF_GRANTS = {
     "allowLocalBinding": (
-        "network.allowLocalBinding: Bash commands may listen on and connect to local ports "
-        "(adb server, dev servers); the host allowlist is unchanged"
+        "network.allowLocalBinding: Bash commands may listen on any port and connect to every local service, "
+        "including an adb server (adb shell reaches any host; adb push/pull moves files), Chrome debugging "
+        "ports and a Docker TCP socket; this is a path out of the sandbox"
     ),
     "allowMachLookup": (
-        "network.allowMachLookup com.apple.CoreSimulator.*: Bash commands may reach the iOS Simulator "
-        "services, which act outside the sandbox on the builder's behalf"
+        f"network.allowMachLookup {', '.join(IOS_MACH_SERVICES)}: Bash commands may drive CoreSimulatorService, "
+        "which runs outside the sandbox (simctl openurl reaches any host; simctl spawn runs a binary with host "
+        "file access); this is a sandbox escape"
     ),
 }
 
@@ -220,6 +243,20 @@ class ClaudeRunner(CodexRunner):
     workflow_package: Path | None = None
     # Opt-in device/browser proof platforms from the project's workflow ([builder] device_proof).
     device_proof: tuple[str, ...] = ()
+    # Boots the mobile devices outside the sandbox before each launch (harbor.device_boot.prepare_devices).
+    device_preparer: Any = None
+
+    async def _execute(self, context, instruction, *, resume, before_spawn=None):
+        if self.device_proof and self.device_preparer is not None:
+            from harbor.device_boot import device_note
+            # A boot can take minutes; keep the supervisor's event loop free meanwhile.
+            statuses = await asyncio.to_thread(self.device_preparer, self.device_proof)
+            for status in statuses:
+                print(f"Harbor: device proof for {self.ticket or context.run_id}: {status.line()[2:]}", file=sys.stderr)
+            note = device_note(statuses)
+            if note:
+                instruction = f"{instruction}\n\n{note}" if instruction else note
+        return await super()._execute(context, instruction, resume=resume, before_spawn=before_spawn)
 
     def _workflow_permissions(self) -> list[str]:
         try:

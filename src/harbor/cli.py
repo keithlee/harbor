@@ -346,12 +346,18 @@ def build_production_dispatcher(
                         "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
                     ) from exc
                 runner.workflow_package = current.package
-                # Read per turn, like the rest of the workflow: an edit applies on the next launch.
-                from harbor.config.workflow import device_proof_settings
-                runner.device_proof = device_proof_settings(current.config)
-                if runner.device_proof and sys.platform != "darwin":
-                    warn_once(device_proof_platform_warning(runner.device_proof))
-            elif device_proof_configured(current.config):
+            # Read per turn, like the rest of the workflow: an edit applies on the next launch.
+            # The same decision harbor doctor reports (harbor.device_proof.granted_platforms).
+            from harbor.config.workflow import device_proof_settings
+            from harbor.device_proof import CODEX_DEVICE_PROOF, granted_platforms
+            granted = granted_platforms(current.config, provider)
+            if granted:
+                from harbor.device_boot import prepare_devices
+                runner.device_proof = granted
+                runner.device_preparer = prepare_devices
+                if sys.platform != "darwin":
+                    warn_once(device_proof_platform_warning(granted))
+            elif device_proof_settings(current.config):
                 warn_once(CODEX_DEVICE_PROOF)
             return runner
     dispatcher = WorktreeDispatcher(
@@ -381,17 +387,35 @@ GITHUB_URL_RESTART = (
 )
 
 
-CODEX_DEVICE_PROOF = (
-    "[builder] device_proof applies to Claude Code builders only and does not change a Codex builder's "
-    "sandbox. Harbor already gives Codex builders network access, which covers local ports (adb, dev "
-    "servers); the Codex sandbox has no setting for simulator services, so a Codex builder cannot use "
-    "xcrun simctl"
-)
+def _device_proof_doctor(config: Any, workflow: Any) -> list[str]:
+    """``harbor doctor`` lines from the factory's own decision, for every provider a builder could run on."""
 
-
-def device_proof_configured(config: Any) -> bool:
     from harbor.config.workflow import device_proof_settings
-    return bool(device_proof_settings(config))
+    from harbor.device_proof import CODEX_DEVICE_PROOF, builder_providers, granted_platforms, open_ledger_read_only
+    from harbor.runner.claude import device_proof_report
+    configured = device_proof_settings(workflow.config)  # load_workflow already refused a bad value
+    try:
+        policy = _quota_policy(config, workflow)
+    except ValueError:
+        policy = None  # reported as "Fallback: invalid" by doctor itself
+    ledger = open_ledger_read_only(_db_path())
+    try:
+        providers = builder_providers(config, policy, ledger)
+    finally:
+        if ledger is not None:
+            ledger.close()
+    granted = {provider: granted_platforms(workflow.config, provider) for provider in providers}
+    claude = [provider for provider, platforms in granted.items() if platforms]
+    if claude:
+        lines = device_proof_report(granted[claude[0]])
+        lines[0] += f" · applies to Claude builders ({', '.join(providers[claude[0]])})"
+    elif "claude" in providers:
+        lines = device_proof_report(())
+    else:
+        lines = []
+    if configured and any(provider != "claude" for provider in providers):
+        lines.append(f"Device proof: not applied to Codex builders ({CODEX_DEVICE_PROOF})")
+    return lines
 
 
 def device_proof_platform_warning(platforms: tuple[str, ...]) -> str:
@@ -577,14 +601,8 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
-    from harbor.config.workflow import device_proof_settings
-    platforms = device_proof_settings(workflow.config)  # load_workflow already refused a bad value
-    if getattr(config, "builder_provider", "codex") == "claude":
-        from harbor.runner.claude import device_proof_report
-        for line in device_proof_report(platforms):
-            print(line)
-    elif platforms:
-        print(f"Device proof: not applied ({CODEX_DEVICE_PROOF})")
+    for line in _device_proof_doctor(config, workflow):
+        print(line)
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False
