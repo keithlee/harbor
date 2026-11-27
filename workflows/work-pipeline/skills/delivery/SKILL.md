@@ -70,12 +70,13 @@ model settings. Include concrete options and a recommendation, and ALWAYS set
 `recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
 option; `null` for none). Harbor decides from that index, and the prose can only veto it: when it
 is `0`, Harbor may accept the first option automatically and resume you with it as the answer, but
-only for a product or acceptance-criteria decision whose options are plain prose (no commands,
-paths, numbers or identifiers). Put a costly, destructive or access-related choice anywhere but
-first, since Harbor's keyword checks for those are best-effort. Keep `recommendation` short and plain, for example "Take option 1 because it
-matches the ticket criteria"; conditions, caveats or mentions of other options send the question
-to a human. That answer never authorizes a merge, so
-`delivery.merge_mode` still decides merges.
+only for a `product_decision`, `ambiguous_ac`, `design_decision` or `new_product_decision` blocker
+whose options are plain prose (no commands, paths, numbers or identifiers). Put a costly,
+destructive or access-related choice anywhere but first, since Harbor's keyword checks for those
+match words, not meaning. Keep `recommendation` short and plain, for example "Take option 1
+because it matches the ticket criteria"; conditions, caveats or mentions of other options send the
+question to a human. An auto-accepted answer does not authorize a merge, so `delivery.merge_mode`
+still decides merges.
 First Mate monitors blocked runs and may resume you with an instruction or start a fresh session.
 
 Return the run-result schema with the actual PR URL, status, waiting_on and a concrete next_action.

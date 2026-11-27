@@ -1622,6 +1622,7 @@ class UnblockLadder:
         if not resumed:
             auto_accept_policy.reopen(self.db, escalation_id)
             return None
+        auto_accept_policy.mark_delivered(self.db, escalation_id)
         # Announce only what actually happened: the builder was resumed.
         body = auto_accept_policy.comment(
             ticket_id, escalation_id, question=question, option=assessment.option,

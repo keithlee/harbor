@@ -479,6 +479,47 @@ def test_documented_limitation_keyword_heuristics_are_not_semantic(harness, firs
     assert "best-effort keyword heuristics" in harness.linear.comments[-1][1]
 
 
+@pytest.mark.parametrize("value", [
+    # The recommendation allowlist is lexical: every word is allowed, the meaning is not checked.
+    blocker("Use the existing date picker", options=["Build a new date picker", "Reuse the old one"]),
+    # Only two or more hyphens count as an identifier.
+    blocker("Option 1", options=["Ship the dark-mode toggle", "Wait"]),
+    blocker("Option 1", options=["Add the dark-mode toggle", "Wait"]),
+    # Only dotted names count as a file name.
+    blocker("Option 1", options=["Simplify the Dockerfile", "Wait"]),
+])
+def test_documented_limitation_lexical_checks_as_described(value):
+    """DOCUMENTED LIMITATIONS (review round 5, B1): the docs describe these
+    checks as lexical; this pins what the code does, not a guarantee."""
+
+    expected = "Ship" not in value["options"][0]  # "ship" is a keyword; the others pass every check
+    # With no ledger, assess stops at the loop-guard step; reaching it means
+    # every eligibility check above it passed.
+    assessment = auto_accept.assess(None, "SAMPLE-7", "run", value, AutoAcceptPolicy())
+    assert recommended_first_option(value).first
+    assert (assessment.status == "refused" and "no Harbor ledger" in assessment.reason) is expected
+
+
+def test_docs_describe_the_rules_as_the_code_enforces_them():
+    root = Path(__file__).resolve().parents[1]
+    docs = (root / "docs" / "configurable-workflows.md").read_text()
+    section = docs.split("### Auto-accepting the builder's first option", 1)[1].split("\n### ", 1)[0]
+    structural, lexical = section.split("#### Lexical checks", 1)
+    assert "firstmate_decisions" not in section  # a retired pipeline.md key
+    assert "enforced exactly" not in docs
+    assert "80% word overlap" in lexical and "dark-mode" in lexical and "Dockerfile" in lexical
+    assert "date picker" in lexical
+    for word in ("overlap", "allowlist", "best-effort"):
+        assert word not in structural.split("#### Structural checks", 1)[1], word
+    readme = (root / "README.md").read_text()
+    assert "equivalent question twice" not in readme and "80% word overlap" in readme
+    skill = (root / "workflows" / "work-pipeline" / "skills" / "delivery" / "SKILL.md").read_text()
+    for kind in sorted(auto_accept.ELIGIBLE_KINDS):
+        assert kind in skill and kind in section
+    template = (root / "workflows" / "work-pipeline" / "workflow.toml").read_text()
+    assert "twice for the same question" not in template
+
+
 def test_a_protected_nested_directory_named_as_a_word_is_not_auto_accepted(tmp_path):
     """Review round 4, B2 (the reviewer's repro): every specific segment counts."""
 
@@ -749,7 +790,8 @@ def test_first_mate_records_and_announces_only_a_delivered_answer(tmp_path):
     try:
         escalation = db.escalations()[-1]
         assert escalation["status"] == "answered" and escalation["answer"] == OPTIONS[0]
-        assert len(auto_accept.history(db, "SAMPLE-7")) == 1
+        [receipt] = auto_accept.history(db, "SAMPLE-7")
+        assert receipt["delivered"] == 1
         [body] = host.comments
         assert f"First Mate auto-accepted option 1 for SAMPLE-7 (escalation #{escalation['id']})" in body
     finally:
@@ -770,6 +812,7 @@ def test_first_mate_leaves_the_escalation_open_when_nothing_is_delivered(tmp_pat
         assert escalation["status"] == "open"
         assert escalation["answer"] is None and escalation["citation"] is None
         assert host.comments == []  # no comment claims a resume that did not happen
+        assert all(row["delivered"] == 0 for row in auto_accept.history(db, "SAMPLE-7"))
     finally:
         db.close()
 
@@ -785,6 +828,56 @@ def test_first_mate_never_overwrites_an_answer_a_human_gave_first(tmp_path):
         assert auto_accept.history(db, "SAMPLE-7") == [] and host.comments == []
     finally:
         db.close()
+
+
+def test_an_undelivered_ladder_auto_accept_does_not_block_first_mate_with_a_false_reason(tmp_path):
+    """Review round 5, B2 (the reviewer's repro): the ladder's resume fails and
+    the escalation is reopened; the receipt is marked undelivered, so First
+    Mate on the same run may still deliver option 1 instead of claiming the
+    builder "blocked again"."""
+
+    harness = Harness(tmp_path)
+
+    async def no_session(run_id, prompt):
+        return False
+
+    harness.ladder.resumer = no_session
+    try:
+        value = blocker("Option 1")
+        assert harness.block(value).action == "park"
+        [receipt] = harness.receipts()
+        assert receipt["delivered"] == 0
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", value, linear_id="linear-7")
+        decision = recovery.apply_auto_accept(harness.db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert decision["action"] == "resume", decision["reason"]
+        assert decision["instruction"].startswith(f"Answer: {OPTIONS[0]}")
+        assert "blocked again" not in decision["reason"]
+    finally:
+        harness.db.close()
+
+
+def test_undelivered_receipts_still_count_toward_the_cap_with_a_true_reason(tmp_path):
+    harness = Harness(tmp_path, auto_accept=AutoAcceptPolicy(max_auto_accepts=1))
+
+    async def no_session(run_id, prompt):
+        return False
+
+    harness.ladder.resumer = no_session
+    try:
+        value = blocker("Option 1")
+        harness.block(value)
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", value, linear_id="linear-7")
+        decision = recovery.apply_auto_accept(harness.db, case, {"action": "escalate", "reason": "r"},
+                                              AutoAcceptPolicy(max_auto_accepts=1))
+        assert decision["action"] == "escalate"
+        assert "were not delivered" in decision["reason"] and "blocked again" not in decision["reason"]
+    finally:
+        harness.db.close()
+
+
+def test_delivered_receipts_are_marked_delivered(harness):
+    assert harness.block(blocker("Option 1")).action == "resume"
+    assert harness.receipts()[0]["delivered"] == 1
 
 
 def test_a_failed_ladder_resume_clears_the_auto_accepted_answer(tmp_path):

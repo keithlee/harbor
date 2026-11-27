@@ -166,11 +166,11 @@ and crash-retry delays come from `workflow.toml`.
 ### Auto-accepting the builder's first option
 
 A blocked builder returns `options`, a `recommendation` and
-`recommended_option_index` (zero-based). When the recommendation picks the
-FIRST option, Harbor records that option as the escalation's answer and resumes
-the same builder session, instead of parking the ticket for a human. First
-Mate's recovery pass applies the same policy when it would otherwise escalate a
-blocked run. This is on by default:
+`recommended_option_index` (zero-based). When that index is `0` and the
+blocker passes the checks below, Harbor records option 1 as the escalation's
+answer and resumes the same builder session, instead of parking the ticket for
+a human. First Mate's recovery pass applies the same policy when it would
+otherwise escalate a blocked run. This is on by default:
 
 ```toml
 [decisions]
@@ -178,8 +178,7 @@ auto_accept_first_option = true   # false: always wait for a human
 max_auto_accepts = 2              # per builder run, 0-10
 ```
 
-`decisions.mode = "human"` (or `firstmate_decisions: human` in `pipeline.md`)
-turns auto-accept off: the project said humans decide.
+`decisions.mode = "human"` also turns auto-accept off.
 
 **What this is, and what it is not.** An auto-answer gives the builder no
 capability it did not already have: it is the builder's own recommendation,
@@ -187,75 +186,93 @@ delivered without waiting. It is not a security boundary. The real boundaries
 are the builder's sandbox, the merge gate (with the reviewer and the risk
 rating) and server-side branch protection. **Projects where product decisions
 carry cost or data risk should set `auto_accept_first_option = false` or
-`decisions.mode = "human"`.** Expect few auto-accepts: anything the rules below
-cannot vouch for goes to a human.
+`decisions.mode = "human"`.** Expect few auto-accepts.
 
-#### Structural rules (enforced exactly)
+#### Structural checks (exact)
 
-- **Kinds.** Only the decision kinds `product_decision`, `ambiguous_ac`,
-  `design_decision` and `new_product_decision` are eligible. An `env_blocker`,
-  `github_transport`, `missing_proof_capability`, `conflicting_instruction` or
-  access/permission blocker is never auto-accepted: answering an access
-  question cannot grant access.
-- **Human mode.** `decisions.mode = "human"` turns auto-accept off.
-- **Structured index only.** Only `recommended_option_index = 0` counts. There
-  is no free-text fallback, so a builder that leaves the index `null` always
-  gets a human.
-- **Plain-prose characters.** Option 1 and the recommendation must be
-  printable ASCII letters, spaces and light punctuation after NFKC (this
-  rejects homoglyphs, zero-width characters and soft hyphens). They may not
-  contain digits, currency, backticks, shell syntax (`-flag`, `|`, `>`, `;`,
-  `&&`, `$`, `=`), a colon, an ALL_CAPS, snake_case or hyphenated identifier,
-  a path, a file name or a URL.
-- **Recommendation allowlist.** The recommendation must be empty, equal
-  option 1, or use only option 1's own words plus a fixed affirmative list
-  (take, choose, pick, go, with, recommend, use, the, first, option, one,
-  because, it, is, simplest, safest, matches, ticket, criteria, keep, ...).
-  It may not refer to another option, read more like another option than
-  option 1, speak against option 1 or add a condition.
-- **Protected paths.** A blocker that touches a protected path, or whose
-  question, options or recommendation mention one, is never auto-accepted.
-  Mentions are case-folded and on whole words: a path token matching a
-  protected pattern, or any non-wildcard segment of a pattern (except generic
-  ones such as `src`, `lib`, `app`, `tests`, `docs`) or a file pattern's stem
-  as a bare word ("security" for `src/harbor/security/**`). A near-name such
-  as "infrastructure" for `infra/**` is not matched: a documented limitation.
-- **Merge-ready runs.** A run parked waiting on a human merge is never
-  auto-accepted, and the answer does not authorize a merge: `merge_mode` and
-  `auto_merge_risks` in `pre_merge` readiness are unchanged, and the answer
-  text says so.
-- **Loop guard.** Once Harbor auto-accepted an option for a ticket, an
-  equivalent question or the same option is left for a human, and so is
-  anything after `max_auto_accepts` auto-accepts in one run. The Linear
-  comment says why.
+These check fields, characters and ledger state, not meaning.
+
+- **Kind.** Only the reported kinds `product_decision`, `ambiguous_ac`,
+  `design_decision` and `new_product_decision` are eligible. Any other kind
+  (`env_blocker`, `github_transport`, `missing_proof_capability`,
+  `conflicting_instruction`, access/permission kinds, ...) is not
+  auto-accepted.
+- **Settings.** `auto_accept_first_option = false` or `decisions.mode = "human"`
+  turns it off.
+- **Structured index.** Only `recommended_option_index = 0` counts; a `null` or
+  other index goes to a human. There is no free-text fallback.
+- **Characters.** Option 1 and the recommendation must consist only of
+  printable ASCII letters, spaces and `, . ' " ! ? ( ) -` after NFKC. That
+  rejects non-ASCII characters (homoglyphs, zero-width characters, soft
+  hyphens), digits, currency, backticks, `/` and `\` (so paths and URLs),
+  `_` (so snake_case), and `| > < ; & $ = ~ * # % @ + [ ] { } ^`. A colon is
+  refused, except one directly after "option 1" in the recommendation. A word
+  starting with `-` (a flag) is refused.
+- **Touched protected paths.** A blocker whose reported or observed changed
+  paths match a protected pattern is not auto-accepted.
+- **Merge-ready runs.** A run parked as `outcome = "parked"`,
+  `waiting_on = "human"` is not auto-accepted. The answer does not authorize a
+  merge: `merge_mode` and `auto_merge_risks` in `pre_merge` readiness are
+  unchanged, and the answer text says so.
+- **Per-run cap.** At most `max_auto_accepts` auto-accepts per builder run,
+  counting attempts that were not delivered.
 - **First Mate binding.** The ladder records its protected-path and
-  decision-mode facts per escalation, bound to a digest of the exact blocker
-  (`auto_accept_assessments`). First Mate answers only an escalation whose
-  question, kind and digest match the blocker it is looking at.
+  decision-mode facts per escalation with a digest of the exact blocker
+  (`auto_accept_assessments`). First Mate answers only the newest open
+  escalation for the run, and only when its question, kind and digest match
+  the blocker it is looking at.
+- **Delivery.** The answer is recorded when the resume launches and announced
+  on Linear only after it is delivered. An exit that delivers nothing (held,
+  superseded, failed or cancelled) reopens the escalation, clears the answer
+  and marks the receipt undelivered. An escalation that is no longer open (for
+  example, a human answered it first) is not overwritten.
+- **Records.** Receipts go in `auto_accepts` with a `delivered` flag. The
+  escalation is `answered` with the citation
+  `harbor:auto-accept-first-option:escalation-<id>` and no `resolutions` row,
+  so it is not reused as authority for later blockers.
 
-#### Best-effort keyword heuristics (not semantic)
+#### Lexical checks (word matching; they cannot detect meaning)
 
-On top of the structural rules, Harbor leaves a question to a human when
-option 1, the question or the recommendation contains keywords suggesting
-secrets or credentials, money, deleting data, merging, or lowering a gate
-(push, merge, land, ship, deploy, release, reset, force, delete, drop, wipe,
-purge, truncate, pay, buy, billing, production, branch, secret, key, token,
-password, credential, env, ci, test, check, coverage, risk, review, protect,
-codeowners and more; names are split on `_ - . /`, so `STRIPE_SECRET_KEY`
-counts). These are **heuristics, not a guarantee**. They match words, not
-meaning, so a plain-English synonym ("Empty the orders table", "Add a service
-fee to every order") is not recognised and can be auto-accepted. That is why
-the opt-out above exists.
+These compare words. They catch common phrasings and miss synonyms and
+paraphrases.
 
-#### Delivery and records
-
-- The answer is recorded when the resume launches and announced on Linear only
-  after it is delivered. Any exit that delivers nothing (held, superseded,
-  failed or cancelled) reopens the escalation and clears the answer. An
-  escalation a human answered first is never overwritten.
-- The receipt goes in the `auto_accepts` table. The escalation is `answered`
-  with the citation `harbor:auto-accept-first-option:escalation-<id>` and no
-  `resolutions` row, so it is not reused as authority for later blockers.
+- **Recommendation word allowlist.** The recommendation must be empty, equal
+  option 1 after normalization, or use only option 1's own words plus a fixed
+  affirmative list (take, choose, pick, go, with, recommend, use, the, first,
+  option, one, because, it, is, simplest, safest, matches, ticket, criteria,
+  keep, ...). This cannot tell whether the text agrees with option 1: "Use the
+  existing date picker" passes for option 1 "Build a new date picker", because
+  every word is allowed.
+- **Other-option references.** Text naming another option by digit (any digit
+  but a lone "1"), number word, single letter b-z, roman numeral from ii,
+  ordinal, or "other", "instead", "vs", "or", and text whose non-filler words
+  overlap another option at least as much as option 1, are refused. Negation
+  and qualifier words ("not", "unsafe", "if", "but", "only", "after",
+  "except", "confirm", "ask", "a human", ...) are refused.
+- **Identifier shapes.** A word that starts with two or more capitals (`ALL_CAPS`, `PRs`) is refused.
+  A hyphenated word is refused only with two or more hyphens
+  (`continue-on-error`); `dark-mode` passes. A file name is refused only when
+  dotted (`deploy.yml`); `Dockerfile` or `Makefile` passes.
+- **Mentioned protected paths.** The question, options and recommendation are
+  scanned for path tokens and for whole-word names taken from the protected
+  patterns: every non-wildcard segment except generic ones (`src`, `lib`,
+  `app`, `tests`, `docs`, ...) and a file pattern's stem, case-folded
+  ("security" for `src/harbor/security/**`). Near-names such as
+  "infrastructure" for `infra/**` are not matched.
+- **Loop guard.** Harbor refuses when, for the same ticket, an earlier
+  delivered (or in-flight) auto-accept had the same option text or a question
+  with at least 80% word overlap. A reworded question with lower overlap is
+  bounded only by the per-run cap. An undelivered receipt does not trigger the
+  guard.
+- **Keyword heuristics (best-effort).** Words suggesting secrets or
+  credentials, money, deleting data, merging or lowering a gate (push, merge,
+  land, ship, deploy, release, reset, force, delete, drop, wipe, purge,
+  truncate, pay, buy, billing, production, branch, secret, key, token,
+  password, credential, env, ci, test, check, coverage, risk, review, protect,
+  codeowners and more; names are split on `_ - . /`, so `STRIPE_SECRET_KEY`
+  counts) send the question to a human. A plain-English synonym ("Empty the
+  orders table", "Add a service fee to every order") is not recognised and can
+  be auto-accepted. That is why the opt-out above exists.
 
 `harbor doctor` prints the effective setting. An invalid value fails workflow
 loading.

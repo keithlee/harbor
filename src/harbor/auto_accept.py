@@ -21,33 +21,43 @@ server-side branch protection.  Projects where product decisions carry cost
 or data risk should set ``auto_accept_first_option = false`` or
 ``decisions.mode = "human"``.
 
-Structural rules (enforced exactly):
+Structural checks (exact; they check fields, characters and ledger state):
 
-* Only the decision kinds in ``ELIGIBLE_KINDS`` are eligible.
-* ``decisions.mode = "human"`` turns auto-accept off.
-* A blocker that touches or mentions a protected path is never auto-accepted.
-* A run already parked waiting on a human merge is never auto-accepted, and
-  the answer does not authorize a merge: the merge gate (``merge_mode`` and
+* Only the reported kinds in ``ELIGIBLE_KINDS`` are eligible.
+* ``auto_accept_first_option = false`` or ``decisions.mode = "human"`` turns
+  auto-accept off.
+* A blocker whose reported or observed changed paths match a protected
+  pattern is not auto-accepted.
+* A run parked waiting on a human merge is not auto-accepted, and the answer
+  does not authorize a merge: the merge gate (``merge_mode`` and
   ``auto_merge_risks`` in pre_merge readiness) is untouched, and the answer
   text says so.
-* Option 1 and the recommendation must be plain-prose characters (printable
-  ASCII letters and light punctuation after NFKC), and the recommendation may
-  use only option 1's words plus a fixed affirmative list.
-* Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
-  question (or the same option) is left for a human.  At most
-  ``max_auto_accepts`` auto-accepts happen per builder run.
+* Option 1 and the recommendation may contain only printable ASCII letters,
+  spaces and light punctuation after NFKC.
+* At most ``max_auto_accepts`` auto-accepts per builder run, undelivered ones
+  included.
 
-Best-effort keyword heuristics (NOT semantic, so synonyms get through):
+Lexical checks (word matching; they cannot detect meaning):
 
-* words suggesting secrets, credentials, money, deleting data, merging or
-  lowering a gate keep the question with a human when they appear.  A
-  plain-English synonym ("Empty the orders table") is not recognised.
+* the recommendation may use only option 1's words plus a fixed affirmative
+  list -- "Use the existing date picker" passes for "Build a new date picker";
+* other-option references, negation and qualifier words are refused;
+* ALL_CAPS words, words with two or more hyphens and dotted file names are
+  refused (``dark-mode`` and ``Dockerfile`` pass);
+* a question, option or recommendation that names a protected path or a
+  specific segment of a protected pattern is refused;
+* loop guard: an earlier delivered or in-flight auto-accept with the same
+  option or a question with at least 80% word overlap is left for a human;
+  rewordings below that are bounded only by the per-run cap;
+* best-effort keyword heuristics for secrets, credentials, money, deleting
+  data, merging or lowering a gate.  A plain-English synonym ("Empty the
+  orders table") is not recognised.
 
 Delivery:
 
-* The answer is recorded only when the resume launches and announced only
-  once delivered; any other exit reopens the escalation with its answer
-  cleared.
+* The answer is recorded when the resume launches and announced only once
+  delivered; any other exit reopens the escalation with its answer cleared
+  and marks the receipt undelivered.
 * Each auto-accept is recorded in ``auto_accepts`` (distinct from operator
   answers, which go to ``resolutions``) and announced on Linear.
 
@@ -410,9 +420,16 @@ def initialize(connection: sqlite3.Connection) -> None:
             option TEXT NOT NULL,
             recommendation TEXT,
             method TEXT,
-            at TEXT NOT NULL
+            at TEXT NOT NULL,
+            delivered INTEGER
         )"""
     )
+    # ``delivered``: NULL while the resume is in flight, 1 once delivered, 0
+    # when nothing reached the builder.  Added after the table first shipped
+    # on this branch, so an existing table gains the column here.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(auto_accepts)")}
+    if "delivered" not in columns:
+        connection.execute("ALTER TABLE auto_accepts ADD COLUMN delivered INTEGER")
     connection.execute("CREATE INDEX IF NOT EXISTS auto_accepts_ticket_idx ON auto_accepts(ticket, run_id)")
     connection.commit()
 
@@ -430,11 +447,12 @@ def history(db: Any, ticket: str) -> list[dict[str, Any]]:
         return []
     initialize(connection)
     rows = connection.execute(
-        "SELECT id, escalation_id, ticket, run_id, source, kind, question, option, recommendation, method, at "
-        "FROM auto_accepts WHERE ticket = ? ORDER BY id",
+        "SELECT id, escalation_id, ticket, run_id, source, kind, question, option, recommendation, method, at, "
+        "delivered FROM auto_accepts WHERE ticket = ? ORDER BY id",
         (str(ticket),),
     ).fetchall()
-    keys = ("id", "escalation_id", "ticket", "run_id", "source", "kind", "question", "option", "recommendation", "method", "at")
+    keys = ("id", "escalation_id", "ticket", "run_id", "source", "kind", "question", "option", "recommendation",
+            "method", "at", "delivered")
     return [dict(zip(keys, tuple(row))) for row in rows]
 
 
@@ -510,19 +528,27 @@ def assess(
         return Assessment("refused", option, choice.method, "no Harbor ledger is available to enforce the loop guard")
     prior = history(db, ticket)
     question = str(blocker.get("question") or "")
+    # The loop guard counts only answers that reached (or are reaching) the
+    # builder: a receipt marked undelivered never resumed anything, so "the
+    # builder blocked again" would be false.
     for row in prior:
+        if row.get("delivered") == 0:
+            continue
         if _equivalent(row["question"], question) or _norm(row["option"]) == _norm(option):
             label = f"escalation #{row['escalation_id']}" if row.get("escalation_id") is not None else "an earlier escalation"
             return Assessment(
                 "refused", option, choice.method,
                 f"Harbor already auto-accepted this recommendation for {label} and the builder blocked again "
-                "with an equivalent question, so a human must decide",
+                "with an equivalent question (80% word overlap or the same option), so a human must decide",
             )
-    count = sum(1 for row in prior if str(row.get("run_id") or "") == str(run_id or ""))
+    in_run = [row for row in prior if str(row.get("run_id") or "") == str(run_id or "")]
+    count = len(in_run)
     if count >= policy.max_auto_accepts:
+        undelivered = sum(1 for row in in_run if row.get("delivered") == 0)
+        why = (f"; {undelivered} earlier auto-accept(s) in this run were not delivered" if undelivered else "")
         return Assessment(
             "refused", option, choice.method,
-            f"the limit of {policy.max_auto_accepts} auto-accepts per builder run is reached ({LIMIT_SETTING})",
+            f"the limit of {policy.max_auto_accepts} auto-accepts per builder run is reached ({LIMIT_SETTING}){why}",
             count,
         )
     return Assessment("accept", option, choice.method, count=count)
@@ -588,18 +614,38 @@ def reopen(db: Any, escalation_id: Any) -> None:
     """Return an auto-accepted escalation to a human when nothing was delivered.
 
     The auto-accepted answer and citation are cleared, so the row reads as an
-    unanswered question again.  The ``auto_accepts`` receipt stays: it still
-    counts for the loop guard.
+    unanswered question again.  The ``auto_accepts`` receipt stays, marked
+    undelivered: it still counts toward the per-run cap, but not for the loop
+    guard (the builder never received it, so it cannot have "blocked again").
     """
 
     connection = _connection(db)
     if connection is None or escalation_id is None:
         return
+    initialize(connection)
     with connection:
         connection.execute(
             "UPDATE escalations SET status = 'open', answered_at = NULL, answer = NULL, citation = NULL "
             "WHERE id = ? AND citation LIKE ?",
             (int(escalation_id), f"{AUTO_ACCEPT_CITATION}:%"),
+        )
+        connection.execute(
+            "UPDATE auto_accepts SET delivered = 0 WHERE escalation_id = ? AND delivered IS NULL",
+            (int(escalation_id),),
+        )
+
+
+def mark_delivered(db: Any, escalation_id: Any) -> None:
+    """Mark the in-flight receipt for ``escalation_id`` delivered (the resume reached the builder)."""
+
+    connection = _connection(db)
+    if connection is None or escalation_id is None:
+        return
+    initialize(connection)
+    with connection:
+        connection.execute(
+            "UPDATE auto_accepts SET delivered = 1 WHERE escalation_id = ? AND delivered IS NULL",
+            (int(escalation_id),),
         )
 
 

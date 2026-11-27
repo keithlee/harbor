@@ -4730,6 +4730,9 @@ class Supervisor:
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
                 delivered = True
+                if answered:
+                    from harbor.auto_accept import mark_delivered
+                    mark_delivered(self.db, auto.get("escalation_id"))
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was

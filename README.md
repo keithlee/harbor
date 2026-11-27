@@ -405,12 +405,14 @@ instructions automatically. Escalations include evidence, options,
 recommendation and prior attempts. When the builder recommends its first
 option, Harbor accepts it automatically and resumes the builder (on by default;
 `[decisions] auto_accept_first_option = false` or `mode = "human"` opts out).
-It only does so for a pure decision kind whose `recommended_option_index` is 0
-and whose option is plain prose. It never does so for a blocker touching or
-naming a protected path, a merge-ready run, a conditional recommendation, or an
-equivalent question twice, and the answer does not authorize a merge. Keywords
-suggesting money, deletion, credentials or gate changes also send the question
-to a human, but those are best-effort heuristics: synonyms get through. An
+It only does so for a decision kind whose `recommended_option_index` is 0 and
+whose option is plain-prose ASCII. It does not do so for a blocker that touches
+a protected path, a merge-ready run, or past `max_auto_accepts` per run, and
+the answer does not authorize a merge. Word-matching checks also send a
+question to a human when it mentions a protected name, repeats an earlier
+auto-accepted question (80% word overlap), sounds conditional, or uses
+keywords suggesting money, deletion, credentials or gate changes. They match
+words, not meaning, so synonyms and rewordings get through. An
 auto-answer gives the builder no capability it did not already have; the
 builder sandbox, the merge gate and branch protection are the boundaries.
 Projects where product decisions carry cost or data risk should opt out; see
