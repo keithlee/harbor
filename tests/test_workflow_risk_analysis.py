@@ -35,7 +35,7 @@ def verdict(risk="low", *, verdict="approve", head=HEAD, author=DELIVERY, **extr
 
 
 def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None, auto_merge_risks=("low",),
-              pr_author=DELIVERY, sandbox_change=False):
+              pr_author=DELIVERY, sandbox_change=False, base_oid=None):
     """Run `harbor workflow check --event pre_merge` against mocked Linear/GitHub.
 
     ``comments`` defaults to one current-head low approval from the delivery identity.
@@ -69,7 +69,7 @@ def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None
 
         async def fetch_pull_requests(self, *args, **kwargs):
             return {"pr_1": {
-                "number": 1, "headRefOid": HEAD, "url": PR_URL, "merged": False,
+                "number": 1, "headRefOid": HEAD, "baseRefOid": base_oid, "url": PR_URL, "merged": False,
                 "mergeable": "MERGEABLE", "body": body,
                 "author": {"login": pr_author, "__typename": "User"} if pr_author else None,
                 "comments": {"nodes": comments},
@@ -192,7 +192,7 @@ def test_pr_query_and_facts_carry_the_pr_author():
     from harbor.poll.github_poller import parse_pull_request
 
     query = build_pull_requests_query("example", "repo", [1])
-    assert "headRefOid\n        author {\n          login" in query
+    assert "headRefOid\n        baseRefOid\n        author {\n          login" in query
     node = {"number": 1, "headRefOid": HEAD, "url": PR_URL, "author": {"login": DELIVERY, "__typename": "User"}}
     assert parse_pull_request(node)["author"] == DELIVERY
     assert parse_pull_request({**node, "author": None})["author"] is None

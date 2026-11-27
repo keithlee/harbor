@@ -128,8 +128,9 @@ def test_pr_create_posts_to_the_configured_repository(fake_curl, monkeypatch, tm
 
 
 def test_pr_merge_pins_the_head_sha(fake_curl, monkeypatch) -> None:
-    monkeypatch.setenv("FAKE_BODY", json.dumps({"merged": True}))
-    # deadbeef is not a real commit; this test is about the request, so [builder] is unchanged.
+    # The fake answers every request with this body: the PR read (head deadbeef) and the merge.
+    monkeypatch.setenv("FAKE_BODY", json.dumps({"merged": True, "head": {"sha": "deadbeef"}, "base": {"sha": "cafe"}}))
+    # deadbeef is not a real commit; this test is about the request, so .harbor/ is unchanged.
     monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: False)
     run(["--repo", "o/r", "pr-merge", "4", "--sha", "deadbeef"], env={}, client=client(fake_curl))
     config = fake_curl.calls()[-1]["config"]

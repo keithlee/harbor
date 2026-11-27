@@ -20,8 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import posixpath
-import re
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -185,47 +183,34 @@ def _pr_summary(pr: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-_REST_MERGE = re.compile(r"/repos/[^/]+/[^/]+/pulls/(\d+)/merge")
-_GRAPHQL_MERGE = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b")
+def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, cwd: str | None = None) -> None:
+    """Refuse to merge a PR that changes ``.harbor/``, or whose diff cannot be read (fail closed).
 
-
-def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str | None, cwd: str | None = None) -> None:
-    """Refuse to merge a PR that changes ``[builder]``, or whose diff cannot be read (fail closed).
-
-    The diff is read from the local checkout the helper runs in (the builder's
-    worktree), at the commit being merged against the PR's base on ``origin``.
+    The base and head come from GitHub as full SHAs, never from local refs a
+    builder could forge (``git tag origin/main HEAD``). ``sha`` must be the PR's
+    current head. The trees are read from the local checkout the helper runs in;
+    a missing commit is fetched into ``refs/harbor/check/`` or the merge is refused.
     """
 
     from harbor.device_proof import builder_sandbox_change, builder_sandbox_refusal
     pr = gh.request("GET", f"{pulls}/{number}") or {}
-    head = sha or (pr.get("head") or {}).get("sha")
-    base = (pr.get("base") or {}).get("ref")
-    change = builder_sandbox_change(cwd or os.getcwd(), head, f"origin/{base}" if base else None)
-    reason = builder_sandbox_refusal(change)
+    head = str((pr.get("head") or {}).get("sha") or "")
+    base = str((pr.get("base") or {}).get("sha") or "")
+    if not head or head != sha:
+        raise GitHubRestError(f"refusing to merge PR #{number}: --sha {sha} is not the PR's current head {head or '(unknown)'}")
+    reason = builder_sandbox_refusal(builder_sandbox_change(cwd or os.getcwd(), head, base))
     if reason:
         raise GitHubRestError(f"refusing to merge PR #{number}: {reason}")
 
 
-def _guard_api_merge(gh: Any, method: str, path: str, body: str | None) -> None:
-    """Hold ``api`` merges to the same rule as ``pr-merge``; it is a Harbor merge path too."""
+def _guard_api_call(method: str, path: str, body: str | None, repository: str | None) -> None:
+    """Hold the ``api`` escape hatch to Harbor's write allowlist (harbor.github_api_policy)."""
 
-    clean = posixpath.normpath(urlsplit(path).path or "/")
-    match = _REST_MERGE.fullmatch(clean)
-    if match and method.upper() == "PUT":
-        try:
-            sha = (json.loads(body) if body else {}).get("sha")
-        except (ValueError, AttributeError):
-            sha = None
-        _refuse_builder_sandbox_change(gh, clean.rsplit("/", 2)[0], int(match.group(1)), sha)
-    if method.upper() == "POST" and re.fullmatch(r"/repos/[^/]+/[^/]+/merges", clean):
-        raise GitHubRestError(
-            "refusing a branch merge through the API: merge a PR with `pr-merge N --sha SHA`, "
-            "which checks for a [builder] change first"
-        )
-    if clean == "/graphql" and body and _GRAPHQL_MERGE.search(body):
-        raise GitHubRestError(
-            "refusing a GraphQL merge: merge with `pr-merge N --sha SHA`, which checks for a [builder] change first"
-        )
+    from harbor.github_api_policy import ApiRefused, check_api_call
+    try:
+        check_api_call(method, path, body, repository)
+    except ApiRefused as exc:
+        raise GitHubRestError(f"refusing api call: {exc}") from None
 
 
 def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Client | None = None) -> Any:
@@ -253,7 +238,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
     gh = client or Client(environ)
     if args.op == "api":
         body = _read(args.input)
-        _guard_api_merge(gh, args.method, args.path, body)
+        _guard_api_call(args.method, args.path, body, (args.repo or environ.get("HARBOR_GITHUB_REPOSITORY") or "").strip() or None)
         return gh.request(args.method, args.path, body)
     repo = _repo(args, environ)
     pulls = f"/repos/{repo}/pulls"

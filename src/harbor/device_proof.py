@@ -1,15 +1,22 @@
-"""Which builders get ``[builder] device_proof``, and whether a PR changes it.
+"""Which builders get ``[builder] device_proof``, and whether a PR changes ``.harbor/``.
 
 ``granted_platforms`` is the single decision the runner factory (for the
 provider a wake actually runs on) and ``harbor doctor`` (for every provider a
 builder of the project could run on) both use, so doctor never reports a grant
 the factory does not apply, or misses one it does.
+
+``builder_sandbox_change`` is a best-effort guard for Harbor's own merge
+commands. It cannot stop a builder that holds a GitHub token or can write the
+repository's git directory; GitHub branch protection with required Code Owner
+review on ``/.harbor/`` is the only hard guarantee.
 """
 from __future__ import annotations
 
+import os
+import re
 import sqlite3
 import subprocess
-import tomllib
+import unicodedata
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,13 +32,13 @@ CODEX_DEVICE_PROOF = (
 
 
 BUILDER_SANDBOX_CHANGED = (
-    "human merge required: the PR changes [builder] in .harbor/workflow/workflow.toml, which can widen the "
-    "builder sandbox (device_proof); Harbor's readiness check and merge command refuse it whatever "
+    "human merge required: the PR changes .harbor/, where [builder] device_proof and [quota_fallback] can "
+    "widen the builder sandbox; Harbor's readiness check and pr-merge do not merge it, whatever "
     "auto_merge_risks says"
 )
 BUILDER_SANDBOX_UNKNOWN = (
-    "human merge required: Harbor could not read the PR diff to rule out a [builder] change in "
-    ".harbor/workflow/workflow.toml (device_proof); Harbor's readiness check and merge command refuse it"
+    "human merge required: Harbor could not read the PR diff against GitHub's base and head SHAs to rule out "
+    "a .harbor/ change; Harbor's readiness check and pr-merge do not merge it"
 )
 
 
@@ -96,13 +103,22 @@ def open_ledger_read_only(path: Path) -> sqlite3.Connection | None:
 
 
 REGULAR_BLOB_MODES = {"100644", "100755"}
+FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+CHECK_REF_PREFIX = "refs/harbor/check/"
+
+
+def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    """git with replacement objects and grafts off, so a builder cannot swap the commits Harbor reads."""
+
+    env = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
+    return subprocess.run(["git", "--no-replace-objects", "-C", str(repo), *args],
+                          capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _tree_entry(repo: Path, rev: str, path: str) -> tuple[str, str, str] | None:
     """``(mode, type, object)`` of exactly ``path`` in ``rev``, or None when it is not there or git fails."""
 
-    listed = subprocess.run(["git", "-C", str(repo), "ls-tree", "-z", rev, "--", path],
-                            capture_output=True, text=True, timeout=30)
+    listed = _git(repo, "ls-tree", "-z", rev, "--", path)
     if listed.returncode != 0:
         return None
     for record in listed.stdout.split("\0"):
@@ -134,46 +150,67 @@ def _workflow_blob(repo: Path, rev: str) -> str | None:
     return entry[2]
 
 
-def _builder_table(repo: Path, rev: str) -> dict | None:
-    """``[builder]`` from ``rev``'s workflow.toml (``{}`` when the table is absent); None if it cannot be read safely."""
-
-    blob = _workflow_blob(repo, rev)
-    if blob is None:
-        return None
-    shown = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
-                           capture_output=True, text=True, timeout=30)
-    if shown.returncode != 0:
-        return None
-    try:
-        return dict(tomllib.loads(shown.stdout).get("builder") or {})
-    except (tomllib.TOMLDecodeError, TypeError, ValueError):
-        return None
+def _has_commit(repo: Path, sha: str) -> bool:
+    found = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha}^{{commit}}")
+    return found.returncode == 0 and found.stdout.strip() == sha
 
 
-def builder_sandbox_change(worktree: Any, head_sha: Any, base_ref: Any) -> bool | None:
-    """Whether the PR head changes ``[builder]`` in the workflow against its merge base.
+def _ensure_commit(repo: Path, sha: str, fetch: bool) -> bool:
+    """True when commit ``sha`` is present, fetching it into a private ref if needed."""
 
-    True when the table differs (added, changed or removed), False when it is
-    the same, None when Harbor cannot tell: no worktree, a head or base it
-    cannot resolve, a workflow.toml that is missing, reached through a symlink
-    or submodule, or not a regular file, or one it cannot parse. Callers treat
-    None as True.
+    if _has_commit(repo, sha):
+        return True
+    if not fetch:
+        return False
+    _git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "origin",
+         f"+{sha}:{CHECK_REF_PREFIX}{sha}", timeout=120)
+    return _has_commit(repo, sha)
+
+
+def _is_harbor_path(path: str) -> bool:
+    """Whether ``path`` is under ``.harbor/`` on a case-insensitive, normalising filesystem (macOS)."""
+
+    first = unicodedata.normalize("NFC", path.split("/", 1)[0])
+    return first.casefold() == WORKFLOW_DIR.parts[0].casefold()
+
+
+def builder_sandbox_change(worktree: Any, head_sha: Any, base_sha: Any, *, fetch: bool = True) -> bool | None:
+    """Whether the PR head changes anything under ``.harbor/`` against its merge base with the PR base.
+
+    ``head_sha`` and ``base_sha`` must be full SHAs from GitHub; ref names are
+    refused, so a forged local ``origin/<base>`` tag or remote ref cannot move
+    the merge base. Any change under a ``.harbor`` directory, compared after
+    Unicode NFC normalisation and case folding (``.HARBOR/workflow/WORKFLOW.toml``
+    lands on ``.harbor/workflow/workflow.toml`` on macOS), counts: ``[builder]``
+    and ``[quota_fallback]`` in config.toml can both widen a grant.
+
+    True on such a change, False when there is none, None when Harbor cannot
+    tell: no worktree, a SHA that is not a full SHA or not present (after one
+    fetch into ``refs/harbor/check/``), or a workflow.toml at either end that is
+    missing or not a regular file reached through plain directories. Callers
+    treat None as True.
     """
 
-    if not worktree or not head_sha or not base_ref:
+    if not worktree or not isinstance(head_sha, str) or not isinstance(base_sha, str):
+        return None
+    if not FULL_SHA.fullmatch(head_sha) or not FULL_SHA.fullmatch(base_sha):
         return None
     repo = Path(str(worktree))
     if not repo.is_dir():
         return None
     try:
-        base = subprocess.run(["git", "-C", str(repo), "merge-base", str(base_ref), str(head_sha)],
-                              capture_output=True, text=True, timeout=30)
-        if base.returncode != 0 or not base.stdout.strip():
+        if not _ensure_commit(repo, head_sha, fetch) or not _ensure_commit(repo, base_sha, fetch):
             return None
-        before = _builder_table(repo, base.stdout.strip())
-        after = _builder_table(repo, str(head_sha))
+        merged = _git(repo, "merge-base", "--end-of-options", base_sha, head_sha)
+        merge_base = merged.stdout.strip()
+        if merged.returncode != 0 or not FULL_SHA.fullmatch(merge_base):
+            return None
+        if _workflow_blob(repo, merge_base) is None or _workflow_blob(repo, head_sha) is None:
+            return None
+        changed = _git(repo, "diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
+                       "--end-of-options", merge_base, head_sha)
     except (OSError, subprocess.SubprocessError):
         return None
-    if before is None or after is None:
+    if changed.returncode != 0:
         return None
-    return before != after
+    return any(_is_harbor_path(path) for path in changed.stdout.split("\0") if path)

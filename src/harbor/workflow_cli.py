@@ -147,9 +147,9 @@ async def fresh_context(config, db, ticket_id, run, event):
         risk = merge_risk(db.connection,config.name,ticket_id,run["id"],raw,fact)
         sandbox_change = None
         if event == "pre_merge":
+            # GitHub's own head and base SHAs, never local refs a builder could forge.
             from harbor.device_proof import builder_sandbox_change
-            base = str(getattr(config, "base_branch", "") or "main")
-            sandbox_change = builder_sandbox_change(run.get("worktree"), fact.get("head_sha"), f"origin/{base}")
+            sandbox_change = builder_sandbox_change(run.get("worktree"), fact.get("head_sha"), fact.get("base_sha"))
         return {"project":config.name,"ticket":ticket_id,"run_id":run["id"],"head_sha":fact.get("head_sha"),
                 "event":event,"fresh":True,"terminal":ticket["state_type"] == "completed",
                 "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled"),
