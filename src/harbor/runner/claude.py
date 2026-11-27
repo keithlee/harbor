@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from uuid import UUID
 
@@ -108,6 +109,71 @@ def sandbox_domains(*extra: str) -> list[str]:
     return list(dict.fromkeys((*DEFAULT_SANDBOX_DOMAINS, *(_domain(host) for host in extra))))
 
 
+# Opt-in device and browser proof (``[builder] device_proof``). Each platform
+# adds only the sandbox keys its tools were seen to need on a live builder;
+# nothing here widens the host allowlist, adds writable paths or turns off a
+# protection. Keys are merged, so "android" plus "web" still asks for local
+# binding once.
+DEVICE_PROOF_RULES: dict[str, dict[str, object]] = {
+    # adb starts its server on 127.0.0.1:5037 and the client connects to it.
+    "android": {"allowLocalBinding": True},
+    # simctl talks to CoreSimulatorService (and simdiskimaged) over XPC.
+    "ios": {"allowMachLookup": ["com.apple.CoreSimulator.*"]},
+    # Metro, Expo, Next and http.server bind a local port, and a client such as curl connects to it.
+    "web": {"allowLocalBinding": True},
+}
+DEVICE_PROOF_GRANTS = {
+    "allowLocalBinding": (
+        "network.allowLocalBinding: Bash commands may listen on and connect to local ports "
+        "(adb server, dev servers); the host allowlist is unchanged"
+    ),
+    "allowMachLookup": (
+        "network.allowMachLookup com.apple.CoreSimulator.*: Bash commands may reach the iOS Simulator "
+        "services, which act outside the sandbox on the builder's behalf"
+    ),
+}
+
+
+def device_proof_network(platforms: tuple[str, ...] | list[str]) -> dict[str, object]:
+    """The sandbox ``network`` keys the enabled device-proof platforms add, or ``{}``.
+
+    An unknown platform raises, so a typo never silently grants nothing or
+    something else.
+    """
+
+    network: dict[str, object] = {}
+    for platform in platforms:
+        if platform not in DEVICE_PROOF_RULES:
+            raise ValueError(f"unknown device_proof platform {platform!r}; use any of {', '.join(DEVICE_PROOF_RULES)}")
+        for key, value in DEVICE_PROOF_RULES[platform].items():
+            if isinstance(value, list):
+                existing = list(network.get(key) or [])
+                network[key] = existing + [item for item in value if item not in existing]
+            else:
+                network[key] = value
+    return network
+
+
+def device_proof_report(platforms: tuple[str, ...] | list[str], system: str | None = None) -> list[str]:
+    """Human-readable lines for ``harbor doctor``: what each enabled platform grants, and where it applies."""
+
+    if not platforms:
+        return ["Device proof: off (builder sandbox has no local ports and no simulator access; set [builder] device_proof to opt in)"]
+    network = device_proof_network(platforms)
+    lines = [f"Device proof: {', '.join(platforms)}"]
+    lines.extend(f"  grants {DEVICE_PROOF_GRANTS[key]}" for key in network)
+    system = sys.platform if system is None else system
+    if system != "darwin":
+        lines.append(
+            "  not effective on this host: Claude Code documents network.allowLocalBinding and "
+            "network.allowMachLookup as macOS-only, so on "
+            f"{'Linux' if system.startswith('linux') else system} the builder cannot rely on them"
+            + (", and there is no iOS Simulator" if "ios" in platforms else "")
+            + "; Harbor has verified device proof on macOS only"
+        )
+    return lines
+
+
 # Wildcards would widen a rule past the one path; a line break would end it.
 _RULE_UNSAFE = "*?[]\n\r"
 
@@ -152,6 +218,8 @@ class ClaudeRunner(CodexRunner):
     harbor_invocation: str = ""
     # The project's workflow package, which lives outside the ticket worktree.
     workflow_package: Path | None = None
+    # Opt-in device/browser proof platforms from the project's workflow ([builder] device_proof).
+    device_proof: tuple[str, ...] = ()
 
     def _workflow_permissions(self) -> list[str]:
         try:
@@ -165,6 +233,10 @@ class ClaudeRunner(CodexRunner):
             domains = sandbox_domains(*self.sandbox_hosts)
         except ValueError as exc:
             raise RunnerError(f"refusing a builder sandbox host: {exc}") from exc
+        try:
+            device_network = device_proof_network(self.device_proof)
+        except ValueError as exc:
+            raise RunnerError(f"refusing builder device proof: {exc}") from exc
         settings = {
             "sandbox": {
                 "enabled": True,
@@ -172,7 +244,7 @@ class ClaudeRunner(CodexRunner):
                 "allowUnsandboxedCommands": False,
                 "autoAllowBashIfSandboxed": True,
                 "filesystem": {"allowWrite": list(self.writable_roots)},
-                "network": {"allowedDomains": domains},
+                "network": {"allowedDomains": domains, **device_network},
             },
         }
         allow = self._workflow_permissions()

@@ -346,6 +346,13 @@ def build_production_dispatcher(
                         "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
                     ) from exc
                 runner.workflow_package = current.package
+                # Read per turn, like the rest of the workflow: an edit applies on the next launch.
+                from harbor.config.workflow import device_proof_settings
+                runner.device_proof = device_proof_settings(current.config)
+                if runner.device_proof and sys.platform != "darwin":
+                    warn_once(device_proof_platform_warning(runner.device_proof))
+            elif device_proof_configured(current.config):
+                warn_once(CODEX_DEVICE_PROOF)
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -372,6 +379,25 @@ GITHUB_URL_RESTART = (
     "set github_api_url (or github_graphql_url / github_endpoint) to a host name the Claude sandbox can allow, "
     "then restart Harbor; a running harbor start keeps the value it started with"
 )
+
+
+CODEX_DEVICE_PROOF = (
+    "[builder] device_proof applies to Claude Code builders only and does not change a Codex builder's "
+    "sandbox. Harbor already gives Codex builders network access, which covers local ports (adb, dev "
+    "servers); the Codex sandbox has no setting for simulator services, so a Codex builder cannot use "
+    "xcrun simctl"
+)
+
+
+def device_proof_configured(config: Any) -> bool:
+    from harbor.config.workflow import device_proof_settings
+    return bool(device_proof_settings(config))
+
+
+def device_proof_platform_warning(platforms: tuple[str, ...]) -> str:
+    from harbor.runner.claude import device_proof_report
+    detail = device_proof_report(platforms)[-1].strip()
+    return f"[builder] device_proof = {list(platforms)} is {detail}"
 
 
 def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
@@ -551,6 +577,14 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
+    from harbor.config.workflow import device_proof_settings
+    platforms = device_proof_settings(workflow.config)  # load_workflow already refused a bad value
+    if getattr(config, "builder_provider", "codex") == "claude":
+        from harbor.runner.claude import device_proof_report
+        for line in device_proof_report(platforms):
+            print(line)
+    elif platforms:
+        print(f"Device proof: not applied ({CODEX_DEVICE_PROOF})")
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False

@@ -336,7 +336,8 @@ def sandbox_domains(argv: list[str]) -> list[str]:
     return settings["sandbox"]["network"]["allowedDomains"]
 
 
-def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", *, provider: str = "claude", **config):
+def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", *, provider: str = "claude",
+                      workflow_extra: str = "", **config):
     import subprocess
     from harbor.cli import build_production_dispatcher
     from harbor.config.projects import ProjectConfig
@@ -344,7 +345,8 @@ def claude_production(tmp_path: Path, monkeypatch, pipeline: str = "", *, provid
     from workflow_support import materialize
 
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
-    path = materialize(tmp_path, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
+    path = materialize(tmp_path, extra=workflow_extra,
+                       models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
     if pipeline:
         (tmp_path / ".harbor" / "pipeline.md").write_text(f"# Pipeline\n{pipeline}\n", encoding="utf-8")
     monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
@@ -590,7 +592,8 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
 
 
 def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
-               linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None):
+               linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None,
+               workflow_extra: str = ""):
     import os
     import subprocess
     import sys
@@ -599,7 +602,8 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
-    materialize(repo, models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
+    materialize(repo, extra=workflow_extra,
+                models={"controller": {"model": "claude-sonnet-5-5", "reasoning_effort": "medium"}})
     pipeline = tmp_path / "pipeline.md"
     # HARBOR_WORKTREE_ROOT does not override a loaded config (worktree_root is "" not None),
     # so set worktree_root in the pipeline to keep doctor's disk check out of the real home.
