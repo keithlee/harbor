@@ -290,7 +290,7 @@ def test_at_most_n_auto_accepts_per_run(tmp_path):
     "Run git reset --hard on the release branch",
     "Truncate the audit_records table",
 ])
-def test_secret_credential_money_or_deletion_options_are_never_auto_accepted(harness, first_option):
+def test_secret_credential_money_or_deletion_keywords_keep_the_question_with_a_human(harness, first_option):
     result = harness.block(blocker("Take the first option.", question="How should Harbor proceed?",
                                    options=[first_option, "Skip it"]))
 
@@ -373,8 +373,8 @@ def test_human_decision_mode_disables_auto_accept(tmp_path):
     ("How should Harbor proceed?", "Add the bot to CODEOWNERS"),
     ("How should Harbor proceed?", "Set merge_mode to workflow_checked"),
 ])
-def test_merge_and_gate_lowering_options_are_never_auto_accepted(harness, question, first_option):
-    """Review B4: the merge gate is cooperative, so an answer must never steer past it."""
+def test_merge_and_gate_lowering_keywords_keep_the_question_with_a_human(harness, question, first_option):
+    """Review B4: best-effort keyword heuristic for merge and gate topics (not a guarantee)."""
 
     result = harness.block(blocker("Take the first option.", question=question, options=[first_option, "Wait"]))
     assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
@@ -452,6 +452,58 @@ def test_a_protected_path_that_is_only_mentioned_is_never_auto_accepted(tmp_path
         assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
         escalation = harness.db.escalations()[-1]
         assert auto_accept.eligibility(harness.db, escalation["id"])["protected"] is True
+    finally:
+        harness.db.close()
+
+
+@pytest.mark.parametrize("first_option", [
+    "Empty the orders table",
+    "Add a service fee to every order",
+    "Paste the shared passcode into the readme",
+    "Comment out the flaky assertions so the suite goes green",
+    "Edit the harbor workflow file so the builder runs unattended",
+])
+def test_documented_limitation_keyword_heuristics_are_not_semantic(harness, first_option):
+    """DOCUMENTED LIMITATION, not a guarantee (review round 4, B1).
+
+    The money, deletion, credential and gate exclusions are best-effort keyword
+    heuristics.  A plain-English synonym is not recognised, so these reviewer
+    inputs ARE auto-accepted.  The safeguards are the structural rules and the
+    opt-out (``auto_accept_first_option = false`` / ``decisions.mode = "human"``),
+    not this filter.  If this test starts failing because a word list grew,
+    keep the docs' claim narrow anyway: no word list can decide meaning.
+    """
+
+    result = harness.block(blocker("Option 1", question="How should Harbor proceed?", options=[first_option, "Wait"]))
+    assert result.action == "resume"
+    assert "best-effort keyword heuristics" in harness.linear.comments[-1][1]
+
+
+def test_a_protected_nested_directory_named_as_a_word_is_not_auto_accepted(tmp_path):
+    """Review round 4, B2 (the reviewer's repro): every specific segment counts."""
+
+    harness = Harness(tmp_path, protected_paths=("src/harbor/security/**",))
+    try:
+        result = harness.block(blocker("Option 1", question="How should the login flow change?",
+                                       options=["Rewrite the security module", "Wait"]))
+        assert result.action == "park" and harness.resumed == []
+        assert auto_accept.eligibility(harness.db, harness.db.escalations()[-1]["id"])["protected"] is True
+    finally:
+        harness.db.close()
+
+
+@pytest.mark.parametrize("pattern,option,protected", [
+    ("src/harbor/worktree.py", "Simplify the worktree helper", True),  # file stem
+    ("src/harbor/security/**", "Tidy the Security notes.", True),  # case-folded, sentence end
+    ("src/harbor/security/**", "Refresh the source comments", False),  # generic "src" alone never counts
+    ("infra/**", "Tune the infrastructure defaults", False),  # documented limitation: near-names
+])
+def test_protected_pattern_names_match_whole_words(tmp_path, pattern, option, protected):
+    harness = Harness(tmp_path, protected_paths=(pattern,))
+    try:
+        harness.block(blocker("Option 1", question="Which wording should we use?", options=[option, "Wait"]))
+        facts = auto_accept.eligibility(harness.db, harness.db.escalations()[-1]["id"])
+        assert facts["protected"] is protected
     finally:
         harness.db.close()
 

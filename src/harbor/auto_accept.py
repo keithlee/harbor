@@ -14,27 +14,37 @@ decision is deterministic and fails closed:
    negative or conditional.
 3. Anything else stays with a human.
 
-Eligibility is decided by fail-closed allowlists: only pure decision kinds,
-only plain-prose option text, and only affirmative recommendation words.  The
-deny-lists below are an extra layer.  All of this is defense in depth, not a
-security boundary: the builder's sandbox and server-side branch protection
-are the boundary.
+What this is NOT: a security boundary.  An auto-answer gives the builder no
+capability it did not already have.  The real boundaries are the builder's
+sandbox, the merge gate (with the reviewer and the risk rating) and
+server-side branch protection.  Projects where product decisions carry cost
+or data risk should set ``auto_accept_first_option = false`` or
+``decisions.mode = "human"``.
 
-Guardrails, each enforced here and covered by tests:
+Structural rules (enforced exactly):
 
-* An answer never authorizes a merge.  The merge gate (``merge_mode`` and
+* Only the decision kinds in ``ELIGIBLE_KINDS`` are eligible.
+* ``decisions.mode = "human"`` turns auto-accept off.
+* A blocker that touches or mentions a protected path is never auto-accepted.
+* A run already parked waiting on a human merge is never auto-accepted, and
+  the answer does not authorize a merge: the merge gate (``merge_mode`` and
   ``auto_merge_risks`` in pre_merge readiness) is untouched, and the answer
-  text says so.  A run already parked waiting on a human merge is never
-  auto-accepted.
+  text says so.
+* Option 1 and the recommendation must be plain-prose characters (printable
+  ASCII letters and light punctuation after NFKC), and the recommendation may
+  use only option 1's words plus a fixed affirmative list.
 * Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
   question (or the same option) is left for a human.  At most
   ``max_auto_accepts`` auto-accepts happen per builder run.
-* An option that involves secrets, credentials, money or deleting data is
-  never auto-accepted, and neither is one about merging or lowering a gate,
-  nor a blocker touching a protected path.  ``decisions.mode = "human"``
-  turns auto-accept off.
-* A recommendation with a condition, a hand-off, a negative description or a
-  reference to any other option is ambiguous: when in doubt, refuse.
+
+Best-effort keyword heuristics (NOT semantic, so synonyms get through):
+
+* words suggesting secrets, credentials, money, deleting data, merging or
+  lowering a gate keep the question with a human when they appear.  A
+  plain-English synonym ("Empty the orders table") is not recognised.
+
+Delivery:
+
 * The answer is recorded only when the resume launches and announced only
   once delivered; any other exit reopens the escalation with its answer
   cleared.
@@ -170,7 +180,7 @@ def plain_prose_reason(text: Any, *, recommendation: bool = False) -> str | None
         return "it contains a file name or dotted identifier"
     match = _ACTION_WORD_RE.search(_norm(value))
     if match is not None:
-        return f"it mentions {match.group(0)!r}, which Harbor never decides on its own"
+        return f"it mentions {match.group(0)!r}, a keyword Harbor leaves to a human"
     return None
 
 
@@ -194,7 +204,10 @@ def mentioned_paths(blocker: Mapping[str, Any]) -> list[str]:
             token = token.replace("\\", "/").strip(".:")
             if token:
                 found.append(token)
-        found.extend(word for word in re.findall(r"[\w.\-]+", value) if word)
+        for word in re.findall(r"[\w.\-]+", value):
+            found.append(word)
+            found.append(word.strip(".-"))  # "module." at a sentence end
+        found.extend(re.findall(r"\w+", value))  # whole words, so "security-module" still names "security"
     return found
 # Options asking the human for secrets, credentials or money, or to approve
 # deleting data.  Matched against the question, the first option and the
@@ -273,7 +286,8 @@ def describe(policy: AutoAcceptPolicy) -> str:
         return f"Auto-accept first option: off ({policy.disabled_by or f'{SETTING} = false'})"
     return (
         f"Auto-accept first option: on · at most {policy.max_auto_accepts} per builder run · "
-        f"never secrets, credentials, money, data deletion, merges or gate changes · never authorizes a merge "
+        f"pure decisions in plain prose only · best-effort keyword heuristics for money, deletion, credentials "
+        f"and gates · does not authorize a merge "
         f"(opt out: {SETTING} = false)"
     )
 
@@ -371,14 +385,14 @@ def sensitive_reason(blocker: Mapping[str, Any]) -> str | None:
     match = _SENSITIVE_RE.search(haystack) or _DOTENV_RE.search(raw)
     if match is not None:
         return (
-            f"the option involves secrets, credentials, money or deleting data (matched {match.group(0)!r}); "
-            "Harbor never auto-accepts those"
+            f"the option may involve secrets, credentials, money or deleting data (keyword {match.group(0)!r}); "
+            "Harbor's best-effort heuristics leave that to a human"
         )
     match = _GATE_RE.search(haystack)
     if match is not None:
         return (
-            f"the option is about merging or lowering a gate (matched {match.group(0)!r}); an auto-accepted "
-            "answer never steers the builder past the merge gate"
+            f"the option may be about merging or lowering a gate (keyword {match.group(0)!r}); Harbor's "
+            "best-effort heuristics leave that to a human"
         )
     return None
 
@@ -695,6 +709,8 @@ def comment(
         f"Answer (option 1): {option}\n"
         f"Builder recommendation: {recommendation or '(structured recommended_option_index = 0)'}\n"
         f"Auto-accept {count + 1} of at most {policy.max_auto_accepts} for this builder run. {MERGE_NOTE}\n"
+        "The answer gives the builder no capability it did not already have; its exclusions for money, "
+        "deletion, credentials and gates are best-effort keyword heuristics, not a review of this option.\n"
         "Harbor resumed the same builder session. To redirect it, reply on this ticket; to turn this off, set "
         "`auto_accept_first_option = false` under [decisions] in .harbor/workflow/workflow.toml."
     )

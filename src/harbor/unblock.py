@@ -519,11 +519,35 @@ def _mentions_protected_path(
     if touches_protected_paths({"touched_paths": mentioned}, protected_paths=folded):
         return True
     words = set(mentioned)
-    for pattern in folded:
-        head = pattern.split("/", 1)[0]
-        if "/" in pattern and head and not any(char in head for char in "*?[") and head in words:
-            return True
-    return False
+    return any(name in words for pattern in folded for name in _protected_names(pattern))
+
+
+# Path segments too generic to identify a protected area by name.
+_GENERIC_SEGMENTS = frozenset(
+    {"src", "lib", "libs", "app", "apps", "test", "tests", "spec", "specs", "doc", "docs", "pkg", "packages",
+     "internal", "cmd", "bin", "source", "sources", "main", "core", "common", "utils", "util"}
+)
+
+
+def _protected_names(pattern: str) -> set[str]:
+    """Whole-word names that identify a protected pattern: every non-wildcard
+    segment (except generic ones such as ``src``), plus a file pattern's stem.
+
+    ``src/harbor/security/**`` yields ``harbor`` and ``security``;
+    ``src/harbor/worktree.py`` yields ``harbor``, ``worktree.py`` and
+    ``worktree``.  A near-name such as "infrastructure" for ``infra/**`` is not
+    matched (a documented limitation).
+    """
+
+    names: set[str] = set()
+    for segment in pattern.strip("/").split("/"):
+        if not segment or any(char in segment for char in "*?[") or segment in _GENERIC_SEGMENTS:
+            continue
+        names.add(segment)
+        stem = segment.rsplit(".", 1)[0] if "." in segment.strip(".") else ""
+        if stem and stem not in _GENERIC_SEGMENTS:
+            names.add(stem)
+    return names
 
 
 def is_product_decision(blocker: Mapping[str, Any]) -> bool:

@@ -68,10 +68,11 @@ Report a blocker only for a real product/design question, ambiguous acceptance c
 environment failure you cannot work around. Never block on Harbor bookkeeping, agent names or
 model settings. Include concrete options and a recommendation, and ALWAYS set
 `recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
-option; `null` for none). Harbor reads only that index, never the prose: when it is `0`, Harbor may
-accept the first option automatically and resume you with it as the answer, but only for a
-product or acceptance-criteria decision whose options are plain prose (no commands, paths, numbers
-or identifiers). Keep `recommendation` short and plain, for example "Take option 1 because it
+option; `null` for none). Harbor decides from that index, and the prose can only veto it: when it
+is `0`, Harbor may accept the first option automatically and resume you with it as the answer, but
+only for a product or acceptance-criteria decision whose options are plain prose (no commands,
+paths, numbers or identifiers). Put a costly, destructive or access-related choice anywhere but
+first, since Harbor's keyword checks for those are best-effort. Keep `recommendation` short and plain, for example "Take option 1 because it
 matches the ticket criteria"; conditions, caveats or mentions of other options send the question
 to a human. That answer never authorizes a merge, so
 `delivery.merge_mode` still decides merges.

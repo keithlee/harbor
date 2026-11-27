@@ -181,69 +181,74 @@ max_auto_accepts = 2              # per builder run, 0-10
 `decisions.mode = "human"` (or `firstmate_decisions: human` in `pipeline.md`)
 turns auto-accept off: the project said humans decide.
 
-This filter is **defense in depth, not a security boundary**. The builder's
-sandbox and server-side branch protection are the boundary. Expect few
-auto-accepts: everything below is an allowlist, and anything it cannot vouch
-for goes to a human.
+**What this is, and what it is not.** An auto-answer gives the builder no
+capability it did not already have: it is the builder's own recommendation,
+delivered without waiting. It is not a security boundary. The real boundaries
+are the builder's sandbox, the merge gate (with the reviewer and the risk
+rating) and server-side branch protection. **Projects where product decisions
+carry cost or data risk should set `auto_accept_first_option = false` or
+`decisions.mode = "human"`.** Expect few auto-accepts: anything the rules below
+cannot vouch for goes to a human.
 
-Only pure decision blockers (`product_decision`, `ambiguous_ac`) are eligible.
-An `env_blocker`, `github_transport`, `missing_proof_capability`,
-`conflicting_instruction` or access/permission blocker is never auto-accepted:
-answering an access question cannot grant access.
+#### Structural rules (enforced exactly)
 
-Option 1, and the recommendation, must be **plain prose**: printable ASCII
-letters, spaces and light punctuation after NFKC (this rejects homoglyphs,
-zero-width characters and soft hyphens). No digits or currency, no backticks,
-no shell syntax (`-flag`, `|`, `>`, `;`, `&&`, `$`, `=`), no colon, no
-ALL_CAPS, snake_case or hyphenated identifier, no path, file name or URL, and
-none of the delivery, money, credential or gate words (push, merge, land, ship,
-deploy, release, rebase, reset, clean, force, squash, revert, delete, drop,
-remove, wipe, purge, discard, overwrite, truncate, publish, upgrade, purchase,
-pay, buy, subscribe, plan, billing, production, prod, main, master, branch,
-secret, key, token, password, credential, cookie, session, jwt, env, ci, test,
-check, coverage, risk, review, protect, codeowners, hook, verify). A protected
-path that the question, an option or the recommendation merely mentions
-(case-folded, or the protected directory as a bare word) counts as touched.
+- **Kinds.** Only the decision kinds `product_decision`, `ambiguous_ac`,
+  `design_decision` and `new_product_decision` are eligible. An `env_blocker`,
+  `github_transport`, `missing_proof_capability`, `conflicting_instruction` or
+  access/permission blocker is never auto-accepted: answering an access
+  question cannot grant access.
+- **Human mode.** `decisions.mode = "human"` turns auto-accept off.
+- **Structured index only.** Only `recommended_option_index = 0` counts. There
+  is no free-text fallback, so a builder that leaves the index `null` always
+  gets a human.
+- **Plain-prose characters.** Option 1 and the recommendation must be
+  printable ASCII letters, spaces and light punctuation after NFKC (this
+  rejects homoglyphs, zero-width characters and soft hyphens). They may not
+  contain digits, currency, backticks, shell syntax (`-flag`, `|`, `>`, `;`,
+  `&&`, `$`, `=`), a colon, an ALL_CAPS, snake_case or hyphenated identifier,
+  a path, a file name or a URL.
+- **Recommendation allowlist.** The recommendation must be empty, equal
+  option 1, or use only option 1's own words plus a fixed affirmative list
+  (take, choose, pick, go, with, recommend, use, the, first, option, one,
+  because, it, is, simplest, safest, matches, ticket, criteria, keep, ...).
+  It may not refer to another option, read more like another option than
+  option 1, speak against option 1 or add a condition.
+- **Protected paths.** A blocker that touches a protected path, or whose
+  question, options or recommendation mention one, is never auto-accepted.
+  Mentions are case-folded and on whole words: a path token matching a
+  protected pattern, or any non-wildcard segment of a pattern (except generic
+  ones such as `src`, `lib`, `app`, `tests`, `docs`) or a file pattern's stem
+  as a bare word ("security" for `src/harbor/security/**`). A near-name such
+  as "infrastructure" for `infra/**` is not matched: a documented limitation.
+- **Merge-ready runs.** A run parked waiting on a human merge is never
+  auto-accepted, and the answer does not authorize a merge: `merge_mode` and
+  `auto_merge_risks` in `pre_merge` readiness are unchanged, and the answer
+  text says so.
+- **Loop guard.** Once Harbor auto-accepted an option for a ticket, an
+  equivalent question or the same option is left for a human, and so is
+  anything after `max_auto_accepts` auto-accepts in one run. The Linear
+  comment says why.
+- **First Mate binding.** The ladder records its protected-path and
+  decision-mode facts per escalation, bound to a digest of the exact blocker
+  (`auto_accept_assessments`). First Mate answers only an escalation whose
+  question, kind and digest match the blocker it is looking at.
 
-Harbor decides deterministically and fails closed. Only the structured
-`recommended_option_index = 0` counts: there is no free-text fallback, so a
-builder that leaves the index `null` always gets a human. The recommendation
-text can only veto the index: it must be empty, equal option 1, or use only
-option 1's own words plus a fixed affirmative list (take, choose, pick, go,
-with, recommend, use, the, first, option, one, because, it, is, simplest,
-safest, matches, ticket, criteria, keep, ...). Any other word refuses. On top
-of that, Harbor refuses when the text:
+#### Best-effort keyword heuristics (not semantic)
 
-- refers to another option by number or digit (any digit but a lone "1",
-  including full-width forms and "2nd"), number word, letter ("option B",
-  "(b)", "plan B"), roman numeral, ordinal, or "other", "instead", "vs";
-- reads at least as much like another option as like option 1 (word overlap);
-- speaks against option 1 ("not", "unsafe", "suboptimal") or adds a condition,
-  exception or hand-off ("if", "but", "only", "after", "except", "actually",
-  "confirm", "approve", "ask", "a human").
+On top of the structural rules, Harbor leaves a question to a human when
+option 1, the question or the recommendation contains keywords suggesting
+secrets or credentials, money, deleting data, merging, or lowering a gate
+(push, merge, land, ship, deploy, release, reset, force, delete, drop, wipe,
+purge, truncate, pay, buy, billing, production, branch, secret, key, token,
+password, credential, env, ci, test, check, coverage, risk, review, protect,
+codeowners and more; names are split on `_ - . /`, so `STRIPE_SECRET_KEY`
+counts). These are **heuristics, not a guarantee**. They match words, not
+meaning, so a plain-English synonym ("Empty the orders table", "Add a service
+fee to every order") is not recognised and can be auto-accepted. That is why
+the opt-out above exists.
 
-Guardrails:
+#### Delivery and records
 
-- The answer never authorizes a merge. `merge_mode` and `auto_merge_risks` in
-  `pre_merge` readiness are unchanged, the answer text says so, and a run
-  parked waiting on a human merge is never auto-accepted. Because the merge
-  gate is cooperative, Harbor also never auto-accepts when the question or
-  option 1 is about merging, force-pushing or pushing to the base branch,
-  branch protection, skipping, disabling or xfailing CI, checks, tests or
-  review, removing tests, lowering coverage, the risk tier, waiving proof, or
-  editing protected paths, CODEOWNERS or the gate configuration.
-- Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
-  question or the same option is left for a human, and so is anything after
-  `max_auto_accepts` auto-accepts in one run. The Linear comment says why.
-- An option involving secrets, credentials, tokens, logins, money, billing or
-  deleting data is never auto-accepted, and neither is a blocker that touches a
-  protected path. Names are split on `_ - . /` first, so `STRIPE_SECRET_KEY` or
-  `GITHUB_TOKEN` count, as do `.env`, PATs, certificates and "drop/truncate/
-  wipe/reset ... table, database, users, records, branch or files". The ladder
-  records its protected-path and decision-mode facts per escalation, bound to
-  a digest of the exact blocker (`auto_accept_assessments`). First Mate answers
-  only an escalation whose question, kind and digest match the blocker it is
-  looking at.
 - The answer is recorded when the resume launches and announced on Linear only
   after it is delivered. Any exit that delivers nothing (held, superseded,
   failed or cancelled) reopens the escalation and clears the answer. An
