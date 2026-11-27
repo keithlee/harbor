@@ -119,7 +119,7 @@ _RULE_UNSAFE = "*?[]\n\r"
 
 
 def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
-    """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
+    """Pre-approvals for the delivery workflow, so these never depend on the ``auto`` classifier.
 
     Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
     or assigns a variable in front of an absolute executable path (directly or

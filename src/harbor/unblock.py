@@ -1519,13 +1519,15 @@ class UnblockLadder:
         cwd = (root / requested).resolve() if requested else root
         commands = delegation.blocker_commands(blocker_value)
         secrets_of = getattr(self.operator, "secrets", None)
-        secrets = tuple(secrets_of(root)) if callable(secrets_of) else ()
-
-        def protected(paths: Sequence[str]) -> bool:
-            return touches_protected_paths({"paths": list(paths)}, protected_paths=self.protected_paths,
-                                           repo_path=authority_repo)
-
-        refusal = delegation.scope_refusal(commands, cwd, root, protected=protected, secrets=secrets)
+        secrets = tuple(secrets_of(root, ticket_id)) if callable(secrets_of) else ()
+        temp_of = getattr(self.operator, "temp_dir", None)
+        temp_dir = temp_of(ticket_id) if callable(temp_of) else None
+        protected = _normalise_paths(self.protected_paths)
+        if authority_repo is not None:
+            protected += _protected_from_agents(Path(authority_repo))
+        from harbor.operator_guard import command_refusal
+        refusal = command_refusal(commands, cwd, root, protected=protected, temp_dir=temp_dir, secrets=secrets,
+                                  base_branch=self.base_branch)
         if refusal is None and not cwd.is_dir():
             refusal = f"the requested working directory {cwd} does not exist"
         if refusal is not None:
@@ -1535,7 +1537,15 @@ class UnblockLadder:
             return None, "First Mate did not run the permission-blocked commands: no ledger to record a receipt"
         cap = self.delegation_cap if self.delegation_cap is not None else delegation.MAX_DELEGATIONS_PER_TICKET
         claimed = delegation.claim(connection, ticket_id, run_id, delegation.request_digest(commands, cwd), cwd,
-                                   commands, cap=cap)
+                                   commands, cap=cap, final=delegation.final_digest(final))
+        if claimed.replay_of is not None:
+            # This exact blocked result was already delegated and the builder
+            # resumed with the output: a replay changes nothing.
+            return UnblockResult(
+                ticket_id, run_id, kind, question, 1, "resume", False,
+                citation=f"first_mate:operator:{claimed.replay_of}",
+                reason=f"already delegated and resumed (permission delegation receipt #{claimed.replay_of})",
+            ), None
         if claimed.receipt_id is None:
             return None, f"First Mate did not run the permission-blocked commands: {claimed.refusal}"
         explanation = " ".join(_text(blocker_value.get(key)) for key in ("question", "evidence")).strip()
@@ -1569,6 +1579,8 @@ class UnblockLadder:
             next_action=("Use these results instead of running the commands again yourself, then continue from "
                          + (str(final.get("next_action") or "").strip() or "where you stopped") + "."),
         )
+        if resumed:
+            delegation.mark_resumed(connection, claimed.receipt_id)
         return UnblockResult(
             ticket_id, run_id, kind, question, 1, "resume" if resumed or command else "escalate", resumed,
             answer=results, citation=citation, resume_command=command, linear_writes=tuple(writes),

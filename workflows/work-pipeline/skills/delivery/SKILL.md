@@ -72,8 +72,9 @@ and may resume you with an instruction or start a fresh session.
 When your permissions or sandbox deny a command or tool, never ask a person to widen them. Finish
 everything else first, then report `kind = "permission_blocker"` with `commands` (the exact shell
 commands, in order), `cwd` (relative to the worktree, or null) and the literal denial as `evidence`.
-Keep the commands inside the worktree or the system temp directory, and never put a credential in
-them. When the project sets `decisions.delegate_permissions = true`, First Mate runs them outside
+Give plain commands: every path inside the worktree, no `bash -c`/`python -c` inline code, no `$`
+variables, globs or `~`, and never a credential. Merges, reviews and pushes to the base branch are
+never delegated. When the project sets `decisions.delegate_permissions = true`, First Mate runs them outside
 your sandbox and resumes this session with their exit codes and output. Other blocker kinds set
 `commands` and `cwd` to null.
 

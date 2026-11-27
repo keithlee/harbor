@@ -271,23 +271,49 @@ def test_cwd_outside_the_worktree_never_runs(db, worktree):
     assert fake.calls == [] and "outside the ticket worktree" in result.reason
 
 
-def test_temp_directory_writes_are_allowed(db, worktree, tmp_path):
+def test_only_the_operators_own_temp_directory_is_allowed_outside_the_worktree(db, worktree, tmp_path):
     import tempfile
-    target = Path(tempfile.gettempdir()) / "harbor-permission-delegation-test.txt"
-    fake, resumed = FakeClaude(), []
-    result = handle(ladder(db, operator=operator(fake), resumed=resumed), worktree,
-                    blocker(f"printf ok > {target} && cat {target} && rm {target}"))
-    assert result.rung == 1 and len(fake.calls) == 1 and "stdout:\nok" in resumed[0][1]
+    op = operator(FakeClaude(), temp_root=tmp_path / "optmp")
+    target = op.temp_dir("SAMPLE-7") / "out.txt"
+    resumed = []
+    result = handle(ladder(db, operator=op, resumed=resumed), worktree,
+                    blocker(f"printf ok > {target} && cat {target}"))
+    assert result.rung == 1 and len(op.process_runner.calls) == 1 and "stdout:\nok" in resumed[0][1]
+    assert op.process_runner.calls[0]["env"]["TMPDIR"] == str(op.temp_dir("SAMPLE-7"))
+    # The shared system temp directory is no longer a blanket exception.
+    shared = Path(tempfile.gettempdir()).resolve() / "harbor-permission-delegation-test.txt"
+    fake = FakeClaude()
+    refused = handle(ladder(db, operator=operator(fake, temp_root=tmp_path / "optmp"), notified=[]), worktree,
+                     blocker(f"printf ok > {shared}"))
+    assert fake.calls == [] and "outside the ticket worktree" in refused.reason
 
 
 def test_the_same_commands_never_run_twice(db, worktree):
     fake, resumed, notified = FakeClaude(), [], []
     lad = ladder(db, operator=operator(fake), resumed=resumed, notified=notified)
     first = handle(lad, worktree, blocker("printf one >> count.txt"))
-    again = handle(lad, worktree, blocker("printf one >> count.txt"))
-    assert first.rung == 1 and len(fake.calls) == 1
-    assert (worktree / "count.txt").read_text() == "one"
+    # The same blocked result delivered again (a replay) is a no-op, not a page.
+    replay = handle(lad, worktree, blocker("printf one >> count.txt"))
+    assert first.rung == 1 and len(fake.calls) == 1 and len(resumed) == 1
+    assert replay.rung == 1 and not replay.resumed and "already delegated and resumed" in replay.reason
+    assert notified == []
+    # The builder blocking again on the same commands after they ran goes to a person.
+    again = handle(lad, worktree, blocker("printf one >> count.txt", question="Still blocked after the run."))
+    assert len(fake.calls) == 1 and (worktree / "count.txt").read_text() == "one"
     assert again.rung == 2 and "already handled these exact commands" in again.reason and notified
+
+
+def test_a_replay_is_not_a_no_op_when_the_resume_failed(db, worktree):
+    fake, notified = FakeClaude(), []
+
+    async def unavailable(run_id, prompt):
+        return False
+
+    lad = UnblockLadder(db, resumer=unavailable, notifier=lambda message: notified.append(message),
+                        operator=operator(fake))
+    handle(lad, worktree, blocker("printf one"))
+    replay = handle(lad, worktree, blocker("printf one"))
+    assert len(fake.calls) == 1 and replay.rung == 2 and notified
 
 
 def test_per_ticket_cap_falls_through_to_a_person(db, worktree):
@@ -311,14 +337,39 @@ def test_no_token_value_in_prompt_receipt_resume_or_comment(db, worktree, monkey
                     blocker("printf done", evidence=f"gh failed with {TOKEN}"))
     assert result.rung == 1
     call = fake.calls[0]
-    # The token reaches the operator only through its environment.
-    assert call["env"]["GITHUB_TOKEN"] == TOKEN and TOKEN not in call["prompt"]
-    assert TOKEN not in " ".join(call["argv"])
+    # The configured token reaches the operator only through its environment, and
+    # Harbor's other variables (GITHUB_TOKEN here) are not passed at all.
+    assert call["env"]["GH_TOKEN"] == TOKEN + "x" and call["env"]["SAMPLE_GH_TOKEN"] == TOKEN + "x"
+    assert "GITHUB_TOKEN" not in call["env"]
+    assert TOKEN not in call["prompt"] and TOKEN not in " ".join(call["argv"])
     rows = [json.dumps(dict(row)) for row in db.connection.execute("SELECT * FROM permission_delegations")]
     rows += [json.dumps(dict(row)) for row in db.escalations()]
     for text in (*rows, resumed[0][1], *(body for _, body in linear.comments)):
         assert TOKEN not in text
     assert "[redacted]" in resumed[0][1]
+
+
+def test_operator_gets_a_minimal_environment_and_printenv_leaks_nothing(db, worktree, monkeypatch):
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret-value-123456")
+    monkeypatch.setenv("DATABASE_URL", "postgres://admin:hunter2@db.internal/app")
+    monkeypatch.setenv("HARBOR_LINEAR_API_KEY", "lin_api_examplevalue123")
+    monkeypatch.setenv("SAMPLE_UNRELATED", "visible-if-leaked")
+    monkeypatch.setenv("HARBOR_DB_PATH", "/var/harbor/ledger.db")
+    fake, resumed = FakeClaude(), []
+    op = operator(fake, env=github_operator_env({"HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_GH_TOKEN"},
+                                                {"SAMPLE_GH_TOKEN": TOKEN}), secret_names=("SAMPLE_GH_TOKEN",))
+    result = handle(ladder(db, operator=op, resumed=resumed), worktree, blocker("printenv"))
+    assert result.rung == 1
+    env = fake.calls[0]["env"]
+    for name in ("AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "HARBOR_LINEAR_API_KEY", "SAMPLE_UNRELATED"):
+        assert name not in env
+    assert env["PATH"] and env["HARBOR_DB_PATH"] == "/var/harbor/ledger.db"
+    # As for builders, git cannot walk up out of the worktree.
+    assert env["GIT_CEILING_DIRECTORIES"] == str(worktree.resolve().parent)
+    text = resumed[0][1] + json.dumps([dict(r) for r in db.connection.execute("SELECT * FROM permission_delegations")])
+    assert "GH_TOKEN=[redacted]" in text and TOKEN not in text
+    for value in ("aws-secret-value-123456", "hunter2", "lin_api_examplevalue123", "visible-if-leaked"):
+        assert value not in text
 
 
 def test_a_command_containing_a_credential_never_runs(db, worktree, monkeypatch):
@@ -338,9 +389,9 @@ def test_github_operator_env_copies_the_configured_token_for_gh():
                                       "HARBOR_GITHUB_API_URL": "https://ghe.example.com/api/v3"},
                                      {"SAMPLE_TOKEN": "value-1234567"})
     assert enterprise["GH_ENTERPRISE_TOKEN"] == "value-1234567" and "GH_TOKEN" not in enterprise
-    # gh's own variable wins when already set.
-    assert "GH_TOKEN" not in github_operator_env({"HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_TOKEN"},
-                                                 {"SAMPLE_TOKEN": "a-12345678", "GH_TOKEN": "b-12345678"})
+    # gh's own variable from the start environment wins, and is passed through.
+    assert github_operator_env({"HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_TOKEN"},
+                               {"SAMPLE_TOKEN": "a-12345678", "GH_TOKEN": "b-12345678"})["GH_TOKEN"] == "b-12345678"
 
 
 # --- configuration -------------------------------------------------------------------------

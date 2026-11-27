@@ -594,12 +594,16 @@ First Mate's *operator* run:
   **without the builder's sandbox**. The auto-mode classifier is the safety
   gate for every command.
 - The working directory is the ticket worktree (or `cwd` inside it). The
-  environment is the one `harbor start` was launched with, plus the builder's
-  GitHub settings. When gh would not otherwise find a token, it gets the
-  configured token variable's value as `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` for
-  GitHub Enterprise Server). A token travels only in the environment. Harbor
-  redacts credential values from the prompt, the receipt, the builder's resume
-  text and the Linear comment, and refuses a command that contains one.
+  environment is minimal, not Harbor's whole one: `PATH`, `HOME`, the user,
+  shell and locale variables, `ANDROID_HOME`/`ANDROID_SDK_ROOT`/`JAVA_HOME`/
+  `DEVELOPER_DIR`, Claude Code's own sign-in variables if you use them, the
+  `HARBOR_*` variables `harbor start` was launched with (except
+  `HARBOR_LINEAR_API_KEY`), and the GitHub token: the configured variable plus
+  `GH_TOKEN` (`GH_ENTERPRISE_TOKEN` for GitHub Enterprise Server) for gh.
+  `GIT_CEILING_DIRECTORIES` keeps git inside the worktree, and `TMPDIR` is a
+  private per-ticket directory. Harbor redacts every token value it passes, and
+  any credential-looking value of its own environment, from the prompt, the
+  receipt, the builder's resume text and the Linear comment.
 - It uses First Mate's model when First Mate runs on Claude, otherwise the
   controller's model when builders run on Claude. Codex has no equivalent of
   `auto` mode between a read-only sandbox and full access, so with neither
@@ -609,17 +613,50 @@ First Mate's *operator* run:
   posts a short Linear comment and resumes the same builder session with the
   results.
 
-Harbor does not run the commands, and asks a person instead, when any of
-these is true:
+Before anything runs, Harbor checks the commands deny-by-default
+(`src/harbor/operator_guard.py`). It runs them only when every check passes,
+and otherwise asks a person:
 
-- a command reaches outside the worktree, other than the system temp
-  directory and never another ticket's worktree;
-- a command touches a protected path;
-- a command uses command substitution (Harbor cannot check it before it runs);
-- a command contains a credential;
-- the same commands already ran for the ticket;
+- Plain argv-style commands only, joined by `;`, `&&`, `||` or `|`, with `>`,
+  `>>`, `<` and `2>&1` redirects. No `$` variables or command substitution, no
+  unquoted globs, braces or `~`, no subshells, background jobs, here-documents
+  or line breaks, and no `VAR=value` prefix.
+- No shells (`sh`, `bash`, `zsh` ...), no interpreter inline code
+  (`python -c`, `node -e`, `perl -e` ..., or an interpreter with no script),
+  and no program that runs other commands (`env`, `xargs`, `sudo`, `eval`,
+  `awk`, `ssh`, `find -exec`/`-delete`, `git -c`, ...). `ln` is refused too:
+  a link target is resolved from the link's directory, so Harbor cannot check
+  it.
+- Every word that could be a path, including the program, redirect targets,
+  `--flag=PATH`, `-oPATH`, `@FILE` and `.`, is resolved with symlinks followed.
+  It must stay inside the ticket worktree or the operator's per-ticket temp
+  directory. Only `http(s)` URLs pass as non-paths. Device-side `adb` paths
+  and `gh api` endpoints are not host paths.
+- No resolved path may overlap a protected path: a match, a file inside a
+  protected directory, or a directory that contains one (so `rm -rf schemas`,
+  `rm -rf .` and `git add .` are refused when `schemas/**` is protected).
+  `git clean`, `git reset --hard`, `git checkout .`, `git restore .`,
+  `git stash` and `git config` are always refused.
+- No merge authority. `gh` is limited to an allowlist (`pr create/list/view/
+  checks/diff/status/comment/edit/checkout`, issue and run reads, `repo view`,
+  `auth status`, release and search reads); `gh pr merge`, `gh pr review` and
+  everything else are refused. `gh api` is GET-only, `--admin` is refused
+  anywhere, and `git push` may not force, delete, mirror, skip hooks or target
+  the base branch.
+- No credential value inside a command.
+- At most 10 commands, each at most 2,000 characters.
+
+Harbor also asks a person when:
+
+- the same commands already ran for the ticket and the builder is blocked
+  again (redelivering the very same blocked result after a successful resume
+  is a no-op);
 - the ticket has already used its 3 operator runs;
 - First Mate refuses, the classifier denies a command, or the run fails.
+
+Commands that run code from the worktree (`./gradlew test`, `npm test`, a
+script) are allowed: that code is the ticket's own, and the auto-mode
+classifier remains the gate for what it does.
 
 **What a new user needs:** Claude Code on `PATH` (or `HARBOR_CLAUDE_EXECUTABLE`),
 First Mate or the builder on Claude, and `delegate_permissions = true`. Restart

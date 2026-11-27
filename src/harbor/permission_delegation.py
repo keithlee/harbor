@@ -10,17 +10,17 @@ commands to a First Mate *operator* run here instead of paging a person:
 
 * Claude Code in ``--permission-mode auto``, so its classifier is the safety
   gate for every command, with only the ``Bash`` tool and no sandbox;
-* cwd is the ticket worktree, and the environment is Harbor's own start-time
-  environment plus the builder's GitHub settings (variable names only, never a
-  token value in a prompt, receipt, log or comment);
+* cwd is the ticket worktree, and the environment is a minimal one (see
+  ``ENV_PASSTHROUGH``) plus the GitHub token variables gh and Harbor's REST
+  helper need; every token value passed is redacted from prompts, receipts,
+  resume text and comments;
 * captured exit codes and truncated output go into a ledger receipt and back
   to the retained builder session.
 
-Harbor refuses before anything runs when a command reaches outside the
-worktree (other than the system temp directory), touches a protected path,
-contains a credential value, or repeats commands that already ran for the
-ticket, and when the per-ticket cap is reached. Each of those falls through to
-the ordinary human escalation.
+Before anything runs, ``harbor.operator_guard`` checks the commands deny-by-
+default (plain argv-style commands inside the worktree, no shells or inline
+code, no protected paths, no merge authority). Repeats, the per-ticket cap and
+any refusal fall through to the ordinary human escalation.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import inspect
 import json
 import os
 import re
-import shlex
 import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,10 +38,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from harbor.operator_guard import MAX_COMMAND_CHARS
+
 # A ticket that keeps needing operator runs has a problem a person should see.
 MAX_DELEGATIONS_PER_TICKET = 3
-MAX_COMMANDS = 10
-MAX_COMMAND_CHARS = 2_000
 # Per stream, per command, in receipts and in the text handed back to the builder.
 MAX_OUTPUT_CHARS = 4_000
 OPERATOR_TIMEOUT_SECONDS = 15 * 60
@@ -63,11 +62,26 @@ DENIAL_MARKERS = (
     "don't-ask",
     "don't ask",
 )
-_SECRET_NAME = re.compile(r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY)$")
+_SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|"
+                          r"SESSION_KEY|_DSN$|DATABASE_URL")
+_URL_USERINFO = re.compile(r"[a-z][a-z0-9+.-]*://[^/\s@]+@", re.IGNORECASE)
 _ALWAYS_SECRET = ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")
-_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "|&", ";;", "\n"}
-_REDIRECTS = {">", ">>", "<", "<<", ">&", "<&", "&>", "&>>", ">|", "<>"}
-_DEVICES = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"}
+# The operator's environment is built from these names only (plus LC_*), never
+# from Harbor's whole environment.
+ENV_PASSTHROUGH = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LANGUAGE", "TZ",
+    # Where the platform tools a builder cannot reach from its sandbox live.
+    "ANDROID_HOME", "ANDROID_SDK_ROOT", "JAVA_HOME", "DEVELOPER_DIR",
+)
+# Claude Code's own sign-in and endpoint, when the operator supplies them by
+# environment rather than its keychain login. Their values are redacted.
+CLAUDE_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+)
+_NOT_SECRET = {"ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"}
+# Harbor variables the operator must never see.
+_HARBOR_PRIVATE = ("HARBOR_LINEAR_API_KEY",)
 
 RESULT_SCHEMA = {
     "type": "object",
@@ -131,10 +145,11 @@ def is_delegable(blocker: Mapping[str, Any]) -> bool:
 def secret_values(env: Mapping[str, str], names: Iterable[str] = ()) -> tuple[str, ...]:
     """Credential values present in ``env``: the well-known token variables, the configured ones, and *_TOKEN etc."""
 
-    wanted = {*_ALWAYS_SECRET, *(name for name in names if name)}
+    wanted = {*_ALWAYS_SECRET, *CLAUDE_ENV, *(name for name in names if name)} - _NOT_SECRET
     values = {
         value.strip() for name, value in env.items()
-        if (name in wanted or _SECRET_NAME.search(name.upper())) and len(value.strip()) >= 8
+        if (name in wanted or _SECRET_NAME.search(name.upper()) or _URL_USERINFO.search(value))
+        and len(value.strip()) >= 8
     }
     # Longest first, so a value that contains another is replaced whole.
     return tuple(sorted(values, key=len, reverse=True))
@@ -153,108 +168,6 @@ def truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return text[:limit] + f"\n[... {len(text) - limit} more characters truncated by Harbor]"
 
 
-def _temp_roots() -> tuple[Path, ...]:
-    roots = {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve(), Path("/var/tmp").resolve()}
-    return tuple(roots)
-
-
-def _inside(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _path_tokens(command: str) -> list[str]:
-    """Every word of a shell command that is not the program it runs."""
-
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    tokens = list(lexer)
-    words: list[str] = []
-    expect_program = True
-    for token in tokens:
-        if token in _SEPARATORS or (token and set(token) <= set(";&|()")):
-            expect_program = True
-            continue
-        if token in _REDIRECTS or (token and set(token) <= set("<>&|")):
-            continue  # the next word is a redirect target: check it as a path
-        if expect_program:
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
-                value = token.split("=", 1)[1]
-                if value:
-                    words.append(value)
-                continue  # an assignment in front of the program
-            expect_program = False
-            continue
-        words.append(token)
-        if "=" in token:
-            words.append(token.split("=", 1)[1])
-    return words
-
-
-def scope_refusal(
-    commands: Sequence[str],
-    cwd: Path,
-    worktree: Path,
-    *,
-    protected: Callable[[Sequence[str]], bool],
-    secrets: Sequence[str] = (),
-) -> str | None:
-    """Why Harbor will not hand these commands to First Mate, or None.
-
-    ``protected`` receives the worktree-relative paths the commands name and
-    reports whether any is protected (the ladder passes its
-    ``touches_protected_paths`` check).
-    """
-
-    if not commands:
-        return "the blocker names no commands"
-    if len(commands) > MAX_COMMANDS:
-        return f"the blocker names {len(commands)} commands; Harbor delegates at most {MAX_COMMANDS}"
-    if not _inside(cwd, worktree):
-        return f"the requested working directory {cwd} is outside the ticket worktree"
-    relative: list[str] = []
-    # Sibling worktrees (other tickets) are never "temp", even when the
-    # worktree root itself happens to live under the temp directory.
-    siblings = worktree.parent
-    temp = _temp_roots()
-    for command in commands:
-        if len(command) > MAX_COMMAND_CHARS:
-            return "a command is longer than Harbor delegates"
-        if any(value and value in command for value in secrets):
-            return "a command contains a credential value"
-        if "`" in command or "$(" in command or "<(" in command or ">(" in command:
-            return f"command substitution cannot be checked before it runs: {command}"
-        try:
-            words = _path_tokens(command)
-        except ValueError as exc:
-            return f"cannot parse command {command!r}: {exc}"
-        for word in words:
-            expanded = os.path.expandvars(os.path.expanduser(word))
-            if "$" in expanded:
-                return f"an unset shell variable cannot be checked before it runs: {word}"
-            if expanded in _DEVICES:
-                continue
-            looks_like_path = expanded.startswith(("/", "~")) or ".." in Path(expanded).parts
-            if not looks_like_path:
-                if not expanded.startswith("-"):
-                    resolved = (cwd / expanded).resolve()
-                    if _inside(resolved, worktree):
-                        relative.append(str(resolved.relative_to(worktree)))
-                continue
-            resolved = (cwd / expanded).resolve()
-            if _inside(resolved, worktree):
-                relative.append(str(resolved.relative_to(worktree)))
-            elif _inside(resolved, siblings) or not any(_inside(resolved, root) for root in temp):
-                return f"a command reaches outside the ticket worktree: {word}"
-    if relative and protected(relative):
-        return "a command touches a protected path"
-    return None
-
-
 def request_digest(commands: Sequence[str], cwd: Path) -> str:
     payload = json.dumps({"cwd": str(cwd), "commands": list(commands)}, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -268,16 +181,28 @@ def receipts_schema(connection: Any) -> None:
         ticket TEXT NOT NULL,
         run_id TEXT,
         digest TEXT NOT NULL,
+        final_digest TEXT,
         cwd TEXT NOT NULL,
         commands_json TEXT NOT NULL,
         status TEXT NOT NULL,
         reason TEXT,
         results_json TEXT,
         model TEXT,
+        resumed INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         finished_at TEXT,
         UNIQUE(ticket, digest))""")
     connection.commit()
+
+
+def final_digest(final: Mapping[str, Any]) -> str:
+    """Identifies one blocked result, so a replay of it is told apart from the builder blocking again."""
+
+    try:
+        payload = json.dumps(final, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(final)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:
@@ -288,18 +213,23 @@ def _now() -> str:
 class Claim:
     receipt_id: int | None
     refusal: str | None = None
+    # Set when this exact blocked result was already delegated and the builder resumed.
+    replay_of: int | None = None
 
 
 def claim(connection: Any, ticket: str, run_id: str, digest: str, cwd: Path, commands: Sequence[str],
-          *, cap: int = MAX_DELEGATIONS_PER_TICKET) -> Claim:
+          *, cap: int = MAX_DELEGATIONS_PER_TICKET, final: str = "") -> Claim:
     """Reserve one delegation, or say why not (duplicate content or per-ticket cap)."""
 
     receipts_schema(connection)
     with connection:
         existing = connection.execute(
-            "SELECT id, status FROM permission_delegations WHERE ticket=? AND digest=?", (ticket, digest),
+            "SELECT id, status, final_digest, resumed FROM permission_delegations WHERE ticket=? AND digest=?",
+            (ticket, digest),
         ).fetchone()
         if existing is not None:
+            if final and existing[2] == final and existing[1] == "ran" and existing[3]:
+                return Claim(None, replay_of=int(existing[0]))
             return Claim(None, f"First Mate already handled these exact commands for {ticket} "
                                f"(receipt #{existing[0]}, {existing[1]}); Harbor does not run them twice")
         count = connection.execute(
@@ -308,9 +238,9 @@ def claim(connection: Any, ticket: str, run_id: str, digest: str, cwd: Path, com
         if count >= cap:
             return Claim(None, f"the per-ticket cap of {cap} First Mate operator runs is reached")
         cursor = connection.execute(
-            "INSERT OR IGNORE INTO permission_delegations(ticket, run_id, digest, cwd, commands_json, status, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (ticket, run_id or None, digest, str(cwd), json.dumps(list(commands)), "running", _now()),
+            "INSERT OR IGNORE INTO permission_delegations(ticket, run_id, digest, final_digest, cwd, commands_json,"
+            " status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ticket, run_id or None, digest, final or None, str(cwd), json.dumps(list(commands)), "running", _now()),
         )
         if cursor.rowcount != 1:
             return Claim(None, "another Harbor process claimed these commands first")
@@ -324,6 +254,11 @@ def finish(connection: Any, receipt_id: int, outcome: "OperatorOutcome") -> None
             (outcome.status, outcome.reason, json.dumps([dict(item) for item in outcome.results]),
              outcome.model, _now(), receipt_id),
         )
+
+
+def mark_resumed(connection: Any, receipt_id: int) -> None:
+    with connection:
+        connection.execute("UPDATE permission_delegations SET resumed=1 WHERE id=?", (receipt_id,))
 
 
 @dataclass(frozen=True)
@@ -368,11 +303,13 @@ class ClaudeOperator:
     executable: str
     model: str
     effort: str | None = None
-    # Added to Harbor's own environment: GitHub settings names, plus GH_TOKEN
-    # copied from the configured variable when gh would not otherwise find it.
+    # The GitHub settings and token variables the operator gets on top of
+    # ENV_PASSTHROUGH (see github_operator_env).
     env: Mapping[str, str] = field(default_factory=dict)
     # Variable names whose values must never appear in prompts or receipts.
     secret_names: tuple[str, ...] = ()
+    # Where per-ticket temp directories are created (default: the system temp directory).
+    temp_root: Path | None = None
     timeout_seconds: float = OPERATOR_TIMEOUT_SECONDS
     process_runner: ProcessRunner | None = None
 
@@ -393,20 +330,47 @@ class ClaudeOperator:
             command.extend(("--effort", str(self.effort)))
         return command
 
-    def environment(self, worktree: Path) -> dict[str, str]:
-        env = os.environ.copy()
+    def temp_dir(self, ticket: str) -> Path:
+        """The operator's private temp directory for one ticket (TMPDIR, and the only path allowed outside the worktree)."""
+
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", ticket) or "ticket"
+        root = Path(self.temp_root) if self.temp_root is not None else Path(tempfile.gettempdir())
+        return (root / "harbor-operator" / name).resolve()
+
+    def environment(self, worktree: Path, ticket: str = "") -> dict[str, str]:
+        """A minimal environment, never Harbor's whole one."""
+
+        start = os.environ
+        env = {name: start[name] for name in (*ENV_PASSTHROUGH, *CLAUDE_ENV) if start.get(name)}
+        env.update({name: value for name, value in start.items() if name.startswith("LC_")})
+        # Harbor's own start-time settings, except credentials it keeps to itself.
+        env.update({name: value for name, value in start.items()
+                    if name.startswith("HARBOR_") and name not in _HARBOR_PRIVATE})
         env.update({str(k): str(v) for k, v in self.env.items()})
-        env.update({"HARBOR_WORKTREE": str(worktree), "PWD": str(worktree)})
+        env.update({
+            "HARBOR_WORKTREE": str(worktree), "PWD": str(worktree),
+            # As for builders: git must not walk up out of the worktree.
+            "GIT_CEILING_DIRECTORIES": str(worktree.parent),
+            "TMPDIR": str(self.temp_dir(ticket or worktree.name)),
+        })
         return env
 
-    def secrets(self, worktree: Path) -> tuple[str, ...]:
-        return secret_values(self.environment(worktree), self.secret_names)
+    def secrets(self, worktree: Path, ticket: str = "") -> tuple[str, ...]:
+        """Every credential value the operator could see or print: exact values passed in, plus Harbor's own."""
+
+        passed = self.environment(worktree, ticket)
+        exact = {passed[name].strip() for name in (*self.secret_names, *_ALWAYS_SECRET, *CLAUDE_ENV)
+                 if passed.get(name, "").strip() and name not in _NOT_SECRET}
+        values = exact | set(secret_values(passed, self.secret_names)) | set(secret_values(os.environ,
+                                                                                            self.secret_names))
+        return tuple(sorted((v for v in values if len(v) >= 4), key=len, reverse=True))
 
     async def run(self, *, ticket: str, commands: Sequence[str], cwd: Path, worktree: Path,
                   reason: str) -> OperatorOutcome:
-        env = self.environment(worktree)
-        secrets = secret_values(env, self.secret_names)
-        prompt = redact(operator_prompt(ticket, commands, cwd, worktree, reason), secrets)
+        env = self.environment(worktree, ticket)
+        secrets = self.secrets(worktree, ticket)
+        Path(env["TMPDIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)
+        prompt = redact(operator_prompt(ticket, commands, cwd, worktree, reason, Path(env["TMPDIR"])), secrets)
         runner = self.process_runner or _run_process
         try:
             value = runner(self.command(), prompt, cwd, env, self.timeout_seconds)
@@ -420,17 +384,24 @@ class ClaudeOperator:
         return parse_outcome(returncode, stdout, stderr, commands, secrets, model=self.model)
 
 
-def operator_prompt(ticket: str, commands: Sequence[str], cwd: Path, worktree: Path, reason: str) -> str:
+def operator_prompt(ticket: str, commands: Sequence[str], cwd: Path, worktree: Path, reason: str,
+                    temp_dir: Path | None = None) -> str:
     listed = "\n".join(f"{index}. {command}" for index, command in enumerate(commands, 1))
     return (
         f"You are Harbor's First Mate, acting as operator for the builder working on ticket {ticket}. "
         "The builder's sandbox or permission settings denied the commands below. Run each one exactly as "
         f"written, in order, with the Bash tool, from the working directory {cwd}. Its ticket worktree is "
-        f"{worktree}.\n"
+        f"{worktree}" + (f"; its private temp directory is {temp_dir}" if temp_dir else "") + ".\n"
+        "Why you are asked: the project's owner turned this on explicitly (`delegate_permissions = true` in the "
+        "project's Harbor workflow), so that commands the builder's sandbox cannot run at all (for example "
+        "network hosts outside its allowlist, gh, adb or the iOS Simulator) are run by First Mate instead of "
+        "waiting for a person. Harbor has already checked these commands against its deny-by-default rules: plain "
+        "commands only, every path inside the worktree, no shells or inline code, no protected paths, no merges, "
+        "reviews or pushes to the base branch. You are the final check.\n"
         "Rules:\n"
         "- Run only these commands. Do not edit files yourself, install anything, or run any other command.\n"
         "- Do not change them, except to quote them correctly for Bash.\n"
-        "- If a command is unsafe, destructive, reaches outside the worktree and the system temp directory, or "
+        "- If a command is unsafe, destructive, reaches outside the worktree and its temp directory, merges, pushes to the base branch, or "
         "is outside what a developer would run for this ticket, do not run it. Return status \"refused\" "
         "with the reason.\n"
         "- If a command fails, still run the rest unless they clearly depend on it.\n"
@@ -565,10 +536,11 @@ def github_operator_env(child_env: Mapping[str, str], environ: Mapping[str, str]
     name = env.get("HARBOR_GITHUB_TOKEN_ENV", "")
     token = environ.get(name, "") if name else ""
     if token:
+        env[name] = token  # Harbor's REST helper reads the configured variable by name
         enterprise = env.get("HARBOR_GITHUB_API_URL", "https://api.github.com").rstrip("/") != "https://api.github.com"
         target = "GH_ENTERPRISE_TOKEN" if enterprise else "GH_TOKEN"
-        if not environ.get(target):
-            env[target] = token
+        # gh's own variable from the start environment wins; it is passed through as is.
+        env[target] = environ.get(target) or token
     return env
 
 
@@ -587,7 +559,8 @@ __all__ = [
     "receipts_schema",
     "redact",
     "request_digest",
+    "final_digest",
+    "mark_resumed",
     "results_text",
-    "scope_refusal",
     "secret_values",
 ]

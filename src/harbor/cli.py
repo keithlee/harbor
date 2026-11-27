@@ -112,8 +112,10 @@ PERMISSION_BLOCKER_INSTRUCTIONS = (
     "not retry with other tricks. First finish everything else you can. Then return status `blocked` with "
     "`blocker.kind = \"permission_blocker\"`, `blocker.commands` = the exact shell commands you need run, in "
     "order, `blocker.cwd` = the directory to run them in (relative to the worktree, or null for its root), and "
-    "`blocker.evidence` = the literal denial. Keep the commands inside the ticket worktree (the system temp "
-    "directory is also allowed) and never put a credential in them. If the project allows it, Harbor has First "
+    "`blocker.evidence` = the literal denial. Give plain commands: every path inside the ticket worktree, no "
+    "shell or interpreter inline code (`bash -c`, `python -c`), no `$` variables, globs or `~`, and never a "
+    "credential. Merges, reviews and pushes to the base branch are never delegated. If the project allows it, "
+    "Harbor has First "
     "Mate run them outside your sandbox and resumes this session with their exit codes and output; otherwise a "
     "person is asked. For every other blocker kind set `commands` and `cwd` to null."
 )
@@ -350,8 +352,8 @@ def build_production_dispatcher(
                         config, github["env"]["HARBOR_GITHUB_API_URL"], ticket, warn=warn_once,
                     )
                 runner.sandbox_hosts = hosts
-                # dontAsk refuses the runtime invocation and reads outside the
-                # worktree unless they are pre-approved; approve exactly these.
+                # Pre-approve the runtime invocation and the workflow package
+                # reads so they never depend on the auto-mode classifier.
                 # Without the registry a builder (new or resumed) could not run
                 # a single workflow check, so refuse to build it and say why.
                 try:

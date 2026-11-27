@@ -419,8 +419,11 @@ When a builder's sandbox or permissions deny a command, the builder reports a
 `[decisions] delegate_permissions = true` (off by default), First Mate runs them
 in the ticket worktree outside the builder sandbox, using Claude Code in `auto`
 permission mode. Harbor records a receipt and resumes the same builder session
-with the output. Commands that leave the worktree or touch protected paths,
-repeats, more than 3 runs per ticket, and First Mate refusals go to a person.
+with the output. Harbor checks the commands deny-by-default first: only plain
+commands inside the worktree, with no shells, inline code, variables or globs,
+no protected paths, and no merges, reviews or pushes to the base branch.
+Anything else, repeats, more than 3 runs per ticket, and First Mate refusals go
+to a person.
 See `docs/configurable-workflows.md` ("Permission blockers").
 
 #### First Mate monitor and recover
