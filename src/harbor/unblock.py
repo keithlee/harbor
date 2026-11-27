@@ -860,7 +860,12 @@ def build_resume_command(run_id: str, prompt: str, *, output_schema: str | None 
 resume_command = build_resume_command
 
 
-async def _invoke_resume(resumer: Any, command: ResumeCommand) -> bool:
+async def _invoke_resume(resumer: Any, command: ResumeCommand, *, before_launch: Any | None = None) -> bool:
+    """Resume through ``resumer``; ``before_launch`` is passed on when the resumer accepts it.
+
+    ``Supervisor.resume_session`` calls it right before the builder starts
+    with the prompt (the hand-off).
+    """
     if resumer is None:
         return False
     target = resumer
@@ -884,7 +889,9 @@ async def _invoke_resume(resumer: Any, command: ResumeCommand) -> bool:
             if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
         names = {parameter.name for parameter in signature.parameters.values()}
-        if {"run_id", "prompt"} <= names:
+        if {"run_id", "prompt"} <= names and before_launch is not None and "before_launch" in names:
+            value = target(run_id=command.run_id, prompt=command.prompt, before_launch=before_launch)
+        elif {"run_id", "prompt"} <= names:
             value = target(run_id=command.run_id, prompt=command.prompt)
         elif {"command", "prompt"} <= names:
             value = target(command=list(command.command), prompt=command.prompt)
@@ -1119,6 +1126,7 @@ class UnblockLadder:
         citation: str = "",
         reason: str = "",
         next_action: str = "",
+        before_launch: Any | None = None,
     ) -> tuple[bool, ResumeCommand | None]:
         if not run_id:
             return False, None
@@ -1132,7 +1140,7 @@ class UnblockLadder:
         prompt += "\nNext step: " + (next_action or "Rerun the previously blocked operation, then verify the ticket acceptance criteria.")
         prompt += "\nContinue your workflow; do not load the skill again and do not create a replacement session."
         command = build_resume_command(run_id, prompt)
-        resumed = await _invoke_resume(self.resumer, command)
+        resumed = await _invoke_resume(self.resumer, command, before_launch=before_launch)
         return resumed, command
 
     def _auto_accept(self) -> AutoAcceptPolicy:
@@ -1596,9 +1604,14 @@ class UnblockLadder:
         """Answer an escalation with the builder's recommended first option.
 
         The receipt is written before the resume, so a re-block inside the
-        same resumed session sees it and the loop guard holds.  Returns
-        ``None`` when the session could not be resumed: the escalation is then
-        reopened and parked for a human as usual.
+        same resumed session sees it and the loop guard holds.  It is marked
+        delivered at the hand-off: when the resumer calls ``before_launch``
+        (the builder is about to start with option 1), or when a resumer
+        without that hook returns success.  From then on the builder has the
+        answer, so the Linear comment is posted even if the turn is later
+        cancelled or fails, and the escalation is NOT reopened.  Only an exit
+        before the hand-off reopens it; then ``None`` is returned and the
+        escalation is parked for a human as usual.
         """
 
         escalation_id = _value(escalation, "id", default=None)
@@ -1610,33 +1623,47 @@ class UnblockLadder:
         )
         answer = auto_accept_policy.answer_text(escalation_id, assessment.option)
         citation = f"{auto_accept_policy.AUTO_ACCEPT_CITATION}:escalation-{escalation_id}"
+        launched = False
+
+        def handed_over() -> None:
+            nonlocal launched
+            if not launched:
+                auto_accept_policy.mark_delivered(self.db, escalation_id)
+                launched = True
+
+        writes: list[str] = []
+        resumed, command = False, None
         try:
             resumed, command = await self._resume(
                 ticket_id, run_id, answer=answer, citation=citation,
                 reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
                 next_action="Apply option 1, then verify the ticket acceptance criteria.",
+                before_launch=handed_over,
             )
-        except BaseException:
-            auto_accept_policy.reopen(self.db, escalation_id)
-            raise
-        if not resumed:
-            auto_accept_policy.reopen(self.db, escalation_id)
+            if resumed:
+                handed_over()
+        finally:
+            if launched:
+                # The builder has option 1: announce it whatever happens next.
+                body = auto_accept_policy.comment(
+                    ticket_id, escalation_id, question=question, option=assessment.option,
+                    recommendation=recommendation, count=assessment.count, policy=policy,
+                )
+                try:
+                    if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
+                        writes.append("comment")
+                except Exception:
+                    pass  # a comment failure never undoes a delivered answer
+            else:
+                auto_accept_policy.reopen(self.db, escalation_id)
+        if not launched:
             return None
-        auto_accept_policy.mark_delivered(self.db, escalation_id)
-        # Announce only what actually happened: the builder was resumed.
-        body = auto_accept_policy.comment(
-            ticket_id, escalation_id, question=question, option=assessment.option,
-            recommendation=recommendation, count=assessment.count, policy=policy,
-        )
-        writes: list[str] = []
-        if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
-            writes.append("comment")
         receipt = {
             "escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
             "count": assessment.count + 1, "limit": policy.max_auto_accepts,
         }
         return UnblockResult(
-            ticket_id, run_id, kind, question, 2, "resume", True,
+            ticket_id, run_id, kind, question, 2, "resume", resumed,
             answer=answer, citation=citation, searched=searched, remediation=remediation,
             resume_command=command, linear_writes=tuple(writes),
             reason="auto-accepted the recommended first option",

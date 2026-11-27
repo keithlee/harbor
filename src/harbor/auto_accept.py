@@ -57,9 +57,12 @@ Lexical checks (word matching; they cannot detect meaning):
 
 Delivery:
 
-* The answer is recorded when the resume launches and announced only once
-  delivered; any other exit reopens the escalation with its answer cleared
-  and marks the receipt undelivered.
+* The answer is recorded before the resume and the receipt is marked
+  delivered at the hand-off (the builder is about to start with option 1).
+  From then on the Linear comment is posted on every exit, cancellation
+  included, and the escalation stays answered.  Only an exit before the
+  hand-off reopens it with its answer cleared and marks the receipt
+  undelivered.
 * Each auto-accept is recorded in ``auto_accepts`` (distinct from operator
   answers, which go to ``resolutions``) and announced on Linear.
 
@@ -134,7 +137,9 @@ _FILLER = frozenset(
 # Only pure decision kinds are ever auto-accepted.  An environment, access,
 # transport, proof or conflicting-instruction blocker never is: answering an
 # access question cannot grant access, and the other kinds are not choices.
-ELIGIBLE_KINDS = frozenset({"product_decision", "ambiguous_ac", "design_decision", "new_product_decision"})
+# Kept equal to the decision kinds the run-result schema can express
+# (``schemas/run-result.json`` blocker.kind enum); a test pins that.
+ELIGIBLE_KINDS = frozenset({"product_decision", "ambiguous_ac"})
 
 # The only words, besides option 1's own words, a recommendation may use.
 AFFIRMATIVE_WORDS = frozenset(
@@ -153,8 +158,9 @@ _PROSE_CHARS_RE = re.compile(r"[A-Za-z ,.'\"!?()]*")
 # The one exception, in a recommendation only: the literal phrase "option 1"
 # or "option #1" (any letter case, exactly one space).  When it starts the
 # recommendation it may be followed directly by a colon.
-_LEADING_OPTION_ONE_RE = re.compile(r"(?i)option #?1:?(?![0-9])")
-_OPTION_ONE_PHRASE_RE = re.compile(r"(?i)(?<![A-Za-z0-9])option #?1(?![0-9])")
+# ``re.ASCII``: case folding is ASCII-only, so "opt\u0131on 1" or "OPT\u0130ON 1" never match.
+_LEADING_OPTION_ONE_RE = re.compile(r"option #?1:?(?![0-9])", re.IGNORECASE | re.ASCII)
+_OPTION_ONE_PHRASE_RE = re.compile(r"(?<![A-Za-z0-9])option #?1(?![0-9])", re.IGNORECASE | re.ASCII)
 # Verbs and nouns of delivery, release, destruction, money, credentials and
 # gates.  Matched against normalized words of option 1 and the
 # recommendation; any match keeps the question with a human.
@@ -359,8 +365,10 @@ def recommended_first_option(blocker: Mapping[str, Any]) -> Choice:
     recommendation = str(blocker.get("recommendation") or "")
     text = _norm(recommendation)
     normalized = [_norm(option) for option in options]
-    if not recommendation.strip():
+    if recommendation == "":  # no recommendation text (null or ""); whitespace is not empty
         return Choice(True, method="structured")
+    if not recommendation.strip():
+        return Choice(False, reason="the recommendation text is only whitespace")
     prose = plain_prose_reason(recommendation, recommendation=True)
     if prose:
         return Choice(False, reason=f"the recommendation text is ineligible: {prose}")
@@ -508,7 +516,8 @@ def assess(
     choice = recommended_first_option(blocker)
     if not choice.first:
         return Assessment("not_applicable", reason=choice.reason)
-    option = _options(blocker)[0].strip()
+    raw_option = _options(blocker)[0]
+    option = raw_option.strip()
     if protected:
         return Assessment(
             "refused", option, choice.method, "the blocker touches a protected path, which always needs a human",
@@ -523,7 +532,7 @@ def assess(
         return Assessment("refused", option, choice.method, sensitive)
     # The allowlist that decides; the deny-lists above only explain the
     # common cases more precisely.
-    prose = plain_prose_reason(option)
+    prose = plain_prose_reason(raw_option)  # the unstripped raw text
     if prose:
         return Assessment("refused", option, choice.method, f"option 1 is ineligible: {prose}")
     if _connection(db) is None:

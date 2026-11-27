@@ -843,20 +843,122 @@ def test_first_mate_records_and_announces_only_a_delivered_answer(tmp_path):
 @pytest.mark.parametrize("eligible,apply", [
     ([False], _launched),  # held before the run starts: early return
     ([True, False], _launched),  # held at launch: _RecoverySuperseded from before_launch
-    ([], _superseded_after_launch),  # the model fallback was refused after the launch
-    ([], _resume_failed),
-    ([], _cancelled),
 ])
-def test_first_mate_leaves_the_escalation_open_when_nothing_is_delivered(tmp_path, eligible, apply):
+def test_first_mate_leaves_the_escalation_open_when_nothing_is_handed_over(tmp_path, eligible, apply):
     db, host = _schedule(tmp_path, eligible=eligible, apply=apply)
     try:
         escalation = db.escalations()[-1]
         assert escalation["status"] == "open"
         assert escalation["answer"] is None and escalation["citation"] is None
         assert host.comments == []  # no comment claims a resume that did not happen
-        assert all(row["delivered"] == 0 for row in auto_accept.history(db, "SAMPLE-7"))
+        assert auto_accept.history(db, "SAMPLE-7") == []
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("apply", [_superseded_after_launch, _resume_failed, _cancelled])
+def test_first_mate_keeps_an_answer_the_builder_already_received(tmp_path, apply):
+    """Review round 7, B3: once before_launch handed option 1 to the builder,
+    a later failure or cancellation (/exit) does not make it "undelivered":
+    the escalation stays answered, the receipt is delivered (so the loop guard
+    holds), and the Linear comment is posted."""
+
+    db, host = _schedule(tmp_path, apply=apply)
+    try:
+        escalation = db.escalations()[-1]
+        assert escalation["status"] == "answered" and escalation["answer"] == OPTIONS[0]
+        assert [row["delivered"] for row in auto_accept.history(db, "SAMPLE-7")] == [1]
+        [body] = host.comments
+        assert "First Mate auto-accepted option 1" in body
+        # The same recommendation is not auto-accepted a second time.
+        case = _case(db, blocker("Option 1"))
+        again = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert again["action"] == "escalate" and "already auto-accepted" in again["reason"]
+    finally:
+        db.close()
+
+
+def test_ladder_keeps_an_answer_the_builder_received_before_a_cancellation(tmp_path):
+    """Review round 7, B3, ladder path: the resumer hands over (before_launch),
+    then the turn is cancelled."""
+
+    harness = Harness(tmp_path)
+
+    async def launch_then_cancel(run_id, prompt, *, before_launch=None):
+        before_launch()
+        harness.resumed.append((run_id, prompt))
+        raise asyncio.CancelledError
+
+    harness.ladder.resumer = launch_then_cancel
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            harness.block(blocker("Option 1"))
+        escalation = harness.db.escalations()[-1]
+        assert escalation["status"] == "answered" and escalation["answer"] == OPTIONS[0]
+        assert [row["delivered"] for row in harness.receipts()] == [1]
+        assert any("Harbor auto-accepted option 1" in body for _, body in harness.linear.comments)
+    finally:
+        harness.db.close()
+
+
+def test_ladder_reopens_only_when_nothing_was_handed_over(tmp_path):
+    harness = Harness(tmp_path)
+
+    async def refuse_before_launch(run_id, prompt, *, before_launch=None):
+        return False
+
+    harness.ladder.resumer = refuse_before_launch
+    try:
+        assert harness.block(blocker("Option 1")).action == "park"
+        assert harness.db.escalations()[-1]["status"] == "open"
+        assert [row["delivered"] for row in harness.receipts()] == [0]
+    finally:
+        harness.db.close()
+
+
+@pytest.mark.parametrize("recommendation", ["\t", "\n", "　", " ", "\x1c\x1d", "   "])
+def test_whitespace_only_recommendation_is_not_accepted(recommendation):
+    """Review round 7, B1 (the reviewer's probes)."""
+
+    assert not recommended_first_option(blocker(recommendation)).first
+
+
+def test_empty_recommendation_lets_the_index_decide():
+    assert recommended_first_option(blocker("")).first
+    assert recommended_first_option(blocker(None)).first
+
+
+@pytest.mark.parametrize("first_option", ["\tUse the short wording\n", "　Use the short wording ",
+                                          "Use the short wording\x1f"])
+def test_option_one_is_checked_unstripped(harness, first_option):
+    """Review round 7, B1 (the reviewer's probes)."""
+
+    result = harness.block(blocker(None, options=[first_option, OPTIONS[1]]))
+    assert result.action != "resume" and harness.resumed == []
+
+
+@pytest.mark.parametrize("recommendation", ["optıon 1", "OPTİON 1"])
+def test_option_one_phrase_matches_ascii_letters_only(recommendation):
+    """Review round 7, B2: Unicode case folding must not widen the exception."""
+
+    assert auto_accept.plain_prose_reason(recommendation, recommendation=True) is not None
+
+
+def test_eligible_kinds_exist_in_the_run_result_schema():
+    """Review round 7, B4: a builder can only report kinds in the schema enum."""
+
+    from harbor.runner.base import BLOCKER_KINDS
+
+    schema = json.loads((Path(__file__).resolve().parents[1] / "schemas" / "run-result.json").read_text())
+    enum = set(schema["properties"]["blocker"]["properties"]["kind"]["enum"])
+    assert auto_accept.ELIGIBLE_KINDS <= enum and auto_accept.ELIGIBLE_KINDS <= BLOCKER_KINDS
+    assert auto_accept.ELIGIBLE_KINDS == {"product_decision", "ambiguous_ac"}
+
+
+def test_documented_exception_option_i_is_the_pronoun_and_means_option_one():
+    """Review round 7, B4: the letter check skips "i" (and "a"); documented."""
+
+    assert recommended_first_option(blocker("Take option i.")).first
 
 
 def test_first_mate_never_overwrites_an_answer_a_human_gave_first(tmp_path):

@@ -192,11 +192,10 @@ carry cost or data risk should set `auto_accept_first_option = false` or
 
 These check fields, characters and ledger state, not meaning.
 
-- **Kind.** Only the reported kinds `product_decision`, `ambiguous_ac`,
-  `design_decision` and `new_product_decision` are eligible. Any other kind
-  (`env_blocker`, `github_transport`, `missing_proof_capability`,
-  `conflicting_instruction`, access/permission kinds, ...) is not
-  auto-accepted.
+- **Kind.** Only the reported kinds `product_decision` and `ambiguous_ac` (the
+  decision kinds the run-result schema can express) are eligible. Every other
+  schema kind (`env_blocker`, `github_transport`, `missing_proof_capability`,
+  `conflicting_instruction`) and any unknown kind is not auto-accepted.
 - **Settings.** `auto_accept_first_option = false` or `decisions.mode = "human"`
   turns it off.
 - **Structured index.** Only `recommended_option_index = 0` counts; a `null` or
@@ -206,11 +205,14 @@ These check fields, characters and ledger state, not meaning.
   space character (0x20) and `, . ' " ! ? ( )`. Every other character is
   refused, including digits, `-` (so no flags, wrapped or not), `:`, `#`,
   `/`, `\`, `_`, backticks, tabs, newlines, control characters and any
-  non-ASCII character. The one exception, in the recommendation only, is the
-  literal phrase `option 1` or `option #1` (any letter case, exactly one
-  space); when that phrase starts the recommendation, a colon may follow it
-  directly (`Option 1: ...`). A colon anywhere else, and `#` outside that
-  phrase, is refused.
+  non-ASCII character. Option 1 is checked unstripped, so leading or trailing
+  tabs, newlines or control characters are refused too. The one exception, in
+  the recommendation only, is the literal phrase `option 1` or `option #1`
+  (ASCII letters in any case, exactly one space); when that phrase starts the
+  recommendation, a colon may follow it directly (`Option 1: ...`). A colon
+  anywhere else, and `#` outside that phrase, is refused. A recommendation
+  that is `null` or exactly `""` counts as no text (the index alone decides);
+  one made only of whitespace is refused.
 - **Touched protected paths.** A blocker whose reported or observed changed
   paths match a protected pattern is not auto-accepted.
 - **Merge-ready runs.** A run parked as `outcome = "parked"`,
@@ -224,11 +226,15 @@ These check fields, characters and ledger state, not meaning.
   (`auto_accept_assessments`). First Mate answers only the newest open
   escalation for the run, and only when its question, kind and digest match
   the blocker it is looking at.
-- **Delivery.** The answer is recorded when the resume launches and announced
-  on Linear only after it is delivered. An exit that delivers nothing (held,
-  superseded, failed or cancelled) reopens the escalation, clears the answer
-  and marks the receipt undelivered. An escalation that is no longer open (for
-  example, a human answered it first) is not overwritten.
+- **Delivery.** The receipt is marked delivered at the hand-off: when the
+  resume or spawn is about to start the builder with option 1 (or, for a
+  resumer without that hook, when it returns success). From then on the
+  builder has the answer, so the Linear comment is posted on every exit,
+  including a cancellation or failure later in the turn, and the escalation
+  stays answered. An exit before the hand-off (held, superseded, resume
+  unavailable) reopens the escalation, clears the answer and marks the
+  receipt undelivered. An escalation that is no longer open (for example, a
+  human answered it first) is not overwritten.
 - **Records.** Receipts go in `auto_accepts` with a `delivered` flag. The
   escalation is `answered` with the citation
   `harbor:auto-accept-first-option:escalation-<id>` and no `resolutions` row,
@@ -247,7 +253,9 @@ paraphrases.
   existing date picker" passes for option 1 "Build a new date picker", because
   every word is allowed.
 - **Other-option references.** Text naming another option by digit (any digit
-  but a lone "1"), number word, single letter b-z, roman numeral from ii,
+  but a lone "1"), number word, single letter b-z except "i" (skipped
+  because it is the pronoun "I"; as a label it would mean option 1 anyway, so
+  "Take option i." is accepted), roman numeral from ii,
   ordinal, or "other", "instead", "vs", "or", and text whose non-filler words
   overlap another option at least as much as option 1, are refused. Negation
   and qualifier words ("not", "unsafe", "if", "but", "only", "after",

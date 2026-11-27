@@ -4697,22 +4697,26 @@ class Supervisor:
 
         async def run() -> None:
             attempted = False
-            answered = False  # an auto-accepted answer was written at launch
-            delivered = False
+            answered = False  # option 1 was recorded and handed to the builder at launch
 
             def before_launch() -> None:
                 nonlocal attempted, answered
                 if not self._first_mate_can_recover(case, reload_policy=True, attempted=attempted):
                     raise _RecoverySuperseded
                 if auto is not None and not answered:
-                    # Written at launch, before the builder's turn, so a
-                    # re-block inside that turn meets the loop guard.  An
-                    # escalation a human answered meanwhile is left alone.
-                    from harbor.auto_accept import EscalationNotOpen
+                    # The hand-off: the builder starts with option 1 right
+                    # after this returns, so the answer is recorded and the
+                    # receipt marked delivered now -- before the turn, so a
+                    # re-block inside it meets the loop guard, and so a later
+                    # cancellation cannot make a received answer look
+                    # undelivered.  An escalation a human answered meanwhile
+                    # is left alone.
+                    from harbor.auto_accept import EscalationNotOpen, mark_delivered
                     try:
                         recovery.record_auto_accept(self.db, case, decision)
                     except EscalationNotOpen:
                         raise _RecoverySuperseded from None
+                    mark_delivered(self.db, auto.get("escalation_id"))
                     answered = True
                 if not attempted:
                     recovery.record(connection, case, decision)
@@ -4729,10 +4733,6 @@ class Supervisor:
                     if not self._first_mate_can_recover(case):
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
-                delivered = True
-                if answered:
-                    from harbor.auto_accept import mark_delivered
-                    mark_delivered(self.db, auto.get("escalation_id"))
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was
@@ -4753,16 +4753,16 @@ class Supervisor:
                 return
             finally:
                 self._recovery_tickets.discard(case.ticket)
-                if answered and not delivered:
-                    # Every exit that did not deliver the auto-accepted answer
-                    # (superseded, held, failed or cancelled) hands the
-                    # escalation back to a human, with its answer cleared.
-                    from harbor.auto_accept import reopen
-                    reopen(self.db, auto.get("escalation_id"))
-            if answered:
-                # Announce only a delivered answer.
-                await self._post_recovery_comment(
-                    case, {**decision, "comment": recovery.auto_accept_comment(case, decision)})
+                if answered:
+                    # The builder received option 1 at launch; announce it on
+                    # every exit, including a failure or cancellation later in
+                    # the turn.  Exits before the hand-off recorded nothing,
+                    # so there is nothing to reopen.
+                    try:
+                        await self._post_recovery_comment(
+                            case, {**decision, "comment": recovery.auto_accept_comment(case, decision)})
+                    except Exception as exc:
+                        self.last_error = f"First Mate comment: {exc}"
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
 

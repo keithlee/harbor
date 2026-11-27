@@ -70,7 +70,7 @@ model settings. Include concrete options and a recommendation, and ALWAYS set
 `recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
 option; `null` for none). Harbor decides from that index, and the prose can only veto it: when it
 is `0`, Harbor may accept the first option automatically and resume you with it as the answer, but
-only for a `product_decision`, `ambiguous_ac`, `design_decision` or `new_product_decision` blocker
+only for a `product_decision` or `ambiguous_ac` blocker
 whose first option and recommendation use only letters, spaces and `, . ' " ! ? ( )`, with no
 identifier-shaped words; the exact rules are in Harbor's `docs/configurable-workflows.md`
 ("Auto-accepting the builder's first option"). Put a costly,
