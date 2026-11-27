@@ -44,7 +44,7 @@
             ]
           },
           "recommended_option_index": {
-            "description": "Zero-based index into options of the recommended option (0 is the first option); null when there is no recommendation.",
+            "description": "Zero-based index into options of the recommended option (0 is the first option); null when there is no recommendation. Always set it when recommending: Harbor reads this index, not the recommendation text, to auto-accept the first option.",
             "type": [
               "integer",
               "null"

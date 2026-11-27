@@ -3,16 +3,16 @@
 When a builder blocks with ``options`` and a recommendation that picks the
 FIRST option, Harbor records that option as the escalation's answer and
 resumes the retained builder session instead of waiting for a human.  The
-decision is deterministic:
+decision is deterministic and fails closed:
 
-1. ``blocker.recommended_option_index`` (0-based) is the preferred signal;
-   ``0`` is the first option.  A recommendation text that names a different
-   option contradicts it, and a contradiction is never auto-accepted.
-2. Without the structured field, only a strict text match counts: the
-   recommendation is exactly the first option's text, or it starts with
-   "first option" / "option 1" (optionally after "take", "choose" and so on)
-   and names no other option, negation or alternative.
-3. Anything else is ambiguous and stays with a human.
+1. Only the structured ``blocker.recommended_option_index == 0`` counts.  There
+   is no free-text fallback: deny-lists over prose keep leaking.
+2. The recommendation text must be consistent with that index.  It may not
+   refer to any other option (a digit other than 1, a number word, a letter,
+   a roman numeral, an ordinal, "plan B", "other", "instead"...), may not
+   paraphrase another option at least as closely as option 1, and may not be
+   negative or conditional.
+3. Anything else stays with a human.
 
 Guardrails, each enforced here and covered by tests:
 
@@ -41,8 +41,11 @@ may cite.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Mapping, Sequence
@@ -56,63 +59,74 @@ MAX_AUTO_ACCEPTS_CEILING = 10
 # Token overlap at or above this counts as the same question re-asked.
 EQUIVALENT_QUESTION_OVERLAP = 0.8
 
-# A recommendation that begins by picking the first option.  Matched against
-# the normalized text (lowercase, punctuation replaced by spaces).
-_FIRST_RE = re.compile(
-    r"^(?:(?:i\s+)?(?:recommend(?:ation)?|suggest(?:ion)?|propose)\s+(?:is\s+)?(?:to\s+)?)?"
-    r"(?:(?:take|choose|pick|select|use|accept|go\s+with|adopt|proceed\s+with)\s+)?"
-    r"(?:the\s+)?(?:first\s+option|option\s+(?:1|one))(?P<rest>(?:\s.*)?)$"
-)
-# Any reference to an option other than the first: a number, a letter label
-# ("option B", "(b)", "take c"), or an ordinal.  Matched against the
-# normalized text, where "(b)" has become " b ".
+# All patterns below run on ``_norm`` text: NFKC (so full-width digits become
+# ASCII), casefolded, apostrophes dropped ("don't" -> "dont"), and every other
+# non-letter-or-digit -- including ``_ - . /`` -- turned into a space, so
+# ``STRIPE_SECRET_KEY`` reads "stripe secret key" and "(b)" reads "b".
+
+# Any reference to an option other than the first.  A bare digit sequence
+# other than "1" is handled separately (``_digits_other_than_one``).
 _OTHER_OPTION_RE = re.compile(
-    r"\b(?:option\s+(?:[02-9]|\d{2,}|[b-z]|two|three|four|five|six)|"
-    r"(?:take|choose|pick|select|use|accept|go\s+with|prefer|adopt)\s+(?:the\s+)?(?:[b-z]|[2-9])|"
-    r"second|third|fourth|fifth|sixth|last|latter|other|another|alternative|alternatively|instead)\b"
+    r"\b(?:[b-h]|[j-z]|ii|iii|iv|vi|vii|viii|ix|"  # letter labels (not "a"/"i") and roman numerals >= 2
+    r"zero|two|three|four|five|six|seven|eight|nine|ten|"
+    r"second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|latter|former|"
+    r"other|others|another|alternative|alternatives|alternatively|instead|rather|versus|vs|"
+    r"both|either|neither|nor|or)\b"
 )
-# A raw "(b)", "b)" or "[b]" label, checked before normalization.
-_LETTER_LABEL_RE = re.compile(r"(?:\(\s*[b-zB-Z]\s*\)|\[\s*[b-zB-Z]\s*\]|(?<![\w(])[b-zB-Z]\))")
-# Negation or a negative description of the option ("unsafe", "risky").
+# Negation or a negative description of option 1.
 _NEGATIVE_RE = re.compile(
-    r"\b(?:not|never|no|avoid|don\s+t|do\s+not|doesn\s+t|isn\s+t|won\s+t|shouldn\s+t|reject|against|"
-    r"unsafe|risky|dangerous|wrong|bad|worse|broken|harmful|insecure|discouraged|neither|nor|or|either|both)\b"
+    r"\b(?:not|never|no|none|avoid|dont|doesnt|isnt|wont|shouldnt|cant|cannot|reject|rejected|against|"
+    r"unsafe|risky|dangerous|wrong|bad|worse|worst|broken|harmful|insecure|discouraged|suboptimal|inferior|"
+    r"weaker|poor|problematic|flawed|considered|rejecting|drawback|downside)\b"
 )
-# A condition, a deferral or a human hand-off: the recommendation is not an
-# unconditional pick, so a human decides.
+# A condition, a deferral, an exception, a change of mind or a human hand-off:
+# the recommendation is not an unconditional pick of option 1.
 _QUALIFIER_RE = re.compile(
-    r"\b(?:if|but|only|after|before|once|unless|until|provided|providing|assuming|when|whenever|"
-    r"as\s+long\s+as|depending|depends|maybe|perhaps|probably|possibly|might|could|would|"
-    r"confirm|confirms|confirmed|confirmation|approve|approves|approved|approval|ask|asks|check\s+with|"
-    r"human|humans|person|operator|someone|team|reviewer|manually)\b"
+    r"\b(?:if|but|only|after|before|once|unless|until|provided|providing|assuming|when|whenever|while|"
+    r"except|excluding|apart|besides|however|although|though|actually|wait|instead|rather|prefer|prefers|"
+    r"preferred|wins|better|beats|over|than|"
+    r"as long as|depending|depends|maybe|perhaps|probably|possibly|might|could|would|"
+    r"confirm|confirms|confirmed|confirmation|approve|approves|approved|approval|ask|asks|check with|"
+    r"human|humans|person|people|operator|someone|team|reviewer|manually)\b"
+)
+# Words that say nothing about WHICH option was picked; ignored by the
+# paraphrase check.
+_FILLER = frozenset(
+    "a an the to of for and with in on at by is it its this that we i you go use take choose pick select "
+    "accept adopt proceed recommend recommended recommendation suggest suggested propose option options first "
+    "one 1 please just".split()
 )
 # Options asking the human for secrets, credentials or money, or to approve
 # deleting data.  Matched against the question, the first option and the
 # recommendation; a match keeps the escalation open for a human.
 _SENSITIVE_RE = re.compile(
-    r"\b(?:secrets?|credentials?|passwords?|passphrases?|api[\s_-]?keys?|access[\s_-]?keys?|"
-    r"private[\s_-]?keys?|ssh[\s_-]?keys?|signing[\s_-]?keys?|tokens?|oauth|2fa|mfa|otp|"
-    r"log\s?in|sign\s?in|auth|authenticate|keychain|"
+    r"\b(?:secrets?|credentials?|creds?|passwords?|passwd|passphrases?|pats?|apikeys?|api keys?|access keys?|"
+    r"private keys?|ssh keys?|signing keys?|keys? pairs?|tokens?|oauth|2fa|mfa|otp|"
+    r"log ?in|sign ?in|auth|authenticate|keychains?|certificates?|certs?|pem|dotenv|"
     r"money|pay|pays|paid|payments?|billing|bill|invoices?|purchases?|buy|subscriptions?|"
-    r"credit[\s_-]?cards?|budgets?|spend|spending|costs?|charges?|refunds?|funds?|funding|pric(?:e|es|ing)|"
-    r"delet(?:e|es|ed|ing|ion)|drop\s+(?:the\s+)?(?:table|database|column|data)|truncate|wipe|purge|"
-    r"destroy|erase|rm\s+-rf|data\s+loss|irreversible)\b",
-    re.IGNORECASE,
+    r"credit cards?|budgets?|spend|spending|costs?|charges?|refunds?|funds?|funding|pric(?:e|es|ing)|"
+    r"delet(?:e|es|ed|ing|ion)|truncat(?:e|es|ed|ing)|wip(?:e|es|ed|ing)|purg(?:e|es|ed|ing)|"
+    r"destroy|erase|rm rf|reset hard|data loss|irreversible|"
+    r"(?:drop|dropp(?:ed|ing)|remov(?:e|es|ed|ing)|clear(?:s|ed|ing)?|reset)(?: \w+){0,3} "
+    r"(?:tables?|databases?|dbs?|data|datasets?|users?|records?|rows?|branch(?:es)?|files?|directory|"
+    r"directories|folders?|buckets?|schemas?|collections?|columns?|indexes|volumes?))\b"
 )
+# ``.env`` is read before normalization (normalized it is just "env").
+_DOTENV_RE = re.compile(r"(?:^|[\s/'\"`(])\.env\b", re.IGNORECASE)
 # Options about merging or about lowering a gate.  The merge gate is
 # cooperative (the builder honours it), so an answer must never steer the
-# builder past it: merging, force-pushing, branch protection, skipping or
-# disabling CI/checks/review, changing the risk tier, waiving proof, or
-# editing protected paths or the gate configuration.
+# builder past it: merging, pushing to the base branch, branch protection,
+# skipping, disabling or xfailing CI/checks/tests/review, lowering coverage,
+# changing the risk tier, waiving proof, or editing protected paths, CODEOWNERS
+# or the gate configuration.
 _GATE_RE = re.compile(
-    r"\b(?:merg(?:e|es|ed|ing)|auto[\s_-]?merge|merge[\s_-]?mode|force[\s_-]?push(?:es|ed|ing)?|push\s+--force|"
-    r"push(?:es|ed|ing)?\s+(?:directly\s+)?to\s+(?:the\s+)?(?:main|master|base|default)|"
-    r"branch[\s_-]?protection|protect(?:ed|ion|ions)?|rulesets?|bypass(?:es|ed|ing)?|"
-    r"skip(?:s|ped|ping)?|disabl(?:e|es|ed|ing)|ignor(?:e|es|ed|ing)|waiv(?:e|es|ed|er|ing)|"
-    r"overrid(?:e|es|den|ing)|turn\s+off|admin|ci|checks?|reviews?|reviewers?|approvals?|"
-    r"risk|risks|risk[\s_-]?tier|proof|proofs|gates?|readiness|workflow\.toml|agents\.md|"
-    r"auto_merge_risks|pre_merge)\b",
-    re.IGNORECASE,
+    r"\b(?:merg(?:e|es|ed|ing)|automerge|force push(?:es|ed|ing)?|push(?:es|ed|ing)? force|"
+    r"push(?:es|ed|ing)?(?: \w+){0,4} (?:to|into|onto) (?:the )?(?:main|master|base|default|trunk|release)|"
+    r"branch protection|protect(?:ed|ion|ions)?|rulesets?|bypass(?:es|ed|ing)?|"
+    r"skip(?:s|ped|ping)?|disabl(?:e|es|ed|ing)|ignor(?:e|es|ed|ing)|waiv(?:e|es|ed|er|ing)|xfail\w*|"
+    r"overrid(?:e|es|den|ing)|turn off|admin|ci|checks?|reviews?|reviewers?|approvals?|"
+    r"(?:remov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|comment(?:s|ed|ing)? out)(?: \w+){0,3} tests?|"
+    r"coverage|codeowners|risk|risks|proof|proofs|gates?|readiness|workflow toml|agents md|pre merge)\b"
 )
 
 
@@ -165,7 +179,21 @@ def describe(policy: AutoAcceptPolicy) -> str:
 
 
 def _norm(text: Any) -> str:
-    return " ".join(re.sub(r"[^\w\s]", " ", str(text or "").casefold()).replace("_", " ").split())
+    """NFKC, casefold, drop apostrophes, and split on everything but letters and digits."""
+
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    value = re.sub(r"['’‘`]", "", value)
+    return " ".join(re.sub(r"[\W_]+", " ", value).split())
+
+
+def _tokens(text: str) -> set[str]:
+    return {token for token in text.split() if token not in _FILLER}
+
+
+def _digits_other_than_one(text: str) -> bool:
+    """Any digit sequence except a lone "1" (covers "2", "2nd", "10", full-width forms)."""
+
+    return any(match != "1" for match in re.findall(r"\d+", text))
 
 
 def _options(blocker: Mapping[str, Any]) -> list[str]:
@@ -180,57 +208,54 @@ class Choice:
     """Whether the recommendation picks the first option, and how Harbor knows."""
 
     first: bool
-    method: str = ""  # "structured" | "exact" | "text" when first
+    method: str = ""  # "structured" when first
     reason: str = ""
 
 
 def recommended_first_option(blocker: Mapping[str, Any]) -> Choice:
-    """Decide, deterministically, whether the recommendation is option 1."""
+    """Decide, deterministically and failing closed, whether the builder picked option 1.
+
+    Only ``recommended_option_index == 0`` counts; the recommendation text can
+    only veto it.
+    """
 
     options = _options(blocker)
     if not options or not options[0].strip() or len(options) != len(blocker.get("options") or []):
         return Choice(False, reason="the blocker lists no usable options")
-    recommendation = str(blocker.get("recommendation") or "")
-    text = _norm(recommendation)
-    normalized = [_norm(option) for option in options]
     index = blocker.get("recommended_option_index")
-    if index is not None:
-        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(options):
-            return Choice(False, reason="recommended_option_index is not a valid option index")
-        if index != 0:
-            return Choice(False, reason=f"the recommendation is option {index + 1}")
-        # The structured field wins over a plain paraphrase of option 1,
-        # never over a text that names another option, speaks against
-        # option 1, or attaches a condition.  When in doubt, refuse.
-        if text and text != normalized[0]:
-            if _LETTER_LABEL_RE.search(recommendation) or _OTHER_OPTION_RE.search(text) \
-                    or any(text == other for other in normalized[1:]):
-                return Choice(False, reason="recommended_option_index contradicts the recommendation text")
-            if _NEGATIVE_RE.search(text) or _QUALIFIER_RE.search(text):
-                return Choice(False, reason="the recommendation is negative or conditional")
+    if index is None:
+        return Choice(False, reason="the builder did not set recommended_option_index")
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(options):
+        return Choice(False, reason="recommended_option_index is not a valid option index")
+    if index != 0:
+        return Choice(False, reason=f"the recommendation is option {index + 1}")
+    text = _norm(blocker.get("recommendation"))
+    normalized = [_norm(option) for option in options]
+    if not text or text == normalized[0]:
         return Choice(True, method="structured")
-    if not text:
-        return Choice(False, reason="no recommendation")
-    if text == normalized[0] and normalized.count(text) == 1:
-        return Choice(True, method="exact")
-    match = _FIRST_RE.match(text)
-    if match is None:
-        return Choice(False, reason="the recommendation does not unambiguously pick the first option")
-    rest = match.group("rest")
-    if (_LETTER_LABEL_RE.search(recommendation) or _OTHER_OPTION_RE.search(rest)
-            or _NEGATIVE_RE.search(rest) or _QUALIFIER_RE.search(rest)):
-        return Choice(False, reason="the recommendation is conditional, negative or names another option")
-    return Choice(True, method="text")
+    if any(text == other for other in normalized[1:]):
+        return Choice(False, reason="the recommendation text is another option")
+    if _digits_other_than_one(text) or _OTHER_OPTION_RE.search(text):
+        return Choice(False, reason="the recommendation text refers to another option")
+    if _NEGATIVE_RE.search(text) or _QUALIFIER_RE.search(text):
+        return Choice(False, reason="the recommendation text is negative or conditional")
+    # The text must not read more like another option than like option 1.
+    words = _tokens(text)
+    first = len(words & _tokens(normalized[0]))
+    if any(len(words & _tokens(other)) >= max(first, 1) for other in normalized[1:]):
+        return Choice(False, reason="the recommendation text paraphrases another option")
+    return Choice(True, method="structured")
 
 
 def sensitive_reason(blocker: Mapping[str, Any]) -> str | None:
     """Why the first option must stay with a human, or ``None``."""
 
     options = _options(blocker)
-    haystack = " ".join(
+    raw = " ".join(
         [str(blocker.get("question") or ""), options[0] if options else "", str(blocker.get("recommendation") or "")]
     )
-    match = _SENSITIVE_RE.search(haystack)
+    haystack = _norm(raw)  # splits STRIPE_SECRET_KEY, GITHUB-TOKEN, db.password, a/b paths
+    match = _SENSITIVE_RE.search(haystack) or _DOTENV_RE.search(raw)
     if match is not None:
         return (
             f"the option involves secrets, credentials, money or deleting data (matched {match.group(0)!r}); "
@@ -443,10 +468,28 @@ def reopen(db: Any, escalation_id: Any) -> None:
         )
 
 
+_DIGEST_FIELDS = ("kind", "question", "options", "recommendation", "recommended_option_index")
+
+
+def blocker_digest(blocker: Mapping[str, Any]) -> str:
+    """A stable digest of the builder-reported blocker fields an answer depends on.
+
+    It binds an escalation's recorded facts to the exact blocker they were
+    computed for: a resumed session keeps its run id, so an older open
+    escalation for the same run is normal and must not lend its facts to a
+    newer blocker.
+    """
+
+    payload = {name: blocker.get(name) for name in _DIGEST_FIELDS}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _eligibility_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
-        """CREATE TABLE IF NOT EXISTS auto_accept_eligibility (
+        """CREATE TABLE IF NOT EXISTS auto_accept_assessments (
             escalation_id INTEGER PRIMARY KEY,
+            blocker_digest TEXT NOT NULL,
             protected INTEGER NOT NULL,
             human_decisions INTEGER NOT NULL,
             at TEXT NOT NULL
@@ -454,12 +497,15 @@ def _eligibility_schema(connection: sqlite3.Connection) -> None:
     )
 
 
-def record_eligibility(db: Any, escalation_id: Any, *, protected: bool, human_decisions: bool) -> None:
-    """Store the ladder's protected-path and decision-mode facts for an escalation.
+def record_eligibility(
+    db: Any, escalation_id: Any, blocker: Mapping[str, Any], *, protected: bool, human_decisions: bool,
+) -> None:
+    """Store the ladder's protected-path and decision-mode facts for one escalation and blocker.
 
     First Mate has no protected-path configuration or worktree diff of its
     own, so it reads these facts instead of re-deriving them from a reason
-    string.  An escalation without a row is never auto-accepted by First Mate.
+    string.  An escalation without a row, or whose row was recorded for a
+    different blocker, is never auto-accepted by First Mate.
     """
 
     connection = _connection(db)
@@ -469,13 +515,13 @@ def record_eligibility(db: Any, escalation_id: Any, *, protected: bool, human_de
     with connection:
         _eligibility_schema(connection)
         connection.execute(
-            "INSERT OR REPLACE INTO auto_accept_eligibility(escalation_id, protected, human_decisions, at) "
-            "VALUES (?,?,?,?)",
-            (int(escalation_id), int(bool(protected)), int(bool(human_decisions)), now),
+            "INSERT OR REPLACE INTO auto_accept_assessments(escalation_id, blocker_digest, protected, "
+            "human_decisions, at) VALUES (?,?,?,?,?)",
+            (int(escalation_id), blocker_digest(blocker), int(bool(protected)), int(bool(human_decisions)), now),
         )
 
 
-def eligibility(db: Any, escalation_id: Any) -> dict[str, bool] | None:
+def eligibility(db: Any, escalation_id: Any) -> dict[str, Any] | None:
     """The ladder's recorded facts for ``escalation_id``, or ``None`` when none were recorded."""
 
     connection = _connection(db)
@@ -483,12 +529,12 @@ def eligibility(db: Any, escalation_id: Any) -> dict[str, bool] | None:
         return None
     _eligibility_schema(connection)
     row = connection.execute(
-        "SELECT protected, human_decisions FROM auto_accept_eligibility WHERE escalation_id = ?",
+        "SELECT blocker_digest, protected, human_decisions FROM auto_accept_assessments WHERE escalation_id = ?",
         (int(escalation_id),),
     ).fetchone()
     if row is None:
         return None
-    return {"protected": bool(row[0]), "human_decisions": bool(row[1])}
+    return {"blocker_digest": str(row[0]), "protected": bool(row[1]), "human_decisions": bool(row[2])}
 
 
 MERGE_NOTE = (

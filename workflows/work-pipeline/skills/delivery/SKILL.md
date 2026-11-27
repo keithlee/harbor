@@ -66,10 +66,13 @@ never push to the base branch. Stop at the PR, move the ticket to review, and re
 ## Blockers
 Report a blocker only for a real product/design question, ambiguous acceptance criteria, or an
 environment failure you cannot work around. Never block on Harbor bookkeeping, agent names or
-model settings. Include concrete options and a recommendation, and set `recommended_option_index`
-to the zero-based index of the option you recommend (`0` is the first option; `null` for none).
-When you recommend the first option, Harbor may accept it automatically and resume you with it as
-the answer; that answer never authorizes a merge, so `delivery.merge_mode` still decides merges.
+model settings. Include concrete options and a recommendation, and ALWAYS set
+`recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
+option; `null` for none). Harbor reads only that index, never the prose: when it is `0`, Harbor may
+accept the first option automatically and resume you with it as the answer. Keep `recommendation`
+a plain reason for that same option, with no conditions and no mention of other options; anything
+else sends the question to a human. That answer never authorizes a merge, so
+`delivery.merge_mode` still decides merges.
 First Mate monitors blocked runs and may resume you with an instruction or start a fresh session.
 
 Return the run-result schema with the actual PR URL, status, waiting_on and a concrete next_action.

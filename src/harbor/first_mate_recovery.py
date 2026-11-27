@@ -451,23 +451,32 @@ def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: 
     finder = getattr(db, "open_escalations", None)
     rows = [row for row in (finder([case.ticket]) if callable(finder) else [])
             if str(row.get("run_id") or "") == case.run_id]
-    escalation_id = rows[-1].get("id") if rows else None
-    # First Mate has no protected-path configuration or worktree diff, so it
-    # reads the facts the ladder recorded for this escalation.  No record
-    # means no assessment, and nothing is auto-accepted.
+    # A resumed session keeps its run id, so an older open escalation for the
+    # same run is normal.  Only an escalation recorded for THIS blocker (same
+    # question and kind, and the same blocker digest in the ladder's
+    # assessment) may be answered; anything else is doubt, and doubt refuses.
+    row = rows[-1] if rows else None
+    escalation_id = row.get("id") if row else None
     facts = auto_accept.eligibility(db, escalation_id)
+    doubt = ""
+    if row is None:
+        doubt = "no open escalation is recorded for this run"
+    elif (" ".join(str(row.get("question") or "").split()) != " ".join(str(case.blocker.get("question") or "").split())
+          or " ".join(str(row.get("kind") or "").split()) != " ".join(case.kind.casefold().replace("-", "_").split())):
+        doubt = f"the open escalation #{escalation_id} was recorded for a different question"
+    elif facts is None:
+        doubt = "Harbor recorded no protected-path assessment for this escalation"
+    elif facts["blocker_digest"] != auto_accept.blocker_digest(case.blocker):
+        doubt = f"Harbor's assessment of escalation #{escalation_id} was recorded for a different blocker"
+    trusted = facts if facts is not None and not doubt else None
     assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,
                                     parked_for_human=case.parked_for_human,
-                                    protected=bool(facts and facts["protected"]),
-                                    human_decisions=bool(human_decisions or (facts and facts["human_decisions"])))
+                                    protected=bool(trusted and trusted["protected"]),
+                                    human_decisions=bool(human_decisions or (trusted and trusted["human_decisions"])))
     if assessment.status == "not_applicable":
         return decision
-    if assessment.accepted and escalation_id is None:
-        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method,
-                                            "no open escalation is recorded for this run")
-    elif assessment.accepted and facts is None:
-        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method,
-                                            "Harbor recorded no protected-path assessment for this escalation")
+    if assessment.accepted and doubt:
+        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method, doubt)
     if not assessment.accepted:
         decision["reason"] = f"{decision.get('reason') or 'escalated'}; auto-accept of option 1 not applied: {assessment.reason}"
         return decision

@@ -41,7 +41,9 @@ def ticket():
     return {"identifier": "SAMPLE-7", "id": "linear-7", "title": "Blocked", "state": "In Progress"}
 
 
-def blocker(recommendation="Take the first option.", *, question=QUESTION, options=OPTIONS, index=None, kind="product_decision"):
+def blocker(recommendation="Take the first option.", *, question=QUESTION, options=OPTIONS, index=0, kind="product_decision"):
+    """A builder blocker; ``index=None`` omits ``recommended_option_index``."""
+
     value = {"kind": kind, "question": question, "options": list(options), "recommendation": recommendation,
              "evidence": "the design file lists two variants"}
     if index is not None:
@@ -127,8 +129,25 @@ def test_first_option_recommendations_are_recognised(value):
     blocker("Do not take the first option."),
     blocker("Option 1 or option 2 both work"),
     blocker("The first option, unless the team wants speed"),
-    blocker("Use the short wording, from the design"),  # a paraphrase without the index
-    blocker(""),
+    # Review round 2, B3: there is no free-text fallback; without the index nothing counts.
+    blocker("Use the short wording, from the design", index=None),
+    blocker("Take the first option.", index=None),
+    blocker("Option 1", index=None),
+    blocker("Use the short wording from the design file", index=None),  # even exactly option 1
+    blocker("", index=None),
+    # ...and with index 0 the text may only agree (the reviewer's exact inputs).
+    blocker("Option 1 was considered; recommend the longer paragraph"),
+    blocker("Option 1 vs 2: the paragraph wins"),
+    blocker("Option 1. Actually prefer the long paragraph"),
+    blocker("Option 1 is suboptimal"),
+    blocker("Option 1 except for the header"),
+    blocker("Option 1: Write a longer explanatory paragraph"),
+    blocker("Option ２"),  # full-width 2
+    blocker("The 2nd option"),
+    blocker("Plan B"),
+    blocker("Option II"),
+    blocker("Use 2"),
+    blocker("Write the explanatory paragraph"),  # paraphrases option 2
     blocker("Take the first option.", options=[]),
     # Review B3: conditions, hand-offs and letter labels are never a plain pick.
     blocker("Option 1 if the tests pass"),
@@ -175,7 +194,7 @@ def test_recommended_first_option_is_auto_accepted_and_resumes_the_builder(harne
     assert harness.linear.states == [] and harness.notices == []
     [receipt] = harness.receipts()
     assert receipt["escalation_id"] == escalation["id"] and receipt["source"] == "ladder"
-    assert receipt["option"] == OPTIONS[0] and receipt["method"] == "text"
+    assert receipt["option"] == OPTIONS[0] and receipt["method"] == "structured"
 
 
 def test_structured_index_zero_accepts_a_paraphrased_recommendation(harness):
@@ -187,7 +206,9 @@ def test_structured_index_zero_accepts_a_paraphrased_recommendation(harness):
 @pytest.mark.parametrize("value", [
     blocker("Option 2"),
     blocker("Take the first option.", index=1),
-    blocker("Use the short wording, from the design"),  # ambiguous paraphrase
+    blocker("Take the first option.", index=None),  # no structured index: no fallback
+    blocker("Option 1 was considered; recommend the longer paragraph"),
+    blocker("Option 1: Write a longer explanatory paragraph"),
 ])
 def test_option_two_or_ambiguous_recommendation_waits_for_a_human(harness, value):
     result = harness.block(value)
@@ -249,6 +270,16 @@ def test_at_most_n_auto_accepts_per_run(tmp_path):
     "Supply the service account password",
     "Approve deleting the legacy user records",
     "Buy the paid plan for the service",
+    # Review round 2, B2: env-var identifiers, .env, PATs, certificates, destructive data ops.
+    "Set STRIPE_SECRET_KEY in the deployment environment",
+    "Export GITHUB_TOKEN so the builder can push",
+    "Add DATABASE_PASSWORD to the service config",
+    "Drop the users table and recreate it",
+    "Copy the values from .env into the container",
+    "Generate a PAT for the bot account",
+    "Upload the TLS certificate",
+    "Run git reset --hard on the release branch",
+    "Truncate the audit_records table",
 ])
 def test_secret_credential_money_or_deletion_options_are_never_auto_accepted(harness, first_option):
     result = harness.block(blocker("Take the first option.", question="How should Harbor proceed?",
@@ -325,6 +356,13 @@ def test_human_decision_mode_disables_auto_accept(tmp_path):
     ("How should Harbor proceed?", "Waive the screenshot proof"),
     ("How should Harbor proceed?", "Edit workflow.toml to allow auto merge"),
     ("Should the reviewer be skipped?", "Yes, continue without it"),
+    # N2 terms, added with the B2 normalization.
+    ("How should Harbor proceed?", "Push the fix straight to main"),
+    ("How should Harbor proceed?", "Mark the flaky test as xfail"),
+    ("How should Harbor proceed?", "Remove the failing tests"),
+    ("How should Harbor proceed?", "Lower the coverage threshold"),
+    ("How should Harbor proceed?", "Add the bot to CODEOWNERS"),
+    ("How should Harbor proceed?", "Set merge_mode to workflow_checked"),
 ])
 def test_merge_and_gate_lowering_options_are_never_auto_accepted(harness, question, first_option):
     """Review B4: the merge gate is cooperative, so an answer must never steer past it."""
@@ -408,8 +446,49 @@ def test_run_result_schema_carries_recommended_option_index():
 
 def _case(db, value, *, run_id="builder-session"):
     row = db.record_escalation("SAMPLE-7", run_id, value["kind"], value["question"], 2, status="open")
-    auto_accept.record_eligibility(db, row["id"], protected=False, human_decisions=False)
+    auto_accept.record_eligibility(db, row["id"], value, protected=False, human_decisions=False)
     return recovery.Case("Sample", "SAMPLE-7", run_id, "blocked", "blocked", value, linear_id="linear-7")
+
+
+def test_first_mate_never_answers_an_older_escalation_with_a_newer_blockers_option(tmp_path):
+    """Review round 2, B1 (reviewer's repro): a resumed session keeps its run id.
+
+    E1 (an unprotected question) is still open when the run re-blocks with Q2 on
+    a protected path, and the ladder raises before rung 2, so no E2 is recorded.
+    First Mate must not answer E1 with Q2's option."""
+
+    harness = Harness(tmp_path, protected_paths=("infra/**",))
+    try:
+        first = harness.block(blocker("Option 2", question="Which colour should the banner use?",
+                                      options=["Blue", "Green"], index=1))
+        assert first.action == "park"
+        e1 = harness.db.escalations()[-1]
+        assert auto_accept.eligibility(harness.db, e1["id"])["protected"] is False
+        q2 = {**blocker("Option 1", question="Should the deploy manifest set replicas to 3?",
+                        options=["Set replicas to three", "Keep one replica"]),
+              "touched_paths": ["infra/deploy.yml"]}
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", q2, linear_id="linear-7")
+        decision = recovery.apply_auto_accept(harness.db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert decision["action"] == "escalate"
+        assert "different question" in decision["reason"]
+        e1_after = harness.db.escalations()[-1]
+        assert e1_after["id"] == e1["id"] and e1_after["status"] == "open" and e1_after["answer"] is None
+        assert auto_accept.history(harness.db, "SAMPLE-7") == []
+    finally:
+        harness.db.close()
+
+
+def test_first_mate_refuses_when_the_assessment_was_for_a_different_blocker(tmp_path):
+    db = HarborDB(tmp_path / "harbor.db")
+    try:
+        recorded = _case(db, blocker("Option 1"))
+        # Same question and kind, but the options changed since Harbor assessed it.
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked",
+                             {**recorded.blocker, "options": ["Use the tiny wording", OPTIONS[1]]}, linear_id="linear-7")
+        decision = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert decision["action"] == "escalate" and "different blocker" in decision["reason"]
+    finally:
+        db.close()
 
 
 def test_first_mate_escalation_becomes_a_resume_with_option_one(tmp_path):

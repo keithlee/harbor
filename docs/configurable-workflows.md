@@ -181,16 +181,18 @@ max_auto_accepts = 2              # per builder run, 0-10
 `decisions.mode = "human"` (or `firstmate_decisions: human` in `pipeline.md`)
 turns auto-accept off: the project said humans decide.
 
-Harbor decides deterministically, and refuses when in doubt.
-`recommended_option_index = 0` counts; any other index does not, and neither
-does an index 0 whose text names another option (a number, a letter such as
-"option B" or "(b)", "second", "other"), speaks against option 1 ("not",
-"unsafe") or adds a condition or hand-off ("if", "but", "only", "after",
-"once", "until", "provided", "confirm", "approve", "ask", "a human"). Without
-the index, only a strict text match counts: the recommendation is exactly the
-first option, or it begins "first option" / "option 1" (optionally "Take ...",
-"Choose ...") with none of those words after it. Anything else, including a
-paraphrase without the index, stays with a human.
+Harbor decides deterministically and fails closed. Only the structured
+`recommended_option_index = 0` counts: there is no free-text fallback, so a
+builder that leaves the index `null` always gets a human. The recommendation
+text can only veto the index. Harbor refuses when the text:
+
+- refers to another option by number or digit (any digit but a lone "1",
+  including full-width forms and "2nd"), number word, letter ("option B",
+  "(b)", "plan B"), roman numeral, ordinal, or "other", "instead", "vs";
+- reads at least as much like another option as like option 1 (word overlap);
+- speaks against option 1 ("not", "unsafe", "suboptimal") or adds a condition,
+  exception or hand-off ("if", "but", "only", "after", "except", "actually",
+  "confirm", "approve", "ask", "a human").
 
 Guardrails:
 
@@ -198,17 +200,22 @@ Guardrails:
   `pre_merge` readiness are unchanged, the answer text says so, and a run
   parked waiting on a human merge is never auto-accepted. Because the merge
   gate is cooperative, Harbor also never auto-accepts when the question or
-  option 1 is about merging, force-pushing, branch protection, skipping or
-  disabling CI, checks or review, the risk tier, waiving proof, or editing
-  protected paths or the gate configuration.
+  option 1 is about merging, force-pushing or pushing to the base branch,
+  branch protection, skipping, disabling or xfailing CI, checks, tests or
+  review, removing tests, lowering coverage, the risk tier, waiving proof, or
+  editing protected paths, CODEOWNERS or the gate configuration.
 - Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
   question or the same option is left for a human, and so is anything after
   `max_auto_accepts` auto-accepts in one run. The Linear comment says why.
 - An option involving secrets, credentials, tokens, logins, money, billing or
   deleting data is never auto-accepted, and neither is a blocker that touches a
-  protected path. The ladder records its protected-path and decision-mode facts
-  per escalation (`auto_accept_eligibility`); First Mate reads them and never
-  auto-accepts an escalation without them.
+  protected path. Names are split on `_ - . /` first, so `STRIPE_SECRET_KEY` or
+  `GITHUB_TOKEN` count, as do `.env`, PATs, certificates and "drop/truncate/
+  wipe/reset ... table, database, users, records, branch or files". The ladder
+  records its protected-path and decision-mode facts per escalation, bound to
+  a digest of the exact blocker (`auto_accept_assessments`). First Mate answers
+  only an escalation whose question, kind and digest match the blocker it is
+  looking at.
 - The answer is recorded when the resume launches and announced on Linear only
   after it is delivered. Any exit that delivers nothing (held, superseded,
   failed or cancelled) reopens the escalation and clears the answer. An

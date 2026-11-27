@@ -1452,7 +1452,7 @@ class UnblockLadder:
         )
         human_decisions = self.policy.decision_mode == "human"
         auto_accept_policy.record_eligibility(
-            self.db, escalation_id, protected=protected_now, human_decisions=human_decisions,
+            self.db, escalation_id, blocker_value, protected=protected_now, human_decisions=human_decisions,
         )
         assessment = auto_accept_policy.assess(
             self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
