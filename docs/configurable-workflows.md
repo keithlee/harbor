@@ -417,6 +417,26 @@ When a boot fails, the prompt quotes the literal error and tells the builder
 to report it as a blocker instead of working around the sandbox. To use a
 particular device, boot it yourself before Harbor launches the builder.
 
+**Web screenshots with Playwright.** With `web`, a builder can serve the app on
+127.0.0.1 and screenshot it with Playwright inside its sandbox. No extra rule
+is needed, but Chromium must run with `--single-process`:
+
+```js
+const browser = await chromium.launch({ args: ["--single-process"] });
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+await page.goto("http://127.0.0.1:3000/");
+await page.screenshot({ path: "desktop.png" });
+await page.setViewportSize({ width: 390, height: 844 });
+await page.screenshot({ path: "mobile.png" });
+```
+
+A normal launch dies with
+`bootstrap_check_in org.chromium.Chromium.MachPortRendezvousServer.<pid>: Permission denied (1100)`.
+Chromium registers a Mach service for its child processes, and the sandbox
+allows looking services up but not registering them. In single-process mode,
+use one page and resize it: a second browser context crashed the browser.
+Harbor puts these instructions in the builder's prompt when `web` is enabled.
+
 **What you are trusting the builder with.** Every platform gives the builder's
 commands a path out of the sandbox. The sandbox flags stay set
 (`failIfUnavailable`, `allowUnsandboxedCommands = false`), and the host
@@ -492,13 +512,28 @@ commands. They do not stop a builder that means to get around them.
   Unicode NFC normalisation and case folding, so `.HARBOR/` and
   `.harbor/workflow/WORKFLOW.toml`, which land on the real files on macOS, count
   too. The comparison is the PR head against its merge base with the PR's base.
+- **An untracked `.harbor/`.** Harbor reads the workflow from the main
+  checkout, so a project may keep `.harbor/` untracked. When neither the merge
+  base nor the PR head tracks anything under `.harbor/`, the PR cannot change
+  it and the check passes. A PR that starts tracking `.harbor/` content counts
+  as a change.
 - **SHAs:** both come from GitHub as full SHAs, never from a local
   `origin/<base>` ref, which a builder can forge with `git tag` or
-  `git update-ref`. A commit missing locally is fetched into
-  `refs/harbor/check/<sha>`.
+  `git update-ref`.
+- **No builder-controlled git config.** The check never runs git with
+  configuration the builder could have written:
+  - It runs in a throwaway bare repository that borrows only the object
+    directory of the main repository's git dir. Harbor resolves that git dir
+    from the project's `repo_path`, not from the worktree's `.git` file.
+  - The throwaway repository runs no hooks and no fsmonitor, and does not use
+    ssh or `ext::` transports, upload-pack hooks, replacement objects, grafts,
+    commit-graphs or a shallow file.
+  - A commit missing locally is fetched only from Harbor's own URL for the
+    configured repository, with `--upload-pack=git-upload-pack`, into the
+    throwaway repository.
 - **Unreadable is refused too.** Missing commits, a SHA that does not match
-  the PR head, and a `.harbor`, `.harbor/workflow` or `workflow.toml` that is a
-  symlink, a submodule or missing all count as unreadable.
+  the PR head, and a tracked `.harbor`, `.harbor/workflow` or `workflow.toml`
+  that is a symlink or a submodule all count as unreadable.
 - **Where it runs:**
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
   - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
@@ -509,16 +544,22 @@ commands. They do not stop a builder that means to get around them.
     configured repository.
   - GraphQL mutations are allowed only for `addPullRequestReviewThreadReply`,
     `resolveReviewThread`, `unresolveReviewThread` and `addComment`. The query
-    is parsed: escapes decoded, comments stripped, aliases and fragments
-    resolved, and anything Harbor cannot parse is refused.
+    is parsed: escapes are decoded, comments stripped and aliases resolved to
+    the real field. Fragments inside a mutation, batches and anything Harbor
+    cannot parse are refused.
+  - A review may only `COMMENT` or `REQUEST_CHANGES`; `APPROVE` is refused.
+  - The repository is the one Harbor configured (`HARBOR_GITHUB_REPOSITORY`).
+    A different `--repo` is refused, and with none configured the helper
+    refuses to run.
   - Merges, refs, contents and branch protection are refused there.
 
 **Known ways around Harbor's checks**, which only branch protection stops:
 - the GitHub token used directly, for example `curl` to the REST or GraphQL API;
 - the GitHub MCP server's merge tool when `[github] transport = "mcp"`;
 - `git push` to the base branch;
-- the repository's git directory, which the builder can write: refs, objects,
-  config and hooks that Harbor's own git commands then read.
+- the repository's git directory, which the builder can write. Harbor reads
+  its objects but no config, refs or hooks, so a forged object is still a way
+  around the check.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`
@@ -560,15 +601,13 @@ and `harbor start` warns once.
 Codex CLI 0.170.0. Live haiku builder sessions used Harbor's exact builder
 argv. `codex sandbox` used an equivalent permission profile. A sandboxed
 builder ran `adb -s emulator-5554 exec-out screencap -p` (a 1080 x 2400 PNG)
-and `simctl io booted screenshot` (1206 x 2622). Harbor's device check reused
+and `simctl io booted screenshot` (1206 x 2622). It also ran Playwright
+(`playwright-core` 1.58, headless Chromium 145) with `--single-process` against a
+page on 127.0.0.1, at 1440 x 900 and 390 x 844. Harbor's device check reused
 the running emulator and simulator. Not verified:
 - Linux;
 - an Intel Mac (the `SimLaunchHost-x86` name);
-- Harbor cold-booting an emulator or simulator (both were already running);
-- a Playwright browser inside the Claude sandbox. Loading `playwright-core`
-  1.58 hung there with `web` enabled, so `web` grants only local ports. Until
-  that is verified, take browser screenshots with Harbor's Codex
-  `playwright_browser_image` or outside the builder.
+- Harbor cold-booting an emulator or simulator (both were already running).
 
 ### Editing mid-run
 

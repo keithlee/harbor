@@ -515,6 +515,9 @@ What each platform turns on:
 - Before each launch, Harbor boots one emulator and one simulator outside the
   sandbox if none is running. It tells the builder the result, quoting the
   literal error if a boot fails.
+- With `web`, the builder can screenshot a local page with Playwright inside
+  its sandbox if it launches Chromium with `--single-process`. Harbor tells it
+  how in the prompt.
 
 **Each platform is a way out of the sandbox, not a small widening:**
 - `adb shell curl` reaches any host, and `adb push` and `adb pull` move files.
