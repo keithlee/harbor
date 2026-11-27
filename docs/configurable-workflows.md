@@ -201,13 +201,16 @@ These check fields, characters and ledger state, not meaning.
   turns it off.
 - **Structured index.** Only `recommended_option_index = 0` counts; a `null` or
   other index goes to a human. There is no free-text fallback.
-- **Characters.** Option 1 and the recommendation must consist only of
-  printable ASCII letters, spaces and `, . ' " ! ? ( ) -` after NFKC. That
-  rejects non-ASCII characters (homoglyphs, zero-width characters, soft
-  hyphens), digits, currency, backticks, `/` and `\` (so paths and URLs),
-  `_` (so snake_case), and `| > < ; & $ = ~ * # % @ + [ ] { } ^`. A colon is
-  refused, except one directly after "option 1" in the recommendation. A word
-  starting with `-` (a flag) is refused.
+- **Characters.** Checked on the raw text, before any normalization. Option 1
+  and the recommendation may contain only the ASCII letters `A-Z a-z`, the
+  space character (0x20) and `, . ' " ! ? ( )`. Every other character is
+  refused, including digits, `-` (so no flags, wrapped or not), `:`, `#`,
+  `/`, `\`, `_`, backticks, tabs, newlines, control characters and any
+  non-ASCII character. The one exception, in the recommendation only, is the
+  literal phrase `option 1` or `option #1` (any letter case, exactly one
+  space); when that phrase starts the recommendation, a colon may follow it
+  directly (`Option 1: ...`). A colon anywhere else, and `#` outside that
+  phrase, is refused.
 - **Touched protected paths.** A blocker whose reported or observed changed
   paths match a protected pattern is not auto-accepted.
 - **Merge-ready runs.** A run parked as `outcome = "parked"`,
@@ -249,10 +252,12 @@ paraphrases.
   overlap another option at least as much as option 1, are refused. Negation
   and qualifier words ("not", "unsafe", "if", "but", "only", "after",
   "except", "confirm", "ask", "a human", ...) are refused.
-- **Identifier shapes.** A word that starts with two or more capitals (`ALL_CAPS`, `PRs`) is refused.
-  A hyphenated word is refused only with two or more hyphens
-  (`continue-on-error`); `dark-mode` passes. A file name is refused only when
-  dotted (`deploy.yml`); `Dockerfile` or `Makefile` passes.
+- **Identifier shapes.** A word (split on spaces, surrounding `, ' " ! ? ( )`
+  removed) is refused when it starts with two capitals (`ALL_CAPS`, `PRs`),
+  contains a lowercase letter followed by a capital (camelCase,
+  `fetchUserData`), starts with `.` (`.gitignore`), or contains a `.` that is
+  not at its end (`deploy.yml`, `e.g.`). A file name without a dot is just a
+  word, so `Dockerfile` or `Makefile` passes.
 - **Mentioned protected paths.** The question, options and recommendation are
   scanned for path tokens and for whole-word names taken from the protected
   patterns: every non-wildcard segment except generic ones (`src`, `lib`,

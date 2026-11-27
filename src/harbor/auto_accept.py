@@ -32,8 +32,10 @@ Structural checks (exact; they check fields, characters and ledger state):
   does not authorize a merge: the merge gate (``merge_mode`` and
   ``auto_merge_risks`` in pre_merge readiness) is untouched, and the answer
   text says so.
-* Option 1 and the recommendation may contain only printable ASCII letters,
-  spaces and light punctuation after NFKC.
+* Option 1 and the recommendation, as raw text, may contain only ASCII
+  letters, the space character and ``, . ' " ! ? ( )`` (``PROSE_CHARACTERS``);
+  the recommendation may also contain the literal phrase "option 1" or
+  "option #1", followed by a colon only when it leads the text.
 * At most ``max_auto_accepts`` auto-accepts per builder run, undelivered ones
   included.
 
@@ -42,8 +44,8 @@ Lexical checks (word matching; they cannot detect meaning):
 * the recommendation may use only option 1's words plus a fixed affirmative
   list -- "Use the existing date picker" passes for "Build a new date picker";
 * other-option references, negation and qualifier words are refused;
-* ALL_CAPS words, words with two or more hyphens and dotted file names are
-  refused (``dark-mode`` and ``Dockerfile`` pass);
+* ALL_CAPS and camelCase words, dotfiles and words with an inner ``.`` are
+  refused; a file name without a dot (``Dockerfile``) passes;
 * a question, option or recommendation that names a protected path or a
   specific segment of a protected pattern is refused;
 * loop guard: an earlier delivered or in-flight auto-accept with the same
@@ -142,14 +144,17 @@ AFFIRMATIVE_WORDS = frozenset(
     "reversible within existing here please ahead".split()
 )
 
-# Plain prose: printable ASCII letters, spaces and light punctuation only.
-# Everything else -- digits, currency, backticks, ``| > < ; & $ = ~ * # / \\
-# _ [ ] { } % @ +`` and every non-ASCII character (homoglyphs, zero-width
-# characters, soft hyphens) -- makes the text ineligible.
-_PROSE_CHARS_RE = re.compile(r"^[A-Za-z ,.'\"!?()\-:]*$")
-# "option 1", "option #1", "option one" are the one exception in a
-# recommendation; they are removed before the plain-prose check.
-_OPTION_ONE_PHRASE_RE = re.compile(r"\boption\s*#?\s*(?:1|one)\b", re.IGNORECASE)
+# Plain prose, checked on the RAW text (no normalization first): exactly the
+# ASCII letters, the space character (0x20) and ``, . ' " ! ? ( )``.  Every
+# other character -- digits, ``-``, ``:``, ``#``, tabs, newlines, control
+# characters, any non-ASCII character -- makes the text ineligible.
+PROSE_CHARACTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ,.'\"!?()"
+_PROSE_CHARS_RE = re.compile(r"[A-Za-z ,.'\"!?()]*")
+# The one exception, in a recommendation only: the literal phrase "option 1"
+# or "option #1" (any letter case, exactly one space).  When it starts the
+# recommendation it may be followed directly by a colon.
+_LEADING_OPTION_ONE_RE = re.compile(r"(?i)option #?1:?(?![0-9])")
+_OPTION_ONE_PHRASE_RE = re.compile(r"(?i)(?<![A-Za-z0-9])option #?1(?![0-9])")
 # Verbs and nouns of delivery, release, destruction, money, credentials and
 # gates.  Matched against normalized words of option 1 and the
 # recommendation; any match keeps the question with a human.
@@ -167,27 +172,25 @@ _ACTION_WORD_RE = re.compile(
 def plain_prose_reason(text: Any, *, recommendation: bool = False) -> str | None:
     """Why ``text`` is not plain prose (so never auto-accepted), or ``None``."""
 
-    raw = str(text or "")
-    value = unicodedata.normalize("NFKC", raw)
+    value = str(text or "")
     if recommendation:
-        # "Option 1: because ..." -- the colon right after the phrase is prose.
-        value = re.sub(r"^\s*:", " ", _OPTION_ONE_PHRASE_RE.sub(" ", value).strip())
-    if ":" in value:
-        return "it contains a colon (a key, setting, URL or code)"
-    if re.search(r"\w-\w+-\w", value):
-        return "it contains a hyphenated identifier"
-    if not _PROSE_CHARS_RE.match(value):
-        bad = next((char for char in value if not re.match(r"[A-Za-z ,.'\"!?()\-:]", char)), "")
+        # The literal exception, removed from the raw text: a leading
+        # "option 1" (optionally with a colon directly after it), then any
+        # other literal "option 1" / "option #1".
+        leading = _LEADING_OPTION_ONE_RE.match(value)
+        if leading:
+            value = " " + value[leading.end():]
+        value = _OPTION_ONE_PHRASE_RE.sub(" ", value)
+    if not _PROSE_CHARS_RE.fullmatch(value):
+        bad = next(char for char in value if char not in PROSE_CHARACTERS)
         return f"it is not plain prose (contains {bad!r})"
-    words = value.split()
-    if any(word.startswith("-") for word in words):
-        return "it contains a command-line flag"
-    if re.search(r":\S", value):
-        return "it contains a colon followed by a non-space (a key, URL or code)"
-    if any(re.fullmatch(r"[A-Z]{2,}[A-Za-z]*", word.strip(",.'\"!?():")) for word in words):
-        return "it contains an ALL_CAPS identifier"
-    if re.search(r"[A-Za-z]\.[A-Za-z]", value):
-        return "it contains a file name or dotted identifier"
+    words = [word.strip(",'\"!?()") for word in value.split(" ")]
+    if any(re.match(r"[A-Z]{2,}", word) for word in words):
+        return "it contains a word starting with two capitals (an ALL_CAPS identifier)"
+    if any(re.search(r"[a-z][A-Z]", word) for word in words):
+        return "it contains a camelCase identifier"
+    if any(word.strip(".") and (word.startswith(".") or "." in word.rstrip(".")) for word in words):
+        return "it contains a dotted name (a file name, dotfile or identifier)"
     match = _ACTION_WORD_RE.search(_norm(value))
     if match is not None:
         return f"it mentions {match.group(0)!r}, a keyword Harbor leaves to a human"

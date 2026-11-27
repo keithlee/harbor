@@ -403,7 +403,7 @@ def test_merge_and_gate_lowering_keywords_keep_the_question_with_a_human(harness
     "Open https://example.test/settings",
     "Bump the timeout to ninety seconds; it is fine",
 ])
-def test_only_plain_prose_first_options_are_auto_accepted(harness, first_option):
+def test_non_prose_first_options_are_not_auto_accepted(harness, first_option):
     result = harness.block(blocker("Option 1", question="How should Harbor proceed?", options=[first_option, "Wait"]))
     assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
     assert "Auto-accept of option 1 not applied" in harness.linear.comments[0][1]
@@ -482,22 +482,58 @@ def test_documented_limitation_keyword_heuristics_are_not_semantic(harness, firs
 @pytest.mark.parametrize("value", [
     # The recommendation allowlist is lexical: every word is allowed, the meaning is not checked.
     blocker("Use the existing date picker", options=["Build a new date picker", "Reuse the old one"]),
-    # Only two or more hyphens count as an identifier.
-    blocker("Option 1", options=["Ship the dark-mode toggle", "Wait"]),
-    blocker("Option 1", options=["Add the dark-mode toggle", "Wait"]),
-    # Only dotted names count as a file name.
+    # A file name without a dot is just a word.
     blocker("Option 1", options=["Simplify the Dockerfile", "Wait"]),
 ])
 def test_documented_limitation_lexical_checks_as_described(value):
     """DOCUMENTED LIMITATIONS (review round 5, B1): the docs describe these
     checks as lexical; this pins what the code does, not a guarantee."""
 
-    expected = "Ship" not in value["options"][0]  # "ship" is a keyword; the others pass every check
     # With no ledger, assess stops at the loop-guard step; reaching it means
     # every eligibility check above it passed.
     assessment = auto_accept.assess(None, "SAMPLE-7", "run", value, AutoAcceptPolicy())
     assert recommended_first_option(value).first
-    assert (assessment.status == "refused" and "no Harbor ledger" in assessment.reason) is expected
+    assert assessment.status == "refused" and "no Harbor ledger" in assessment.reason
+
+
+@pytest.mark.parametrize("text,recommendation", [
+    # Review round 6, B1: the character check runs on the raw text.
+    ("Take option\n#\t1", True),
+    ("Take option\x1c\x1d\x1e1", True),
+    ("Take option  1", True),  # two spaces: not the literal phrase
+    ("Take the first\toption", True),
+    ("Use the ｓhort wording", False),  # full-width letter: NFKC would have folded it
+    ("Use the short wording #", False),  # "#" only inside the literal "option #1"
+    ("Take it: now", True),  # a colon only directly after a leading "option 1"
+    # Review round 6, B2: no hyphen anywhere, so no wrapped flags.
+    ("Remove it (-rf)", False),
+    ('Run it "-v"', False),
+    ("Run it '-x'", False),
+    ("Use the dark-mode toggle", False),
+    ("Use the dark--mode toggle", False),
+    ("Use the dark-mode- toggle", False),
+    # Review round 6, B3: dotfiles, inner dots and camelCase.
+    ("Edit the .gitignore", False),
+    ("Tune the .npmrc", False),
+    ("Add a .prettierrc", False),
+    ("Use e.g. the short one", False),
+    ("Call fetchUserData again", False),
+    ("Use the SHORT wording", False),
+])
+def test_plain_prose_rules_exactly_as_documented(text, recommendation):
+    assert auto_accept.plain_prose_reason(text, recommendation=recommendation) is not None
+
+
+@pytest.mark.parametrize("text,recommendation", [
+    ("Option 1", True),
+    ("option #1", True),
+    ("Option 1: it matches the ticket criteria.", True),
+    ("I recommend option 1.", True),
+    ("Use the short wording from the design file.", False),
+    ("Keep the wording (it's simplest)!", False),
+])
+def test_plain_prose_accepts_exactly_the_documented_set(text, recommendation):
+    assert auto_accept.plain_prose_reason(text, recommendation=recommendation) is None
 
 
 def test_docs_describe_the_rules_as_the_code_enforces_them():
@@ -507,7 +543,11 @@ def test_docs_describe_the_rules_as_the_code_enforces_them():
     structural, lexical = section.split("#### Lexical checks", 1)
     assert "firstmate_decisions" not in section  # a retired pipeline.md key
     assert "enforced exactly" not in docs
-    assert "80% word overlap" in lexical and "dark-mode" in lexical and "Dockerfile" in lexical
+    assert "80% word overlap" in lexical and "Dockerfile" in lexical and "camelCase" in lexical
+    # Review round 6: the character set is documented exactly as the code defines it.
+    assert "the space character (0x20) and `, . ' \" ! ? ( )`" in " ".join(structural.split())
+    assert set(auto_accept.PROSE_CHARACTERS) == set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ,.'\"!?()")
+    assert "directly (`Option 1: ...`)" in structural and "after NFKC" not in section
     assert "date picker" in lexical
     for word in ("overlap", "allowlist", "best-effort"):
         assert word not in structural.split("#### Structural checks", 1)[1], word
@@ -516,6 +556,8 @@ def test_docs_describe_the_rules_as_the_code_enforces_them():
     skill = (root / "workflows" / "work-pipeline" / "skills" / "delivery" / "SKILL.md").read_text()
     for kind in sorted(auto_accept.ELIGIBLE_KINDS):
         assert kind in skill and kind in section
+    assert "(no commands, paths, numbers or identifiers)" not in skill  # review round 6, B4
+    assert "docs/configurable-workflows.md" in skill
     template = (root / "workflows" / "work-pipeline" / "workflow.toml").read_text()
     assert "twice for the same question" not in template
 
