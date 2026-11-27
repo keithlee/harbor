@@ -247,13 +247,15 @@ class ClaudeRunner(CodexRunner):
     device_preparer: Any = None
 
     async def _execute(self, context, instruction, *, resume, before_spawn=None):
-        if self.device_proof and self.device_preparer is not None:
+        if self.device_proof:
             from harbor.device_boot import device_note
-            # A boot can take minutes; keep the supervisor's event loop free meanwhile.
-            statuses = await asyncio.to_thread(self.device_preparer, self.device_proof)
+            statuses = []
+            if self.device_preparer is not None and {"android", "ios"} & set(self.device_proof):
+                # A boot can take minutes; keep the supervisor's event loop free meanwhile.
+                statuses = await asyncio.to_thread(self.device_preparer, self.device_proof)
             for status in statuses:
                 print(f"Harbor: device proof for {self.ticket or context.run_id}: {status.line()[2:]}", file=sys.stderr)
-            note = device_note(statuses)
+            note = device_note(statuses, web="web" in self.device_proof)
             if note:
                 instruction = f"{instruction}\n\n{note}" if instruction else note
         return await super()._execute(context, instruction, resume=resume, before_spawn=before_spawn)

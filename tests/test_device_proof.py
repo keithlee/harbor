@@ -501,10 +501,10 @@ def test_only_github_shas_are_accepted(tmp_path: Path) -> None:
     repo, base = _repo_with_workflow(tmp_path)
     _write(repo, "src/app.py", "print('changed')\n")
     head = _commit_all(repo, "code only")
-    assert builder_sandbox_change(repo, head, base) is False
+    assert builder_sandbox_change(repo / ".git", head, base) is False
     for bad_base in ("main", "origin/main", base[:12], "HEAD"):
-        assert builder_sandbox_change(repo, head, bad_base) is None
-    assert builder_sandbox_change(repo, "feature", base) is None
+        assert builder_sandbox_change(repo / ".git", head, bad_base) is None
+    assert builder_sandbox_change(repo / ".git", "feature", base) is None
     assert builder_sandbox_change(tmp_path / "missing", head, base) is None
     assert builder_sandbox_change(None, head, base) is None
 
@@ -519,7 +519,7 @@ def test_a_forged_origin_base_cannot_hide_a_harbor_change(tmp_path: Path, forger
     _git(repo, command, ref, head)  # what a sandboxed builder can run in its own worktree
     # The forgery works against anything that trusts the local ref: the merge base becomes the head itself.
     assert _git(repo, "merge-base", ref, head) == head
-    assert builder_sandbox_change(repo, head, base) is True
+    assert builder_sandbox_change(repo / ".git", head, base) is True
 
 
 def test_any_case_folded_harbor_change_counts(tmp_path: Path) -> None:
@@ -529,10 +529,10 @@ def test_any_case_folded_harbor_change_counts(tmp_path: Path) -> None:
                        ("pipeline", ".harbor/pipeline.md")):
         repo, base = _repo_with_workflow(tmp_path / name.replace(" ", "-"))
         _write(repo, path, '[builder]\ndevice_proof = ["android"]\n')
-        assert builder_sandbox_change(repo, _commit_all(repo, name), base) is True, path
+        assert builder_sandbox_change(repo / ".git", _commit_all(repo, name), base) is True, path
     repo, base = _repo_with_workflow(tmp_path / "unrelated")
     _write(repo, "docs/harbor.md", "a .harbor mention outside .harbor/\n")
-    assert builder_sandbox_change(repo, _commit_all(repo, "docs"), base) is False
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "docs"), base) is False
 
 
 def test_a_symlinked_workflow_dir_cannot_hide_a_builder_grant(tmp_path: Path) -> None:
@@ -546,11 +546,11 @@ def test_a_symlinked_workflow_dir_cannot_hide_a_builder_grant(tmp_path: Path) ->
     (repo / ".harbor" / "workflow").rmdir()
     os.symlink("../cfg", repo / ".harbor" / "workflow")
     pr1 = _commit_all(repo, "PR1: symlink the workflow dir")
-    assert builder_sandbox_change(repo, pr1, base) is None
+    assert builder_sandbox_change(repo / ".git", pr1, base) is None
     # PR2, as if PR1 had merged: grant device_proof through the symlink target, outside .harbor/.
     _write(repo, "cfg/workflow.toml", 'version = 1\n[builder]\ndevice_proof = ["ios"]\n')
     pr2 = _commit_all(repo, "PR2: grant device_proof via cfg/")
-    assert builder_sandbox_change(repo, pr2, pr1) is None
+    assert builder_sandbox_change(repo / ".git", pr2, pr1) is None
     # The runtime follows the link, which is why the check must not read "unchanged".
     assert tomllib.loads((repo / WORKFLOW).read_text())["builder"]["device_proof"] == ["ios"]
 
@@ -562,21 +562,22 @@ def test_symlinked_harbor_dir_workflow_file_submodule_and_missing_are_unreadable
     repo, base = _repo_with_workflow(tmp_path / "harbor-link")
     shutil.move(str(repo / ".harbor"), str(repo / "elsewhere"))
     os.symlink("elsewhere", repo / ".harbor")
-    assert builder_sandbox_change(repo, _commit_all(repo, "symlink .harbor"), base) is None
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink .harbor"), base) is None
     repo, base = _repo_with_workflow(tmp_path / "file-link")
     (repo / WORKFLOW).rename(repo / ".harbor" / "workflow" / "real.toml")
     os.symlink("real.toml", repo / WORKFLOW)
-    assert builder_sandbox_change(repo, _commit_all(repo, "symlink workflow.toml"), base) is None
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink workflow.toml"), base) is None
     repo, base = _repo_with_workflow(tmp_path / "submodule")
     _git(repo, "rm", "-q", "-r", ".harbor/workflow")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},.harbor/workflow")
     _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "submodule")
     head = _git(repo, "rev-parse", "HEAD")
     assert "160000 commit" in _git(repo, "ls-tree", head, "--", ".harbor/workflow")
-    assert builder_sandbox_change(repo, head, base) is None
+    assert builder_sandbox_change(repo / ".git", head, base) is None
+    # Deleting the tracked workflow is a .harbor/ change: True, which needs a human merge just like None.
     repo, base = _repo_with_workflow(tmp_path / "missing")
     (repo / WORKFLOW).unlink()
-    assert builder_sandbox_change(repo, _commit_all(repo, "delete workflow"), base) is None
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "delete workflow"), base) is True
 
 
 def test_a_commit_missing_locally_fails_closed(tmp_path: Path) -> None:
@@ -584,20 +585,23 @@ def test_a_commit_missing_locally_fails_closed(tmp_path: Path) -> None:
     repo, base = _repo_with_workflow(tmp_path)
     head = base
     absent = "1" * 40
-    assert builder_sandbox_change(repo, absent, base) is None  # no origin to fetch it from
-    assert builder_sandbox_change(repo, head, absent) is None
+    assert builder_sandbox_change(repo / ".git", absent, base) is None  # no origin to fetch it from
+    assert builder_sandbox_change(repo / ".git", head, absent) is None
 
 
-def test_a_missing_commit_is_fetched_into_a_private_ref(tmp_path: Path) -> None:
-    from harbor.device_proof import CHECK_REF_PREFIX, builder_sandbox_change
+def test_a_missing_commit_is_fetched_from_harbors_url_into_a_throwaway_repo(tmp_path: Path) -> None:
+    import subprocess
+    from harbor.device_proof import builder_sandbox_change
     upstream, base = _repo_with_workflow(tmp_path / "upstream")
     _write(upstream, "src/app.py", "print('upstream')\n")
     head = _commit_all(upstream, "only upstream has this")
     clone = tmp_path / "clone"
     _git(tmp_path, "clone", "-q", "--no-local", "--single-branch", "--branch", "main", str(upstream), str(clone))
-    assert builder_sandbox_change(clone, head, base, fetch=False) is None
-    assert builder_sandbox_change(clone, head, base) is False
-    assert _git(clone, "rev-parse", f"{CHECK_REF_PREFIX}{head}") == head
+    assert builder_sandbox_change(clone / ".git", head, base) is None  # no fetch URL: fail closed
+    assert builder_sandbox_change(clone / ".git", head, base, fetch_url=str(upstream / ".git")) is False
+    # The fetch went into Harbor's private repository; the builder's repository is not written.
+    missing = subprocess.run(["git", "-C", str(clone), "cat-file", "-e", head], capture_output=True)
+    assert missing.returncode != 0
 
 
 # --- Harbor's merge command ------------------------------------------------------------------
@@ -635,7 +639,7 @@ def test_pr_merge_refuses_a_harbor_change_even_with_forged_refs(tmp_path: Path, 
     _git(Path.cwd(), "update-ref", "refs/remotes/origin/main", head)
     gh = FakeGitHub(head, base)
     with pytest.raises(GitHubRestError, match=r"refusing to merge PR #4: human merge required: the PR changes \.harbor/"):
-        run(["--repo", "o/r", "pr-merge", "4", "--sha", head], env={}, client=gh)
+        run(["--repo", "o/r", "pr-merge", "4", "--sha", head], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
     assert [m for m, _, _ in gh.requests] == ["GET"]  # never sent the merge
 
 
@@ -644,7 +648,7 @@ def test_pr_merge_refuses_a_sha_that_is_not_the_pr_head(tmp_path: Path, monkeypa
     head, base = _merge_repo(tmp_path, monkeypatch)
     gh = FakeGitHub(head, base)
     with pytest.raises(GitHubRestError, match="is not the PR's current head"):
-        run(["--repo", "o/r", "pr-merge", "4", "--sha", base], env={}, client=gh)
+        run(["--repo", "o/r", "pr-merge", "4", "--sha", base], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
     assert [m for m, _, _ in gh.requests] == ["GET"]
 
 
@@ -653,7 +657,7 @@ def test_pr_merge_refuses_when_the_diff_cannot_be_read(tmp_path: Path, monkeypat
     monkeypatch.chdir(tmp_path)  # not a git checkout
     gh = FakeGitHub("a" * 40, "b" * 40)
     with pytest.raises(GitHubRestError, match="could not read the PR diff"):
-        run(["--repo", "o/r", "pr-merge", "4", "--sha", "a" * 40], env={}, client=gh)
+        run(["--repo", "o/r", "pr-merge", "4", "--sha", "a" * 40], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
     assert [m for m, _, _ in gh.requests] == ["GET"]
 
 
@@ -661,11 +665,11 @@ def test_pr_merge_and_pr_comment_still_work(tmp_path: Path, monkeypatch) -> None
     from harbor.github_rest import run
     head, base = _merge_repo(tmp_path, monkeypatch)
     gh = FakeGitHub(head, base)
-    assert run(["--repo", "o/r", "pr-merge", "4", "--sha", head], env={}, client=gh) == {"merged": True}
+    assert run(["--repo", "o/r", "pr-merge", "4", "--sha", head], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh) == {"merged": True}
     assert gh.requests[-1][:2] == ("PUT", "/repos/o/r/pulls/4/merge")
     note = tmp_path / "note.md"
     note.write_text("Thanks, fixed.")
-    run(["--repo", "o/r", "pr-comment", "4", "--body-file", str(note)], env={}, client=gh)
+    run(["--repo", "o/r", "pr-comment", "4", "--body-file", str(note)], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
     assert gh.requests[-1] == ("POST", "/repos/o/r/issues/4/comments", {"body": "Thanks, fixed."})
 
 
@@ -737,16 +741,148 @@ def test_pre_merge_checks_githubs_head_and_base_shas_not_local_refs(tmp_path, mo
     from test_workflow_risk_analysis import HEAD, analysis, pre_merge, verdict
     seen = []
 
-    def record(worktree, head, base, **kwargs):
-        seen.append((str(worktree), head, base))
+    def record(git_dir, head, base, **kwargs):
+        seen.append((git_dir, head, base, kwargs.get("fetch_url")))
         return False
 
     monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", record)
+    main = tmp_path / "main"
+    (main / ".git").mkdir(parents=True)
     base = "b" * 40
     code, out = pre_merge(tmp_path, monkeypatch, capsys, description="Risk: low", body=analysis("Risk tier: low"),
-                          comments=[verdict("low")], sandbox_change="real", base_oid=base)
-    assert seen == [(str(tmp_path), HEAD, base)] and code == 0
+                          comments=[verdict("low")], sandbox_change="real", base_oid=base, repo_path=str(main))
+    # GitHub's SHAs, the MAIN repository's git dir from Harbor's config (not the run's worktree, which is
+    # tmp_path here), and Harbor's own fetch URL rather than the worktree's origin.
+    assert seen == [((main / ".git").resolve(), HEAD, base, "https://github.com/example/repo.git")] and code == 0
     seen.clear()
     code, out = pre_merge(tmp_path, monkeypatch, capsys, description="Risk: low", body=analysis("Risk tier: low"),
-                          comments=[verdict("low")], sandbox_change="real", base_oid=None)
-    assert seen == [(str(tmp_path), HEAD, None)]
+                          comments=[verdict("low")], sandbox_change="real", base_oid=None, repo_path=str(main))
+    assert [entry[2] for entry in seen] == [None]
+
+
+# --- fourth review: untracked .harbor/, planted git config, shallow files ----------------------
+
+def _repo_without_harbor(tmp_path: Path) -> tuple[Path, str]:
+    """A project that keeps .harbor/ untracked (Harbor reads it from the main checkout)."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _write(repo, "app.txt", "v1\n")
+    base = _commit_all(repo, "base without .harbor")
+    _write(repo, WORKFLOW, 'version = 1\n[builder]\ndevice_proof = ["ios"]\n')  # untracked, like Bookgen's
+    _git(repo, "checkout", "-q", "-b", "feature")
+    return repo, base
+
+
+def test_an_untracked_harbor_dir_does_not_block_app_only_prs(tmp_path: Path) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_without_harbor(tmp_path)
+    _write(repo, "app.txt", "v2\n")
+    _git(repo, "add", "app.txt")
+    _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "app only")
+    head = _git(repo, "rev-parse", "HEAD")
+    assert "?? .harbor/" in _git(repo, "status", "--porcelain")
+    assert _git(repo, "ls-tree", base, "--", ".harbor") == ""
+    assert builder_sandbox_change(repo / ".git", head, base) is False
+
+
+@pytest.mark.parametrize("path", [WORKFLOW, ".HARBOR/workflow/workflow.toml", ".harbor/pipeline.md"])
+def test_a_pr_that_starts_tracking_harbor_counts(tmp_path: Path, path: str) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_without_harbor(tmp_path)
+    _write(repo, path, '[builder]\ndevice_proof = ["android"]\n')
+    _git(repo, "add", "-f", path)
+    _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "track .harbor")
+    assert builder_sandbox_change(repo / ".git", _git(repo, "rev-parse", "HEAD"), base) is True
+
+
+def test_planted_git_config_never_runs(tmp_path: Path) -> None:
+    """The reviewer's repro: the supervisor's fetch ran remote.origin.uploadpack from config the builder controls."""
+    from harbor.device_proof import builder_sandbox_change
+    upstream, base = _repo_with_workflow(tmp_path / "upstream")
+    _write(upstream, WORKFLOW, 'version = 1\n[builder]\ndevice_proof = ["ios"]\n')
+    head = _commit_all(upstream, "grant, only upstream has it")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", "--no-local", "--single-branch", "--branch", "main", str(upstream), str(clone))
+    pwned = tmp_path / "PWNED"
+    hooks = clone / ".git" / "evil-hooks"
+    hooks.mkdir()
+    for hook in ("post-checkout", "reference-transaction", "post-merge", "fsmonitor-watchman"):
+        (hooks / hook).write_text(f"#!/bin/sh\ntouch {pwned}-{hook}\n")
+        (hooks / hook).chmod(0o755)
+    for key, value in (("remote.origin.uploadpack", f"touch {pwned}; git-upload-pack"),
+                       ("core.fsmonitor", f"touch {pwned}-fsmonitor; false"), ("core.hooksPath", str(hooks)),
+                       ("core.sshCommand", f"touch {pwned}-ssh; false"),
+                       ("uploadpack.packObjectsHook", f"touch {pwned}-pack; git"),
+                       ("core.alternateRefsCommand", f"touch {pwned}-altrefs; true")):
+        _git(clone, "config", key, value)
+    # Harbor fetches from its own configured URL, never from the planted origin, and reads none of that config.
+    assert builder_sandbox_change(clone / ".git", head, base, fetch_url=str(upstream / ".git")) is True
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("PWNED")) == []
+
+
+def test_a_shallow_file_in_the_repository_is_ignored(tmp_path: Path) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    _write(repo, WORKFLOW, 'version = 1\n[builder]\ndevice_proof = ["ios"]\n')
+    grant = _commit_all(repo, "grant")
+    _write(repo, "src/app.py", "print('later')\n")
+    head = _commit_all(repo, "later")
+    # The builder can write .git/shallow: cut the history at the grant so its parent (the base) disappears.
+    (repo / ".git" / "shallow").write_text(f"{grant}\n")
+    assert _git(repo, "rev-list", "--count", head) == "2"  # git in the builder's repo now sees a cut history
+    assert builder_sandbox_change(repo / ".git", head, base) is True
+
+
+@pytest.mark.parametrize(("body", "allowed"), [
+    ('{"event": "APPROVE", "body": "lgtm"}', False),
+    ('{"body": "pending review, no event"}', False),
+    ('{"event": "approve"}', False),
+    ("not json", False),
+    ('{"event": "COMMENT", "body": "x"}', True),
+    ('{"event": "REQUEST_CHANGES", "body": "x"}', True),
+])
+def test_a_builder_can_review_but_never_approve(body, allowed, tmp_path) -> None:
+    from harbor.github_rest import GitHubRestError, run
+    (tmp_path / "review.json").write_text(body)
+    gh = FakeGitHub("a" * 40, "b" * 40)
+    argv = ["api", "POST", "/repos/o/r/pulls/4/reviews", "--input", str(tmp_path / "review.json")]
+    if allowed:
+        run(argv, env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+        assert gh.requests[0][:2] == ("POST", "/repos/o/r/pulls/4/reviews")
+    else:
+        with pytest.raises(GitHubRestError, match="refusing api call"):
+            run(argv, env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+        assert gh.requests == []
+
+
+def test_the_configured_repository_wins_over_a_builder_supplied_repo(tmp_path) -> None:
+    from harbor.github_rest import GitHubRestError, run
+    gh = FakeGitHub("a" * 40, "b" * 40)
+    with pytest.raises(GitHubRestError, match="--repo attacker/repo is not the configured repository o/r"):
+        run(["--repo", "attacker/repo", "pr-view", "4"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    with pytest.raises(GitHubRestError, match="no repository configured"):
+        run(["--repo", "o/r", "pr-view", "4"], env={}, client=gh)
+    with pytest.raises(GitHubRestError, match="no repository configured"):
+        run(["api", "GET", "/repos/o/r/pulls/4"], env={}, client=gh)
+    assert gh.requests == []
+    run(["--repo", "O/R", "pr-view", "4"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert gh.requests == [("GET", "/repos/o/r/pulls/4", None)]
+
+
+def test_the_web_platform_tells_the_builder_how_to_launch_chromium(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from harbor.runner.codex import CodexRunner
+
+    seen = {}
+
+    async def fake_execute(self, context, instruction, *, resume, before_spawn=None):
+        seen["instruction"] = instruction
+
+    monkeypatch.setattr(CodexRunner, "_execute", fake_execute)
+    runner = ClaudeRunner(tmp_path, model="claude-sonnet-5-5", reasoning_effort="medium", executable="claude")
+    runner.device_proof = ("web",)
+    runner.device_preparer = lambda platforms: pytest.fail("web needs no device boot")
+    asyncio.run(runner._execute(runner._new_context(None), "Build SAMPLE-1", resume=False))
+    assert "--single-process" in seen["instruction"] and "MachPortRendezvousServer" in seen["instruction"]
+    assert "setViewportSize" in seen["instruction"]

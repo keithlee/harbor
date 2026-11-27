@@ -43,7 +43,7 @@ def test_fresh_context_scopes_actual_client_observations(tmp_path,monkeypatch):
 def test_pre_merge_checks_fresh_linear_state(tmp_path, monkeypatch, capsys, state, state_type, ready):
     pr_url = "https://github.com/example/repo/pull/1"
     # The fake head is not a real commit; this test is about Linear state, so the [builder] diff is unchanged.
-    monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: False)
+    monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args, **kwargs: False)
 
     class Linear:
         def __init__(self, **kwargs):

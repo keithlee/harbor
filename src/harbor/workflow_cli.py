@@ -148,8 +148,13 @@ async def fresh_context(config, db, ticket_id, run, event):
         sandbox_change = None
         if event == "pre_merge":
             # GitHub's own head and base SHAs, never local refs a builder could forge.
-            from harbor.device_proof import builder_sandbox_change
-            sandbox_change = builder_sandbox_change(run.get("worktree"), fact.get("head_sha"), fact.get("base_sha"))
+            # The git dir and fetch URL come from Harbor's project config, never from the
+            # worktree, whose .git file and config the builder can rewrite.
+            from harbor.device_proof import builder_sandbox_change, git_fetch_url, main_git_dir
+            sandbox_change = builder_sandbox_change(
+                main_git_dir(getattr(config, "repo_path", None)), fact.get("head_sha"), fact.get("base_sha"),
+                fetch_url=git_fetch_url(profile.github_api_url, profile.repository if profile.repository_owner else None),
+            )
         return {"project":config.name,"ticket":ticket_id,"run_id":run["id"],"head_sha":fact.get("head_sha"),
                 "event":event,"fresh":True,"terminal":ticket["state_type"] == "completed",
                 "hold":bool(inactive_merge or ticket["hold"] or ticket["blocked_by"] or ticket["state_type"] == "canceled"),

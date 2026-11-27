@@ -16,9 +16,11 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import unicodedata
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from harbor.config.workflow import WORKFLOW_DIR, device_proof_settings
 
@@ -105,22 +107,79 @@ def open_ledger_read_only(path: Path) -> sqlite3.Connection | None:
 REGULAR_BLOB_MODES = {"100644", "100755"}
 FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 CHECK_REF_PREFIX = "refs/harbor/check/"
+# Config a builder could have planted in the repository it can write is never read:
+# the check runs git in a private bare repository that borrows only the objects.
+HARDENING = (
+    "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c", "core.sshCommand=",
+    "-c", "protocol.ext.allow=never", "-c", "uploadpack.packObjectsHook=", "-c", "core.alternateRefsCommand=",
+    # A commit-graph in the borrowed object directory could lie about parents and move the merge base.
+    "-c", "core.commitGraph=false",
+)
 
 
-def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
-    """git with replacement objects and grafts off, so a builder cannot swap the commits Harbor reads."""
+def main_git_dir(path: Any) -> Path | None:
+    """The common git directory of the repository at ``path`` (or above it), read without running git.
 
-    env = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
-    return subprocess.run(["git", "--no-replace-objects", "-C", str(repo), *args],
-                          capture_output=True, text=True, timeout=timeout, env=env)
+    A worktree's ``.git`` file points at ``<common>/worktrees/<name>``, whose
+    ``commondir`` names the common directory. Nothing in the repository's
+    config is consulted.
+    """
 
-
-def _tree_entry(repo: Path, rev: str, path: str) -> tuple[str, str, str] | None:
-    """``(mode, type, object)`` of exactly ``path`` in ``rev``, or None when it is not there or git fails."""
-
-    listed = _git(repo, "ls-tree", "-z", rev, "--", path)
-    if listed.returncode != 0:
+    if not path:
         return None
+    start = Path(str(path)).expanduser()
+    for directory in (start, *start.parents):
+        dot = directory / ".git"
+        if dot.is_dir():
+            return dot.resolve()
+        if dot.is_file():
+            text = dot.read_text(encoding="utf-8", errors="replace").strip()
+            if not text.startswith("gitdir:"):
+                return None
+            admin = (directory / text.split(":", 1)[1].strip()).resolve()
+            common = admin / "commondir"
+            if common.is_file():
+                return (admin / common.read_text(encoding="utf-8").strip()).resolve()
+            return admin
+    return None
+
+
+class _CheckRepo:
+    """A throwaway bare repository whose only link to the real one is ``objects/info/alternates``."""
+
+    def __init__(self, git_dir: Path):
+        self.git_dir = git_dir
+        self._tmp = tempfile.TemporaryDirectory(prefix="harbor-check-")
+        self.path = Path(self._tmp.name) / "check.git"
+
+    def __enter__(self) -> "_CheckRepo":
+        objects = self.git_dir / "objects"
+        if not objects.is_dir():
+            raise OSError(f"{objects} is not a git object directory")
+        init = self.run("init", "--bare", "--quiet", str(self.path), git_dir=False)
+        if init.returncode != 0:
+            raise OSError(init.stderr.strip())
+        (self.path / "objects" / "info" / "alternates").write_text(str(objects) + "\n", encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._tmp.cleanup()
+
+    def run(self, *args: str, timeout: float = 30, git_dir: bool = True) -> subprocess.CompletedProcess:
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1",
+                   GIT_CEILING_DIRECTORIES=str(Path(self._tmp.name)))
+        location = ("--git-dir", str(self.path)) if git_dir else ()
+        return subprocess.run(["git", "--no-replace-objects", *HARDENING, *location, *args],
+                              capture_output=True, text=True, timeout=timeout, env=env, cwd=self._tmp.name)
+
+
+def _tree_entry(repo: _CheckRepo, rev: str, path: str) -> tuple[str, str, str] | None:
+    """``(mode, type, object)`` of exactly ``path`` in ``rev``; None when absent. Raises OSError if git fails."""
+
+    listed = repo.run("ls-tree", "-z", "--end-of-options", rev, "--", path)
+    if listed.returncode != 0:
+        raise OSError(listed.stderr.strip())
     for record in listed.stdout.split("\0"):
         meta, _, name = record.partition("\t")
         if name == path and len(meta.split()) == 3:
@@ -129,41 +188,52 @@ def _tree_entry(repo: Path, rev: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
-def _workflow_blob(repo: Path, rev: str) -> str | None:
-    """The workflow.toml blob in ``rev``, only when every component is a plain tree or a regular file.
+def _harbor_tracked(repo: _CheckRepo, rev: str) -> bool:
+    """Whether ``rev`` tracks anything at a top-level name that case-folds to ``.harbor``."""
 
-    ``ls-tree`` lists nothing under a symlinked ``.harbor`` or
-    ``.harbor/workflow``, although Harbor's runtime resolves the link and loads
-    the target, so a missing entry, a symlink (120000), a submodule (160000) or
-    anything but a regular blob (100644/100755) is unreadable, never "absent".
-    workflow.toml is mandatory for a Harbor project, so absence is unreadable too.
+    listed = repo.run("ls-tree", "-z", "--name-only", "--end-of-options", rev)
+    if listed.returncode != 0:
+        raise OSError(listed.stderr.strip())
+    return any(_is_harbor_path(name) for name in listed.stdout.split("\0") if name)
+
+
+def _workflow_path_is_plain(repo: _CheckRepo, rev: str) -> bool:
+    """False when ``.harbor``, ``.harbor/workflow`` or workflow.toml is tracked as anything but a plain
+    directory / regular file (a symlink 120000, a submodule 160000, ...).
+
+    ``ls-tree`` lists nothing under a symlinked directory although Harbor's
+    runtime follows the link, so such an entry must never read as "absent".
+    A component that is not tracked at all is fine: the project keeps it
+    untracked in the main checkout, where a PR cannot change it.
     """
 
     parts = WORKFLOW_FILE.split("/")
-    for depth in range(1, len(parts)):
+    for depth in range(1, len(parts) + 1):
         entry = _tree_entry(repo, rev, "/".join(parts[:depth]))
-        if entry is None or entry[0] != "040000" or entry[1] != "tree":
-            return None
-    entry = _tree_entry(repo, rev, WORKFLOW_FILE)
-    if entry is None or entry[0] not in REGULAR_BLOB_MODES or entry[1] != "blob":
-        return None
-    return entry[2]
+        if entry is None:
+            return True
+        last = depth == len(parts)
+        if last and (entry[1] != "blob" or entry[0] not in REGULAR_BLOB_MODES):
+            return False
+        if not last and (entry[1] != "tree" or entry[0] != "040000"):
+            return False
+    return True
 
 
-def _has_commit(repo: Path, sha: str) -> bool:
-    found = _git(repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha}^{{commit}}")
+def _has_commit(repo: _CheckRepo, sha: str) -> bool:
+    found = repo.run("rev-parse", "--verify", "--quiet", "--end-of-options", f"{sha}^{{commit}}")
     return found.returncode == 0 and found.stdout.strip() == sha
 
 
-def _ensure_commit(repo: Path, sha: str, fetch: bool) -> bool:
-    """True when commit ``sha`` is present, fetching it into a private ref if needed."""
+def _ensure_commit(repo: _CheckRepo, sha: str, fetch_url: str | None) -> bool:
+    """True when commit ``sha`` is readable, fetching it from Harbor's configured URL if needed."""
 
     if _has_commit(repo, sha):
         return True
-    if not fetch:
+    if not fetch_url:
         return False
-    _git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "origin",
-         f"+{sha}:{CHECK_REF_PREFIX}{sha}", timeout=120)
+    repo.run("fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "--upload-pack=git-upload-pack",
+             "--end-of-options", fetch_url, f"+{sha}:{CHECK_REF_PREFIX}{sha}", timeout=120)
     return _has_commit(repo, sha)
 
 
@@ -174,41 +244,63 @@ def _is_harbor_path(path: str) -> bool:
     return first.casefold() == WORKFLOW_DIR.parts[0].casefold()
 
 
-def builder_sandbox_change(worktree: Any, head_sha: Any, base_sha: Any, *, fetch: bool = True) -> bool | None:
+def git_fetch_url(api_url: str | None, repository: str | None) -> str | None:
+    """Harbor's own https git URL for ``owner/name`` on the configured GitHub host, or None."""
+
+    if not repository or repository.count("/") != 1:
+        return None
+    from harbor.github_rest import rest_base_url
+    host = urlsplit(rest_base_url(api_url)).hostname or ""
+    if host == "api.github.com" or host.startswith("api."):
+        host = host[len("api."):]
+    return f"https://{host}/{repository}.git" if host else None
+
+
+def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *,
+                           fetch_url: str | None = None) -> bool | None:
     """Whether the PR head changes anything under ``.harbor/`` against its merge base with the PR base.
 
-    ``head_sha`` and ``base_sha`` must be full SHAs from GitHub; ref names are
-    refused, so a forged local ``origin/<base>`` tag or remote ref cannot move
-    the merge base. Any change under a ``.harbor`` directory, compared after
-    Unicode NFC normalisation and case folding (``.HARBOR/workflow/WORKFLOW.toml``
-    lands on ``.harbor/workflow/workflow.toml`` on macOS), counts: ``[builder]``
-    and ``[quota_fallback]`` in config.toml can both widen a grant.
+    ``git_dir`` is the repository's common git directory, resolved by the
+    caller from Harbor's project config (``main_git_dir``). git runs in a
+    private bare repository that only borrows its objects, with hooks,
+    fsmonitor, ssh and ext transports, upload-pack hooks, replacement objects,
+    grafts and shallow files out of reach, so config a builder planted in the
+    repository is never read or run. ``head_sha`` and ``base_sha`` must be
+    full SHAs from GitHub, never local refs a builder could forge. A missing
+    commit is fetched from ``fetch_url`` (Harbor's configured remote) only.
 
-    True on such a change, False when there is none, None when Harbor cannot
-    tell: no worktree, a SHA that is not a full SHA or not present (after one
-    fetch into ``refs/harbor/check/``), or a workflow.toml at either end that is
-    missing or not a regular file reached through plain directories. Callers
-    treat None as True.
+    Any change under a ``.harbor`` directory, compared after Unicode NFC
+    normalisation and case folding, counts: ``[builder]`` and
+    ``[quota_fallback]`` can both widen a grant. A project that keeps
+    ``.harbor/`` untracked (Harbor reads it from the main checkout) gets False
+    when the PR still tracks nothing there, and True when it adds some.
+
+    Returns True on a change, False when there is none, None when Harbor
+    cannot tell (bad SHAs, a commit it cannot read, or a tracked ``.harbor``,
+    ``.harbor/workflow`` or workflow.toml that is a symlink, a submodule or
+    not a regular file). Callers treat None as True.
     """
 
-    if not worktree or not isinstance(head_sha, str) or not isinstance(base_sha, str):
+    if not isinstance(head_sha, str) or not isinstance(base_sha, str):
         return None
     if not FULL_SHA.fullmatch(head_sha) or not FULL_SHA.fullmatch(base_sha):
         return None
-    repo = Path(str(worktree))
-    if not repo.is_dir():
+    if not git_dir or not Path(str(git_dir)).is_dir():
         return None
     try:
-        if not _ensure_commit(repo, head_sha, fetch) or not _ensure_commit(repo, base_sha, fetch):
-            return None
-        merged = _git(repo, "merge-base", "--end-of-options", base_sha, head_sha)
-        merge_base = merged.stdout.strip()
-        if merged.returncode != 0 or not FULL_SHA.fullmatch(merge_base):
-            return None
-        if _workflow_blob(repo, merge_base) is None or _workflow_blob(repo, head_sha) is None:
-            return None
-        changed = _git(repo, "diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
-                       "--end-of-options", merge_base, head_sha)
+        with _CheckRepo(Path(str(git_dir)).resolve()) as repo:
+            if not _ensure_commit(repo, head_sha, fetch_url) or not _ensure_commit(repo, base_sha, fetch_url):
+                return None
+            merged = repo.run("merge-base", "--end-of-options", base_sha, head_sha)
+            merge_base = merged.stdout.strip()
+            if merged.returncode != 0 or not FULL_SHA.fullmatch(merge_base):
+                return None
+            if not _harbor_tracked(repo, merge_base) and not _harbor_tracked(repo, head_sha):
+                return False
+            if not _workflow_path_is_plain(repo, merge_base) or not _workflow_path_is_plain(repo, head_sha):
+                return None
+            changed = repo.run("diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
+                               "--end-of-options", merge_base, head_sha)
     except (OSError, subprocess.SubprocessError):
         return None
     if changed.returncode != 0:

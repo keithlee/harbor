@@ -154,15 +154,26 @@ def prepare_devices(platforms: Sequence[str], env: dict[str, str] | None = None,
     return statuses
 
 
-def device_note(statuses: Sequence[DeviceStatus]) -> str:
+WEB_NOTE = (
+    "Harbor web proof: you may serve the app on 127.0.0.1 and screenshot it with Playwright inside your sandbox. "
+    "Launch Chromium with `--single-process` (for example `chromium.launch({ args: ['--single-process'] })`): "
+    "a normal launch dies with `bootstrap_check_in org.chromium.Chromium.MachPortRendezvousServer...: Permission "
+    "denied (1100)`, because the sandbox does not let Chromium register its Mach service. In single-process mode "
+    "use one page and resize it (`page.setViewportSize`) between screenshots; a second browser context crashes."
+)
+
+
+def device_note(statuses: Sequence[DeviceStatus], web: bool = False) -> str:
     """The text Harbor appends to the builder's prompt; empty when nothing was prepared."""
 
-    if not statuses:
-        return ""
-    lines = ["Harbor device proof: before this turn Harbor checked, and booted where needed, one device per "
-             "platform outside your sandbox. Do not boot, shut down or erase devices yourself."]
-    lines += [status.line() for status in statuses]
-    if any(not status.ready for status in statuses):
-        lines.append("A device that is NOT ready cannot be used this turn. Quote the error above when you report the "
-                     "missing proof as a blocker; do not work around the sandbox.")
+    lines = []
+    if statuses:
+        lines.append("Harbor device proof: before this turn Harbor checked, and booted where needed, one device per "
+                     "platform outside your sandbox. Do not boot, shut down or erase devices yourself.")
+        lines += [status.line() for status in statuses]
+        if any(not status.ready for status in statuses):
+            lines.append("A device that is NOT ready cannot be used this turn. Quote the error above when you report "
+                         "the missing proof as a blocker; do not work around the sandbox.")
+    if web:
+        lines.append(WEB_NOTE)
     return "\n".join(lines)

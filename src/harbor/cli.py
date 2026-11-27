@@ -525,6 +525,14 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
     if token_env:
         child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env
+    # pr-merge's .harbor/ check reads these from Harbor's config, not from the worktree.
+    from harbor.device_proof import git_fetch_url, main_git_dir
+    git_dir = main_git_dir(getattr(config, "repo_path", None))
+    if git_dir is not None:
+        child_env["HARBOR_GIT_DIR"] = str(git_dir)
+    fetch_url = git_fetch_url(rest_url, repository or None)
+    if fetch_url:
+        child_env["HARBOR_GIT_FETCH_URL"] = fetch_url
     mcp = {"url": settings["mcp_url"], "token_env": token_env} if settings["transport"] == "mcp" and token_env else None
     # Only Claude's sandbox filters by host, so only a Claude project is held
     # to its host rules here (start and doctor fail closed). A resumed Claude

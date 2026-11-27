@@ -35,7 +35,7 @@ def verdict(risk="low", *, verdict="approve", head=HEAD, author=DELIVERY, **extr
 
 
 def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None, auto_merge_risks=("low",),
-              pr_author=DELIVERY, sandbox_change=False, base_oid=None):
+              pr_author=DELIVERY, sandbox_change=False, base_oid=None, repo_path=None):
     """Run `harbor workflow check --event pre_merge` against mocked Linear/GitHub.
 
     ``comments`` defaults to one current-head low approval from the delivery identity.
@@ -43,7 +43,7 @@ def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None
     for unreadable); ``"real"`` runs the real check against ``tmp_path``.
     """
     if sandbox_change != "real":
-        monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: sandbox_change)
+        monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args, **kwargs: sandbox_change)
     comments = [verdict("low")] if comments is None else comments
 
     class Linear:
@@ -86,7 +86,7 @@ def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None
         f"[delivery]\nauto_merge_risks = {json.dumps(list(auto_merge_risks))}\n[evidence]\nfeedback = \"advisory\"\n"))
     cfg = SimpleNamespace(
         name="A", linear_api_url="https://linear.invalid", linear_project_scope=("canonical",),
-        github_repository="example/repo", required_checks=("tests",), workflow_path=workflow,
+        github_repository="example/repo", required_checks=("tests",), workflow_path=workflow, repo_path=repo_path,
     )
     args = build_parser().parse_args(["workflow", "check", "A", "--ticket", "A-1", "--event", "pre_merge"])
     db = HarborDB(":memory:")

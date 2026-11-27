@@ -66,11 +66,29 @@ def check_api_call(method: str, path: str, body: str | None, repository: str | N
     if repository and match.group(1).casefold() != repository.casefold():
         raise ApiRefused(f"{verb} {path}: writes are limited to the configured repository {repository}")
     rest = match.group(2)
+    if verb == "POST" and re.fullmatch(rf"pulls/{_NUMBER}/reviews", rest):
+        _check_review(body)
     if not any(verb == allowed and pattern.fullmatch(rest) for allowed, pattern in REST_WRITES):
         raise ApiRefused(
             f"{verb} {path} is not on Harbor's write allowlist (comments, replies, reviews, labels, PR create/edit). "
             "Merge with `pr-merge N --sha SHA`; refs, contents, branch protection and merges are refused"
         )
+
+
+REVIEW_EVENTS = {"COMMENT", "REQUEST_CHANGES"}
+
+
+def _check_review(body: str | None) -> None:
+    """A builder may comment on or request changes to a PR, never approve it."""
+
+    try:
+        payload: Any = json.loads(body or "")
+    except ValueError as exc:
+        raise ApiRefused("POST pulls/N/reviews: the body must be JSON") from exc
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if event not in REVIEW_EVENTS:
+        raise ApiRefused(f"POST pulls/N/reviews: event must be one of {', '.join(sorted(REVIEW_EVENTS))}, "
+                         f"not {event!r}; a builder never approves a PR")
 
 
 # --- GraphQL -------------------------------------------------------------------------------

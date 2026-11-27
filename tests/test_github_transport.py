@@ -131,8 +131,8 @@ def test_pr_merge_pins_the_head_sha(fake_curl, monkeypatch) -> None:
     # The fake answers every request with this body: the PR read (head deadbeef) and the merge.
     monkeypatch.setenv("FAKE_BODY", json.dumps({"merged": True, "head": {"sha": "deadbeef"}, "base": {"sha": "cafe"}}))
     # deadbeef is not a real commit; this test is about the request, so .harbor/ is unchanged.
-    monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args: False)
-    run(["--repo", "o/r", "pr-merge", "4", "--sha", "deadbeef"], env={}, client=client(fake_curl))
+    monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args, **kwargs: False)
+    run(["--repo", "o/r", "pr-merge", "4", "--sha", "deadbeef"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=client(fake_curl))
     config = fake_curl.calls()[-1]["config"]
     assert 'request = "PUT"' in config and "/repos/o/r/pulls/4/merge" in config
     assert '\\"sha\\": \\"deadbeef\\"' in config and '\\"merge_method\\": \\"squash\\"' in config
@@ -149,7 +149,7 @@ def test_pr_checks_reports_how_many_legacy_statuses_exist(fake_curl, monkeypatch
         def request(self, method, path, payload=None):  # noqa: ARG002
             return next(responses)
 
-    result = run(["--repo", "o/r", "pr-checks", "4"], env={}, client=Scripted({"GITHUB_TOKEN": TOKEN}))
+    result = run(["--repo", "o/r", "pr-checks", "4"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=Scripted({"GITHUB_TOKEN": TOKEN}))
     assert result["check_runs"] == [{"name": "tests", "status": "completed", "conclusion": "success"}]
     assert result["combined_status"] == "pending" and result["combined_status_count"] == 0
 
@@ -195,6 +195,7 @@ def test_rest_transport_passes_names_and_endpoints_never_the_token(tmp_path: Pat
         "HARBOR_GITHUB_API_URL": "https://api.github.com",
         "HARBOR_GITHUB_REPOSITORY": "owner/repo",
         "HARBOR_GITHUB_TOKEN_ENV": "GH_TOKEN",
+        "HARBOR_GIT_FETCH_URL": "https://github.com/owner/repo.git",
     }
     assert github["mcp"] is None
     assert "-m harbor.github_rest" in github["fact"] and "owner/repo" in github["fact"]
@@ -213,7 +214,7 @@ def test_mcp_transport_configures_the_server_with_a_token_reference(tmp_path: Pa
 
 
 def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path) -> None:
-    github = builder_github(project(tmp_path), workflow(), "claude", env={})
+    github = builder_github(project(tmp_path), workflow(), "claude", env={"HARBOR_GITHUB_REPOSITORY": "o/r"})
     assert github["token_env"] is None and "HARBOR_GITHUB_TOKEN_ENV" not in github["env"]
     assert "no GitHub token" in github["fact"] and "blocker" in github["fact"]
     assert "If the gh CLI works" in github["fact"]  # keychain-only gh users are not stranded

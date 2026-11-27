@@ -157,9 +157,15 @@ class Client:
 
 
 def _repo(args: argparse.Namespace, env: Mapping[str, str]) -> str:
-    repo = (args.repo or env.get("HARBOR_GITHUB_REPOSITORY") or "").strip()
+    """The repository Harbor configured for this run. A different ``--repo`` is refused, never followed."""
+
+    repo = (env.get("HARBOR_GITHUB_REPOSITORY") or "").strip()
     if repo.count("/") != 1 or not all(repo.split("/")):
-        raise GitHubRestError("no repository: pass --repo owner/name or set HARBOR_GITHUB_REPOSITORY")
+        raise GitHubRestError("no repository configured: Harbor sets HARBOR_GITHUB_REPOSITORY from the project's "
+                              "github_repository; this helper does not act on an unconfigured repository")
+    requested = (args.repo or "").strip()
+    if requested and requested.casefold() != repo.casefold():
+        raise GitHubRestError(f"--repo {requested} is not the configured repository {repo}")
     return repo
 
 
@@ -183,22 +189,24 @@ def _pr_summary(pr: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, cwd: str | None = None) -> None:
+def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, env: Mapping[str, str]) -> None:
     """Refuse to merge a PR that changes ``.harbor/``, or whose diff cannot be read (fail closed).
 
     The base and head come from GitHub as full SHAs, never from local refs a
     builder could forge (``git tag origin/main HEAD``). ``sha`` must be the PR's
-    current head. The trees are read from the local checkout the helper runs in;
-    a missing commit is fetched into ``refs/harbor/check/`` or the merge is refused.
+    current head. The git dir and fetch URL come from Harbor (``HARBOR_GIT_DIR``,
+    ``HARBOR_GIT_FETCH_URL``); without them the check falls back to the checkout
+    it runs in and does not fetch.
     """
 
-    from harbor.device_proof import builder_sandbox_change, builder_sandbox_refusal
+    from harbor.device_proof import builder_sandbox_change, builder_sandbox_refusal, main_git_dir
     pr = gh.request("GET", f"{pulls}/{number}") or {}
     head = str((pr.get("head") or {}).get("sha") or "")
     base = str((pr.get("base") or {}).get("sha") or "")
     if not head or head != sha:
         raise GitHubRestError(f"refusing to merge PR #{number}: --sha {sha} is not the PR's current head {head or '(unknown)'}")
-    reason = builder_sandbox_refusal(builder_sandbox_change(cwd or os.getcwd(), head, base))
+    git_dir = env.get("HARBOR_GIT_DIR") or main_git_dir(os.getcwd())
+    reason = builder_sandbox_refusal(builder_sandbox_change(git_dir, head, base, fetch_url=env.get("HARBOR_GIT_FETCH_URL")))
     if reason:
         raise GitHubRestError(f"refusing to merge PR #{number}: {reason}")
 
@@ -238,7 +246,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
     gh = client or Client(environ)
     if args.op == "api":
         body = _read(args.input)
-        _guard_api_call(args.method, args.path, body, (args.repo or environ.get("HARBOR_GITHUB_REPOSITORY") or "").strip() or None)
+        _guard_api_call(args.method, args.path, body, _repo(args, environ))
         return gh.request(args.method, args.path, body)
     repo = _repo(args, environ)
     pulls = f"/repos/{repo}/pulls"
@@ -269,7 +277,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
             "combined_status": (status or {}).get("state"),
             "combined_status_count": (status or {}).get("total_count", 0),
         }
-    _refuse_builder_sandbox_change(gh, pulls, args.number, args.sha)
+    _refuse_builder_sandbox_change(gh, pulls, args.number, args.sha, environ)
     payload = {"sha": args.sha, "merge_method": args.method}
     if args.subject:
         payload["commit_title"] = args.subject
