@@ -27,9 +27,10 @@ mode = "cite_only"
 require_citation = true
 require_rationale = true
 # When a blocked builder recommends the FIRST of its options, Harbor records
-# that option as the answer and resumes the builder (default on). Never for
-# secrets, credentials, money or data deletion, never twice for the same
-# question, and never a merge authorization. Set false to always ask a human.
+# that option as the answer and resumes the builder (default on; mode = "human"
+# turns it off). Never for secrets, credentials, money, data deletion, protected
+# paths, merges or gate changes, never twice for the same question, and never a
+# merge authorization. Set false to always ask a human.
 # auto_accept_first_option = true
 # max_auto_accepts = 2        # per builder run, 0-10
 

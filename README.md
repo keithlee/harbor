@@ -404,9 +404,10 @@ step on Linear. It cannot change protected paths or reconcile conflicting
 instructions automatically. Escalations include evidence, options,
 recommendation and prior attempts. When the builder recommends its first
 option, Harbor accepts it automatically and resumes the builder (on by default;
-`[decisions] auto_accept_first_option = false` opts out). It never does so for
-secrets, credentials, money or data deletion, never twice for an equivalent
-question, and the answer never authorizes a merge; see
+`[decisions] auto_accept_first_option = false` or `mode = "human"` opts out).
+It never does so for secrets, credentials, money, data deletion, protected
+paths, merges or gate changes, or for a conditional recommendation, never twice
+for an equivalent question, and the answer never authorizes a merge; see
 `docs/configurable-workflows.md`. Empty `decision_authors` accepts visible
 ticket participants; configure Linear user IDs to restrict comment authority.
 

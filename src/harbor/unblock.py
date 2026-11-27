@@ -1442,10 +1442,23 @@ class UnblockLadder:
         label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"
         # The builder recommended its own first option: record that option as
         # the answer and resume, unless a guardrail keeps it with a human.
+        # Recompute protection here: triage can escalate (human decision mode,
+        # conflicting instructions, the rung-1 cap) before its own check.
+        protected_now = protected or triage_result.reason == "protected path" or touches_protected_paths(
+            blocker_value,
+            protected_paths=list(self.protected_paths) + _paths(
+                _value(blocker_value, "protected_paths", "protectedPaths", default=None)),
+            repo_path=authority_repo,
+        )
+        human_decisions = self.policy.decision_mode == "human"
+        auto_accept_policy.record_eligibility(
+            self.db, escalation_id, protected=protected_now, human_decisions=human_decisions,
+        )
         assessment = auto_accept_policy.assess(
             self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
             parked_for_human=_is_parked_for_human(final),
-            protected=protected or triage_result.reason == "protected path",
+            protected=protected_now,
+            human_decisions=human_decisions,
         )
         if assessment.accepted and escalation_id is not None and run_id:
             accepted = await self._auto_accept_first_option(
@@ -1542,6 +1555,21 @@ class UnblockLadder:
             self.db, escalation_id=escalation_id, ticket=ticket_id, run_id=run_id, source="ladder", kind=kind,
             question=question, option=assessment.option, recommendation=recommendation, method=assessment.method,
         )
+        answer = auto_accept_policy.answer_text(escalation_id, assessment.option)
+        citation = f"{auto_accept_policy.AUTO_ACCEPT_CITATION}:escalation-{escalation_id}"
+        try:
+            resumed, command = await self._resume(
+                ticket_id, run_id, answer=answer, citation=citation,
+                reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
+                next_action="Apply option 1, then verify the ticket acceptance criteria.",
+            )
+        except BaseException:
+            auto_accept_policy.reopen(self.db, escalation_id)
+            raise
+        if not resumed:
+            auto_accept_policy.reopen(self.db, escalation_id)
+            return None
+        # Announce only what actually happened: the builder was resumed.
         body = auto_accept_policy.comment(
             ticket_id, escalation_id, question=question, option=assessment.option,
             recommendation=recommendation, count=assessment.count, policy=policy,
@@ -1549,16 +1577,6 @@ class UnblockLadder:
         writes: list[str] = []
         if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
             writes.append("comment")
-        answer = auto_accept_policy.answer_text(escalation_id, assessment.option)
-        citation = f"{auto_accept_policy.AUTO_ACCEPT_CITATION}:escalation-{escalation_id}"
-        resumed, command = await self._resume(
-            ticket_id, run_id, answer=answer, citation=citation,
-            reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
-            next_action="Apply option 1, then verify the ticket acceptance criteria.",
-        )
-        if not resumed:
-            auto_accept_policy.reopen(self.db, escalation_id)
-            return None
         receipt = {
             "escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
             "count": assessment.count + 1, "limit": policy.max_auto_accepts,

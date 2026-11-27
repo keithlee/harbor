@@ -433,7 +433,8 @@ def latest_flag_id(connection) -> int | None:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: Any) -> dict:
+def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: Any, *,
+                      human_decisions: bool = False) -> dict:
     """Turn First Mate's escalate into a resume with option 1, when policy allows.
 
     Applies only to a blocked run whose blocker recommends its first option
@@ -451,34 +452,58 @@ def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: 
     rows = [row for row in (finder([case.ticket]) if callable(finder) else [])
             if str(row.get("run_id") or "") == case.run_id]
     escalation_id = rows[-1].get("id") if rows else None
-    # The ladder parks a protected-path blocker with that reason; First Mate
-    # has no protected-path configuration of its own, so it honours the row.
-    protected = bool(rows) and "protected path" in str(rows[-1].get("reason") or "")
+    # First Mate has no protected-path configuration or worktree diff, so it
+    # reads the facts the ladder recorded for this escalation.  No record
+    # means no assessment, and nothing is auto-accepted.
+    facts = auto_accept.eligibility(db, escalation_id)
     assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,
-                                    parked_for_human=case.parked_for_human, protected=protected)
+                                    parked_for_human=case.parked_for_human,
+                                    protected=bool(facts and facts["protected"]),
+                                    human_decisions=bool(human_decisions or (facts and facts["human_decisions"])))
     if assessment.status == "not_applicable":
         return decision
     if assessment.accepted and escalation_id is None:
         assessment = auto_accept.Assessment("refused", assessment.option, assessment.method,
                                             "no open escalation is recorded for this run")
+    elif assessment.accepted and facts is None:
+        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method,
+                                            "Harbor recorded no protected-path assessment for this escalation")
     if not assessment.accepted:
         decision["reason"] = f"{decision.get('reason') or 'escalated'}; auto-accept of option 1 not applied: {assessment.reason}"
         return decision
     question = str(case.blocker.get("question") or "")
     recommendation = str(case.blocker.get("recommendation") or "").strip()
-    auto_accept.record(db, escalation_id=escalation_id, ticket=case.ticket, run_id=case.run_id, source="first_mate",
-                       kind=case.kind, question=question, option=assessment.option, recommendation=recommendation,
-                       method=assessment.method)
+    # Nothing is written yet: the supervisor records the answer when the
+    # resume launches (``record_auto_accept``), posts the comment only after
+    # it is delivered, and reopens the escalation on any other exit.
     return {
         "action": "resume",
         "instruction": "Answer: " + auto_accept.answer_text(escalation_id, assessment.option),
         "reason": f"auto-accepted the recommended first option for escalation #{escalation_id} "
                   f"(First Mate proposed escalate: {decision.get('reason') or 'no reason given'})",
-        "comment": auto_accept.comment(case.ticket, escalation_id, question=question, option=assessment.option,
-                                       recommendation=recommendation, count=assessment.count, policy=policy,
-                                       source="First Mate"),
-        "auto_accept": {"escalation_id": escalation_id, "option": assessment.option, "method": assessment.method},
+        "auto_accept": {"escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
+                        "question": question, "recommendation": recommendation, "kind": case.kind,
+                        "count": assessment.count, "max_auto_accepts": policy.max_auto_accepts},
     }
+
+
+def record_auto_accept(db: Any, case: Case, decision: Mapping[str, Any]) -> None:
+    """Write the auto-accept receipt and mark the escalation answered (at launch)."""
+    from harbor import auto_accept
+    payload = decision["auto_accept"]
+    auto_accept.record(db, escalation_id=payload["escalation_id"], ticket=case.ticket, run_id=case.run_id,
+                       source="first_mate", kind=payload["kind"], question=payload["question"],
+                       option=payload["option"], recommendation=payload["recommendation"], method=payload["method"])
+
+
+def auto_accept_comment(case: Case, decision: Mapping[str, Any]) -> str:
+    """The Linear comment for a delivered First Mate auto-accept."""
+    from harbor import auto_accept
+    payload = decision["auto_accept"]
+    policy = auto_accept.AutoAcceptPolicy(max_auto_accepts=int(payload["max_auto_accepts"]))
+    return auto_accept.comment(case.ticket, payload["escalation_id"], question=payload["question"],
+                               option=payload["option"], recommendation=payload["recommendation"],
+                               count=int(payload["count"]), policy=policy, source="First Mate")
 
 
 def comment(case: Case, decision: Mapping[str, Any]) -> str:

@@ -20,12 +20,17 @@ from harbor.auto_accept import AutoAcceptPolicy, policy_from_config, recommended
 from harbor.config.workflow import load_workflow
 from harbor.db import HarborDB
 from harbor.readiness import evaluate
+from harbor.recovery import BlockerPolicy
 from harbor.runner.base import validate_result
+from harbor.supervisor import Supervisor, _RecoverySuperseded
 from harbor.unblock import UnblockLadder
 from workflow_support import config
 
-QUESTION = "The base branch is protected. How should the PR be merged?"
-OPTIONS = ["Keep the protection and merge it yourself", "Temporarily lift the protection so the builder can merge"]
+QUESTION = "The empty state has no copy yet. Which wording should it use?"
+OPTIONS = ["Use the short wording from the design file", "Write a longer explanatory paragraph"]
+# The review's original fixture: a merge question must never be auto-accepted.
+MERGE_QUESTION = "The base branch is protected. How should the PR be merged?"
+MERGE_OPTIONS = ["Keep the protection and merge it yourself", "Temporarily lift the protection so the builder can merge"]
 
 
 def run(awaitable):
@@ -38,7 +43,7 @@ def ticket():
 
 def blocker(recommendation="Take the first option.", *, question=QUESTION, options=OPTIONS, index=None, kind="product_decision"):
     value = {"kind": kind, "question": question, "options": list(options), "recommendation": recommendation,
-             "evidence": "branch protection rejected the push"}
+             "evidence": "the design file lists two variants"}
     if index is not None:
         value["recommended_option_index"] = index
     return value
@@ -98,14 +103,14 @@ def harness(tmp_path):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("value", [
-    blocker(index=0, recommendation="Keep the protection and merge it yourself; do not bypass it"),
+    blocker(index=0, recommendation="Go with the short wording from the design file."),
     blocker(index=0, recommendation=None),
     blocker("Take the first option."),
     blocker("Option 1"),
     blocker("option #1: keep it"),
     blocker("I recommend option 1."),
-    blocker("Choose the first option because it keeps review intact"),
-    blocker("Keep the protection and merge it yourself"),  # exactly option 1
+    blocker("Choose the first option because it matches the design file"),
+    blocker("Use the short wording from the design file"),  # exactly option 1
 ])
 def test_first_option_recommendations_are_recognised(value):
     assert recommended_first_option(value).first
@@ -118,13 +123,26 @@ def test_first_option_recommendations_are_recognised(value):
     blocker(index=5),
     blocker("Option 2"),
     blocker("Take the second option."),
-    blocker("Temporarily lift the protection so the builder can merge"),  # exactly option 2
+    blocker("Write a longer explanatory paragraph"),  # exactly option 2
     blocker("Do not take the first option."),
     blocker("Option 1 or option 2 both work"),
     blocker("The first option, unless the team wants speed"),
-    blocker("Keep the protection, merge it yourself"),  # a paraphrase without the index
+    blocker("Use the short wording, from the design"),  # a paraphrase without the index
     blocker(""),
     blocker("Take the first option.", options=[]),
+    # Review B3: conditions, hand-offs and letter labels are never a plain pick.
+    blocker("Option 1 if the tests pass"),
+    blocker("Option 1, but only after a human confirms"),
+    blocker("Take option 1 once the reviewer approves"),
+    blocker("Option 1 until we check with the team"),
+    blocker("Option 1 provided nothing else breaks"),
+    blocker("Go with option B", index=0),
+    blocker("Option A is unsafe; take (b)", index=0),
+    blocker("Take b)", index=0),
+    blocker("The second one", index=0),
+    blocker("The short wording is unsafe here", index=0),
+    blocker("Not the short wording", index=0),
+    blocker("Use the short wording if legal agrees", index=0),
 ])
 def test_other_or_ambiguous_recommendations_are_not_first(value):
     assert not recommended_first_option(value).first
@@ -161,7 +179,7 @@ def test_recommended_first_option_is_auto_accepted_and_resumes_the_builder(harne
 
 
 def test_structured_index_zero_accepts_a_paraphrased_recommendation(harness):
-    result = harness.block(blocker("Keep the protection and merge it yourself.", index=0))
+    result = harness.block(blocker("Go with the short wording from the design file.", index=0))
     assert result.action == "resume"
     assert harness.receipts()[0]["method"] == "structured"
 
@@ -169,7 +187,7 @@ def test_structured_index_zero_accepts_a_paraphrased_recommendation(harness):
 @pytest.mark.parametrize("value", [
     blocker("Option 2"),
     blocker("Take the first option.", index=1),
-    blocker("Keep the protection, merge it yourself"),  # ambiguous paraphrase
+    blocker("Use the short wording, from the design"),  # ambiguous paraphrase
 ])
 def test_option_two_or_ambiguous_recommendation_waits_for_a_human(harness, value):
     result = harness.block(value)
@@ -186,7 +204,7 @@ def test_loop_guard_leaves_a_repeated_question_for_a_human(harness):
     assert first.action == "resume"
 
     # The resumed builder blocks again with an equivalent question.
-    again = harness.block(blocker("Take the first option.", question=QUESTION.replace("How", "how") + " "))
+    again = harness.block(blocker("Take the first option.", question=QUESTION.replace("Which", "which") + " "))
 
     assert again.action == "park" and len(harness.resumed) == 1
     assert len(harness.receipts()) == 1
@@ -250,18 +268,70 @@ def test_a_protected_path_blocker_is_never_auto_accepted(tmp_path):
         harness.db.close()
 
 
-def test_first_mate_honours_the_ladders_protected_path_park(tmp_path):
+@pytest.mark.parametrize("ladder", [
+    {"policy": BlockerPolicy(decision_mode="human")},  # triage stops at "project requires human decisions"
+    {"rung_one_cap": 0},  # triage stops at "same-kind rung-1 cap reached"
+    {"policy": BlockerPolicy(decision_mode="cite_only")},
+])
+def test_first_mate_never_auto_accepts_a_protected_path_blocker_the_ladder_parked(tmp_path, ladder):
+    """Review B1: triage can escalate before its protected-path check, so the
+    escalation reason need not say "protected path"; First Mate must still refuse."""
+
+    harness = Harness(tmp_path, protected_paths=("infra/**",), **ladder)
+    try:
+        value = {**blocker("Option 1"), "touched_paths": ["infra/deploy.yml"]}
+        parked = harness.block(value)
+        assert parked.action == "park" and harness.resumed == []
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", value, linear_id="linear-7")
+        decision = recovery.apply_auto_accept(harness.db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert decision["action"] == "escalate"
+        assert auto_accept.history(harness.db, "SAMPLE-7") == []
+        assert harness.db.escalations()[-1]["status"] == "open"
+    finally:
+        harness.db.close()
+
+
+def test_first_mate_refuses_an_escalation_without_a_recorded_assessment(tmp_path):
     db = HarborDB(tmp_path / "harbor.db")
     try:
         value = blocker("Option 1")
-        db.record_escalation("SAMPLE-7", "builder-session", value["kind"], value["question"], 2,
-                             status="open", reason="protected path")
+        db.record_escalation("SAMPLE-7", "builder-session", value["kind"], value["question"], 2, status="open")
         case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", value)
         decision = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
-        assert decision["action"] == "escalate" and "protected path" in decision["reason"]
-        assert auto_accept.history(db, "SAMPLE-7") == []
+        assert decision["action"] == "escalate" and "no protected-path assessment" in decision["reason"]
     finally:
         db.close()
+
+
+def test_human_decision_mode_disables_auto_accept(tmp_path):
+    harness = Harness(tmp_path, policy=BlockerPolicy(decision_mode="human"))
+    try:
+        assert harness.block(blocker("Option 1", index=0)).action == "park"
+        assert harness.resumed == [] and harness.receipts() == []
+    finally:
+        harness.db.close()
+    policy = policy_from_config(load_workflow(config(tmp_path, extra='[decisions]\nmode = "human"\n')).config)
+    assert not policy.enabled
+    assert auto_accept.describe(policy) == 'Auto-accept first option: off (decisions.mode = "human")'
+
+
+@pytest.mark.parametrize("question,first_option", [
+    (MERGE_QUESTION, MERGE_OPTIONS[0]),
+    ("How should Harbor proceed?", "Merge the PR now"),
+    ("How should Harbor proceed?", "Force-push over main"),
+    ("How should Harbor proceed?", "Disable branch protection"),
+    ("How should Harbor proceed?", "Skip the failing CI check"),
+    ("How should Harbor proceed?", "Mark the risk as low"),
+    ("How should Harbor proceed?", "Waive the screenshot proof"),
+    ("How should Harbor proceed?", "Edit workflow.toml to allow auto merge"),
+    ("Should the reviewer be skipped?", "Yes, continue without it"),
+])
+def test_merge_and_gate_lowering_options_are_never_auto_accepted(harness, question, first_option):
+    """Review B4: the merge gate is cooperative, so an answer must never steer past it."""
+
+    result = harness.block(blocker("Take the first option.", question=question, options=[first_option, "Wait"]))
+    assert result.action == "park" and harness.resumed == [] and harness.receipts() == []
+    assert "merging or lowering a gate" in harness.linear.comments[0][1]
 
 
 def test_auto_accept_never_authorizes_a_merge(tmp_path):
@@ -337,7 +407,8 @@ def test_run_result_schema_carries_recommended_option_index():
 # --------------------------------------------------------------------------
 
 def _case(db, value, *, run_id="builder-session"):
-    db.record_escalation("SAMPLE-7", run_id, value["kind"], value["question"], 2, status="open")
+    row = db.record_escalation("SAMPLE-7", run_id, value["kind"], value["question"], 2, status="open")
+    auto_accept.record_eligibility(db, row["id"], protected=False, human_decisions=False)
     return recovery.Case("Sample", "SAMPLE-7", run_id, "blocked", "blocked", value, linear_id="linear-7")
 
 
@@ -350,12 +421,15 @@ def test_first_mate_escalation_becomes_a_resume_with_option_one(tmp_path):
 
         decision = recovery.apply_auto_accept(db, case, escalated, AutoAcceptPolicy())
 
-        escalation = db.escalations()[-1]
         assert decision["action"] == "resume"
         assert decision["instruction"].startswith(f"Answer: {OPTIONS[0]}")
         assert "does not authorize a merge" in decision["instruction"]
+        # Deciding writes nothing; the answer is recorded at launch.
+        assert db.escalations()[-1]["status"] == "open" and auto_accept.history(db, "SAMPLE-7") == []
+        recovery.record_auto_accept(db, case, decision)
+        escalation = db.escalations()[-1]
         assert f"First Mate auto-accepted option 1 for SAMPLE-7 (escalation #{escalation['id']})" \
-            in recovery.comment(case, decision)
+            in recovery.auto_accept_comment(case, decision)
         assert escalation["status"] == "answered"
         assert auto_accept.history(db, "SAMPLE-7")[0]["source"] == "first_mate"
 
@@ -383,3 +457,137 @@ def test_first_mate_keeps_escalating_option_two_opt_out_and_secrets(tmp_path, va
         assert auto_accept.history(db, "SAMPLE-7") == []
     finally:
         db.close()
+
+
+# --------------------------------------------------------------------------
+# First Mate delivery: answered only when delivered (review B2)
+# --------------------------------------------------------------------------
+
+class RecoveryHost:
+    """Just the supervisor state ``Supervisor._schedule_recovery`` touches."""
+
+    _schedule_recovery = Supervisor._schedule_recovery
+
+    def __init__(self, db, *, eligible, apply):
+        self.db = db
+        self._recovery_tickets: set[str] = set()
+        self._dispatch_tasks: dict = {}
+        self.eligible = list(eligible)  # successive _first_mate_can_recover answers
+        self.apply = apply
+        self.comments: list[str] = []
+        self.notices: list[str] = []
+
+    def _first_mate_can_recover(self, case, reload_policy=False, attempted=False):
+        return self.eligible.pop(0) if self.eligible else True
+
+    async def _apply_recovery(self, case, decision, *, before_launch):
+        await self.apply(before_launch)
+
+    async def _post_recovery_comment(self, case, decision):
+        self.comments.append(recovery.comment(case, decision))
+
+    async def _notify_operator(self, key, message):
+        self.notices.append(message)
+
+    def _dispatch_finished(self, key, task):
+        pass
+
+
+async def _launched(before_launch):
+    before_launch()
+
+
+async def _superseded_after_launch(before_launch):
+    before_launch()
+    raise _RecoverySuperseded
+
+
+async def _resume_failed(before_launch):
+    before_launch()
+    raise RuntimeError("retained builder session is not available to resume")
+
+
+async def _cancelled(before_launch):
+    before_launch()
+    raise asyncio.CancelledError
+
+
+def _schedule(tmp_path, *, eligible=(), apply=_launched, before=None):
+    db = HarborDB(tmp_path / "harbor.db")
+    case = _case(db, blocker("Option 1"))
+    decision = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+    assert decision["action"] == "resume"
+    if before is not None:
+        before(db)
+    host = RecoveryHost(db, eligible=eligible, apply=apply)
+
+    async def go():
+        host._schedule_recovery(case, decision)
+        await asyncio.gather(*host._dispatch_tasks.values(), return_exceptions=True)
+
+    run(go())
+    return db, host
+
+
+def test_first_mate_records_and_announces_only_a_delivered_answer(tmp_path):
+    db, host = _schedule(tmp_path)
+    try:
+        escalation = db.escalations()[-1]
+        assert escalation["status"] == "answered" and escalation["answer"] == OPTIONS[0]
+        assert len(auto_accept.history(db, "SAMPLE-7")) == 1
+        [body] = host.comments
+        assert f"First Mate auto-accepted option 1 for SAMPLE-7 (escalation #{escalation['id']})" in body
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("eligible,apply", [
+    ([False], _launched),  # held before the run starts: early return
+    ([True, False], _launched),  # held at launch: _RecoverySuperseded from before_launch
+    ([], _superseded_after_launch),  # the model fallback was refused after the launch
+    ([], _resume_failed),
+    ([], _cancelled),
+])
+def test_first_mate_leaves_the_escalation_open_when_nothing_is_delivered(tmp_path, eligible, apply):
+    db, host = _schedule(tmp_path, eligible=eligible, apply=apply)
+    try:
+        escalation = db.escalations()[-1]
+        assert escalation["status"] == "open"
+        assert escalation["answer"] is None and escalation["citation"] is None
+        assert host.comments == []  # no comment claims a resume that did not happen
+    finally:
+        db.close()
+
+
+def test_first_mate_never_overwrites_an_answer_a_human_gave_first(tmp_path):
+    def human_answers(db):
+        db.update_escalation(db.escalations()[-1]["id"], status="answered")
+
+    db, host = _schedule(tmp_path, before=human_answers)
+    try:
+        escalation = db.escalations()[-1]
+        assert escalation["status"] == "answered" and escalation["citation"] is None
+        assert auto_accept.history(db, "SAMPLE-7") == [] and host.comments == []
+    finally:
+        db.close()
+
+
+def test_a_failed_ladder_resume_clears_the_auto_accepted_answer(tmp_path):
+    harness = Harness(tmp_path)
+
+    async def no_session(run_id, prompt):
+        return False
+
+    harness.ladder.resumer = no_session
+    try:
+        result = harness.block(blocker("Option 1"))
+        assert result.action == "park"
+        escalation = harness.db.escalations()[-1]
+        assert escalation["status"] == "open"
+        assert escalation["answer"] is None and escalation["citation"] is None
+        # The only comment is the park; none claims a resume.
+        assert len(harness.linear.comments) == 1
+        assert "auto-accepted option 1" not in harness.linear.comments[0][1]
+        assert "could not be resumed" in harness.linear.comments[0][1]
+    finally:
+        harness.db.close()

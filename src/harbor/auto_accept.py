@@ -24,7 +24,14 @@ Guardrails, each enforced here and covered by tests:
   question (or the same option) is left for a human.  At most
   ``max_auto_accepts`` auto-accepts happen per builder run.
 * An option that involves secrets, credentials, money or deleting data is
-  never auto-accepted, and neither is a blocker touching a protected path.
+  never auto-accepted, and neither is one about merging or lowering a gate,
+  nor a blocker touching a protected path.  ``decisions.mode = "human"``
+  turns auto-accept off.
+* A recommendation with a condition, a hand-off, a negative description or a
+  reference to any other option is ambiguous: when in doubt, refuse.
+* The answer is recorded only when the resume launches and announced only
+  once delivered; any other exit reopens the escalation with its answer
+  cleared.
 * Each auto-accept is recorded in ``auto_accepts`` (distinct from operator
   answers, which go to ``resolutions``) and announced on Linear.
 
@@ -56,15 +63,28 @@ _FIRST_RE = re.compile(
     r"(?:(?:take|choose|pick|select|use|accept|go\s+with|adopt|proceed\s+with)\s+)?"
     r"(?:the\s+)?(?:first\s+option|option\s+(?:1|one))(?P<rest>(?:\s.*)?)$"
 )
-# Any sign that the recommendation is not a plain "option 1": another option,
-# a negation, or an alternative.
-_OTHER_RE = re.compile(
-    r"\b(?:option\s+(?:[02-9]|\d{2,}|two|three|four|five)|second|third|fourth|fifth|last|other|"
-    r"alternative|alternatively|instead|not|never|avoid|unless|don\s+t|do\s+not|or|either|neither|both)\b"
-)
-# An explicit reference to an option other than the first.
+# Any reference to an option other than the first: a number, a letter label
+# ("option B", "(b)", "take c"), or an ordinal.  Matched against the
+# normalized text, where "(b)" has become " b ".
 _OTHER_OPTION_RE = re.compile(
-    r"\b(?:option\s+(?:[02-9]|\d{2,}|two|three|four|five)|(?:second|third|fourth|fifth|last|other)\s+option)\b"
+    r"\b(?:option\s+(?:[02-9]|\d{2,}|[b-z]|two|three|four|five|six)|"
+    r"(?:take|choose|pick|select|use|accept|go\s+with|prefer|adopt)\s+(?:the\s+)?(?:[b-z]|[2-9])|"
+    r"second|third|fourth|fifth|sixth|last|latter|other|another|alternative|alternatively|instead)\b"
+)
+# A raw "(b)", "b)" or "[b]" label, checked before normalization.
+_LETTER_LABEL_RE = re.compile(r"(?:\(\s*[b-zB-Z]\s*\)|\[\s*[b-zB-Z]\s*\]|(?<![\w(])[b-zB-Z]\))")
+# Negation or a negative description of the option ("unsafe", "risky").
+_NEGATIVE_RE = re.compile(
+    r"\b(?:not|never|no|avoid|don\s+t|do\s+not|doesn\s+t|isn\s+t|won\s+t|shouldn\s+t|reject|against|"
+    r"unsafe|risky|dangerous|wrong|bad|worse|broken|harmful|insecure|discouraged|neither|nor|or|either|both)\b"
+)
+# A condition, a deferral or a human hand-off: the recommendation is not an
+# unconditional pick, so a human decides.
+_QUALIFIER_RE = re.compile(
+    r"\b(?:if|but|only|after|before|once|unless|until|provided|providing|assuming|when|whenever|"
+    r"as\s+long\s+as|depending|depends|maybe|perhaps|probably|possibly|might|could|would|"
+    r"confirm|confirms|confirmed|confirmation|approve|approves|approved|approval|ask|asks|check\s+with|"
+    r"human|humans|person|operator|someone|team|reviewer|manually)\b"
 )
 # Options asking the human for secrets, credentials or money, or to approve
 # deleting data.  Matched against the question, the first option and the
@@ -79,6 +99,21 @@ _SENSITIVE_RE = re.compile(
     r"destroy|erase|rm\s+-rf|data\s+loss|irreversible)\b",
     re.IGNORECASE,
 )
+# Options about merging or about lowering a gate.  The merge gate is
+# cooperative (the builder honours it), so an answer must never steer the
+# builder past it: merging, force-pushing, branch protection, skipping or
+# disabling CI/checks/review, changing the risk tier, waiving proof, or
+# editing protected paths or the gate configuration.
+_GATE_RE = re.compile(
+    r"\b(?:merg(?:e|es|ed|ing)|auto[\s_-]?merge|merge[\s_-]?mode|force[\s_-]?push(?:es|ed|ing)?|push\s+--force|"
+    r"push(?:es|ed|ing)?\s+(?:directly\s+)?to\s+(?:the\s+)?(?:main|master|base|default)|"
+    r"branch[\s_-]?protection|protect(?:ed|ion|ions)?|rulesets?|bypass(?:es|ed|ing)?|"
+    r"skip(?:s|ped|ping)?|disabl(?:e|es|ed|ing)|ignor(?:e|es|ed|ing)|waiv(?:e|es|ed|er|ing)|"
+    r"overrid(?:e|es|den|ing)|turn\s+off|admin|ci|checks?|reviews?|reviewers?|approvals?|"
+    r"risk|risks|risk[\s_-]?tier|proof|proofs|gates?|readiness|workflow\.toml|agents\.md|"
+    r"auto_merge_risks|pre_merge)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -87,6 +122,7 @@ class AutoAcceptPolicy:
 
     enabled: bool = DEFAULT_ENABLED
     max_auto_accepts: int = DEFAULT_MAX_AUTO_ACCEPTS
+    disabled_by: str = ""  # the setting that turned it off, for doctor
 
 
 def validate_settings(decisions: Mapping[str, Any]) -> None:
@@ -101,24 +137,29 @@ def validate_settings(decisions: Mapping[str, Any]) -> None:
 
 
 def policy_from_config(config: Mapping[str, Any] | None) -> AutoAcceptPolicy:
-    """The effective policy; absent keys take the defaults (on, 2 per run)."""
+    """The effective policy; absent keys take the defaults (on, 2 per run).
+
+    ``decisions.mode = "human"`` says humans make every decision, so it turns
+    auto-accept off whatever ``auto_accept_first_option`` says.
+    """
 
     decisions = (config or {}).get("decisions") or {}
     validate_settings(decisions)
-    return AutoAcceptPolicy(
-        enabled=decisions.get("auto_accept_first_option", DEFAULT_ENABLED),
-        max_auto_accepts=decisions.get("max_auto_accepts", DEFAULT_MAX_AUTO_ACCEPTS),
-    )
+    limit = decisions.get("max_auto_accepts", DEFAULT_MAX_AUTO_ACCEPTS)
+    if decisions.get("mode") == "human":
+        return AutoAcceptPolicy(False, limit, 'decisions.mode = "human"')
+    enabled = decisions.get("auto_accept_first_option", DEFAULT_ENABLED)
+    return AutoAcceptPolicy(enabled, limit, "" if enabled else f"{SETTING} = false")
 
 
 def describe(policy: AutoAcceptPolicy) -> str:
     """One ``harbor doctor`` line."""
 
     if not policy.enabled:
-        return f"Auto-accept first option: off ({SETTING} = false)"
+        return f"Auto-accept first option: off ({policy.disabled_by or f'{SETTING} = false'})"
     return (
         f"Auto-accept first option: on · at most {policy.max_auto_accepts} per builder run · "
-        f"never secrets, credentials, money or data deletion · never authorizes a merge "
+        f"never secrets, credentials, money, data deletion, merges or gate changes · never authorizes a merge "
         f"(opt out: {SETTING} = false)"
     )
 
@@ -158,19 +199,28 @@ def recommended_first_option(blocker: Mapping[str, Any]) -> Choice:
             return Choice(False, reason="recommended_option_index is not a valid option index")
         if index != 0:
             return Choice(False, reason=f"the recommendation is option {index + 1}")
-        # The structured field wins over a paraphrase ("Keep the protection
-        # and merge it yourself"), never over a text naming another option.
-        if text and (_OTHER_OPTION_RE.search(text) or any(text == other for other in normalized[1:])):
-            return Choice(False, reason="recommended_option_index contradicts the recommendation text")
+        # The structured field wins over a plain paraphrase of option 1,
+        # never over a text that names another option, speaks against
+        # option 1, or attaches a condition.  When in doubt, refuse.
+        if text and text != normalized[0]:
+            if _LETTER_LABEL_RE.search(recommendation) or _OTHER_OPTION_RE.search(text) \
+                    or any(text == other for other in normalized[1:]):
+                return Choice(False, reason="recommended_option_index contradicts the recommendation text")
+            if _NEGATIVE_RE.search(text) or _QUALIFIER_RE.search(text):
+                return Choice(False, reason="the recommendation is negative or conditional")
         return Choice(True, method="structured")
     if not text:
         return Choice(False, reason="no recommendation")
     if text == normalized[0] and normalized.count(text) == 1:
         return Choice(True, method="exact")
     match = _FIRST_RE.match(text)
-    if match is not None and not _OTHER_RE.search(match.group("rest")):
-        return Choice(True, method="text")
-    return Choice(False, reason="the recommendation does not unambiguously pick the first option")
+    if match is None:
+        return Choice(False, reason="the recommendation does not unambiguously pick the first option")
+    rest = match.group("rest")
+    if (_LETTER_LABEL_RE.search(recommendation) or _OTHER_OPTION_RE.search(rest)
+            or _NEGATIVE_RE.search(rest) or _QUALIFIER_RE.search(rest)):
+        return Choice(False, reason="the recommendation is conditional, negative or names another option")
+    return Choice(True, method="text")
 
 
 def sensitive_reason(blocker: Mapping[str, Any]) -> str | None:
@@ -181,12 +231,18 @@ def sensitive_reason(blocker: Mapping[str, Any]) -> str | None:
         [str(blocker.get("question") or ""), options[0] if options else "", str(blocker.get("recommendation") or "")]
     )
     match = _SENSITIVE_RE.search(haystack)
-    if match is None:
-        return None
-    return (
-        f"the option involves secrets, credentials, money or deleting data (matched {match.group(0)!r}); "
-        "Harbor never auto-accepts those"
-    )
+    if match is not None:
+        return (
+            f"the option involves secrets, credentials, money or deleting data (matched {match.group(0)!r}); "
+            "Harbor never auto-accepts those"
+        )
+    match = _GATE_RE.search(haystack)
+    if match is not None:
+        return (
+            f"the option is about merging or lowering a gate (matched {match.group(0)!r}); an auto-accepted "
+            "answer never steers the builder past the merge gate"
+        )
+    return None
 
 
 def initialize(connection: sqlite3.Connection) -> None:
@@ -267,9 +323,12 @@ def assess(
     *,
     parked_for_human: bool = False,
     protected: bool = False,
+    human_decisions: bool = False,
 ) -> Assessment:
     if not policy.enabled:
-        return Assessment("not_applicable", reason=f"{SETTING} is off")
+        return Assessment("not_applicable", reason=f"auto-accept is off ({policy.disabled_by or SETTING})")
+    if human_decisions:
+        return Assessment("not_applicable", reason="the project's decision mode is human")
     choice = recommended_first_option(blocker)
     if not choice.first:
         return Assessment("not_applicable", reason=choice.reason)
@@ -338,6 +397,17 @@ def record(
     from contextlib import nullcontext
 
     with lock if lock is not None else nullcontext():
+        if escalation_id is not None:
+            # Only an escalation still waiting on a human is answered.  First
+            # Mate records at launch, so a human may have answered first.
+            updated = connection.execute(
+                "UPDATE escalations SET status = 'answered', answered_at = ?, answer = ?, citation = ? "
+                "WHERE id = ? AND COALESCE(status, 'open') = 'open'",
+                (now, option, f"{AUTO_ACCEPT_CITATION}:escalation-{escalation_id}", int(escalation_id)),
+            ).rowcount
+            if updated != 1:
+                connection.rollback()
+                raise EscalationNotOpen(f"escalation {escalation_id} is no longer open")
         cursor = connection.execute(
             "INSERT INTO auto_accepts(escalation_id, ticket, run_id, source, kind, question, option, recommendation, method, at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -346,25 +416,79 @@ def record(
                 source, kind, question, option, recommendation or None, method, now,
             ),
         )
-        if escalation_id is not None:
-            connection.execute(
-                "UPDATE escalations SET status = 'answered', answered_at = ?, answer = ?, citation = ? WHERE id = ?",
-                (now, option, f"{AUTO_ACCEPT_CITATION}:escalation-{escalation_id}", int(escalation_id)),
-            )
         connection.commit()
     return int(cursor.lastrowid)
 
 
+class EscalationNotOpen(RuntimeError):
+    """The escalation was answered or superseded before Harbor could auto-accept it."""
+
+
 def reopen(db: Any, escalation_id: Any) -> None:
-    """Return an auto-accepted escalation to a human after its resume failed."""
+    """Return an auto-accepted escalation to a human when nothing was delivered.
+
+    The auto-accepted answer and citation are cleared, so the row reads as an
+    unanswered question again.  The ``auto_accepts`` receipt stays: it still
+    counts for the loop guard.
+    """
 
     connection = _connection(db)
     if connection is None or escalation_id is None:
         return
     with connection:
         connection.execute(
-            "UPDATE escalations SET status = 'open', answered_at = NULL WHERE id = ?", (int(escalation_id),)
+            "UPDATE escalations SET status = 'open', answered_at = NULL, answer = NULL, citation = NULL "
+            "WHERE id = ? AND citation LIKE ?",
+            (int(escalation_id), f"{AUTO_ACCEPT_CITATION}:%"),
         )
+
+
+def _eligibility_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS auto_accept_eligibility (
+            escalation_id INTEGER PRIMARY KEY,
+            protected INTEGER NOT NULL,
+            human_decisions INTEGER NOT NULL,
+            at TEXT NOT NULL
+        )"""
+    )
+
+
+def record_eligibility(db: Any, escalation_id: Any, *, protected: bool, human_decisions: bool) -> None:
+    """Store the ladder's protected-path and decision-mode facts for an escalation.
+
+    First Mate has no protected-path configuration or worktree diff of its
+    own, so it reads these facts instead of re-deriving them from a reason
+    string.  An escalation without a row is never auto-accepted by First Mate.
+    """
+
+    connection = _connection(db)
+    if connection is None or escalation_id is None:
+        return
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connection:
+        _eligibility_schema(connection)
+        connection.execute(
+            "INSERT OR REPLACE INTO auto_accept_eligibility(escalation_id, protected, human_decisions, at) "
+            "VALUES (?,?,?,?)",
+            (int(escalation_id), int(bool(protected)), int(bool(human_decisions)), now),
+        )
+
+
+def eligibility(db: Any, escalation_id: Any) -> dict[str, bool] | None:
+    """The ladder's recorded facts for ``escalation_id``, or ``None`` when none were recorded."""
+
+    connection = _connection(db)
+    if connection is None or escalation_id is None:
+        return None
+    _eligibility_schema(connection)
+    row = connection.execute(
+        "SELECT protected, human_decisions FROM auto_accept_eligibility WHERE escalation_id = ?",
+        (int(escalation_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"protected": bool(row[0]), "human_decisions": bool(row[1])}
 
 
 MERGE_NOTE = (

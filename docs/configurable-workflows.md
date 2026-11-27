@@ -178,27 +178,43 @@ auto_accept_first_option = true   # false: always wait for a human
 max_auto_accepts = 2              # per builder run, 0-10
 ```
 
-Harbor decides deterministically. `recommended_option_index = 0` counts; any
-other index does not. Without that field, only a strict text match counts: the
-recommendation is exactly the first option, or it begins "first option" /
-"option 1" (optionally "Take ...", "Choose ...") and mentions no other option,
-negation or alternative. Anything else, including a paraphrase without the
-index, stays with a human.
+`decisions.mode = "human"` (or `firstmate_decisions: human` in `pipeline.md`)
+turns auto-accept off: the project said humans decide.
+
+Harbor decides deterministically, and refuses when in doubt.
+`recommended_option_index = 0` counts; any other index does not, and neither
+does an index 0 whose text names another option (a number, a letter such as
+"option B" or "(b)", "second", "other"), speaks against option 1 ("not",
+"unsafe") or adds a condition or hand-off ("if", "but", "only", "after",
+"once", "until", "provided", "confirm", "approve", "ask", "a human"). Without
+the index, only a strict text match counts: the recommendation is exactly the
+first option, or it begins "first option" / "option 1" (optionally "Take ...",
+"Choose ...") with none of those words after it. Anything else, including a
+paraphrase without the index, stays with a human.
 
 Guardrails:
 
 - The answer never authorizes a merge. `merge_mode` and `auto_merge_risks` in
   `pre_merge` readiness are unchanged, the answer text says so, and a run
-  parked waiting on a human merge is never auto-accepted.
+  parked waiting on a human merge is never auto-accepted. Because the merge
+  gate is cooperative, Harbor also never auto-accepts when the question or
+  option 1 is about merging, force-pushing, branch protection, skipping or
+  disabling CI, checks or review, the risk tier, waiving proof, or editing
+  protected paths or the gate configuration.
 - Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
   question or the same option is left for a human, and so is anything after
   `max_auto_accepts` auto-accepts in one run. The Linear comment says why.
 - An option involving secrets, credentials, tokens, logins, money, billing or
   deleting data is never auto-accepted, and neither is a blocker that touches a
-  protected path.
-- Harbor posts a Linear comment naming the escalation id and records the
-  receipt in the `auto_accepts` table. The escalation is `answered` with the
-  citation `harbor:auto-accept-first-option:escalation-<id>` and no
+  protected path. The ladder records its protected-path and decision-mode facts
+  per escalation (`auto_accept_eligibility`); First Mate reads them and never
+  auto-accepts an escalation without them.
+- The answer is recorded when the resume launches and announced on Linear only
+  after it is delivered. Any exit that delivers nothing (held, superseded,
+  failed or cancelled) reopens the escalation and clears the answer. An
+  escalation a human answered first is never overwritten.
+- The receipt goes in the `auto_accepts` table. The escalation is `answered`
+  with the citation `harbor:auto-accept-first-option:escalation-<id>` and no
   `resolutions` row, so it is not reused as authority for later blockers.
 
 `harbor doctor` prints the effective setting. An invalid value fails workflow

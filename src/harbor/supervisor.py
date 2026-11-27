@@ -4669,13 +4669,16 @@ class Supervisor:
                     from harbor.auto_accept import policy_from_config
                     try:
                         policy = policy_from_config(self.dispatcher.workflow.config)
-                        decision = recovery.apply_auto_accept(self.db, case, decision, policy)
+                        human = getattr(getattr(ladder, "policy", None), "decision_mode", "") == "human"
+                        decision = recovery.apply_auto_accept(self.db, case, decision, policy, human_decisions=human)
                     except Exception as exc:  # an unreadable policy auto-accepts nothing
                         self.last_error = f"First Mate auto-accept: {exc}"
                 if decision["action"] == "wait":
                     recovery.record(connection, case, decision)
                     continue
-                await self._post_recovery_comment(case, decision)
+                if not isinstance(decision.get("auto_accept"), Mapping):
+                    # An auto-accept is announced only once it is delivered.
+                    await self._post_recovery_comment(case, decision)
             finally:
                 self._recovery_tickets.discard(case.ticket)
             if self._first_mate_can_recover(case):
@@ -4690,13 +4693,27 @@ class Supervisor:
         # ourselves under the same ticket key.
         previous = self._dispatch_tasks.get(case.ticket)
 
+        auto = decision.get("auto_accept") if isinstance(decision.get("auto_accept"), Mapping) else None
+
         async def run() -> None:
             attempted = False
+            answered = False  # an auto-accepted answer was written at launch
+            delivered = False
 
             def before_launch() -> None:
-                nonlocal attempted
+                nonlocal attempted, answered
                 if not self._first_mate_can_recover(case, reload_policy=True, attempted=attempted):
                     raise _RecoverySuperseded
+                if auto is not None and not answered:
+                    # Written at launch, before the builder's turn, so a
+                    # re-block inside that turn meets the loop guard.  An
+                    # escalation a human answered meanwhile is left alone.
+                    from harbor.auto_accept import EscalationNotOpen
+                    try:
+                        recovery.record_auto_accept(self.db, case, decision)
+                    except EscalationNotOpen:
+                        raise _RecoverySuperseded from None
+                    answered = True
                 if not attempted:
                     recovery.record(connection, case, decision)
                     attempted = True
@@ -4712,6 +4729,7 @@ class Supervisor:
                     if not self._first_mate_can_recover(case):
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
+                delivered = True
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was
@@ -4722,11 +4740,6 @@ class Supervisor:
                         "started: the ticket is no longer eligible for recovery (held, shelved, closed or superseded).")
                 return
             except Exception as exc:
-                if isinstance(decision.get("auto_accept"), Mapping):
-                    # The auto-accepted answer never reached the builder: hand
-                    # the escalation back to a human.
-                    from harbor.auto_accept import reopen
-                    reopen(self.db, decision["auto_accept"].get("escalation_id"))
                 if not attempted and not self._first_mate_can_recover(case):
                     return
                 if connection is not None:
@@ -4737,6 +4750,16 @@ class Supervisor:
                 return
             finally:
                 self._recovery_tickets.discard(case.ticket)
+                if answered and not delivered:
+                    # Every exit that did not deliver the auto-accepted answer
+                    # (superseded, held, failed or cancelled) hands the
+                    # escalation back to a human, with its answer cleared.
+                    from harbor.auto_accept import reopen
+                    reopen(self.db, auto.get("escalation_id"))
+            if answered:
+                # Announce only a delivered answer.
+                await self._post_recovery_comment(
+                    case, {**decision, "comment": recovery.auto_accept_comment(case, decision)})
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
 
