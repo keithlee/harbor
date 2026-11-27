@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
+import re
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -183,6 +185,49 @@ def _pr_summary(pr: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_REST_MERGE = re.compile(r"/repos/[^/]+/[^/]+/pulls/(\d+)/merge")
+_GRAPHQL_MERGE = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b")
+
+
+def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str | None, cwd: str | None = None) -> None:
+    """Refuse to merge a PR that changes ``[builder]``, or whose diff cannot be read (fail closed).
+
+    The diff is read from the local checkout the helper runs in (the builder's
+    worktree), at the commit being merged against the PR's base on ``origin``.
+    """
+
+    from harbor.device_proof import builder_sandbox_change, builder_sandbox_refusal
+    pr = gh.request("GET", f"{pulls}/{number}") or {}
+    head = sha or (pr.get("head") or {}).get("sha")
+    base = (pr.get("base") or {}).get("ref")
+    change = builder_sandbox_change(cwd or os.getcwd(), head, f"origin/{base}" if base else None)
+    reason = builder_sandbox_refusal(change)
+    if reason:
+        raise GitHubRestError(f"refusing to merge PR #{number}: {reason}")
+
+
+def _guard_api_merge(gh: Any, method: str, path: str, body: str | None) -> None:
+    """Hold ``api`` merges to the same rule as ``pr-merge``; it is a Harbor merge path too."""
+
+    clean = posixpath.normpath(urlsplit(path).path or "/")
+    match = _REST_MERGE.fullmatch(clean)
+    if match and method.upper() == "PUT":
+        try:
+            sha = (json.loads(body) if body else {}).get("sha")
+        except (ValueError, AttributeError):
+            sha = None
+        _refuse_builder_sandbox_change(gh, clean.rsplit("/", 2)[0], int(match.group(1)), sha)
+    if method.upper() == "POST" and re.fullmatch(r"/repos/[^/]+/[^/]+/merges", clean):
+        raise GitHubRestError(
+            "refusing a branch merge through the API: merge a PR with `pr-merge N --sha SHA`, "
+            "which checks for a [builder] change first"
+        )
+    if clean == "/graphql" and body and _GRAPHQL_MERGE.search(body):
+        raise GitHubRestError(
+            "refusing a GraphQL merge: merge with `pr-merge N --sha SHA`, which checks for a [builder] change first"
+        )
+
+
 def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Client | None = None) -> Any:
     environ = dict(os.environ if env is None else env)
     parser = argparse.ArgumentParser(prog="harbor.github_rest", description=__doc__.splitlines()[0])
@@ -207,7 +252,9 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
     args = parser.parse_args(list(argv))
     gh = client or Client(environ)
     if args.op == "api":
-        return gh.request(args.method, args.path, _read(args.input))
+        body = _read(args.input)
+        _guard_api_merge(gh, args.method, args.path, body)
+        return gh.request(args.method, args.path, body)
     repo = _repo(args, environ)
     pulls = f"/repos/{repo}/pulls"
     if args.op == "pr-view":
@@ -237,6 +284,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
             "combined_status": (status or {}).get("state"),
             "combined_status_count": (status or {}).get("total_count", 0),
         }
+    _refuse_builder_sandbox_change(gh, pulls, args.number, args.sha)
     payload = {"sha": args.sha, "merge_method": args.method}
     if args.subject:
         payload["commit_title"] = args.subject

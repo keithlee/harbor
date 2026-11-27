@@ -24,6 +24,25 @@ CODEX_DEVICE_PROOF = (
 )
 
 
+BUILDER_SANDBOX_CHANGED = (
+    "human merge required: the PR changes [builder] in .harbor/workflow/workflow.toml, which can widen the "
+    "builder sandbox (device_proof); Harbor's readiness check and merge command refuse it whatever "
+    "auto_merge_risks says"
+)
+BUILDER_SANDBOX_UNKNOWN = (
+    "human merge required: Harbor could not read the PR diff to rule out a [builder] change in "
+    ".harbor/workflow/workflow.toml (device_proof); Harbor's readiness check and merge command refuse it"
+)
+
+
+def builder_sandbox_refusal(change: bool | None) -> str | None:
+    """Why Harbor must not merge, given ``builder_sandbox_change``; None only for an explicit False."""
+
+    if change is False:
+        return None
+    return BUILDER_SANDBOX_CHANGED if change is True else BUILDER_SANDBOX_UNKNOWN
+
+
 def granted_platforms(workflow_config: Mapping[str, Any], provider: str) -> tuple[str, ...]:
     """The device-proof platforms a builder on ``provider`` is granted: Claude only."""
 
@@ -76,16 +95,52 @@ def open_ledger_read_only(path: Path) -> sqlite3.Connection | None:
         return None
 
 
-def _builder_table(repo: Path, rev: str) -> dict | None:
-    """``[builder]`` from ``rev``'s workflow.toml; ``{}`` when the file or table is absent; None if unreadable."""
+REGULAR_BLOB_MODES = {"100644", "100755"}
 
-    listed = subprocess.run(["git", "-C", str(repo), "ls-tree", "--name-only", rev, "--", WORKFLOW_FILE],
+
+def _tree_entry(repo: Path, rev: str, path: str) -> tuple[str, str, str] | None:
+    """``(mode, type, object)`` of exactly ``path`` in ``rev``, or None when it is not there or git fails."""
+
+    listed = subprocess.run(["git", "-C", str(repo), "ls-tree", "-z", rev, "--", path],
                             capture_output=True, text=True, timeout=30)
     if listed.returncode != 0:
         return None
-    if not listed.stdout.strip():
-        return {}
-    shown = subprocess.run(["git", "-C", str(repo), "show", f"{rev}:{WORKFLOW_FILE}"],
+    for record in listed.stdout.split("\0"):
+        meta, _, name = record.partition("\t")
+        if name == path and len(meta.split()) == 3:
+            mode, kind, obj = meta.split()
+            return mode, kind, obj
+    return None
+
+
+def _workflow_blob(repo: Path, rev: str) -> str | None:
+    """The workflow.toml blob in ``rev``, only when every component is a plain tree or a regular file.
+
+    ``ls-tree`` lists nothing under a symlinked ``.harbor`` or
+    ``.harbor/workflow``, although Harbor's runtime resolves the link and loads
+    the target, so a missing entry, a symlink (120000), a submodule (160000) or
+    anything but a regular blob (100644/100755) is unreadable, never "absent".
+    workflow.toml is mandatory for a Harbor project, so absence is unreadable too.
+    """
+
+    parts = WORKFLOW_FILE.split("/")
+    for depth in range(1, len(parts)):
+        entry = _tree_entry(repo, rev, "/".join(parts[:depth]))
+        if entry is None or entry[0] != "040000" or entry[1] != "tree":
+            return None
+    entry = _tree_entry(repo, rev, WORKFLOW_FILE)
+    if entry is None or entry[0] not in REGULAR_BLOB_MODES or entry[1] != "blob":
+        return None
+    return entry[2]
+
+
+def _builder_table(repo: Path, rev: str) -> dict | None:
+    """``[builder]`` from ``rev``'s workflow.toml (``{}`` when the table is absent); None if it cannot be read safely."""
+
+    blob = _workflow_blob(repo, rev)
+    if blob is None:
+        return None
+    shown = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
                            capture_output=True, text=True, timeout=30)
     if shown.returncode != 0:
         return None
@@ -100,7 +155,9 @@ def builder_sandbox_change(worktree: Any, head_sha: Any, base_ref: Any) -> bool 
 
     True when the table differs (added, changed or removed), False when it is
     the same, None when Harbor cannot tell: no worktree, a head or base it
-    cannot resolve, or a workflow it cannot parse. Callers treat None as True.
+    cannot resolve, a workflow.toml that is missing, reached through a symlink
+    or submodule, or not a regular file, or one it cannot parse. Callers treat
+    None as True.
     """
 
     if not worktree or not head_sha or not base_ref:

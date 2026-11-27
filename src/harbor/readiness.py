@@ -4,16 +4,9 @@ Only facts Harbor can verify itself gate a handoff or merge: hold state, PR
 identity, mergeability and CI. Review, risk and proof belong to the
 work-pipeline skill; Harbor no longer gates on its own receipts for them.
 """
+from harbor.device_proof import BUILDER_SANDBOX_CHANGED, BUILDER_SANDBOX_UNKNOWN, builder_sandbox_refusal
 
-
-BUILDER_SANDBOX_CHANGED = (
-    "human merge required: the PR changes [builder] in .harbor/workflow/workflow.toml, which can widen the "
-    "builder sandbox (device_proof); it never merges automatically, whatever auto_merge_risks says"
-)
-BUILDER_SANDBOX_UNKNOWN = (
-    "human merge required: Harbor could not read the PR diff to rule out a [builder] change in "
-    ".harbor/workflow/workflow.toml (device_proof), so it does not merge automatically"
-)
+__all__ = ["BUILDER_SANDBOX_CHANGED", "BUILDER_SANDBOX_UNKNOWN", "builder_sandbox_failures", "evaluate"]
 
 
 def builder_sandbox_failures(context):
@@ -22,10 +15,8 @@ def builder_sandbox_failures(context):
     ``builder_sandbox_change`` is True, False or None (unreadable). Anything but
     an explicit False, including a missing key, fails closed.
     """
-    change = context.get("builder_sandbox_change")
-    if change is False:
-        return []
-    return [BUILDER_SANDBOX_CHANGED if change is True else BUILDER_SANDBOX_UNKNOWN]
+    reason = builder_sandbox_refusal(context.get("builder_sandbox_change"))
+    return [reason] if reason else []
 
 
 def evaluate(policy, context):
