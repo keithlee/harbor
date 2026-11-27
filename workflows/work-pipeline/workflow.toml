@@ -19,8 +19,8 @@ transport = "rest"
 # Each platform is a path out of the builder's sandbox (adb and simctl reach any
 # host; local binding exposes every local service). Read
 # docs/configurable-workflows.md#device-and-browser-proof-builder before enabling.
-# Harbor's readiness check and merge command refuse a PR that changes this
-# table; for a hard guarantee, require Code Owner review for .harbor/ on GitHub.
+# Before enabling, protect .harbor/ on GitHub with required Code Owner review;
+# Harbor's own merge checks are best effort and a builder can get around them.
 #   android: local ports (adb server)   ios: two iOS Simulator services
 #   web: local ports (dev servers)
 # [builder]

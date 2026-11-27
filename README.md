@@ -524,12 +524,13 @@ What each platform turns on:
   Docker TCP socket, databases.
 
 Enable it only on a machine or user account where the builder may have that
-reach. Harbor's readiness check and its merge command (`harbor.github_rest
-pr-merge`) refuse a PR that changes `[builder]`, and also one whose diff they
-cannot read. A builder with a GitHub token could still merge through the API
-directly, so for a hard guarantee protect the base branch and require Code
-Owner review for `.harbor/` (for example `/.harbor/ @your-org/harbor-admins`
-in `.github/CODEOWNERS`). An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
+reach. A builder could open a PR that grants itself these rules. Harbor's
+merge checks are best-effort guards on its own commands: a builder holding a
+GitHub token, or able to write its repo's git directory, can get around them.
+A project that enables device proof SHOULD protect the base branch on GitHub
+with required Code Owner review. Put `/.harbor/ @your-org/harbor-admins` in
+`.github/CODEOWNERS`, and do not let the builder's account bypass the rule; the
+docs list the exact steps. An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
 builder the project could run.
 
 Claude Code's documentation describes these settings as macOS-only. Harbor
@@ -629,9 +630,10 @@ needs and keeps the delivery instructions opaque.
   the ledger or pretend the builder completed.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
-  path out of the sandbox (adb and simctl reach any host). Harbor's readiness
-  check and merge command refuse a PR that changes `[builder]`. Only branch
-  protection with Code Owner review on `.harbor/` stops a direct API merge.
+  path out of the sandbox (adb and simctl reach any host). Only GitHub branch
+  protection with Code Owner review on `.harbor/` reliably stops a builder from
+  merging a change that widens its own grant. Harbor's own merge checks are
+  best effort.
 
 ## Test fixtures and external proof
 

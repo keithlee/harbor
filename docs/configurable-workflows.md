@@ -154,7 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
-| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; Harbor refuses to merge a change to it through its own merge paths (see below for a hard guarantee) |
+| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; protect `.harbor/` with Code Owner review on GitHub before enabling it |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -456,59 +456,69 @@ enable it on a shared workstation, on a machine with production credentials,
 or for repositories whose tickets come from people you do not trust to steer
 the builder.
 
-**Harbor refuses to merge a `[builder]` change, but only through its own
-paths.** The builder edits the ticket worktree, not `.harbor/workflow` in your
-main checkout, so it cannot grant itself these rules for its current run. It
-could open a PR that adds them. Harbor refuses to merge that PR through its
-own readiness check and merge commands:
-- **What Harbor compares.** `[builder]` in `.harbor/workflow/workflow.toml`
-  at the PR head, against the merge base on `origin/<base>`. The file must be
-  a regular file (mode 100644 or 100755) reached through plain directories at
-  both ends.
-- **A changed table.** If `[builder]` was added, changed or removed, Harbor
-  refuses with `human merge required: the PR changes [builder] ...`, whatever
-  `merge_mode` and `auto_merge_risks` say.
-- **A diff Harbor cannot read.** This covers:
-  - no worktree, or a head or base Harbor cannot resolve;
-  - a workflow.toml that is missing or cannot be parsed;
-  - a `.harbor`, `.harbor/workflow` or `workflow.toml` that is a symlink or a
-    submodule.
+**Protect `.harbor/` on GitHub before you enable device proof.** A builder
+could open a PR that grants itself `device_proof`, or widens which builders
+get it through `[quota_fallback]`. Harbor cannot stop that PR merging on its
+own. The builder holds a GitHub token and can write its worktree's git
+directory, so it can get around any check that runs on the builder's machine.
+The only hard guarantee is GitHub branch protection on the base branch with
+required Code Owner review. A project that enables `device_proof` SHOULD set
+it up:
 
-  Harbor refuses with `human merge required: Harbor could not read the PR
-  diff ...`. A symlink would otherwise hide the file from git's tree listing,
-  while Harbor's runtime follows the link.
-- **Where it is checked:**
-  - the bundled readiness hook at `pre_merge`;
-  - `harbor workflow check` itself, so replacing the hook does not remove it;
-  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`;
-  - that helper's `api` escape hatch: `api PUT /repos/o/r/pulls/N/merge` gets
-    the same check, and `api POST /repos/o/r/merges` and GraphQL
-    `mergePullRequest` / `enablePullRequestAutoMerge` / `mergeBranch` are
-    refused.
+1. Add `.github/CODEOWNERS` on the base branch with a line that gives `.harbor/`
+   to a person or team, never to the account whose token the builder uses:
 
-**That is not a hard guarantee.** A builder holds a GitHub token and has
-network access to GitHub. It could:
-- call the REST API with `curl` directly;
-- merge through the GitHub MCP server's merge tool when
-  `[github] transport = "mcp"`;
-- `git push` to the base branch.
+   ```text
+   /.harbor/ @your-org/harbor-admins
+   ```
 
-Harbor's checks do not see any of those. For a guarantee, enforce it on
-GitHub:
-- Protect the base branch.
-- Require a pull request with at least one approving review.
-- Turn on "Require review from Code Owners".
-- Give a person, not the token the builder uses, ownership of `.harbor/`.
-- Do not let that token bypass the protection.
+2. In the repository's Settings → Branches (or Rules → Rulesets), add a rule for
+   the base branch that:
+   - requires a pull request before merging, with at least 1 approval;
+   - requires review from Code Owners;
+   - dismisses stale approvals when new commits are pushed;
+   - blocks force pushes and deletion.
+3. Do not add the builder's account or token to the bypass list. The rule must
+   also apply to administrators if that account is an admin; turn on "Do not
+   allow bypassing the above settings", or leave the account out of a
+   ruleset's bypass list.
+4. Check it: open a test PR that edits `.harbor/` and confirm GitHub shows
+   "Review required" from the code owner.
 
-For example, in `.github/CODEOWNERS`:
+**What Harbor checks on its own commands (best effort).** These checks stop
+the builder merging a `.harbor/` change by accident through Harbor's own
+commands. They do not stop a builder that means to get around them.
+- **What counts:** any change to a path under `.harbor/`, compared after
+  Unicode NFC normalisation and case folding, so `.HARBOR/` and
+  `.harbor/workflow/WORKFLOW.toml`, which land on the real files on macOS, count
+  too. The comparison is the PR head against its merge base with the PR's base.
+- **SHAs:** both come from GitHub as full SHAs, never from a local
+  `origin/<base>` ref, which a builder can forge with `git tag` or
+  `git update-ref`. A commit missing locally is fetched into
+  `refs/harbor/check/<sha>`.
+- **Unreadable is refused too.** Missing commits, a SHA that does not match
+  the PR head, and a `.harbor`, `.harbor/workflow` or `workflow.toml` that is a
+  symlink, a submodule or missing all count as unreadable.
+- **Where it runs:**
+  - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
+  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
+- **The helper's `api` command is an allowlist.**
+  - Reads (`GET`, `HEAD`) go through.
+  - Writes are allowed only for PR create and edit, issue and review comments,
+    replies, reviews and labels, under `/repos/<owner>/<repo>/` for the
+    configured repository.
+  - GraphQL mutations are allowed only for `addPullRequestReviewThreadReply`,
+    `resolveReviewThread`, `unresolveReviewThread` and `addComment`. The query
+    is parsed: escapes decoded, comments stripped, aliases and fragments
+    resolved, and anything Harbor cannot parse is refused.
+  - Merges, refs, contents and branch protection are refused there.
 
-```text
-/.harbor/ @your-org/harbor-admins
-```
-
-Then a PR that touches `.harbor/` cannot merge until that owner approves it,
-however it is merged.
+**Known ways around Harbor's checks**, which only branch protection stops:
+- the GitHub token used directly, for example `curl` to the REST or GraphQL API;
+- the GitHub MCP server's merge tool when `[github] transport = "mcp"`;
+- `git push` to the base branch;
+- the repository's git directory, which the builder can write: refs, objects,
+  config and hooks that Harbor's own git commands then read.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`
