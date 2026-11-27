@@ -507,15 +507,31 @@ in `<repo>/.harbor/workflow/workflow.toml`:
 device_proof = ["android", "ios", "web"]   # any subset; absent means off
 ```
 
-`android` and `web` let Bash commands bind and connect to local ports
-(`network.allowLocalBinding`). `ios` lets them reach the iOS Simulator
-services (`network.allowMachLookup = ["com.apple.CoreSimulator.*"]`). The
-sandbox stays on and the host allowlist and writable paths do not change. The
-trade-off is real: local binding opens every loopback port on the machine to
-the builder's commands, and the simulator services act outside the sandbox.
-An unknown platform fails closed. `harbor doctor` prints what is granted, and
-says when it does not apply: on Linux, where Claude Code ignores these keys,
-and for Codex builders, which already have local ports but cannot reach the
+What each platform turns on:
+- `android` and `web` let Bash commands bind and connect to local ports
+  (`network.allowLocalBinding`).
+- `ios` lets them drive two named iOS Simulator services
+  (`network.allowMachLookup`).
+- Before each launch, Harbor boots one emulator and one simulator outside the
+  sandbox if none is running. It tells the builder the result, quoting the
+  literal error if a boot fails.
+
+**Each platform is a way out of the sandbox, not a small widening:**
+- `adb shell curl` reaches any host, and `adb push` and `adb pull` move files.
+- `simctl openurl` reaches any host, and `simctl spawn` runs code outside the
+  sandbox with host file access.
+- Local binding also exposes every local service: Chrome debugging ports, a
+  Docker TCP socket, databases.
+
+Enable it only on a machine or user account where the builder may have that
+reach. A PR that changes `[builder]` never merges automatically: Harbor
+requires a human merge, and also when it cannot read the diff. An unknown
+platform fails closed. `harbor doctor` prints what is granted to any Claude
+builder the project could run.
+
+Claude Code's documentation describes these settings as macOS-only. Harbor
+was not tested with them on Linux, and doctor flags a non-macOS host. Codex
+builders are not changed: they already have local ports and cannot reach the
 simulator. See
 [Device and browser proof](docs/configurable-workflows.md#device-and-browser-proof-builder).
 
@@ -609,8 +625,9 @@ needs and keeps the delivery instructions opaque.
 - Pause stops new dispatch/resume and suspends deadlines; it does not erase
   the ledger or pretend the builder completed.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
-  when the project lists them in `[builder] device_proof`. It is never turned
-  off or widened to other hosts.
+  when the project lists them in `[builder] device_proof`. Each of those is a
+  path out of the sandbox (adb and simctl reach any host). A PR that changes
+  `[builder]` always needs a human merge.
 
 ## Test fixtures and external proof
 

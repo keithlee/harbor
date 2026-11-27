@@ -16,10 +16,12 @@ auto_merge_risks = []
 transport = "rest"
 
 # Opt-in device and browser proof for Claude builders on macOS (off when absent).
-# Each platform widens the builder's Bash sandbox by exactly one rule; see
+# Each platform is a path out of the builder's sandbox (adb and simctl reach any
+# host; local binding exposes every local service). Read
 # docs/configurable-workflows.md#device-and-browser-proof-builder before enabling.
-#   android: local ports (adb server)   ios: iOS Simulator services
-#   web: local ports (dev servers, Playwright)
+# A PR that changes this table always needs a human merge.
+#   android: local ports (adb server)   ios: two iOS Simulator services
+#   web: local ports (dev servers)
 # [builder]
 # device_proof = ["android", "ios", "web"]
 

