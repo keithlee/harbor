@@ -402,7 +402,12 @@ up answers from the same project. Bounded mode permits a supplied reversible
 implementation option within AC; it records the option, rationale and next
 step on Linear. It cannot change protected paths or reconcile conflicting
 instructions automatically. Escalations include evidence, options,
-recommendation and prior attempts. Empty `decision_authors` accepts visible
+recommendation and prior attempts. When the builder recommends its first
+option, Harbor accepts it automatically and resumes the builder (on by default;
+`[decisions] auto_accept_first_option = false` opts out). It never does so for
+secrets, credentials, money or data deletion, never twice for an equivalent
+question, and the answer never authorizes a merge; see
+`docs/configurable-workflows.md`. Empty `decision_authors` accepts visible
 ticket participants; configure Linear user IDs to restrict comment authority.
 
 Unexpected builder exits and failed First Mate invocations receive bounded

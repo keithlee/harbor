@@ -4663,6 +4663,15 @@ class Supervisor:
                     self.last_error = f"First Mate monitor: {exc}"
                     continue
                 decision = recovery.validate(proposal, case, settings)
+                if decision["action"] == "escalate":
+                    # The builder may have recommended its own first option;
+                    # the project's auto-accept policy answers it instead.
+                    from harbor.auto_accept import policy_from_config
+                    try:
+                        policy = policy_from_config(self.dispatcher.workflow.config)
+                        decision = recovery.apply_auto_accept(self.db, case, decision, policy)
+                    except Exception as exc:  # an unreadable policy auto-accepts nothing
+                        self.last_error = f"First Mate auto-accept: {exc}"
                 if decision["action"] == "wait":
                     recovery.record(connection, case, decision)
                     continue
@@ -4713,6 +4722,11 @@ class Supervisor:
                         "started: the ticket is no longer eligible for recovery (held, shelved, closed or superseded).")
                 return
             except Exception as exc:
+                if isinstance(decision.get("auto_accept"), Mapping):
+                    # The auto-accepted answer never reached the builder: hand
+                    # the escalation back to a human.
+                    from harbor.auto_accept import reopen
+                    reopen(self.db, decision["auto_accept"].get("escalation_id"))
                 if not attempted and not self._first_mate_can_recover(case):
                     return
                 if connection is not None:

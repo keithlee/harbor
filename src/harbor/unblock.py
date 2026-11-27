@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from harbor import auto_accept as auto_accept_policy
+from harbor.auto_accept import AutoAcceptPolicy
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
@@ -291,6 +293,7 @@ class UnblockResult:
     linear_writes: tuple[str, ...] = ()
     reason: str = ""
     escalation: Mapping[str, Any] | None = None
+    auto_accept: Mapping[str, Any] | None = None
 
     @property
     def same_session(self) -> bool:
@@ -320,6 +323,7 @@ class UnblockResult:
             "linear_writes": list(self.linear_writes),
             "reason": self.reason,
             "escalation": dict(self.escalation) if self.escalation else None,
+            "auto_accept": dict(self.auto_accept) if self.auto_accept else None,
         }
 
 
@@ -946,8 +950,12 @@ class UnblockLadder:
         policy: BlockerPolicy | None = None,
         base_branch: str = "main",
         linear_projects: Iterable[str] = (),
+        auto_accept: AutoAcceptPolicy | None = None,
     ) -> None:
         self.db = db
+        # ``None`` reads the project's workflow ([decisions]) on every blocker,
+        # falling back to the default policy (on) when no workflow is attached.
+        self.auto_accept_policy = auto_accept
         if db is not None:
             try:
                 # The comment receipt table is owned by Phase 3 and is kept
@@ -1072,6 +1080,22 @@ class UnblockLadder:
         command = build_resume_command(run_id, prompt)
         resumed = await _invoke_resume(self.resumer, command)
         return resumed, command
+
+    def _auto_accept(self) -> AutoAcceptPolicy:
+        """The current auto-accept policy; an unreadable workflow disables it."""
+
+        if self.auto_accept_policy is not None:
+            return self.auto_accept_policy
+        workflow = getattr(self, "workflow", None)
+        if workflow is None:
+            return AutoAcceptPolicy()
+        try:
+            reload = getattr(workflow, "reload", None)
+            if callable(reload):
+                workflow = self.workflow = reload()
+            return auto_accept_policy.policy_from_config(workflow.config)
+        except (OSError, ValueError):
+            return AutoAcceptPolicy(enabled=False)
 
     async def _notify(self, reason: str) -> bool:
         if self.notifier is None:
@@ -1416,6 +1440,26 @@ class UnblockLadder:
         )
         escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
         label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"
+        # The builder recommended its own first option: record that option as
+        # the answer and resume, unless a guardrail keeps it with a human.
+        assessment = auto_accept_policy.assess(
+            self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
+            parked_for_human=_is_parked_for_human(final),
+            protected=protected or triage_result.reason == "protected path",
+        )
+        if assessment.accepted and escalation_id is not None and run_id:
+            accepted = await self._auto_accept_first_option(
+                ticket, ticket_id, run_id, kind, question, blocker_value, escalation, assessment, remediation, searched,
+            )
+            if accepted is not None:
+                return accepted
+            assessment = auto_accept_policy.Assessment(
+                "refused", assessment.option, assessment.method, "the retained builder session could not be resumed",
+            )
+        elif assessment.accepted:
+            assessment = auto_accept_policy.Assessment(
+                "refused", assessment.option, assessment.method, "the escalation has no ledger id or builder session",
+            )
         body = (
             f"[harbor] Blocked {ticket_id} after deterministic remediation and rung-1 triage ({label}).\n"
             f"Question: {question}\n"
@@ -1425,6 +1469,7 @@ class UnblockLadder:
             f"Recommendation: {blocker_value.get('recommendation') or 'No supported recommendation'}\n"
             f"Evidence: {json.dumps(blocker_value.get('evidence', []))}\n"
             f"Prior attempts: {self._prior_rung_zero(ticket_id, kind) + self._prior_rung_one(ticket_id, kind)}\n"
+            + (auto_accept_policy.refusal_line(assessment) if assessment.status == "refused" else "")
             + _reply_instruction(escalation_id)
         )
         writes: list[str] = []
@@ -1467,6 +1512,64 @@ class UnblockLadder:
             linear_writes=tuple(writes),
             reason=reason,
             escalation=escalation,
+        )
+
+    async def _auto_accept_first_option(
+        self,
+        ticket: Mapping[str, Any],
+        ticket_id: str,
+        run_id: str,
+        kind: str,
+        question: str,
+        blocker_value: Mapping[str, Any],
+        escalation: Mapping[str, Any] | None,
+        assessment: auto_accept_policy.Assessment,
+        remediation: RemediationResult,
+        searched: tuple[str, ...],
+    ) -> UnblockResult | None:
+        """Answer an escalation with the builder's recommended first option.
+
+        The receipt is written before the resume, so a re-block inside the
+        same resumed session sees it and the loop guard holds.  Returns
+        ``None`` when the session could not be resumed: the escalation is then
+        reopened and parked for a human as usual.
+        """
+
+        escalation_id = _value(escalation, "id", default=None)
+        policy = self._auto_accept()
+        recommendation = _text(blocker_value.get("recommendation")).strip()
+        auto_accept_policy.record(
+            self.db, escalation_id=escalation_id, ticket=ticket_id, run_id=run_id, source="ladder", kind=kind,
+            question=question, option=assessment.option, recommendation=recommendation, method=assessment.method,
+        )
+        body = auto_accept_policy.comment(
+            ticket_id, escalation_id, question=question, option=assessment.option,
+            recommendation=recommendation, count=assessment.count, policy=policy,
+        )
+        writes: list[str] = []
+        if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
+            writes.append("comment")
+        answer = auto_accept_policy.answer_text(escalation_id, assessment.option)
+        citation = f"{auto_accept_policy.AUTO_ACCEPT_CITATION}:escalation-{escalation_id}"
+        resumed, command = await self._resume(
+            ticket_id, run_id, answer=answer, citation=citation,
+            reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
+            next_action="Apply option 1, then verify the ticket acceptance criteria.",
+        )
+        if not resumed:
+            auto_accept_policy.reopen(self.db, escalation_id)
+            return None
+        receipt = {
+            "escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
+            "count": assessment.count + 1, "limit": policy.max_auto_accepts,
+        }
+        return UnblockResult(
+            ticket_id, run_id, kind, question, 2, "resume", True,
+            answer=answer, citation=citation, searched=searched, remediation=remediation,
+            resume_command=command, linear_writes=tuple(writes),
+            reason="auto-accepted the recommended first option",
+            escalation={**escalation, "status": "answered"} if isinstance(escalation, Mapping) else escalation,
+            auto_accept=receipt,
         )
 
     unblock = handle

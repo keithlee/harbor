@@ -148,7 +148,7 @@ model = "gpt-6-luna"
 | --- | --- | --- |
 | `[delivery]` | `merge_mode = "human"` | `workflow_checked` allows merges for `auto_merge_risks` when `pre_merge` readiness passes |
 | `[recovery]` | enabled, 30/120/300 s, 3 attempts | crash retries after an unexpected builder exit |
-| `[decisions]` | `cite_only` | how First Mate answers blockers: `human`, `cite_only`, `bounded` |
+| `[decisions]` | `cite_only`, `auto_accept_first_option = true` | how First Mate answers blockers: `human`, `cite_only`, `bounded`; whether a recommended first option is accepted automatically |
 | `[evidence]` | `ci = "required"`, `feedback = "advisory"` | what readiness gates on |
 | `[cleanup]` | `after_merge` | worktree cleanup after an observed merge |
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
@@ -162,6 +162,47 @@ receipts for them, and a human still merges by default.
 
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
+
+### Auto-accepting the builder's first option
+
+A blocked builder returns `options`, a `recommendation` and
+`recommended_option_index` (zero-based). When the recommendation picks the
+FIRST option, Harbor records that option as the escalation's answer and resumes
+the same builder session, instead of parking the ticket for a human. First
+Mate's recovery pass applies the same policy when it would otherwise escalate a
+blocked run. This is on by default:
+
+```toml
+[decisions]
+auto_accept_first_option = true   # false: always wait for a human
+max_auto_accepts = 2              # per builder run, 0-10
+```
+
+Harbor decides deterministically. `recommended_option_index = 0` counts; any
+other index does not. Without that field, only a strict text match counts: the
+recommendation is exactly the first option, or it begins "first option" /
+"option 1" (optionally "Take ...", "Choose ...") and mentions no other option,
+negation or alternative. Anything else, including a paraphrase without the
+index, stays with a human.
+
+Guardrails:
+
+- The answer never authorizes a merge. `merge_mode` and `auto_merge_risks` in
+  `pre_merge` readiness are unchanged, the answer text says so, and a run
+  parked waiting on a human merge is never auto-accepted.
+- Loop guard: once Harbor auto-accepted an option for a ticket, an equivalent
+  question or the same option is left for a human, and so is anything after
+  `max_auto_accepts` auto-accepts in one run. The Linear comment says why.
+- An option involving secrets, credentials, tokens, logins, money, billing or
+  deleting data is never auto-accepted, and neither is a blocker that touches a
+  protected path.
+- Harbor posts a Linear comment naming the escalation id and records the
+  receipt in the `auto_accepts` table. The escalation is `answered` with the
+  citation `harbor:auto-accept-first-option:escalation-<id>` and no
+  `resolutions` row, so it is not reused as authority for later blockers.
+
+`harbor doctor` prints the effective setting. An invalid value fails workflow
+loading.
 
 ### Merge risk (`auto_merge_risks`)
 

@@ -525,6 +525,8 @@ async def _doctor(project_name: str) -> int:
     print(f"Workflow: {workflow.package} · {workflow.digest}")
     print(f"Models: {workflow.models_path} · controller {controller['model']} · First Mate {workflow.config['first_mate']['model']}")
     print(f"Merge authority: {workflow.config['delivery']['merge_mode']} (cooperative)")
+    from harbor.auto_accept import describe, policy_from_config
+    print(describe(policy_from_config(workflow.config)))
     try:
         github = builder_github(config, workflow, getattr(config, "builder_provider", "codex"))
     except ValueError as exc:

@@ -117,6 +117,7 @@ class Case:
     flag_id: int | None = None
     flag_ids: list = field(default_factory=list)  # every pending watchdog flag folded into this case
     provider: str = ""  # the run's recorded builder provider (normally "codex" or "claude"); "" when unknown
+    parked_for_human: bool = False  # the final was parked waiting on a human merge
 
     @property
     def attempts(self) -> int:
@@ -154,6 +155,11 @@ def _final(raw: Any) -> dict:
     except (TypeError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _parked_for_human(final: Mapping[str, Any]) -> bool:
+    return (str(final.get("outcome") or "").casefold() == "parked"
+            and str(final.get("waiting_on") or "").casefold() == "human")
 
 
 def builder_provider(connection, run_id: str) -> str:
@@ -238,7 +244,8 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue
         cases[run_id] = Case(project, ticket, run_id, trigger, status, blocker,
                              str(final.get("summary") or ""), str(session or ""), str(linear_id or ""), str(title or ""),
-                             history(connection, run_id), provider=builder_provider(connection, run_id))
+                             history(connection, run_id), provider=builder_provider(connection, run_id),
+                             parked_for_human=_parked_for_human(final))
     for event_id, ticket, payload in connection.execute(
         "SELECT e.id, e.identifier, e.payload_json FROM events e LEFT JOIN first_mate_flags_seen s ON s.event_id = e.id "
         "WHERE e.project = ? AND e.event_type = 'watchdog.flag' AND s.event_id IS NULL ORDER BY e.id", (project,)
@@ -263,7 +270,8 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
         case = cases.get(run[0]) or Case(project, str(ticket), run[0], f"watchdog:{flag.get('kind', 'flag')}", str(run[1] or "").casefold(),
                                           final.get("blocker") if isinstance(final.get("blocker"), dict) else {},
                                           str(final.get("summary") or ""), str(run[3] or ""), str(run[4] or ""), str(run[5] or ""),
-                                          history(connection, run[0]), provider=builder_provider(connection, run[0]))
+                                          history(connection, run[0]), provider=builder_provider(connection, run[0]),
+                                          parked_for_human=_parked_for_human(final))
         case.detail = "; ".join(filter(None, [case.detail, str(flag.get("detail") or flag.get("kind") or "")]))
         case.flag_id = event_id
         case.flag_ids.append(event_id)
@@ -425,8 +433,58 @@ def latest_flag_id(connection) -> int | None:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: Any) -> dict:
+    """Turn First Mate's escalate into a resume with option 1, when policy allows.
+
+    Applies only to a blocked run whose blocker recommends its first option
+    and whose escalation is still open (Harbor's ladder records it at rung 2).
+    It shares the ladder's guardrails and ``auto_accepts`` receipts, so a
+    recommendation the ladder already auto-accepted is never accepted twice.
+    A guardrail refusal keeps the escalation and says why in the comment.
+    """
+    from harbor import auto_accept
+
+    decision = dict(decision)
+    if decision.get("action") != "escalate" or case.status != "blocked" or not case.blocker:
+        return decision
+    finder = getattr(db, "open_escalations", None)
+    rows = [row for row in (finder([case.ticket]) if callable(finder) else [])
+            if str(row.get("run_id") or "") == case.run_id]
+    escalation_id = rows[-1].get("id") if rows else None
+    # The ladder parks a protected-path blocker with that reason; First Mate
+    # has no protected-path configuration of its own, so it honours the row.
+    protected = bool(rows) and "protected path" in str(rows[-1].get("reason") or "")
+    assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,
+                                    parked_for_human=case.parked_for_human, protected=protected)
+    if assessment.status == "not_applicable":
+        return decision
+    if assessment.accepted and escalation_id is None:
+        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method,
+                                            "no open escalation is recorded for this run")
+    if not assessment.accepted:
+        decision["reason"] = f"{decision.get('reason') or 'escalated'}; auto-accept of option 1 not applied: {assessment.reason}"
+        return decision
+    question = str(case.blocker.get("question") or "")
+    recommendation = str(case.blocker.get("recommendation") or "").strip()
+    auto_accept.record(db, escalation_id=escalation_id, ticket=case.ticket, run_id=case.run_id, source="first_mate",
+                       kind=case.kind, question=question, option=assessment.option, recommendation=recommendation,
+                       method=assessment.method)
+    return {
+        "action": "resume",
+        "instruction": "Answer: " + auto_accept.answer_text(escalation_id, assessment.option),
+        "reason": f"auto-accepted the recommended first option for escalation #{escalation_id} "
+                  f"(First Mate proposed escalate: {decision.get('reason') or 'no reason given'})",
+        "comment": auto_accept.comment(case.ticket, escalation_id, question=question, option=assessment.option,
+                                       recommendation=recommendation, count=assessment.count, policy=policy,
+                                       source="First Mate"),
+        "auto_accept": {"escalation_id": escalation_id, "option": assessment.option, "method": assessment.method},
+    }
+
+
 def comment(case: Case, decision: Mapping[str, Any]) -> str:
-    lines = [f"[First Mate recovery] {decision['action']} ({case.trigger})", f"Reason: {decision['reason']}"]
+    if decision.get("comment"):
+        return str(decision["comment"])
+    lines =[f"[First Mate recovery] {decision['action']} ({case.trigger})", f"Reason: {decision['reason']}"]
     if decision.get("instruction"):
         lines.append(f"Instruction: {decision['instruction']}")
     lines.append(f"Recovery {case.attempts + 1} of the configured budget.")
