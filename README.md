@@ -496,6 +496,35 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
+### File edits, extra hosts and `/tmp` for Claude builders
+
+A Claude builder and its child agents have the `Edit` and `Write` tools,
+approved for the ticket worktree only; `dontAsk` refuses an edit anywhere
+else. Nothing to configure.
+
+Two sandbox widenings are opt-in per project, in
+`<repo>/.harbor/workflow/workflow.toml`, and both are off when absent:
+
+```toml
+[builder]
+allowed_domains = ["fonts.googleapis.com", "fonts.gstatic.com"]   # exact host names
+allow_tmp = true                                                  # Bash may write /tmp
+```
+
+- `allowed_domains` adds exact host names to the Bash network allowlist, for
+  builds that fetch from them (for example `next build` and Google Fonts). Any
+  command the builder runs can then send data to those hosts. A wildcard,
+  scheme, port, path, IP address or duplicate stops Harbor instead of being
+  widened.
+- `allow_tmp` makes `/tmp` (and `/private/tmp` on macOS) writable, for tests
+  that hardcode `/tmp`. `/tmp` is shared with every process on the host, so
+  the builder can read and overwrite other programs' temp files and leave files
+  behind. Code that uses the temp directory (`tempfile`, `os.tmpdir()`) works
+  without it, so prefer fixing such tests.
+
+`harbor doctor` shows both. See
+[Claude builder file tools, extra hosts and `/tmp`](docs/configurable-workflows.md#claude-builder-file-tools-extra-hosts-and-tmp-builder).
+
 ### Emulator, simulator and local web proof for Claude builders
 
 A Claude builder's Bash sandbox blocks `adb`, `xcrun simctl` and local dev
@@ -640,6 +669,10 @@ needs and keeps the delivery instructions opaque.
   local worktree. Unobserved claims remain fail-closed.
 - Pause stops new dispatch/resume and suspends deadlines; it does not erase
   the ledger or pretend the builder completed.
+- A Claude builder edits files with `Edit` and `Write` only inside its ticket
+  worktree. Its Bash sandbox reaches hosts beyond the default allowlist only
+  when listed in `[builder] allowed_domains`, and writes `/tmp` only with
+  `[builder] allow_tmp = true`.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
   path out of the sandbox: adb and simctl reach any host, and with `ios` the
