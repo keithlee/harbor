@@ -1,10 +1,9 @@
 """Workflow event integration and conservative cleanup eligibility."""
-import subprocess
 from datetime import datetime, timezone
 
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
-from harbor.safe_git import git_argv
+from harbor.safe_git import UnsafeGitDirectory, run_worktree_git
 
 
 async def handoff(supervisor,wake,result):
@@ -53,7 +52,16 @@ async def cleanup_allowed(supervisor,wake,result,target,run_id):
     context = await handoff(supervisor,wake,result)
     if not context['facts'].get('merged') or not context.get('terminal'):
         return False
-    head = subprocess.run(git_argv('-C',str(target),'rev-parse','HEAD'),check=True,capture_output=True,text=True).stdout.strip()
+    # The builder controls ``target``: refuse it unless its git metadata is the
+    # project repository's, and read HEAD with no hooks or credentials.
+    manager = getattr(supervisor, 'worktree_manager', None) or getattr(supervisor.dispatcher, 'worktree_manager', None)
+    repo = getattr(manager, 'repo', None)
+    if repo is None:
+        return False
+    try:
+        head = run_worktree_git(target, repo, 'rev-parse', 'HEAD', check=True).stdout.strip()
+    except UnsafeGitDirectory:
+        return False
     if head != context['head_sha']:
         return False
     receipts = await execute_event(workflow,'pre_cleanup',context,cwd=target)

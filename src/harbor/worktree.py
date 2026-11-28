@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from harbor.safe_git import git_argv
+from harbor.safe_git import UnsafeGitDirectory, run_git, run_worktree_git
 
 
 DEFAULT_DISK_FLOOR_GB = 5.0
@@ -99,12 +99,9 @@ def free_disk_gb(path: str | Path = ".") -> float:
 
 
 def _common_git_dir(repo: Path) -> Path:
-    result = subprocess.run(
-        git_argv("-C", str(repo), "rev-parse", "--git-common-dir"),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    """The operator repository's common git directory (never call it on a builder worktree)."""
+
+    result = run_git(repo, "rev-parse", "--git-common-dir", check=True)
     raw = Path(result.stdout.strip())
     return (repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
 
@@ -131,14 +128,19 @@ def git_lock(repo: str | Path) -> Iterator[Path]:
             lock_path.unlink()
 
 
-def _run_git(repo: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+def _run_git(repo: Path, args: Sequence[str], *, worktree_of: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Run git in the operator's ``repo``, or, with ``worktree_of``, in builder worktree ``repo`` of it.
+
+    A builder worktree whose git metadata does not lead back to
+    ``worktree_of`` is refused before git runs (see ``safe_git``).
+    """
+
     try:
-        return subprocess.run(
-            git_argv("-C", str(repo), *args),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        if worktree_of is not None:
+            return run_worktree_git(repo, worktree_of, *args, check=True)
+        return run_git(repo, *args, check=True)
+    except UnsafeGitDirectory as exc:
+        raise WorktreeConfinementError(f"worktree repository mismatch: {exc}") from exc
     except FileNotFoundError as exc:  # pragma: no cover - host configuration
         raise WorktreeError("git executable was not found") from exc
     except subprocess.CalledProcessError as exc:
@@ -262,9 +264,9 @@ class WorktreeManager:
                     retryable_ready = not has_runs or not self.custody.execute("SELECT 1 FROM runs WHERE ticket=?",(ticket,)).fetchone()
                 if not row or tuple(row[:3]) != (str(self.repo),str(target),branch) or (row[4] != "installing" and not retryable_ready):
                     raise WorktreeError(f"worktree path already exists without retryable custody: {target}")
-                if _common_git_dir(target) != _common_git_dir(self.repo) or _run_git(target,["rev-parse","--show-toplevel"]).stdout.strip() != str(target):
+                if self._git(target,["rev-parse","--show-toplevel"]).stdout.strip() != str(target):
                     raise WorktreeConfinementError("setup worktree repository mismatch")
-                if _run_git(target,["branch","--show-current"]).stdout.strip() != branch or _run_git(target,["rev-parse","HEAD"]).stdout.strip() != row[3]:
+                if self._git(target,["branch","--show-current"]).stdout.strip() != branch or self._git(target,["rev-parse","HEAD"]).stdout.strip() != row[3]:
                     raise WorktreeError("setup worktree branch or HEAD changed")
                 worktree = Worktree(self.repo,target,branch,self.base_ref)
             else:
@@ -276,7 +278,7 @@ class WorktreeManager:
                 self.verify(worktree)
                 if self.custody is not None:
                     with self.custody:
-                        self.custody.execute("INSERT OR REPLACE INTO worktree_setup VALUES (?,?,?,?,?,?,?)", (self.repo_name,ticket,str(self.repo),str(target),branch,_run_git(target,["rev-parse","HEAD"]).stdout.strip(),"installing"))
+                        self.custody.execute("INSERT OR REPLACE INTO worktree_setup VALUES (?,?,?,?,?,?,?)", (self.repo_name,ticket,str(self.repo),str(target),branch,self._git(target,["rev-parse","HEAD"]).stdout.strip(),"installing"))
         if not retryable_ready:
             self.install(worktree)
         if self.custody is not None:
@@ -295,9 +297,9 @@ class WorktreeManager:
         if not row or not row[0] or Path(row[0]).is_symlink() or Path(row[0]).resolve() != target:
             raise WorktreeConfinementError("retained worktree custody mismatch")
         branch = f"harbor/{_safe_ticket(ticket)}"
-        if _common_git_dir(target) != _common_git_dir(self.repo) or _run_git(target,["rev-parse","--show-toplevel"]).stdout.strip() != str(target):
+        if self._git(target,["rev-parse","--show-toplevel"]).stdout.strip() != str(target):
             raise WorktreeConfinementError("retained worktree repository mismatch")
-        if _run_git(target,["branch","--show-current"]).stdout.strip() != branch:
+        if self._git(target,["branch","--show-current"]).stdout.strip() != branch:
             raise WorktreeError("retained worktree branch mismatch")
         return Worktree(self.repo,target,branch,self.base_ref)
 
@@ -347,16 +349,16 @@ class WorktreeManager:
             raise WorktreeConfinementError("worktree does not belong to this manager")
         if not target.is_dir():
             raise WorktreeError(f"worktree is missing: {target}")
-        branch = _run_git(target, ["branch", "--show-current"]).stdout.strip()
+        branch = self._git(target, ["branch", "--show-current"]).stdout.strip()
         if branch != worktree.branch:
             raise WorktreeError(f"unexpected worktree branch {branch!r}; expected {worktree.branch!r}")
-        target_head = _run_git(target, ["rev-parse", "HEAD"]).stdout.strip()
+        target_head = self._git(target, ["rev-parse", "HEAD"]).stdout.strip()
         base_head = _run_git(self.repo, ["rev-parse", worktree.base_ref]).stdout.strip()
         if target_head != base_head:
             raise WorktreeError(
                 f"worktree is not based on fresh {worktree.base_ref} ({target_head} != {base_head})"
             )
-        if _run_git(target, ["status", "--porcelain"]).stdout:
+        if self._git(target, ["status", "--porcelain"]).stdout:
             raise WorktreeError("new worktree is unexpectedly dirty")
 
     def remove(self, worktree: Worktree | str | Path) -> None:
@@ -371,15 +373,14 @@ class WorktreeManager:
         if not target.exists() and not target.is_symlink():
             return
         with git_lock(self.repo):
-            if _common_git_dir(target) != _common_git_dir(self.repo):
-                raise WorktreeConfinementError("cleanup repository mismatch")
             # Modified or untracked files are work someone may want: keep the
             # worktree for inspection. Ignored files are install/build output
             # (node_modules, .next, ...) that every worktree accumulates; they
             # never block cleanup, or no worktree could ever be removed.
-            if _run_git(target, ["status", "--porcelain", "--untracked-files=all"]).stdout:
+            # ``_git`` first proves the worktree's metadata is this repository's.
+            if self._git(target, ["status", "--porcelain", "--untracked-files=all"]).stdout:
                 raise WorktreeError("cleanup retained modified or untracked files")
-            for line in _run_git(target, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).stdout.splitlines():
+            for line in self._git(target, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).stdout.splitlines():
                 if not line.startswith("!! "):
                     continue
                 ignored = (target / line[3:].rstrip("/")).resolve() if not (target / line[3:]).is_symlink() else target / line[3:]
@@ -392,6 +393,11 @@ class WorktreeManager:
 
     def path_for(self, ticket: str) -> Path:
         return self._target(ticket)
+
+    def _git(self, target: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Git in a builder worktree, refused unless its metadata belongs to this repository."""
+
+        return _run_git(target, args, worktree_of=self.repo)
 
 
 def create_worktree(repo: str | Path, ticket: str, **kwargs: object) -> Worktree:
