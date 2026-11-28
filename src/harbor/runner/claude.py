@@ -201,13 +201,15 @@ def device_proof_report(platforms: tuple[str, ...] | list[str], system: str | No
 _RULE_UNSAFE = "*?[]\n\r"
 
 
-def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
+def workflow_permissions(invocation: str, package: str | Path | None, helper: str = "") -> list[str]:
     """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
 
     Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
     or assigns a variable in front of an absolute executable path (directly or
     through ``/usr/bin/env``), which is exactly what Harbor's runtime
-    invocation does, so that one prefix is approved literally. Read, Glob and
+    invocation and its GitHub helper invocation
+    (harbor.github_rest.builder_helper_invocation) do, so those two prefixes
+    are approved literally. Read, Glob and
     Grep are limited to the working directory, and the workflow package lives
     outside the ticket worktree, so it is approved read-only. Both still run
     inside the OS sandbox: nothing becomes writable or reachable that was not
@@ -220,6 +222,11 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
         if any(char in invocation for char in _RULE_UNSAFE):
             raise ValueError("the Harbor runtime invocation contains a character a permission rule cannot express")
         allow.append(f"Bash({invocation}:*)")
+    helper = helper.strip()
+    if helper:
+        if any(char in helper for char in _RULE_UNSAFE):
+            raise ValueError("the GitHub helper invocation contains a character a permission rule cannot express")
+        allow.append(f"Bash({helper}:*)")
     if package is not None:
         resolved = Path(package).expanduser().resolve()
         if not resolved.is_dir():
@@ -231,10 +238,58 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
     return allow
 
 
+def builder_shell_note(helper: str = "") -> str:
+    """What a dontAsk Claude builder's Bash may and may not run, appended to every turn.
+
+    Found live with ``ClaudeRunner.command`` (Claude Code 2.1.332): sandboxed
+    Bash is auto-allowed, but every command that sets an environment variable
+    is refused with "Claude Code is running in don't ask mode", and an allow
+    rule does not help ``export``. Refused: ``FOO=1 cmd``, ``env FOO=1 cmd``,
+    ``/usr/bin/env FOO=1 cmd``, ``cd sub && FOO=1 npm test``, ``export FOO=1``
+    alone or chained, ``set -a; . ./.env.local``, ``sh -c 'FOO=1 cmd'``, and
+    even ``node -e "console.log('FOO=' + x)"``. ``Bash(export:*)`` does not
+    make ``export`` pass; ``Bash(env:*)`` would make ``env FOO=1 cmd`` pass but
+    approves every command behind ``env``, so Harbor does not add it.
+    Allowed: a variable read from a file in the worktree (``node
+    --env-file=.env.local``, or a framework's own ``.env.local``), which the
+    Write tool may create there. A resumed session never sees the launch
+    prompt again, so the exact GitHub helper command is repeated here.
+    """
+
+    lines = [
+        "Harbor shell note (Claude Code in dontAsk mode): sandboxed Bash runs without asking, but Claude Code "
+        "refuses every command that sets an environment variable, and a refused form never works on retry. Refused: "
+        "`FOO=1 cmd`, `env FOO=1 cmd`, `/usr/bin/env FOO=1 cmd`, `cd dir && FOO=1 cmd`, `export FOO=1` (alone or "
+        "chained), `set -a; . ./.env.local` and `sh -c 'FOO=1 cmd'`; the only exceptions are Harbor's runtime "
+        "invocation and GitHub helper command, run exactly as given. To give your own build, test or dev-server command a variable, write it to an "
+        "env file in the ticket worktree with the Write tool and let the tool read it: `.env.local` (read by Next.js, "
+        "Vite and dotenv; Next.js also reads `.env.development.local`, `.env.production.local` and `.env.test.local`), "
+        "or `node --env-file=.env.local script.js` for plain Node. Text that looks like an assignment inside inline "
+        "code is refused as well (`node -e \"console.log('FOO=' + x)\"`), so put such code in a script file. "
+        "Use placeholder or scratch values only (for example a scratch database path inside the worktree), never "
+        "a real secret, and never commit the file: "
+        "check `git status` before each commit. If a command needs a variable and reads no env file, report a "
+        "blocker that names the variable instead of working around the refusal.",
+    ]
+    if helper:
+        lines.append(
+            f"GitHub helper: run it exactly as `{helper} <op>`; that exact prefix is pre-approved, and its "
+            "configuration is already in it. Do not add `/usr/bin/env`, `PYTHONPATH`, `python -m` or any variable in "
+            "front of it, and do not change its interpreter or path, or Claude Code refuses it. The token is already "
+            "in your environment under the variable that HARBOR_GITHUB_TOKEN_ENV names; never print or echo it."
+        )
+    return "\n".join(lines)
+
+
 # The builder's file tools. Edit and Write run inside Claude Code, outside the
 # OS sandbox, so the ``Edit(...)`` rule below (which covers every file-editing
 # tool) is their only boundary; dontAsk refuses an edit anywhere else.
-BUILDER_TOOLS = "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent"
+# TaskStop stops a Bash command the builder started with run_in_background (a dev
+# server for web proof). Without it nothing can: pkill and lsof cannot see that
+# process from a later sandboxed command, and a ``claude -p`` session with a
+# background command still running does not end until it exits (live: about ten
+# minutes). It acts only on this session's own background tasks.
+BUILDER_TOOLS = "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent,TaskStop"
 
 
 def worktree_permissions(worktree: str | Path) -> list[str]:
@@ -269,6 +324,8 @@ class ClaudeRunner(CodexRunner):
     sandbox_hosts: tuple[str, ...] = ()
     # The exact ``harbor`` runtime prefix the builder prompt tells it to use.
     harbor_invocation: str = ""
+    # The exact GitHub REST helper invocation (harbor.github_rest.builder_helper_invocation).
+    github_helper_invocation: str = ""
     # The project's workflow package, which lives outside the ticket worktree.
     workflow_package: Path | None = None
     # Opt-in device/browser proof platforms from the project's workflow ([builder] device_proof).
@@ -292,12 +349,16 @@ class ClaudeRunner(CodexRunner):
             note = device_note(statuses, web="web" in self.device_proof)
             if note:
                 instruction = f"{instruction}\n\n{note}" if instruction else note
+        # Every turn, fresh or resumed: a resumed session never sees the launch prompt again.
+        shell = builder_shell_note(self.github_helper_invocation)
+        instruction = f"{instruction}\n\n{shell}" if instruction else shell
         return await super()._execute(context, instruction, resume=resume, before_spawn=before_spawn)
 
     def _workflow_permissions(self) -> list[str]:
         try:
             return [*worktree_permissions(self.worktree),
-                    *workflow_permissions(self.harbor_invocation, self.workflow_package)]
+                    *workflow_permissions(self.harbor_invocation, self.workflow_package,
+                                          self.github_helper_invocation)]
         except ValueError as exc:
             raise RunnerError(f"refusing a builder permission: {exc}") from exc
 

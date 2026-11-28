@@ -483,6 +483,8 @@ def build_production_dispatcher(
                         "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
                     ) from exc
                 runner.workflow_package = current.package
+                # The helper command, like the runtime invocation, is approved literally and named every turn.
+                runner.github_helper_invocation = github["helper"]
                 # Opt-in sandbox widenings, read per turn like device_proof below.
                 from harbor.config.workflow import builder_allow_tmp, builder_allowed_domains
                 runner.allowed_domains = builder_allowed_domains(current.config)
@@ -641,9 +643,8 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     transport is Claude-only.
     """
 
-    import shlex
     from harbor.config.workflow import github_settings
-    from harbor.github_rest import rest_base_url, token_env_name
+    from harbor.github_rest import builder_helper_invocation, rest_base_url, token_env_name
 
     environ = os.environ if env is None else env
     settings = github_settings(workflow.config)
@@ -660,7 +661,6 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     # The same resolved repository the GitHub poller reads, so the builder
     # never acts on a different repository than Harbor observes.
     repository = profile.repository if profile.repository_owner else ""
-    helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
     child_env = {"HARBOR_GITHUB_API_URL": rest_url}
     if repository:
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
@@ -674,6 +674,10 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     fetch_url = git_fetch_url(rest_url, repository or None)
     if fetch_url:
         child_env["HARBOR_GIT_FETCH_URL"] = fetch_url
+    # The one command builders run for the helper (named in the prompt, and
+    # approved literally for Claude under dontAsk): its configuration is pinned
+    # in front, and the token is referenced only by HARBOR_GITHUB_TOKEN_ENV.
+    helper = builder_helper_invocation(child_env)
     mcp = {"url": settings["mcp_url"], "token_env": token_env} if settings["transport"] == "mcp" and token_env else None
     # Only Claude's sandbox filters by host, so only a Claude project is held
     # to its host rules here (start and doctor fail closed). A resumed Claude
@@ -686,6 +690,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "token_env": token_env,
         "token_names": token_names,
         "env": child_env,
+        "helper": helper,
         "mcp": mcp,
         "sandbox_hosts": hosts,
         "linear_sandbox_warning": linear_warning,
@@ -730,7 +735,7 @@ async def _doctor(project_name: str) -> int:
         print(f"GitHub transport: invalid ({exc})")
         scope_ok = False
     else:
-        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (python -m harbor.github_rest)"
+        where = github["mcp_url"] if github["transport"] == "mcp" else f"REST helper ({github['helper']})"
         if github["token_env"]:
             print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
         else:
@@ -749,13 +754,13 @@ async def _doctor(project_name: str) -> int:
                       "(Bash may write the host's shared temp directory)")
             from harbor.runner.claude import workflow_permissions
             try:
-                workflow_permissions(_runtime_invocation(config), workflow.package)
+                workflow_permissions(_runtime_invocation(config), workflow.package, github["helper"])
             except ValueError as exc:
                 print(f"Builder permissions: invalid ({exc}); a Claude builder could not run harbor or read the workflow")
                 scope_ok = False
             else:
                 print(f"Builder permissions: Edit and Write in the ticket worktree only · harbor runtime invocation "
-                      f"(sandboxed) · read-only {workflow.package}")
+                      f"and GitHub helper invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
     for line in _device_proof_doctor(config, workflow):

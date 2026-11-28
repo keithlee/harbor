@@ -239,7 +239,13 @@ transport = "rest"   # default; or "mcp" (Claude builders only)
 ```
 
 **`rest` (default, no extra setup).** The builder runs Harbor's helper,
-`python -m harbor.github_rest`, which calls the GitHub REST API through `curl`.
+`harbor/github_rest.py`, which calls the GitHub REST API through `curl`. The
+prompt names one exact command for it:
+`/usr/bin/env HARBOR_GITHUB_API_URL=… HARBOR_GITHUB_REPOSITORY=… HARBOR_GITHUB_TOKEN_ENV=<name> <python> -I <harbor source>/harbor/github_rest.py`.
+It pins the API, the repository and the *name* of the token variable; the
+token value stays in the builder's environment. A Claude builder gets an exact
+`Bash(<that command>:*)` permission rule for it, like the `harbor` runtime
+invocation, and every turn (fresh or resumed) repeats the command.
 Operations: `pr-view`, `pr-create`, `pr-edit`, `pr-comment`, `pr-checks`,
 `pr-merge` (pinned to a head SHA) and `api METHOD /path` for anything else. It
 uses the token you already export for Harbor (`GITHUB_TOKEN` or `GH_TOKEN`),
@@ -297,7 +303,7 @@ implementor and reviewer children. A Claude builder does this with Claude
 Code's `Agent` tool, which Harbor always enables; there is nothing to
 configure. Children run inside the builder's own Claude Code process, so they
 get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Edit`,
-`Write`, `Skill`, `Agent`), its permission rules and `dontAsk` mode, and the
+`Write`, `Skill`, `Agent`, `TaskStop`), its permission rules and `dontAsk` mode, and the
 same Bash sandbox: the same writable paths and the same network allowlist
 below. They cannot use a tool, edit a file or reach a host the builder cannot.
 Verified on macOS with Claude Code 2.1.332: a child created and edited files in
@@ -446,6 +452,23 @@ One limit of Claude Code itself remains: in `dontAsk` mode, a Bash command
 with a `?` in a URL argument (`curl 'https://example.com/?a=1'`) is refused as
 a permission, whatever the host. The same request made from a script, such as
 Python's `urllib`, is only checked by the network allowlist.
+
+Another: in `dontAsk` mode Claude Code refuses every Bash command that sets an
+environment variable: `FOO=1 cmd`, `env FOO=1 cmd`, `/usr/bin/env FOO=1 cmd`,
+`cd sub && FOO=1 npm test`, `export FOO=1` (alone or chained),
+`set -a; . ./.env.local`, `sh -c 'FOO=1 cmd'`, and even
+`node -e "console.log('FOO=' + x)"`. Only an exact allow rule passes one, which
+is why Harbor's two commands have one. `Bash(export:*)` does not help, and
+`Bash(env:*)` would approve every command behind `env`, so Harbor adds neither.
+Each turn's shell note tells the builder to write variables to an env file in
+the worktree with `Write` (`.env.local`, which Next.js, Vite and dotenv read,
+or `node --env-file=.env.local script.js`) and never to commit it. With web
+proof, the builder starts a dev server with Bash `run_in_background: true` and
+stops it with `TaskStop`. `cmd &` and `nohup` leave a process that outlives the
+session, and a later `pkill` or `lsof` cannot see it. A `claude -p` session
+whose background command is still running does not end until that command
+exits; live, that took 614 s without `TaskStop` and 31 s with it. Verified on
+macOS with Claude Code 2.1.332.
 
 ### Device and browser proof (`[builder]`)
 
@@ -689,7 +712,7 @@ commands. They do not stop a builder that means to get around them.
     runtime would follow those links to files outside `.harbor/`.
 - **Where it runs:**
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
-  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
+  - the builder's merge command, the GitHub helper's `pr-merge N --sha SHA`.
 - **The helper's `api` command is an allowlist.**
   - Reads (`GET`, `HEAD`) go through when they carry no request body, except
     on `/graphql`: GraphQL is POST only, so its mutation allowlist always

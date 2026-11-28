@@ -32,7 +32,8 @@ def test_claude_builder_can_spawn_child_agents_within_the_same_sandbox(tmp_path:
     assert "Agent" in _tools(argv)
     # Children inherit this exact set: no web or MCP tool is added with Agent, and the
     # file-writing tools are approved for the worktree only (test_claude_builder_file_tools.py).
-    assert sorted(_tools(argv)) == ["Agent", "Bash", "Edit", "Glob", "Grep", "Read", "Skill", "Write"]
+    # TaskStop only stops this session's own background Bash tasks (test_claude_builder_shell.py).
+    assert sorted(_tools(argv)) == ["Agent", "Bash", "Edit", "Glob", "Grep", "Read", "Skill", "TaskStop", "Write"]
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     sandbox = json.loads(argv[argv.index("--settings") + 1])["sandbox"]
     assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True

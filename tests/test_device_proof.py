@@ -459,7 +459,9 @@ def test_the_builder_prompt_carries_the_boot_result(tmp_path: Path, monkeypatch)
     assert "- ios: ready: iPhone Air (NEW) already booted" in text and "Quote the error above" in text
     runner.device_proof = ()
     asyncio.run(runner._execute(runner._new_context(None), "Build SAMPLE-1", resume=False))
-    assert seen["instruction"] == "Build SAMPLE-1"
+    # Without device proof only the per-turn shell note (harbor.runner.claude.builder_shell_note) follows.
+    assert seen["instruction"].startswith("Build SAMPLE-1\n\nHarbor shell note")
+    assert "Harbor device proof" not in seen["instruction"] and "Harbor web proof" not in seen["instruction"]
 
 
 # --- the .harbor/ diff check: GitHub SHAs only, any .harbor change, plain paths ---------------
