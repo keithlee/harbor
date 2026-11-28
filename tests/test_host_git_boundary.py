@@ -15,6 +15,7 @@ import asyncio
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,7 @@ import pytest
 import harbor.safe_git as safe_git
 from harbor.safe_git import UnsafeGitDirectory, git_env, run_worktree_git, worktree_git_dirs
 from harbor.unblock import UnblockLadder
-from harbor.worktree import WorktreeConfinementError, WorktreeManager
+from harbor.worktree import WorktreeConfinementError, WorktreeError, WorktreeManager
 
 TOKEN = "ghp_planted_gitdir_probe_token"
 SECRETS = {
@@ -388,14 +389,12 @@ def test_verify_and_remove_never_enter_a_planted_submodule(project) -> None:
     plant_submodule(project, committed=False)
     with pytest.raises(WorktreeError, match="dirty"):
         project.manager.verify(project.worktree)
-    with pytest.raises(WorktreeError, match="modified or untracked"):
+    with pytest.raises(WorktreeError, match="submodule or nested git repository"):
         project.manager.remove(project.worktree)
     assert ran(project) == ""
     git(project.worktree.path, *IDENTITY, "commit", "-q", "-m", "add sub")
-    try:  # the gitlink is committed, so the dirty check passes and git itself decides
+    with pytest.raises(WorktreeError, match="submodule or nested git repository"):
         project.manager.remove(project.worktree)
-    except WorktreeError:
-        pass
     assert ran(project) == ""
 
 
@@ -433,3 +432,114 @@ def test_relative_empty_and_worktree_path_entries_never_find_a_planted_git(proje
     assert safe_git.safe_path(environ["PATH"]) == os.pathsep.join([str(wt / "bin"), real])
     assert safe_git.safe_path(environ["PATH"], outside=wt.resolve()) == real
     assert safe_git.safe_path(":.:bin") == os.defpath
+
+
+# --- a deleted or broken .git must not skip the ladder's observed diff ------------------------
+
+
+@pytest.mark.parametrize("damage", ["deleted", "unreadable", "directory"])
+def test_unblock_ladder_fails_closed_when_the_builder_breaks_its_git_file(project, damage) -> None:
+    """Without the observed diff the protected-path gate would trust the builder's own path claims."""
+
+    wt = project.worktree.path
+    (wt / "PROTECTED.md").write_text("builder change\n")
+    dot = wt / ".git"
+    if damage == "deleted":
+        dot.unlink()
+    elif damage == "unreadable":
+        dot.chmod(0)
+    else:
+        dot.unlink()
+        dot.mkdir()
+    decided = []
+
+    async def mate(*args, **kwargs):
+        decided.append(args)
+        return {"disposition": "resolve", "answer": "A", "citation": "project:x", "reason": "preapproved"}
+
+    async def resume(run_id, prompt):
+        return True
+
+    ladder = UnblockLadder(first_mate=mate, resumer=resume, repo_path=project.checkout, protected_paths=("PROTECTED.md",))
+    try:
+        with pytest.raises(UnsafeGitDirectory):
+            asyncio.run(ladder.handle(*_ladder_args(wt)))
+    finally:
+        if damage == "unreadable":
+            dot.chmod(0o644)
+    assert not decided, "an unverified worktree must never reach automatic resolution"
+
+
+# --- cleanup must not delete work Harbor cannot see ------------------------------------------
+
+
+def test_remove_keeps_a_committed_submodule_with_uncommitted_work(project) -> None:
+    sub = plant_submodule(project, committed=True)  # leaves sub/f.txt modified, uncommitted
+    assert run_worktree_git(project.worktree.path, project.checkout, "status", "--porcelain").stdout == ""
+    with pytest.raises(WorktreeError, match=r"submodule or nested git repository \(sub\)"):
+        project.manager.remove(project.worktree)
+    assert (sub / "f.txt").read_text() == "two\n"
+    assert ran(project) == ""
+
+
+def test_remove_keeps_a_worktree_with_an_ignored_nested_repository(project) -> None:
+    (project.checkout / ".git" / "info" / "exclude").write_text("vendor/\n")
+    nested = project.worktree.path / "vendor" / "lib"
+    git(project.worktree.path, "init", "-q", str(nested))
+    (nested / "work.txt").write_text("uncommitted\n")
+    assert run_worktree_git(project.worktree.path, project.checkout, "status", "--porcelain").stdout == ""
+    with pytest.raises(WorktreeError, match=r"nested git repository \(vendor/lib\)"):
+        project.manager.remove(project.worktree)
+    assert (nested / "work.txt").exists()
+
+
+def test_remove_still_deletes_a_clean_worktree(project) -> None:
+    project.manager.remove(project.worktree)
+    assert not project.worktree.path.exists()
+
+
+# --- a forged commit-graph must not change the ladder's base...HEAD diff ----------------------
+
+_GRAPH_PARENT_NONE = 0x70000000
+
+
+def _forge_commit_graph(graph: Path, parents: dict, levels: dict) -> None:
+    """Rewrite first parents and topological levels in a v1 commit-graph, as a builder could."""
+
+    data = bytearray(graph.read_bytes())
+    assert data[:4] == b"CGPH"
+    table = {}
+    for i in range(data[6] + 1):
+        chunk, offset = struct.unpack(">4sQ", data[8 + 12 * i: 20 + 12 * i])
+        table[chunk] = offset
+    oidl, cdat = table[b"OIDL"], table[b"CDAT"]
+    oids = [bytes(data[oidl + 20 * i: oidl + 20 * (i + 1)]).hex() for i in range((cdat - oidl) // 20)]
+    for child, parent in parents.items():
+        index = _GRAPH_PARENT_NONE if parent is None else oids.index(parent)
+        struct.pack_into(">I", data, cdat + 36 * oids.index(child) + 20, index)
+    for oid, level in levels.items():
+        entry = cdat + 36 * oids.index(oid) + 28
+        word = struct.unpack(">Q", data[entry: entry + 8])[0]
+        struct.pack_into(">Q", data, entry, (level << 34) | (word & ((1 << 34) - 1)))
+    graph.unlink()  # git writes it read-only; objects/info/ is builder-writable
+    graph.write_bytes(bytes(data))
+
+
+def test_a_forged_commit_graph_does_not_change_the_merge_base_diff(project) -> None:
+    wt, base = project.worktree.path, project.head
+    (wt / "PROTECTED.md").write_text("x\n")
+    git(wt, "add", "PROTECTED.md")
+    git(wt, *IDENTITY, "commit", "-q", "-m", "C1")
+    c1 = git(wt, "rev-parse", "HEAD")
+    (wt / "other.txt").write_text("y\n")
+    git(wt, "add", "other.txt")
+    git(wt, *IDENTITY, "commit", "-q", "-m", "C2")
+    c2 = git(wt, "rev-parse", "HEAD")
+    git(project.checkout, "-c", "commitGraph.generationVersion=1", "commit-graph", "write", "--reachable")
+    graph = project.checkout / ".git" / "objects" / "info" / "commit-graph"
+    _forge_commit_graph(graph, {c1: None, base: c1}, {c1: 1, base: 2, c2: 2})
+    # Guard: git trusts the forged graph unless told not to.
+    forged = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], cwd=wt, capture_output=True, text=True)
+    assert forged.returncode != 0 or "PROTECTED.md" not in forged.stdout
+    result = run_worktree_git(wt, project.checkout, "diff", "--name-only", f"{base}...HEAD")
+    assert result.returncode == 0 and set(result.stdout.split()) == {"PROTECTED.md", "other.txt"}

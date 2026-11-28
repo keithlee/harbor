@@ -938,7 +938,10 @@ Cleanup requires an independently observed merge, a completed delivery, a
 terminal Linear state, the exact local/merged PR head, stopped processes, no
 open escalation, no hold and passing `pre_cleanup` hooks. Modified or untracked
 files keep the worktree for inspection; git-ignored install and build output
-(`node_modules/`, `.next/`, ...) is removed with it. The branch is never deleted.
+(`node_modules/`, `.next/`, ...) is removed with it. A worktree that contains a
+submodule or any nested git repository (even inside an ignored directory) is
+also kept, because Harbor's git does not look inside those and could not see
+uncommitted work there; remove it by hand. The branch is never deleted.
 All ignored files go, including any unique ignored content (local notes,
 generated `storage/` data, `.env` copies): keep anything you need outside the
 worktree or commit it.
@@ -1034,7 +1037,12 @@ submodule a builder adds is a repository whose config is the builder's. An
 added or changed submodule commit is still reported; changes inside a
 submodule's files are not. Empty and relative `PATH` entries, and entries
 inside the worktree, are dropped from git's environment, so a `git` the
-builder planted is never the one that runs. No setup is needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
+builder planted is never the one that runs. Commit-graph files, which a builder
+can write, are not used (`core.commitGraph=false`), so they cannot move the
+merge base of the blocker ladder's diff. If a run's worktree has no readable
+`.git` file, the blocker ladder refuses the blocker instead of trusting the
+builder's own list of touched paths, and reports it to you. No setup is
+needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
 against a throwaway repository; the Claude sandbox and Linux were checked
 through the generated settings only.
 
