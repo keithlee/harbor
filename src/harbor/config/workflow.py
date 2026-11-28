@@ -27,7 +27,64 @@ SECTIONS = {
     "evidence": {"feedback", "ci"},
     "states": {"ready", "paused", "terminal"},
     "github": {"transport", "mcp_url"},
+    "builder": {"device_proof", "allowed_domains", "allow_tmp"},
 }
+DEVICE_PROOF_PLATFORMS = ("android", "ios", "web")
+
+
+def device_proof_settings(data) -> tuple[str, ...]:
+    """The builder's opt-in device/browser proof platforms; ``()`` when absent.
+
+    Fails closed: anything but a list of known, distinct platform names raises,
+    so a typo never launches a builder with a sandbox nobody asked for.
+    """
+    section = dict((data or {}).get("builder") or {})
+    value = section.get("device_proof", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("builder.device_proof must be a list of platform names")
+    unknown = [item for item in value if item not in DEVICE_PROOF_PLATFORMS]
+    if unknown:
+        raise ValueError(
+            f"unknown builder.device_proof platform(s) {', '.join(map(repr, unknown))}; "
+            f"use any of {', '.join(DEVICE_PROOF_PLATFORMS)}"
+        )
+    if len(set(value)) != len(value):
+        raise ValueError("builder.device_proof lists a platform twice")
+    return tuple(value)
+
+
+def builder_allowed_domains(data) -> tuple[str, ...]:
+    """Extra host names a Claude builder's Bash sandbox may reach; ``()`` when absent.
+
+    Fails closed: each entry must be a plain lower-case host name (no scheme,
+    port, path, wildcard or IP literal), listed once, so a bad value never
+    widens the allowlist past the named host.
+    """
+    from harbor.runner.claude import _domain
+    section = dict((data or {}).get("builder") or {})
+    value = section.get("allowed_domains", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("builder.allowed_domains must be a list of host names")
+    for item in value:
+        try:
+            _domain(item)
+        except ValueError:
+            raise ValueError(
+                f"builder.allowed_domains entry {item!r} is not a plain lower-case host name "
+                "(no scheme, port, path, wildcard or IP address)"
+            ) from None
+    if len(set(value)) != len(value):
+        raise ValueError("builder.allowed_domains lists a host twice")
+    return tuple(value)
+
+
+def builder_allow_tmp(data) -> bool:
+    """Whether a Claude builder's Bash sandbox may write the host's shared ``/tmp``; False when absent."""
+    section = dict((data or {}).get("builder") or {})
+    value = section.get("allow_tmp", False)
+    if type(value) is not bool:
+        raise ValueError("builder.allow_tmp must be true or false")
+    return value
 GITHUB_TRANSPORTS = {"rest", "mcp"}
 DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 
@@ -310,6 +367,9 @@ def load_workflow(path: Path) -> Workflow:
     if any(state_groups[i] & state_groups[j] for i in range(3) for j in range(i+1,3)):
         raise ValueError("ready, paused and terminal states must not overlap")
     github_settings(data)
+    device_proof_settings(data)
+    builder_allowed_domains(data)
+    builder_allow_tmp(data)
     deadline = data.get("execution",{}).get("deadline_minutes",90)
     if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or deadline <= 0:
         raise ValueError("deadline must be positive and finite")

@@ -62,6 +62,28 @@ def dumps(data, prefix=""):
     return out
 
 
+def reviewed_pr(head, risk="low", author="sample-delivery"):
+    """PR node fields for a merge-eligible risk rating at ``head``.
+
+    They give a builder `## Risk Analysis` tier and the reviewer's approve
+    verdict comment, both for ``head`` and both from the PR's opener.
+    """
+    verdict = {"review": {"head_sha": head, "verdict": "approve", "proof_verified": True,
+                          "feedback_digest": "d", "risk": risk, "risk_rationale": "fixture"}}
+    return {
+        "body": f"## Risk Analysis\nRisk tier: {risk}\n<!-- harbor:risk-sha:{head} -->\n",
+        "author": {"login": author, "__typename": "User"},
+        "comments": {"nodes": [{"id": "verdict-1", "body": json.dumps(verdict),
+                                "author": {"login": author, "__typename": "User"},
+                                "createdAt": "2026-01-01T00:00:00Z"}]},
+    }
+
+
+# The reviewer's verdict comment is itself a PR comment, so tests that need a
+# rated PR to pass pre_merge keep feedback advisory instead of replying to it.
+ADVISORY_FEEDBACK = '[evidence]\nfeedback = "advisory"\n'
+
+
 def config(tmp_path, preset="minimal", extra="", models=None):
     """Copy the bundled work-pipeline into ``tmp_path/.harbor/workflow``.
 
