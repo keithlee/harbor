@@ -592,14 +592,22 @@ commands. They do not stop a builder that means to get around them.
   - **Run inside the builder** (`pr-merge`, or `harbor workflow check` started
     by the builder), the check uses the builder's own environment and
     executables. Its result is only as trustworthy as the builder.
-- **Unreadable is refused too.** Missing commits, a SHA that does not match
-  the PR head, and a tracked `.harbor`, `.harbor/workflow` or `workflow.toml`
-  that is a symlink or a submodule all count as unreadable.
+- **Unreadable is refused too.** These count as unreadable:
+  - missing commits, or a SHA that does not match the PR head;
+  - any tracked entry whose path case-folds to `.harbor` or anything below it
+    that is not a plain directory (040000) or a regular file (100644 or
+    100755), at the base, the head or the merge result. That covers symlinks
+    and submodules at any depth and in any letter case, such as
+    `.HARBOR -> cfg`, `.harbor/WORKFLOW -> ../cfg` or
+    `.harbor/workflow/config.toml -> ../../cfg.toml`. On macOS, Harbor's
+    runtime would follow those links to files outside `.harbor/`.
 - **Where it runs:**
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
   - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
 - **The helper's `api` command is an allowlist.**
-  - Reads (`GET`, `HEAD`) go through when they carry no request body.
+  - Reads (`GET`, `HEAD`) go through when they carry no request body, except
+    on `/graphql`: GraphQL is POST only, so its mutation allowlist always
+    applies.
   - Writes are allowed only for PR create, PR edit, issue and review comments,
     replies, reviews and labels, under `/repos/<owner>/<repo>/` for the
     configured repository. A PR edit (`PATCH pulls/N`) may set only `title`
@@ -636,7 +644,12 @@ untracked `.harbor/`:
 - anything Harbor runs outside the sandbox that a merged PR controls (the
   `install_command`, git hooks), and the `ios` and `android` escapes. These
   can edit the main checkout directly, so branch protection does not stop
-  them either.
+  them either;
+- Harbor's own owner-approved-merge instruction
+  (`src/harbor/pr_events.py`), which tells the builder to merge with
+  `gh pr merge --match-head-commit`. That command does not go through
+  `pr-merge` or its `.harbor/` check. This predates device proof and is not
+  changed here.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`
