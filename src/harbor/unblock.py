@@ -27,7 +27,7 @@ from typing import Any, Literal
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
-from harbor.safe_git import IGNORE_SUBMODULES, run_worktree_git
+from harbor.safe_git import IGNORE_SUBMODULES, main_git_dir, run_worktree_git
 from harbor.wake import apply_phase3_migration
 
 
@@ -1220,7 +1220,15 @@ class UnblockLadder:
         run_repo = Path(str(run_repo_value)) if run_repo_value else None
         authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
 
-        if authority_repo is not None and os.path.lexists(authority_repo / ".git"):
+        # When the project repository is a git checkout (always, for a
+        # registered project), the run's own worktree is always inspected: a
+        # builder that deletes or breaks its ``.git`` must not skip the
+        # observed-diff check and leave the protected-path gate to its own
+        # path claims.  ``run_worktree_git`` raises ``UnsafeGitDirectory`` for a
+        # missing or foreign ``.git``, so the blocker is reported to the
+        # operator and never auto-resolved.
+        must_inspect = authority_repo is not None and authority_repo == run_repo and main_git_dir(self.repo_path) is not None
+        if authority_repo is not None and (must_inspect or os.path.lexists(authority_repo / ".git")):
             # Use observed changes, not only the builder's path claims.
             # This git runs on the host with Harbor's environment, in a
             # directory the builder controls: ``run_worktree_git`` refuses a

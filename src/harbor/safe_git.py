@@ -65,6 +65,10 @@ LOCAL_HARDENING: tuple[str, ...] = (
     "-c", "core.alternateRefsCommand=",
     "-c", "diff.ignoreSubmodules=dirty",
     "-c", "status.submoduleSummary=false",
+    # ``objects/info/commit-graph`` is builder-writable and git trusts the
+    # parents it lists, so a forged one could move the merge base of the
+    # blocker ladder's ``base...HEAD`` diff.  Read parents from the commits.
+    "-c", "core.commitGraph=false",
 )
 IGNORE_SUBMODULES = "--ignore-submodules=dirty"
 
@@ -170,7 +174,10 @@ def main_git_dir(path: Any) -> Path | None:
 def _read_pointer(path: Path, prefix: str = "") -> str:
     if path.is_symlink() or not path.is_file():
         raise UnsafeGitDirectory(f"{path} is missing or not a regular file")
-    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError as exc:
+        raise UnsafeGitDirectory(f"{path} is unreadable: {exc.strerror or exc}") from exc
     if "\n" in text or not text.startswith(prefix):
         raise UnsafeGitDirectory(f"{path} is not a git pointer file")
     return text[len(prefix):].strip()
