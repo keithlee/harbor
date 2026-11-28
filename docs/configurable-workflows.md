@@ -920,10 +920,23 @@ the blocker (`/answer`, or a comment on the ticket). Harbor installs again
 before the resumed turn. Harbor logs every check to stderr as
 `Harbor: dependencies for <ticket>: ...`.
 
-Rung-0 remediation's own `pnpm install`, for a builder-reported
-`Cannot find module`, runs only in the run's linked worktree. It runs without
-Harbor's credentials or the SSH agent, in its own process group that a timeout
-kills.
+**A builder-reported `Cannot find module`.** Rung-0 remediation does not run a
+package manager. It marks the run's worktree (a linked worktree only) as needing
+a reinstall in Harbor's ledger, and resumes the session. The resumed turn's
+pre-turn install then does the reinstall with the project's `install_command`,
+not a hard-coded `pnpm install`. That install uses the rules above: install
+scripts only on inputs that match the base branch or Harbor's last trusted
+install, the credential-free environment and its own process group. A builder
+that writes a `postinstall` and then reports `Cannot find module` itself gets
+an install with scripts off. With `install_command: none` nothing reinstalls,
+and the ladder's rung-0 attempt limit stops the retries.
+
+The other rung-0 commands, `gh auth status` and `adb start-server`, keep
+Harbor's environment, because `gh auth status` must see Harbor's own
+credentials. Each runs by absolute path from Harbor's `PATH`, with empty,
+relative and worktree entries removed (as `harbor.safe_git` does for git), in a
+private temporary directory. So a `gh` that a builder plants in its worktree or
+`node_modules/.bin` never runs.
 
 **Environment.** Both installs run as the user who runs Harbor. The
 creation-time install inherits Harbor's whole environment. The pre-turn

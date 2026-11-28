@@ -577,6 +577,11 @@ ticket's wake is not replayed every poll. Fix the cause, then answer the
 blocker (`/answer`, or a comment on the ticket), and Harbor installs again
 before the resumed turn.
 
+When a builder itself reports `Cannot find module`, rung-0 remediation runs no
+package manager. It only marks the worktree for a reinstall and resumes. The
+resumed turn's pre-turn install does the work under the rules above, so a
+`postinstall` the builder wrote does not run.
+
 **Environment.** At worktree creation the install runs on the base branch's
 files and inherits Harbor's whole environment, credentials included. Before a
 turn, Harbor removes its own credentials from the install's environment:
