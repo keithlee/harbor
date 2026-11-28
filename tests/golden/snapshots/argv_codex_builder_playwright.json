@@ -14,7 +14,7 @@
   "-c",
   "permissions.harbor-playwright.network.enabled=true",
   "-c",
-  "permissions.harbor-playwright.filesystem={\"<tmp>/state\"=\"write\", \"<tmp>/repo/.git\"=\"write\", \"<tmp>/repo/.git/worktrees/wt\"=\"write\"}",
+  "permissions.harbor-playwright.filesystem={\"<tmp>/state\"=\"write\", \"<tmp>/repo/.git/objects\"=\"write\", \"<tmp>/repo/.git/refs\"=\"write\", \"<tmp>/repo/.git/logs\"=\"write\", \"<tmp>/repo/.git/packed-refs\"=\"write\", \"<tmp>/repo/.git/packed-refs.lock\"=\"write\", \"<tmp>/repo/.git/shallow\"=\"write\", \"<tmp>/repo/.git/shallow.lock\"=\"write\", \"<tmp>/repo/.git/worktrees/wt\"=\"write\"}",
   "--output-schema",
   "<run-result schema>",
   "--json",

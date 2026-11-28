@@ -4,8 +4,9 @@ A linked worktree's `.git` is a FILE pointing at `<repo>/.git/worktrees/<name>`.
 Commits write objects, refs, reflogs and per-worktree metadata there, all
 OUTSIDE the worktree, so a plain workspace-write sandbox cannot commit at all
 -- the builder reported "Operation not permitted writing shared worktree
-metadata" on a real run.  The repository's git directory is therefore granted,
-and the operator's working tree is deliberately not.
+metadata" on a real run.  The parts of the repository's git directory that a
+commit writes are therefore granted.  The operator's working tree, and the
+shared config and hooks that git runs outside the sandbox, are deliberately not.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from harbor.runner.codex import CodexRunner
+from harbor.runner.codex import SHARED_GIT_WRITABLE, CodexRunner
 
 
 def linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
@@ -37,12 +38,19 @@ def config_values(runner: CodexRunner, *, resume: bool = False) -> dict[str, str
     return out
 
 
-def test_the_shared_git_dir_is_discovered_and_made_writable(tmp_path: Path) -> None:
+def commit_roots(repo: Path) -> list[str]:
+    common = (repo / ".git").resolve()
+    return [*(str(common / name) for name in SHARED_GIT_WRITABLE), str(common / "worktrees" / "SAMPLE-42")]
+
+
+def test_the_shared_git_dir_is_discovered_and_its_commit_paths_made_writable(tmp_path: Path) -> None:
     repo, worktree = linked_worktree(tmp_path)
     runner = CodexRunner(worktree, ticket="SAMPLE-42")
     assert runner.git_dir == (repo / ".git").resolve()
     roots = json.loads(config_values(runner)["sandbox_workspace_write.writable_roots"])
-    assert roots == [str((repo / ".git").resolve())]
+    assert roots == commit_roots(repo)
+    # The shared config and hooks run outside the sandbox, so they stay read-only.
+    assert str((repo / ".git").resolve()) not in roots
 
 
 def test_the_operators_working_tree_is_never_writable(tmp_path: Path) -> None:
@@ -93,8 +101,7 @@ def test_extra_writable_roots_are_honoured(tmp_path: Path) -> None:
     extra.mkdir()
     runner = CodexRunner(worktree, ticket="SAMPLE-42", writable_roots=[extra])
     roots = json.loads(config_values(runner)["sandbox_workspace_write.writable_roots"])
-    assert str(extra.resolve()) in roots
-    assert str((repo / ".git").resolve()) in roots
+    assert roots == [str(extra.resolve()), *commit_roots(repo)]
 
 
 def test_the_resume_command_reapplies_config_without_unsupported_flags(tmp_path: Path) -> None:
@@ -106,7 +113,5 @@ def test_the_resume_command_reapplies_config_without_unsupported_flags(tmp_path:
     assert "resume" in resumed
     config = config_values(runner, resume=True)
     assert config["sandbox_workspace_write.network_access"] == "true"
-    assert str((repo / ".git").resolve()) in json.loads(
-        config["sandbox_workspace_write.writable_roots"]
-    )
+    assert json.loads(config["sandbox_workspace_write.writable_roots"]) == commit_roots(repo)
     assert "-C" not in resumed and "-s" not in resumed

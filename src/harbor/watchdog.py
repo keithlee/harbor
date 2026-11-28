@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from harbor.safe_git import UnsafeGitDirectory, run_worktree_git
+
 ACTIVE = ("running", "waiting", "starting")
 REPEAT_LIMIT = 3
 
@@ -31,10 +33,19 @@ def initialize(connection) -> None:
     connection.execute("CREATE TABLE IF NOT EXISTS watchdog_state (key TEXT PRIMARY KEY, value TEXT, changed_at REAL NOT NULL)")
 
 
-def _head(worktree: str | None) -> str:
-    if not worktree or not Path(worktree).is_dir():
+def _head(worktree: str | None, repo: str | Path | None) -> str:
+    """The worktree's HEAD, or "" when it cannot be read safely.
+
+    Without the project repository there is nothing to check the worktree's
+    git metadata against, so git is not run at all.
+    """
+
+    if not worktree or not repo or not Path(worktree).is_dir():
         return ""
-    result = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True, text=True)
+    try:
+        result = run_worktree_git(worktree, repo, "rev-parse", "HEAD", timeout=10)
+    except (UnsafeGitDirectory, OSError, subprocess.SubprocessError):
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -83,7 +94,7 @@ def _receipts(connection, ticket: str, run_id: str) -> int:
 
 
 def tick(connection, project: str, *, minutes: float = 30, heartbeat_path: Path | None = None,
-         heartbeat_seconds: float = 60, now: float | None = None) -> list[dict]:
+         heartbeat_seconds: float = 60, now: float | None = None, repo: str | Path | None = None) -> list[dict]:
     """One watchdog pass. Returns the new flags it wrote."""
     initialize(connection)
     now = time.time() if now is None else now
@@ -100,7 +111,7 @@ def tick(connection, project: str, *, minutes: float = 30, heartbeat_path: Path 
         for run_id, ticket, status, worktree, finished, merged, cleanup_at, final_json in runs:
             status = str(status or "").casefold()
             if status in ACTIVE:
-                signature = f"{_head(worktree)}|{_receipts(connection, ticket, run_id)}"
+                signature = f"{_head(worktree, repo)}|{_receipts(connection, ticket, run_id)}"
                 value, changed = _state(connection, f"progress:{run_id}")
                 if value != signature:
                     _set(connection, f"progress:{run_id}", signature, now)
@@ -176,7 +187,8 @@ async def watch(project: str, *, minutes: float, interval: float, once: bool = F
     try:
         while True:
             for flag in tick(db.connection, config.name, minutes=minutes, heartbeat_path=beat,
-                             heartbeat_seconds=float(getattr(config, "heartbeat_seconds", 60))):
+                             heartbeat_seconds=float(getattr(config, "heartbeat_seconds", 60)),
+                             repo=getattr(config, "repo_path", None)):
                 print(f"Harbor watch: {flag['kind']} {flag.get('ticket') or config.name}: {flag['detail']}", flush=True)
             if once:
                 return 0

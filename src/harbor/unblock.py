@@ -13,6 +13,7 @@ from __future__ import annotations
 import fnmatch
 import inspect
 import json
+import os
 import re
 import subprocess
 
@@ -26,6 +27,7 @@ from typing import Any, Literal
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
+from harbor.safe_git import IGNORE_SUBMODULES, main_git_dir, run_worktree_git
 from harbor.wake import apply_phase3_migration
 
 
@@ -1218,21 +1220,39 @@ class UnblockLadder:
         run_repo = Path(str(run_repo_value)) if run_repo_value else None
         authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
 
-        if authority_repo is not None and (authority_repo / ".git").exists():
+        # When the project repository is a git checkout (always, for a
+        # registered project), the run's own worktree is always inspected: a
+        # builder that deletes or breaks its ``.git`` must not skip the
+        # observed-diff check and leave the protected-path gate to its own
+        # path claims.  ``run_worktree_git`` raises ``UnsafeGitDirectory`` for a
+        # missing or foreign ``.git``, so the blocker is reported to the
+        # operator and never auto-resolved.
+        must_inspect = authority_repo is not None and authority_repo == run_repo and main_git_dir(self.repo_path) is not None
+        if authority_repo is not None and (must_inspect or os.path.lexists(authority_repo / ".git")):
             # Use observed changes, not only the builder's path claims.
-            paths = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            paths += subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
+            # This git runs on the host with Harbor's environment, in a
+            # directory the builder controls: ``run_worktree_git`` refuses a
+            # worktree whose metadata is not the project repository's, and runs
+            # with no hooks, fsmonitor or credentials.
+            if self.repo_path is None:
+                raise ValueError("cannot inspect changed paths without the project repository")
+
+            def git(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+                return run_worktree_git(authority_repo, self.repo_path, *args, timeout=5, check=check)
+
+            paths = git("diff", IGNORE_SUBMODULES, "--name-only", "HEAD", check=True).stdout.splitlines()
+            paths += git("ls-files", "--others", "--exclude-standard", check=True).stdout.splitlines()
             # Linked worktrees are created from the configured remote branch;
             # a matching local branch need not exist and may be stale.
             base_sha = None
             for ref in (f"refs/remotes/origin/{self.base_branch}", f"refs/heads/{self.base_branch}"):
-                resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
+                resolved = git("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
                 if resolved.returncode == 0:
                     base_sha = resolved.stdout.strip()
                     break
             if base_sha is None:
                 raise ValueError("cannot inspect changed paths against configured base branch")
-            branch_diff = subprocess.run(["git", "diff", "--name-only", f"{base_sha}...HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
+            branch_diff = git("diff", IGNORE_SUBMODULES, "--name-only", f"{base_sha}...HEAD")
             if branch_diff.returncode != 0:
                 raise ValueError("cannot inspect changed paths against configured base branch")
             paths += branch_diff.stdout.splitlines()

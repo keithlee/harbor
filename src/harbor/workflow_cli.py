@@ -11,6 +11,7 @@ import httpx
 from harbor.config.workflow import load_workflow
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
+from harbor.safe_git import UnsafeGitDirectory, run_worktree_git
 
 
 def _one_line(exc):
@@ -61,7 +62,9 @@ def _attach_retained_worktree(config, db, ticket):
             "then run workflow checks from it"
         ) from exc
     try:
-        head = subprocess.run(["git","-C",str(worktree.path),"rev-parse","--verify","HEAD"],check=True,capture_output=True,text=True).stdout.strip()
+        head = run_worktree_git(worktree.path, worktree.repo, "rev-parse", "--verify", "HEAD", check=True).stdout.strip()
+    except UnsafeGitDirectory as exc:
+        raise ValueError(f"the retained worktree for {ticket} is not a worktree of {worktree.repo} ({_one_line(exc)})") from exc
     except subprocess.CalledProcessError as exc:
         raise ValueError(
             f"the retained worktree for {ticket} has no readable HEAD commit "
