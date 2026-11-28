@@ -277,6 +277,11 @@ class WorktreeManager:
                         self.custody.execute("INSERT OR REPLACE INTO worktree_setup VALUES (?,?,?,?,?,?,?)", (self.repo_name,ticket,str(self.repo),str(target),branch,_run_git(target,["rev-parse","HEAD"]).stdout.strip(),"installing"))
         if not retryable_ready:
             self.install(worktree)
+            if self.custody is not None and self.install_command:
+                # The first builder turn's pre-turn check (harbor.dependencies)
+                # then sees these inputs as installed instead of installing twice.
+                from harbor.dependencies import record
+                record(self.custody, worktree.path, self.install_command, status="installed", project=self.repo_name)
         if self.custody is not None:
             with self.custody:
                 self.custody.execute("UPDATE worktree_setup SET status='ready' WHERE project=? AND ticket=?", (self.repo_name,ticket))
@@ -306,6 +311,12 @@ class WorktreeManager:
         packages, so without this the builder's first command fails on a
         missing module -- exactly the rung-0 blocker the ladder then has to
         remediate.
+
+        It runs outside any builder sandbox and inherits Harbor's whole
+        environment, credentials included, on a worktree made from the base
+        branch. The reinstall before each builder turn
+        (``harbor.dependencies``) runs the same command on files the builder
+        can edit, so it removes Harbor's credentials first.
         """
 
         if not self.install_command:

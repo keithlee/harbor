@@ -500,6 +500,13 @@ def build_production_dispatcher(
                     warn_once(device_proof_platform_warning(granted))
             elif device_proof_settings(current.config):
                 warn_once(CODEX_DEVICE_PROOF)
+            # Claude and Codex alike: reinstall outside the sandbox before each turn
+            # when the lockfile changed or node_modules is missing (HAN-94). None
+            # when the project has no install_command.
+            from harbor.dependencies import pre_turn_installer
+            runner.dependency_preparer = pre_turn_installer(
+                manager, db, project=config.name, extra_secrets=(github.get("token_env") or "",),
+            )
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
