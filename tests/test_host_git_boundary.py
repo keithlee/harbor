@@ -12,6 +12,7 @@ drive every Harbor path that runs git in a builder worktree.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -325,3 +326,110 @@ def test_worktree_git_dirs_accepts_the_repository_itself_and_its_linked_worktree
     with pytest.raises(UnsafeGitDirectory):
         worktree_git_dirs(project.tmp / "home", project.checkout)
     assert run_worktree_git(project.worktree.path, project.checkout, "rev-parse", "HEAD").stdout.strip() == project.head
+
+
+# --- B1: a planted submodule ------------------------------------------------------------
+
+
+def plant_submodule(p: SimpleNamespace, *, committed: bool) -> Path:
+    """A nested repository, added as a gitlink, whose own config runs the payload as a clean filter.
+
+    Its ``.gitmodules`` entry sets ``ignore = none``, which overrides a
+    ``diff.ignoreSubmodules`` config default, so only the command-line
+    ``--ignore-submodules`` holds.  A file inside it is edited afterwards, so
+    a ``status`` or ``diff`` that checks the submodule's work tree runs git in
+    it, and that git runs the builder's filter.
+    """
+
+    wt = p.worktree.path
+    sub = wt / "sub"
+    git(wt, "init", "-q", "sub")
+    (sub / "f.txt").write_text("one\n")
+    git(sub, "add", "f.txt")
+    git(sub, *IDENTITY, "commit", "-q", "-m", "sub")
+    git(sub, "config", "filter.evil.clean", f"{p.payload} clean")
+    (sub / ".git" / "info").mkdir(exist_ok=True)
+    (sub / ".git" / "info" / "attributes").write_text("* filter=evil\n")
+    (wt / ".gitmodules").write_text('[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = none\n')
+    git(wt, "add", ".gitmodules", "sub")
+    if committed:
+        git(wt, *IDENTITY, "commit", "-q", "-m", "add sub")
+    (sub / "f.txt").write_text("two\n")
+    return sub
+
+
+def test_planted_submodule_runs_code_without_the_command_line_ignore(project) -> None:
+    """Guard: the submodule vector is real, and a config default alone does not stop it."""
+
+    plant_submodule(project, committed=True)
+    subprocess.run(["git", "-c", "diff.ignoreSubmodules=all", "status", "--porcelain"],
+                   cwd=project.worktree.path, capture_output=True, text=True)
+    assert "clean" in ran(project)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("args", [
+    ("status", "--porcelain"),
+    ("status", "--porcelain", "--ignored", "--untracked-files=all"),
+    ("diff", "--name-only", "HEAD"),
+    ("diff", "--ignore-submodules=none", "--name-only", "HEAD"),  # a caller cannot opt back in
+])
+def test_harbor_git_never_enters_a_planted_submodule(project, committed, args) -> None:
+    plant_submodule(project, committed=committed)
+    out = run_worktree_git(project.worktree.path, project.checkout, *args, check=True).stdout
+    assert ran(project) == ""
+    if not committed:  # an added gitlink is still reported, without entering it
+        assert "sub" in out
+
+
+def test_verify_and_remove_never_enter_a_planted_submodule(project) -> None:
+    from harbor.worktree import WorktreeError
+
+    plant_submodule(project, committed=False)
+    with pytest.raises(WorktreeError, match="dirty"):
+        project.manager.verify(project.worktree)
+    with pytest.raises(WorktreeError, match="modified or untracked"):
+        project.manager.remove(project.worktree)
+    assert ran(project) == ""
+    git(project.worktree.path, *IDENTITY, "commit", "-q", "-m", "add sub")
+    try:  # the gitlink is committed, so the dirty check passes and git itself decides
+        project.manager.remove(project.worktree)
+    except WorktreeError:
+        pass
+    assert ran(project) == ""
+
+
+def test_unblock_ladder_sees_a_submodule_at_a_protected_path_without_entering_it(project) -> None:
+    plant_submodule(project, committed=True)
+    ladder = UnblockLadder(first_mate=_forbidden, repo_path=project.checkout, protected_paths=("sub",))
+    result = asyncio.run(ladder.handle(*_ladder_args(project.worktree.path)))
+    assert result.reason == "protected path" and not result.resumed
+    assert ran(project) == ""
+
+
+# --- N4: a planted git on PATH --------------------------------------------------------------
+
+
+def test_relative_empty_and_worktree_path_entries_never_find_a_planted_git(project) -> None:
+    wt = project.worktree.path
+    for planted in (wt / "git", wt / "bin" / "git"):
+        planted.parent.mkdir(exist_ok=True)
+        planted.write_text(f"#!/bin/sh\necho planted-git >> '{project.marker}'\n")
+        planted.chmod(0o755)
+    real = str(Path(shutil.which("git")).parent)
+    environ = {"PATH": os.pathsep.join(["", ".", "bin", str(wt / "bin"), real]), "HOME": str(project.home)}
+    # Guard: Python looks the program up on the child's PATH, relative to cwd.
+    subprocess.run(["git", "--version"], cwd=wt, env=environ, capture_output=True)
+    assert "planted-git" in ran(project)
+    project.marker.unlink()
+    assert run_worktree_git(wt, project.checkout, "rev-parse", "HEAD", environ=environ).stdout.strip() == project.head
+    # In the operator's checkout there is no worktree to exclude; relative and empty entries still go.
+    for planted in (project.checkout / "git", project.checkout / "bin" / "git"):
+        planted.parent.mkdir(exist_ok=True)
+        shutil.copy(wt / "git", planted)
+    relative_only = {**environ, "PATH": os.pathsep.join(["", ".", "bin", real])}
+    assert safe_git.run_git(project.checkout, "rev-parse", "HEAD", environ=relative_only).stdout.strip() == project.head
+    assert ran(project) == ""
+    assert safe_git.safe_path(environ["PATH"]) == os.pathsep.join([str(wt / "bin"), real])
+    assert safe_git.safe_path(environ["PATH"], outside=wt.resolve()) == real
+    assert safe_git.safe_path(":.:bin") == os.defpath
