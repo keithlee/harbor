@@ -7,8 +7,10 @@ the factory does not apply, or misses one it does.
 
 ``builder_sandbox_change`` is a best-effort guard for Harbor's own merge
 commands. It cannot stop a builder that holds a GitHub token or can write the
-repository's git directory; GitHub branch protection with required Code Owner
-review on ``/.harbor/`` is the only hard guarantee.
+repository's git directory. For a tracked ``.harbor/``, GitHub branch
+protection with required Code Owner review makes PR changes need a human; it
+does not cover an untracked ``.harbor/``, code Harbor runs unsandboxed
+(install_command, git hooks), or the ``ios``/``android`` escapes.
 """
 from __future__ import annotations
 
@@ -297,7 +299,12 @@ def git_fetch_url(api_url: str | None, repository: str | None) -> str | None:
 
 def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_url: str | None = None,
                            token: str | None = None, reasons: list[str] | None = None) -> bool | None:
-    """Whether the PR head changes anything under ``.harbor/`` against its merge base with the PR base.
+    """Whether merging the PR head would change anything under ``.harbor/`` on the PR base.
+
+    The merge result comes from ``git merge-tree --write-tree`` (the same ort
+    merge GitHub runs, over every merge base), so a criss-cross history cannot
+    hide a change behind one convenient merge base; a conflict is unknown. On a
+    git without ``--write-tree`` the head is compared with every merge base.
 
     ``git_dir`` is the repository's common git directory, resolved by the
     caller from Harbor's project config (``main_git_dir``). git runs in a
@@ -340,19 +347,38 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
                 missing = _ensure_commit(repo, sha, fetch_url, token)
                 if missing:
                     return unknown(missing)
-            merged = repo.run("merge-base", "--end-of-options", base_sha, head_sha)
-            merge_base = merged.stdout.strip()
-            if merged.returncode != 0 or not FULL_SHA.fullmatch(merge_base):
-                return unknown(f"no merge base between {base_sha} and {head_sha}")
-            if not _harbor_tracked(repo, merge_base) and not _harbor_tracked(repo, head_sha):
+            # What the merge would put on the base: GitHub merges against a virtual base built from
+            # every merge base (ort), so a criss-cross history must not be reduced to one merge base.
+            merged = repo.run("merge-tree", "--write-tree", "--no-messages", "--end-of-options", base_sha, head_sha)
+            result = merged.stdout.split("\n", 1)[0].strip()
+            if merged.returncode == 0 and FULL_SHA.fullmatch(result):
+                compare = [(base_sha, result)]
+                ends = (base_sha, head_sha, result)
+            elif merged.returncode == 1:
+                return unknown(f"merging {head_sha} into {base_sha} conflicts; Harbor cannot tell what would land")
+            elif "--write-tree" in (merged.stderr or "") or "usage" in (merged.stderr or "").lower():
+                # git older than 2.38: no merge-tree --write-tree. Any merge base whose .harbor/
+                # differs from the head's counts, so a criss-cross cannot pick the convenient one.
+                bases = repo.run("merge-base", "--all", "--end-of-options", base_sha, head_sha)
+                merge_bases = [line.strip() for line in bases.stdout.splitlines() if line.strip()]
+                if bases.returncode != 0 or not merge_bases or not all(FULL_SHA.fullmatch(m) for m in merge_bases):
+                    return unknown(f"no merge base between {base_sha} and {head_sha}")
+                compare = [(merge_base, head_sha) for merge_base in merge_bases]
+                ends = (*merge_bases, head_sha)
+            else:
+                return unknown(f"git merge-tree failed: {(merged.stderr or '').strip() or merged.returncode}")
+            if not any(_harbor_tracked(repo, end) for end in ends):
                 return False
-            if not _workflow_path_is_plain(repo, merge_base) or not _workflow_path_is_plain(repo, head_sha):
+            if not all(_workflow_path_is_plain(repo, end) for end in ends):
                 return unknown("a tracked .harbor, .harbor/workflow or workflow.toml is a symlink, a submodule "
                                "or not a regular file")
-            changed = repo.run("diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
-                               "--end-of-options", merge_base, head_sha)
+            for before, after in compare:
+                changed = repo.run("diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
+                                   "--end-of-options", before, after)
+                if changed.returncode != 0:
+                    return unknown(f"git diff-tree failed: {changed.stderr.strip()}")
+                if any(_is_harbor_path(path) for path in changed.stdout.split("\0") if path):
+                    return True
     except (OSError, subprocess.SubprocessError) as exc:
         return unknown(f"git failed: {exc}")
-    if changed.returncode != 0:
-        return unknown(f"git diff-tree failed: {changed.stderr.strip()}")
-    return any(_is_harbor_path(path) for path in changed.stdout.split("\0") if path)
+    return False

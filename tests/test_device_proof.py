@@ -962,3 +962,80 @@ def test_no_token_fails_closed_with_a_clear_reason(tmp_path: Path, monkeypatch) 
                                   token=None, reasons=why) is None
     assert calls == []  # nothing to authenticate with, so no fetch is attempted
     assert "no GitHub token is configured" in why[0]
+
+
+# --- sixth review: criss-cross merges ------------------------------------------------------
+
+def _dated_commit(repo: Path, message: str, when: int, *parents_to_merge: str) -> str:
+    import os
+    import subprocess
+    env = {**os.environ, "GIT_AUTHOR_DATE": f"@{when} +0000", "GIT_COMMITTER_DATE": f"@{when} +0000",
+           "GIT_AUTHOR_NAME": "Sample", "GIT_AUTHOR_EMAIL": "sample@example.test",
+           "GIT_COMMITTER_NAME": "Sample", "GIT_COMMITTER_EMAIL": "sample@example.test"}
+    if parents_to_merge:
+        subprocess.run(["git", "-C", str(repo), "merge", "-q", "--no-ff", "--no-commit", "-s", "ours",
+                        *parents_to_merge], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", message],
+                   check=True, capture_output=True, env=env)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("x1_first", [True, False], ids=["X1-older", "X2-older"])
+def test_a_criss_cross_merge_cannot_hide_a_harbor_change(tmp_path: Path, x1_first: bool) -> None:
+    """The reviewer's repro: a single merge base (X1) shows no change, but the merge GitHub makes lands 'v1 grant'."""
+    from harbor.device_proof import builder_sandbox_change
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    t = 1_700_000_000
+    _write(repo, WORKFLOW, "v1 grant\n")
+    _write(repo, "app.txt", "0\n")
+    y = _dated_commit(repo, "Y: v1 grant", t)
+    x1_time, x2_time = (t + 10, t + 20) if x1_first else (t + 20, t + 10)
+    _git(repo, "checkout", "-q", "-b", "x1", y)
+    _write(repo, "app.txt", "x1\n")
+    x1 = _dated_commit(repo, "X1: leaves workflow.toml alone", x1_time)
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, WORKFLOW, "v2 nogrant\n")
+    x2 = _dated_commit(repo, "X2: v2 nogrant", x2_time)
+    # Main merges X1 (keeping v2 nogrant): B.
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "app.txt", "x1\n")
+    b = _dated_commit(repo, "B: merge X1 into main", t + 30, x1)
+    # The PR, on X1, merges X2 and resets the file to v1 grant in the merge commit: H.
+    _git(repo, "checkout", "-q", "-B", "pr", x1)
+    _write(repo, WORKFLOW, "v1 grant\n")
+    h = _dated_commit(repo, "H: merge X2, keep v1 grant", t + 40, x2)
+    bases = set(_git(repo, "merge-base", "--all", b, h).split())
+    assert bases == {x1, x2}  # criss-cross: two merge bases
+    landed = _git(repo, "merge-tree", "--write-tree", b, h).splitlines()[0]
+    assert _git(repo, "cat-file", "-p", f"{landed}:{WORKFLOW}") == "v1 grant"  # what GitHub would merge
+    assert _git(repo, "cat-file", "-p", f"{b}:{WORKFLOW}") == "v2 nogrant"
+    assert builder_sandbox_change(repo / ".git", h, b) is True
+
+
+def test_a_conflicting_merge_is_unknown(tmp_path: Path) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    _write(repo, "src/app.py", "print('pr')\n")
+    head = _commit_all(repo, "pr side")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "src/app.py", "print('main')\n")
+    main = _commit_all(repo, "main side")
+    why: list[str] = []
+    assert builder_sandbox_change(repo / ".git", head, main, reasons=why) is None
+    assert "conflicts" in why[0]
+
+
+def test_a_change_that_main_already_has_does_not_count(tmp_path: Path) -> None:
+    """The merge result is compared with the base, so a .harbor/ edit already on main is not the PR's change."""
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, WORKFLOW, 'version = 1\n[delivery]\nmerge_mode = "workflow_checked"\n')
+    main = _commit_all(repo, "main edits .harbor/ itself")
+    _git(repo, "checkout", "-q", "feature")
+    _write(repo, "src/app.py", "print('feature')\n")
+    head = _commit_all(repo, "app only")
+    assert builder_sandbox_change(repo / ".git", head, main) is False
