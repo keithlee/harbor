@@ -73,6 +73,12 @@ class SpawnObserver:
     started: bool = False
 
     def attempt(self) -> None:
+        # Scoped to the one launch it observes: once the builder started,
+        # later invocations in the same context (a model-fallback
+        # re-execute, a nested ladder's ordinary resumes) neither re-run the
+        # gate nor change the outcome.
+        if self.started:
+            return
         self.attempted = True
         if self.on_attempt is not None:
             self.on_attempt()
@@ -1075,6 +1081,11 @@ class BaseRunner:
                 context.process = None
                 self.active = None
                 raise
+            # The observed launch is over: work nested inside this turn (the
+            # supervisor routes the result through the ladder in the same
+            # context) must not inherit it.  The caller still holds the
+            # observer and restores the variable with its own token.
+            SPAWN_OBSERVER.set(None)
         # Read the builder's output and watch the deadline before the prompt
         # is written.  A prompt larger than the pipe buffer only drains as
         # fast as the builder reads it: a builder that writes its own output

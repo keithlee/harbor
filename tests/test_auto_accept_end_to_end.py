@@ -143,6 +143,92 @@ def test_ladder_honours_an_opt_out_made_while_the_runner_is_prepared(tmp_path, e
         db.close()
 
 
+def test_an_opt_out_after_the_hand_off_does_not_block_later_ordinary_resumes(tmp_path):
+    """Review round 11, B1 (the reviewer's repro, real runners).
+
+    The ladder auto-accepts #1 and the builder starts.  During that turn the
+    operator opts out, and the builder re-blocks with an env blocker the
+    ladder resolves deterministically.  That ordinary resume must still run
+    (two builder invocations), #1 stays answered and delivered, and no false
+    "not applied" park comment is posted for #1."""
+
+    db, supervisor, mate, linear, ladder, notices = _build(tmp_path)
+    workflow_file = supervisor.dispatcher.workflow.package / "workflow.toml"
+    counter = tmp_path / "invocations"
+    reblock = {"status": "blocked", "outcome": "no_pr", "waiting_on": "none", "summary": "connector",
+               "next_action": "retry", "blocker": {
+                   "kind": "env_blocker", "question": "The Linear connector requires approval; how should I proceed?",
+                   "options": [], "recommendation": None, "recommended_option_index": None, "evidence": None}}
+    done = {"status": "waiting", "outcome": "pr_open", "waiting_on": "review", "summary": "done",
+            "pr_url": "https://example.test/pr/1", "next_action": None, "blocker": None}
+    body = (
+        "import json, pathlib, sys\n"
+        "sys.stdin.read()\n"
+        f"counter = pathlib.Path({str(counter)!r})\n"
+        "n = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "counter.write_text(str(n))\n"
+        "if n == 1:\n"
+        f"    wf = pathlib.Path({str(workflow_file)!r})\n"
+        "    wf.write_text(wf.read_text().replace('mode = \"cite_only\"', "
+        "'mode = \"cite_only\"\\nauto_accept_first_option = false'))\n"
+        f"    print(json.dumps({{'type': 'result', 'result': {reblock!r}}}), flush=True)\n"
+        "else:\n"
+        f"    print(json.dumps({{'type': 'result', 'result': {done!r}}}), flush=True)\n"
+    )
+    executable = _fake_codex(tmp_path, body)
+
+    async def factory(worktree, wake):
+        return CodexRunner(worktree, db=db, ticket="HAN-86", run_id=wake.run_id, executable=executable,
+                           deadline_seconds=30)
+
+    supervisor.dispatcher.runner_factory = factory
+    try:
+        _ladder_pass(supervisor)
+        assert int(counter.read_text()) == 2, supervisor.last_error  # the ordinary resume ran
+        first = db.escalations()[0]
+        assert first["status"] == "answered" and first["answer"] == OPTIONS[0]
+        assert [row["delivered"] for row in auto_accept.history(db, "HAN-86")] == [1]
+        bodies = [body for _, body in linear.comments]
+        assert any("Harbor auto-accepted option 1 for HAN-86 (escalation #1)" in b for b in bodies)
+        assert not any("Auto-accept of option 1 not applied" in b for b in bodies), bodies
+    finally:
+        db.close()
+
+
+def test_the_launch_gate_never_fires_after_the_builder_started(tmp_path):
+    """Review round 11, B1: a later invocation in the same context (a model
+    fallback re-execute, a nested resume) cannot trip the gate or flip the
+    outcome once the observed launch started."""
+
+    from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+    calls = []
+
+    def gate():
+        calls.append("gate")
+        if len(calls) > 1:
+            raise AssertionError("gate re-run after the hand-off")
+
+    observer = SpawnObserver(on_start=lambda: calls.append("start"), on_attempt=gate)
+    executable = _fake_codex(tmp_path, STARTS)
+    worktree = tmp_path / "wt-gate"
+    worktree.mkdir()
+
+    async def go():
+        token = SPAWN_OBSERVER.set(observer)
+        try:
+            runner = CodexRunner(worktree, ticket="HAN-86", executable=executable, deadline_seconds=30)
+            await runner.start("first launch", run_id="run-gate")
+            assert observer.started and SPAWN_OBSERVER.get() is None  # scoped to that launch
+            SPAWN_OBSERVER.set(observer)  # even if a layer re-installs it...
+            await runner.resume("run-gate", "fallback re-execute")
+        finally:
+            SPAWN_OBSERVER.reset(token)
+
+    asyncio.run(go())
+    assert calls == ["gate", "start"]  # ...the second invocation is a no-op for the observer
+
+
 def test_digest_covers_every_path_bearing_field():
     """Review round 10, B2(a)."""
 

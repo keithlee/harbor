@@ -1657,6 +1657,8 @@ class UnblockLadder:
         def still_enabled() -> None:
             # Called by the runner as it begins the launch, before any spawn.
             # Remembered here too, in case a layer between converts the error.
+            if launched:
+                return  # this launch already handed option 1 over
             why = self._auto_accept_withdrawn()
             if why:
                 gate["withdrawn"] = why
@@ -1678,7 +1680,9 @@ class UnblockLadder:
                 withdrawn_reason = str(exc)
             finally:
                 SPAWN_OBSERVER.reset(token)
-            withdrawn_reason = withdrawn_reason or gate.get("withdrawn", "")
+            # Once the builder started with option 1 the answer is delivered;
+            # a later opt-out cannot withdraw it.
+            withdrawn_reason = "" if launched else (withdrawn_reason or gate.get("withdrawn", ""))
             # A resumer that never reached a Harbor runner (an embedded or
             # test seam) can only report success; a real runner reports the
             # actual process start through the observer.
