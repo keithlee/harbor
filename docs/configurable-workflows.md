@@ -540,7 +540,16 @@ commands. They do not stop a builder that means to get around them.
 - **What counts:** any change to a path under `.harbor/`, compared after
   Unicode NFC normalisation and case folding, so `.HARBOR/` and
   `.harbor/workflow/WORKFLOW.toml`, which land on the real files on macOS, count
-  too. The comparison is the PR head against its merge base with the PR's base.
+  too. Two comparisons, and either one counts:
+  - `.harbor/` on the PR's base against what merging the PR would land there,
+    from `git merge-tree --write-tree`. That is the same ort merge GitHub runs,
+    over every merge base. On a git without `--write-tree`, the PR head is
+    compared with every merge base.
+  - every commit in the PR (`base..head`), because a rebase merge replays the
+    commits one at a time. For a merge commit, only the content it introduces
+    itself counts.
+
+  A merge conflict counts as unreadable.
 - **An untracked `.harbor/`.** Harbor reads the workflow from the main
   checkout, so a project may keep `.harbor/` untracked. When neither the merge
   base nor the PR head tracks anything under `.harbor/`, the PR cannot change
@@ -559,7 +568,12 @@ commands. They do not stop a builder that means to get around them.
     commit-graphs or a shallow file.
   - A commit missing locally is fetched only from Harbor's own URL for the
     configured repository, with `--upload-pack=git-upload-pack`, into the
-    throwaway repository.
+    throwaway repository. The URL's host comes from the configured API URL:
+    - `api.github.com` becomes `github.com`;
+    - `api.<name>.ghe.com` becomes `<name>.ghe.com`;
+    - any other host is GitHub Enterprise Server, which serves git on its API
+      host, and is used unchanged (for example `https://api.corp.example/api/graphql`
+      fetches from `api.corp.example`, never `corp.example`).
   - The fetch authenticates with Harbor's GitHub token: the same
     `GITHUB_TOKEN`, `GH_TOKEN` or `github_token_env` variable the REST helper
     uses. Harbor passes it to git through environment config, as an
