@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from harbor.clients.github import GitHubClient, build_pull_requests_query
 from harbor.config.profile import PipelineProfile
 from harbor.facts.ci import classify_ci
-from harbor.facts.threads import parse_comment_surfaces, parse_threads
+from harbor.facts.threads import author_login, parse_comment_surfaces, parse_threads
 from harbor.pr_events import PREventProcessor
 from harbor.url_credentials import has_userinfo
 
@@ -235,7 +235,12 @@ def parse_pull_request(
     facts: dict[str, Any] = {
         "number": number,
         "body": pull_request.get("body"),
+        # The PR opener is the delivery identity; reviewer verdict comments
+        # count toward merge risk only when they come from the same login.
+        "author": author_login(pull_request.get("author")),
         "head_sha": head_sha,
+        # GitHub's base tip, so a merge check never trusts a local origin/<base> ref.
+        "base_sha": str(pull_request.get("baseRefOid") or "") or None,
         "mergeable": pull_request.get("mergeable"),
         "state": pull_request.get("state"),
         "merged": merged,

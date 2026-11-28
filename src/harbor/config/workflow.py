@@ -27,7 +27,30 @@ SECTIONS = {
     "evidence": {"feedback", "ci"},
     "states": {"ready", "paused", "terminal"},
     "github": {"transport", "mcp_url"},
+    "builder": {"device_proof"},
 }
+DEVICE_PROOF_PLATFORMS = ("android", "ios", "web")
+
+
+def device_proof_settings(data) -> tuple[str, ...]:
+    """The builder's opt-in device/browser proof platforms; ``()`` when absent.
+
+    Fails closed: anything but a list of known, distinct platform names raises,
+    so a typo never launches a builder with a sandbox nobody asked for.
+    """
+    section = dict((data or {}).get("builder") or {})
+    value = section.get("device_proof", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("builder.device_proof must be a list of platform names")
+    unknown = [item for item in value if item not in DEVICE_PROOF_PLATFORMS]
+    if unknown:
+        raise ValueError(
+            f"unknown builder.device_proof platform(s) {', '.join(map(repr, unknown))}; "
+            f"use any of {', '.join(DEVICE_PROOF_PLATFORMS)}"
+        )
+    if len(set(value)) != len(value):
+        raise ValueError("builder.device_proof lists a platform twice")
+    return tuple(value)
 GITHUB_TRANSPORTS = {"rest", "mcp"}
 DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 
@@ -310,6 +333,7 @@ def load_workflow(path: Path) -> Workflow:
     if any(state_groups[i] & state_groups[j] for i in range(3) for j in range(i+1,3)):
         raise ValueError("ready, paused and terminal states must not overlap")
     github_settings(data)
+    device_proof_settings(data)
     deadline = data.get("execution",{}).get("deadline_minutes",90)
     if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or deadline <= 0:
         raise ValueError("deadline must be positive and finite")
