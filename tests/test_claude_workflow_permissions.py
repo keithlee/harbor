@@ -31,9 +31,13 @@ def runner(tmp_path: Path) -> ClaudeRunner:
                         writable_roots=(tmp_path / "state",))
 
 
-def test_an_unwired_runner_adds_no_permissions(tmp_path: Path) -> None:
+def edit_rule(tmp_path: Path) -> str:
+    return f"Edit(/{(tmp_path / 'wt').resolve()}/**)"
+
+
+def test_an_unwired_runner_approves_only_edits_in_its_worktree(tmp_path: Path) -> None:
     (tmp_path / "wt").mkdir()
-    assert "permissions" not in settings(runner(tmp_path).command("x", run_id="run"))
+    assert settings(runner(tmp_path).command("x", run_id="run"))["permissions"] == {"allow": [edit_rule(tmp_path)]}
 
 
 def test_only_the_runtime_invocation_and_the_package_are_pre_approved(tmp_path: Path) -> None:
@@ -45,7 +49,7 @@ def test_only_the_runtime_invocation_and_the_package_are_pre_approved(tmp_path: 
     wired.harbor_invocation = INVOCATION
     wired.workflow_package = package
     s = settings(wired.command("x", run_id="run"))
-    assert s["permissions"] == {"allow": [f"Bash({INVOCATION}:*)", f"Read(/{package.resolve()}/**)"]}
+    assert s["permissions"] == {"allow": [edit_rule(tmp_path), f"Bash({INVOCATION}:*)", f"Read(/{package.resolve()}/**)"]}
     # Nothing else widens: the OS sandbox, its writable roots and network stay as they were.
     assert s["sandbox"] == plain["sandbox"]
     assert s["sandbox"]["enabled"] is True and s["sandbox"]["allowUnsandboxedCommands"] is False
@@ -56,7 +60,8 @@ def test_the_github_mcp_approval_is_kept_alongside(tmp_path: Path) -> None:
     wired = runner(tmp_path)
     wired.harbor_invocation = INVOCATION
     wired.github_mcp = {"url": "https://api.githubcopilot.com/mcp/", "token_env": "GITHUB_TOKEN"}
-    assert settings(wired.command("x", run_id="run"))["permissions"]["allow"] == [f"Bash({INVOCATION}:*)", "mcp__github"]
+    assert settings(wired.command("x", run_id="run"))["permissions"]["allow"] == [
+        edit_rule(tmp_path), f"Bash({INVOCATION}:*)", "mcp__github"]
 
 
 @pytest.mark.parametrize("invocation", ["/bin/harbor*", "/bin/harbor\nrm -rf /"])
@@ -98,7 +103,7 @@ def test_the_production_claude_builder_may_run_the_invocation_its_prompt_names(t
         invocation = next(line.split(": ", 1)[1] for line in prompt.splitlines()
                           if line.startswith("Authoritative runtime invocation: "))
         package = dispatcher.workflow.package.resolve()
-        assert s["permissions"]["allow"] == [f"Bash({invocation}:*)", f"Read(/{package}/**)"]
+        assert s["permissions"]["allow"] == [f"Edit(/{worktree.resolve()}/**)", f"Bash({invocation}:*)", f"Read(/{package}/**)"]
         assert not worktree.resolve().is_relative_to(package)
         assert s["sandbox"]["enabled"] is True and s["sandbox"]["failIfUnavailable"] is True
         assert s["sandbox"]["filesystem"]["allowWrite"][0] == str((tmp_path / "ledger").resolve())
@@ -119,7 +124,7 @@ def test_doctor_reports_the_claude_builder_permissions(tmp_path: Path) -> None:
     from test_github_transport import run_doctor
     result = run_doctor(tmp_path, "claude", None)
     package = (tmp_path / "repo" / ".harbor" / "workflow").resolve()
-    assert (f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {package}"
+    assert (f"Builder permissions: Edit and Write in the ticket worktree only · harbor runtime invocation (sandboxed) · read-only {package}"
             in result.stdout), result.stdout + result.stderr
 
 
@@ -147,7 +152,7 @@ def test_parentheses_and_spaces_in_paths_are_approved_literally(tmp_path: Path) 
     wired = runner(tmp_path)
     wired.harbor_invocation = "/usr/bin/env PYTHONPATH='/h (copy)/src' /h/python -P -m harbor.cli"
     wired.workflow_package = package
-    assert settings(wired.command("x", run_id="run"))["permissions"]["allow"] == [
+    assert settings(wired.command("x", run_id="run"))["permissions"]["allow"] == [edit_rule(tmp_path),
         "Bash(/usr/bin/env PYTHONPATH='/h (copy)/src' /h/python -P -m harbor.cli:*)", f"Read(/{package.resolve()}/**)"]
 
 

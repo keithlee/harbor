@@ -3,7 +3,7 @@
 The bundled delivery skill tells the builder to spawn planner, implementor and
 reviewer children. Claude Code exposes that only through its ``Agent`` tool, so
 the builder argv must name it. Children run in the same Claude Code process, so
-they share the parent's ``--tools`` set, permission mode and sandbox settings;
+they share the parent's ``--tools`` set, permission rules, mode and sandbox settings;
 adding ``Agent`` must not widen any of those.
 """
 
@@ -30,8 +30,9 @@ def test_claude_builder_can_spawn_child_agents_within_the_same_sandbox(tmp_path:
     argv = runner.command("ignored", run_id=SESSION, resume=resume)
 
     assert "Agent" in _tools(argv)
-    # Children inherit this exact set: no file-writing, web or MCP tool is added with Agent.
-    assert sorted(_tools(argv)) == ["Agent", "Bash", "Glob", "Grep", "Read", "Skill"]
+    # Children inherit this exact set: no web or MCP tool is added with Agent, and the
+    # file-writing tools are approved for the worktree only (test_claude_builder_file_tools.py).
+    assert sorted(_tools(argv)) == ["Agent", "Bash", "Edit", "Glob", "Grep", "Read", "Skill", "Write"]
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     sandbox = json.loads(argv[argv.index("--settings") + 1])["sandbox"]
     assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True
