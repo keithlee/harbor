@@ -16,6 +16,9 @@ from harbor.resources import runtime_asset
 
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_REASONING_EFFORT = "xhigh"
+# Entries of a shared git directory that worktree commits, fetches and pushes
+# write.  Lock files are listed because git creates them next to the file.
+SHARED_GIT_WRITABLE = ("objects", "refs", "logs", "packed-refs", "packed-refs.lock", "shallow", "shallow.lock")
 
 
 class CodexRunner(BaseRunner):
@@ -75,13 +78,15 @@ class CodexRunner(BaseRunner):
         # A linked worktree's ``.git`` is a FILE pointing at
         # ``<repo>/.git/worktrees/<name>``.  Commits write objects, refs, reflogs
         # and per-worktree metadata there -- all outside the worktree -- so a
-        # plain workspace-write sandbox cannot commit at all.  The repository's
-        # git directory is therefore a required writable root.  The operator's
-        # working tree is NOT included, so the checkout stays untouched.
+        # plain workspace-write sandbox cannot commit at all.  Those parts of
+        # the repository's git directory are therefore writable roots.  The
+        # operator's working tree is NOT included, so the checkout stays
+        # untouched, and see ``_git_writable_roots`` for what else stays out.
         roots: list[str] = [str(Path(item).expanduser().resolve()) for item in writable_roots]
         self.git_dir = Path(git_dir).expanduser().resolve() if git_dir is not None else self._discover_git_dir()
-        if self.git_dir is not None and str(self.git_dir) not in roots:
-            roots.append(str(self.git_dir))
+        for root in self._git_writable_roots():
+            if root not in roots:
+                roots.append(root)
         self.writable_roots = tuple(roots)
         # The builder pushes and opens the PR itself, so it needs the network.
         self.network_access = bool(network_access)
@@ -113,6 +118,32 @@ class CodexRunner(BaseRunner):
         if target is None:
             return None
         return next((parent for parent in (target, *target.parents) if parent.name == ".git"), target)
+
+    def _git_writable_roots(self) -> list[str]:
+        """The parts of the git directory a builder must write to commit and push.
+
+        For a linked worktree this is the shared object store, refs, reflogs
+        and packed refs, plus the worktree's own ``worktrees/<name>`` admin
+        directory (HEAD, index, FETCH_HEAD, rebase state).  The shared
+        ``config``, ``hooks/``, ``info/`` and ``modules/`` are left read-only:
+        Harbor and the operator run git in this repository outside the
+        sandbox, so a builder that could write them could plant a hook,
+        ``core.fsmonitor``, ``core.sshCommand``, a credential helper or a
+        filter driver that then runs unsandboxed with the operator's
+        credentials.  A side effect is that ``git push -u`` cannot record the
+        upstream in the shared config; the push itself still succeeds.
+
+        A plain ``.git`` directory is not shared with the operator's checkout,
+        so it is still granted whole.
+        """
+
+        if self.git_dir is None:
+            return []
+        admin = self._worktree_git_dir()
+        if admin is None or admin.parent != self.git_dir / "worktrees":
+            return [str(self.git_dir)]
+        shared = [self.git_dir / name for name in SHARED_GIT_WRITABLE]
+        return [str(path) for path in (*shared, admin)]
 
     def _sandbox_config(self) -> list[str]:
         """Codex ``-c`` overrides that make a linked worktree usable."""

@@ -938,7 +938,10 @@ Cleanup requires an independently observed merge, a completed delivery, a
 terminal Linear state, the exact local/merged PR head, stopped processes, no
 open escalation, no hold and passing `pre_cleanup` hooks. Modified or untracked
 files keep the worktree for inspection; git-ignored install and build output
-(`node_modules/`, `.next/`, ...) is removed with it. The branch is never deleted.
+(`node_modules/`, `.next/`, ...) is removed with it. A worktree that contains a
+submodule or any nested git repository (even inside an ignored directory) is
+also kept, because Harbor's git does not look inside those and could not see
+uncommitted work there; remove it by hand. The branch is never deleted.
 All ignored files go, including any unique ignored content (local notes,
 generated `storage/` data, `.env` copies): keep anything you need outside the
 worktree or commit it.
@@ -999,6 +1002,49 @@ Codex builders need neither: their
 `workspace-write` sandbox reads anywhere and has no per-command approval.
 Verified on macOS with Claude Code 2.1.332 by running the generated command
 against a throwaway repository and worktree; not run on Linux.
+
+**Builder access to git metadata.** A ticket worktree's commits are stored in
+the project repository's git directory, outside the worktree. Builders of both
+providers can write only the parts a commit, fetch and push need: `objects/`,
+`refs/`, `logs/`, `packed-refs` (and `shallow`), and the worktree's own
+`worktrees/<name>/` directory. The shared `config`, `hooks/`, `info/` and
+`modules/` stay read-only, because Harbor and you run git in that repository
+outside the sandbox, and a builder that could edit them could make git run its
+code there (a hook, `core.fsmonitor`, `core.sshCommand`, a credential helper or
+a filter driver). One visible effect: `git push -u` from a builder pushes but
+cannot record the upstream in the shared config, and git prints an error for
+that part. Harbor's own git commands also run with repository hooks and
+`core.fsmonitor` turned off (`-c core.hooksPath=/dev/null -c
+core.fsmonitor=false`), so a hook you installed in the project repository does
+not run when Harbor creates, checks or removes a ticket worktree. They also
+refuse `ext::` transports and replacement objects, run with every `GIT_*`
+variable removed and `GIT_CONFIG_NOSYSTEM=1`, and get none of Harbor's
+credentials (only `PATH`, `HOME`, the user name and the locale). The exceptions are
+`git fetch` and `git worktree add` in your checkout, which keep your system
+config and GitHub token so your credential helper and Git LFS still work.
+Before Harbor runs git inside a ticket worktree (the blocker ladder's diff,
+worktree checks and cleanup, the watchdog, `harbor workflow check`), it reads
+the worktree's `.git` file and fails closed unless it names
+`<repo>/.git/worktrees/<name>`, whose `commondir` leads back to the project's
+git directory and whose `gitdir` leads back to that worktree. It also fails
+closed if that admin directory has a `config.worktree` file. Git then runs with `GIT_DIR`,
+`GIT_COMMON_DIR` and `GIT_WORK_TREE` pinned to those checked paths, so a
+builder that points `.git` at a git directory of its own cannot make Harbor
+read that directory's config. Harbor's git also never enters a submodule
+(`--ignore-submodules=dirty` on every `status` and `diff`, plus
+`submodule.recurse=false` and `fetch.recurseSubmodules=false`), because a
+submodule a builder adds is a repository whose config is the builder's. An
+added or changed submodule commit is still reported; changes inside a
+submodule's files are not. Empty and relative `PATH` entries, and entries
+inside the worktree, are dropped from git's environment, so a `git` the
+builder planted is never the one that runs. Commit-graph files, which a builder
+can write, are not used (`core.commitGraph=false`), so they cannot move the
+merge base of the blocker ladder's diff. If a run's worktree has no readable
+`.git` file, the blocker ladder refuses the blocker instead of trusting the
+builder's own list of touched paths, and reports it to you. No setup is
+needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
+against a throwaway repository; the Claude sandbox and Linux were checked
+through the generated settings only.
 
 ## Verification map
 

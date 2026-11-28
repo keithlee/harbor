@@ -14,7 +14,7 @@ def test_cleanup_requires_fresh_terminal_merge_and_exact_head(tmp_path,monkeypat
     db=HarborDB(':memory:')
     workflow=load_workflow(config(tmp_path))
     run={'id':'r','status':'completed','finished_at':datetime.now(timezone.utc).isoformat()}
-    supervisor=SimpleNamespace(project='A',db=db,dispatcher=SimpleNamespace(workflow=workflow),_ticket_key=lambda t:'A-1',_latest_run=lambda t:run)
+    supervisor=SimpleNamespace(project='A',db=db,dispatcher=SimpleNamespace(workflow=workflow),_ticket_key=lambda t:'A-1',_latest_run=lambda t:run,worktree_manager=SimpleNamespace(repo=repo))
     context={'project':'A','ticket':'A-1','run_id':'r','facts':{'merged':True},'terminal':True,'head_sha':head}
     async def handoff(*args):return context
     monkeypatch.setattr('harbor.workflow_lifecycle.handoff',handoff)

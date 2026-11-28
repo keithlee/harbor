@@ -26,6 +26,7 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from harbor.config.workflow import WORKFLOW_DIR, device_proof_settings
+from harbor.safe_git import main_git_dir  # noqa: F401  (re-exported; callers import it from here)
 
 WORKFLOW_FILE = (WORKFLOW_DIR / "workflow.toml").as_posix()
 CODEX_DEVICE_PROOF = (
@@ -119,33 +120,6 @@ HARDENING = (
     # A commit-graph in the borrowed object directory could lie about parents and move the merge base.
     "-c", "core.commitGraph=false",
 )
-
-
-def main_git_dir(path: Any) -> Path | None:
-    """The common git directory of the repository at ``path`` (or above it), read without running git.
-
-    A worktree's ``.git`` file points at ``<common>/worktrees/<name>``, whose
-    ``commondir`` names the common directory. Nothing in the repository's
-    config is consulted.
-    """
-
-    if not path:
-        return None
-    start = Path(str(path)).expanduser()
-    for directory in (start, *start.parents):
-        dot = directory / ".git"
-        if dot.is_dir():
-            return dot.resolve()
-        if dot.is_file():
-            text = dot.read_text(encoding="utf-8", errors="replace").strip()
-            if not text.startswith("gitdir:"):
-                return None
-            admin = (directory / text.split(":", 1)[1].strip()).resolve()
-            common = admin / "commondir"
-            if common.is_file():
-                return (admin / common.read_text(encoding="utf-8").strip()).resolve()
-            return admin
-    return None
 
 
 class _CheckRepo:
