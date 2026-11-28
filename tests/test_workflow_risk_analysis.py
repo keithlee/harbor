@@ -35,11 +35,15 @@ def verdict(risk="low", *, verdict="approve", head=HEAD, author=DELIVERY, **extr
 
 
 def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None, auto_merge_risks=("low",),
-              pr_author=DELIVERY):
+              pr_author=DELIVERY, sandbox_change=False, base_oid=None, repo_path=None):
     """Run `harbor workflow check --event pre_merge` against mocked Linear/GitHub.
 
     ``comments`` defaults to one current-head low approval from the delivery identity.
+    ``sandbox_change`` stubs the PR's ``[builder]`` diff check (True, False or None
+    for unreadable); ``"real"`` runs the real check against ``tmp_path``.
     """
+    if sandbox_change != "real":
+        monkeypatch.setattr("harbor.device_proof.builder_sandbox_change", lambda *args, **kwargs: sandbox_change)
     comments = [verdict("low")] if comments is None else comments
 
     class Linear:
@@ -65,7 +69,7 @@ def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None
 
         async def fetch_pull_requests(self, *args, **kwargs):
             return {"pr_1": {
-                "number": 1, "headRefOid": HEAD, "url": PR_URL, "merged": False,
+                "number": 1, "headRefOid": HEAD, "baseRefOid": base_oid, "url": PR_URL, "merged": False,
                 "mergeable": "MERGEABLE", "body": body,
                 "author": {"login": pr_author, "__typename": "User"} if pr_author else None,
                 "comments": {"nodes": comments},
@@ -82,7 +86,7 @@ def pre_merge(tmp_path, monkeypatch, capsys, *, description, body, comments=None
         f"[delivery]\nauto_merge_risks = {json.dumps(list(auto_merge_risks))}\n[evidence]\nfeedback = \"advisory\"\n"))
     cfg = SimpleNamespace(
         name="A", linear_api_url="https://linear.invalid", linear_project_scope=("canonical",),
-        github_repository="example/repo", required_checks=("tests",), workflow_path=workflow,
+        github_repository="example/repo", required_checks=("tests",), workflow_path=workflow, repo_path=repo_path,
     )
     args = build_parser().parse_args(["workflow", "check", "A", "--ticket", "A-1", "--event", "pre_merge"])
     db = HarborDB(":memory:")
@@ -188,7 +192,7 @@ def test_pr_query_and_facts_carry_the_pr_author():
     from harbor.poll.github_poller import parse_pull_request
 
     query = build_pull_requests_query("example", "repo", [1])
-    assert "headRefOid\n        author {\n          login" in query
+    assert "headRefOid\n        baseRefOid\n        author {\n          login" in query
     node = {"number": 1, "headRefOid": HEAD, "url": PR_URL, "author": {"login": DELIVERY, "__typename": "User"}}
     assert parse_pull_request(node)["author"] == DELIVERY
     assert parse_pull_request({**node, "author": None})["author"] is None

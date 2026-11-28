@@ -76,6 +76,7 @@ def build_pull_requests_query(owner: str, repo: str, numbers: Iterable[int]) -> 
         mergeable
         createdAt
         headRefOid
+        baseRefOid
         author {{
           login
           __typename

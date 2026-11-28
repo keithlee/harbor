@@ -1,11 +1,15 @@
 """Native headless Claude Code invocations."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import platform
 import re
 import shutil
+import sys
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from harbor.runner.base import RunnerError
@@ -108,6 +112,91 @@ def sandbox_domains(*extra: str) -> list[str]:
     return list(dict.fromkeys((*DEFAULT_SANDBOX_DOMAINS, *(_domain(host) for host in extra))))
 
 
+# Opt-in device and browser proof (``[builder] device_proof``). Each platform
+# adds only the sandbox keys its tools were seen to need on a live builder.
+# None of them is harmless: each gives Bash a path out of the sandbox (see
+# DEVICE_PROOF_GRANTS and docs/configurable-workflows.md). Keys are merged, so
+# "android" plus "web" still asks for local binding once.
+def ios_mach_services(machine: str | None = None) -> tuple[str, ...]:
+    """The exact Mach services simctl list, install, launch and io screenshot need on a booted simulator.
+
+    Found live in a sandboxed Claude builder: with CoreSimulatorService alone a
+    booted device shows "liblaunch_sim.dylib could not be opened" and simctl
+    says "No devices are booted"; adding the host-architecture SimLaunchHost made
+    install, launch and screenshot work. simdiskimaged, SimulatorTrampoline,
+    SimRenderingServices and SimAudioProcessorServices were not needed. Booting
+    is not granted: Harbor boots the simulator outside the sandbox
+    (harbor.device_boot). Only the arm64 name was verified live.
+    """
+
+    machine = platform.machine() if machine is None else machine
+    host = "x86" if machine in {"x86_64", "i386"} else "arm64"
+    return ("com.apple.CoreSimulator.CoreSimulatorService", f"com.apple.CoreSimulator.SimLaunchHost-{host}")
+
+
+IOS_MACH_SERVICES = ios_mach_services()
+DEVICE_PROOF_RULES: dict[str, dict[str, object]] = {
+    # The adb client connects to the adb server on 127.0.0.1:5037, or starts it there.
+    "android": {"allowLocalBinding": True},
+    # simctl asks CoreSimulatorService, which runs outside the sandbox, to act on a booted simulator.
+    "ios": {"allowMachLookup": list(IOS_MACH_SERVICES)},
+    # Metro, Expo, Next and http.server bind a local port, and a client such as curl connects to it.
+    "web": {"allowLocalBinding": True},
+}
+DEVICE_PROOF_GRANTS = {
+    "allowLocalBinding": (
+        "network.allowLocalBinding: Bash commands may listen on any port and connect to every local service, "
+        "including an adb server (adb shell reaches any host; adb push/pull moves files), Chrome debugging "
+        "ports and a Docker TCP socket; this is a path out of the sandbox"
+    ),
+    "allowMachLookup": (
+        f"network.allowMachLookup {', '.join(IOS_MACH_SERVICES)}: Bash commands may drive CoreSimulatorService, "
+        "which runs outside the sandbox (simctl openurl reaches any host; simctl spawn runs a binary with host "
+        "file access); this is a sandbox escape"
+    ),
+}
+
+
+def device_proof_network(platforms: tuple[str, ...] | list[str]) -> dict[str, object]:
+    """The sandbox ``network`` keys the enabled device-proof platforms add, or ``{}``.
+
+    An unknown platform raises, so a typo never silently grants nothing or
+    something else.
+    """
+
+    network: dict[str, object] = {}
+    for platform in platforms:
+        if platform not in DEVICE_PROOF_RULES:
+            raise ValueError(f"unknown device_proof platform {platform!r}; use any of {', '.join(DEVICE_PROOF_RULES)}")
+        for key, value in DEVICE_PROOF_RULES[platform].items():
+            if isinstance(value, list):
+                existing = list(network.get(key) or [])
+                network[key] = existing + [item for item in value if item not in existing]
+            else:
+                network[key] = value
+    return network
+
+
+def device_proof_report(platforms: tuple[str, ...] | list[str], system: str | None = None) -> list[str]:
+    """Human-readable lines for ``harbor doctor``: what each enabled platform grants, and where it applies."""
+
+    if not platforms:
+        return ["Device proof: off (builder sandbox has no local ports and no simulator access; set [builder] device_proof to opt in)"]
+    network = device_proof_network(platforms)
+    lines = [f"Device proof: {', '.join(platforms)}"]
+    lines.extend(f"  grants {DEVICE_PROOF_GRANTS[key]}" for key in network)
+    system = sys.platform if system is None else system
+    if system != "darwin":
+        lines.append(
+            "  not effective on this host: Claude Code documents network.allowLocalBinding and "
+            "network.allowMachLookup as macOS-only, so on "
+            f"{'Linux' if system.startswith('linux') else system} the builder cannot rely on them"
+            + (", and there is no iOS Simulator" if "ios" in platforms else "")
+            + "; Harbor has verified device proof on macOS only"
+        )
+    return lines
+
+
 # Wildcards would widen a rule past the one path; a line break would end it.
 _RULE_UNSAFE = "*?[]\n\r"
 
@@ -152,6 +241,24 @@ class ClaudeRunner(CodexRunner):
     harbor_invocation: str = ""
     # The project's workflow package, which lives outside the ticket worktree.
     workflow_package: Path | None = None
+    # Opt-in device/browser proof platforms from the project's workflow ([builder] device_proof).
+    device_proof: tuple[str, ...] = ()
+    # Boots the mobile devices outside the sandbox before each launch (harbor.device_boot.prepare_devices).
+    device_preparer: Any = None
+
+    async def _execute(self, context, instruction, *, resume, before_spawn=None):
+        if self.device_proof:
+            from harbor.device_boot import device_note
+            statuses = []
+            if self.device_preparer is not None and {"android", "ios"} & set(self.device_proof):
+                # A boot can take minutes; keep the supervisor's event loop free meanwhile.
+                statuses = await asyncio.to_thread(self.device_preparer, self.device_proof)
+            for status in statuses:
+                print(f"Harbor: device proof for {self.ticket or context.run_id}: {status.line()[2:]}", file=sys.stderr)
+            note = device_note(statuses, web="web" in self.device_proof)
+            if note:
+                instruction = f"{instruction}\n\n{note}" if instruction else note
+        return await super()._execute(context, instruction, resume=resume, before_spawn=before_spawn)
 
     def _workflow_permissions(self) -> list[str]:
         try:
@@ -165,6 +272,10 @@ class ClaudeRunner(CodexRunner):
             domains = sandbox_domains(*self.sandbox_hosts)
         except ValueError as exc:
             raise RunnerError(f"refusing a builder sandbox host: {exc}") from exc
+        try:
+            device_network = device_proof_network(self.device_proof)
+        except ValueError as exc:
+            raise RunnerError(f"refusing builder device proof: {exc}") from exc
         settings = {
             "sandbox": {
                 "enabled": True,
@@ -172,7 +283,7 @@ class ClaudeRunner(CodexRunner):
                 "allowUnsandboxedCommands": False,
                 "autoAllowBashIfSandboxed": True,
                 "filesystem": {"allowWrite": list(self.writable_roots)},
-                "network": {"allowedDomains": domains},
+                "network": {"allowedDomains": domains, **device_network},
             },
         }
         allow = self._workflow_permissions()

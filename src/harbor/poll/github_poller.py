@@ -239,6 +239,8 @@ def parse_pull_request(
         # count toward merge risk only when they come from the same login.
         "author": author_login(pull_request.get("author")),
         "head_sha": head_sha,
+        # GitHub's base tip, so a merge check never trusts a local origin/<base> ref.
+        "base_sha": str(pull_request.get("baseRefOid") or "") or None,
         "mergeable": pull_request.get("mergeable"),
         "state": pull_request.get("state"),
         "merged": merged,

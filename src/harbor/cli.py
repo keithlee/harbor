@@ -346,6 +346,19 @@ def build_production_dispatcher(
                         "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
                     ) from exc
                 runner.workflow_package = current.package
+            # Read per turn, like the rest of the workflow: an edit applies on the next launch.
+            # The same decision harbor doctor reports (harbor.device_proof.granted_platforms).
+            from harbor.config.workflow import device_proof_settings
+            from harbor.device_proof import CODEX_DEVICE_PROOF, granted_platforms
+            granted = granted_platforms(current.config, provider)
+            if granted:
+                from harbor.device_boot import prepare_devices
+                runner.device_proof = granted
+                runner.device_preparer = prepare_devices
+                if sys.platform != "darwin":
+                    warn_once(device_proof_platform_warning(granted))
+            elif device_proof_settings(current.config):
+                warn_once(CODEX_DEVICE_PROOF)
             return runner
     dispatcher = WorktreeDispatcher(
         manager,
@@ -372,6 +385,43 @@ GITHUB_URL_RESTART = (
     "set github_api_url (or github_graphql_url / github_endpoint) to a host name the Claude sandbox can allow, "
     "then restart Harbor; a running harbor start keeps the value it started with"
 )
+
+
+def _device_proof_doctor(config: Any, workflow: Any) -> list[str]:
+    """``harbor doctor`` lines from the factory's own decision, for every provider a builder could run on."""
+
+    from harbor.config.workflow import device_proof_settings
+    from harbor.device_proof import CODEX_DEVICE_PROOF, builder_providers, granted_platforms, open_ledger_read_only
+    from harbor.runner.claude import device_proof_report
+    configured = device_proof_settings(workflow.config)  # load_workflow already refused a bad value
+    try:
+        policy = _quota_policy(config, workflow)
+    except ValueError:
+        policy = None  # reported as "Fallback: invalid" by doctor itself
+    ledger = open_ledger_read_only(_db_path())
+    try:
+        providers = builder_providers(config, policy, ledger)
+    finally:
+        if ledger is not None:
+            ledger.close()
+    granted = {provider: granted_platforms(workflow.config, provider) for provider in providers}
+    claude = [provider for provider, platforms in granted.items() if platforms]
+    if claude:
+        lines = device_proof_report(granted[claude[0]])
+        lines[0] += f" · applies to Claude builders ({', '.join(providers[claude[0]])})"
+    elif "claude" in providers:
+        lines = device_proof_report(())
+    else:
+        lines = []
+    if configured and any(provider != "claude" for provider in providers):
+        lines.append(f"Device proof: not applied to Codex builders ({CODEX_DEVICE_PROOF})")
+    return lines
+
+
+def device_proof_platform_warning(platforms: tuple[str, ...]) -> str:
+    from harbor.runner.claude import device_proof_report
+    detail = device_proof_report(platforms)[-1].strip()
+    return f"[builder] device_proof = {list(platforms)} is {detail}"
 
 
 def linear_sandbox_hosts(config: Any) -> tuple[tuple[str, ...], str | None]:
@@ -475,6 +525,14 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
     if token_env:
         child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env
+    # pr-merge's .harbor/ check reads these from Harbor's config, not from the worktree.
+    from harbor.device_proof import git_fetch_url, main_git_dir
+    git_dir = main_git_dir(getattr(config, "repo_path", None))
+    if git_dir is not None:
+        child_env["HARBOR_GIT_DIR"] = str(git_dir)
+    fetch_url = git_fetch_url(rest_url, repository or None)
+    if fetch_url:
+        child_env["HARBOR_GIT_FETCH_URL"] = fetch_url
     mcp = {"url": settings["mcp_url"], "token_env": token_env} if settings["transport"] == "mcp" and token_env else None
     # Only Claude's sandbox filters by host, so only a Claude project is held
     # to its host rules here (start and doctor fail closed). A resumed Claude
@@ -551,6 +609,8 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
+    for line in _device_proof_doctor(config, workflow):
+        print(line)
     if config.install_command is None:
         print("Installation: missing explicit command or none")
         scope_ok = False

@@ -496,6 +496,61 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
+### Emulator, simulator and local web proof for Claude builders
+
+A Claude builder's Bash sandbox blocks `adb`, `xcrun simctl` and local dev
+servers by default. To let it capture that proof on macOS, opt in per project
+in `<repo>/.harbor/workflow/workflow.toml`:
+
+```toml
+[builder]
+device_proof = ["android", "ios", "web"]   # any subset; absent means off
+```
+
+What each platform turns on:
+- `android` and `web` let Bash commands bind and connect to local ports
+  (`network.allowLocalBinding`).
+- `ios` lets them drive two named iOS Simulator services
+  (`network.allowMachLookup`).
+- Before each launch, Harbor boots one emulator and one simulator outside the
+  sandbox if none is running. It tells the builder the result, quoting the
+  literal error if a boot fails.
+- With `web`, the builder can screenshot a local page with Playwright inside
+  its sandbox if it launches Chromium with `--single-process`. Harbor tells it
+  how in the prompt.
+
+**Each platform is a way out of the sandbox, not a small widening:**
+- `adb shell curl` reaches any host, and `adb push` and `adb pull` move files.
+- `simctl openurl` reaches any host, and `simctl spawn` runs code outside the
+  sandbox with host file access.
+- Local binding also exposes every local service: Chrome debugging ports, a
+  Docker TCP socket, databases.
+
+Enable it only on a machine or user account where the builder may have that
+reach. With `ios` (and, through adb, `android`) the builder can effectively
+act as the user who runs Harbor on the host, so no repository-level control
+bounds it. That includes rewriting the main checkout's `.harbor/` directly.
+
+A builder could also open a PR that grants itself these rules. Harbor's merge
+checks are best-effort guards on its own commands. If `.harbor/` is
+untracked, CODEOWNERS does not apply to it, and anything Harbor runs outside
+the sandbox can write it: `install_command`, git hooks, and the device escapes.
+The recommended setup is to track `.harbor/` and protect the base branch with
+required Code Owner review (`/.harbor/ @your-org/harbor-admins` in
+`.github/CODEOWNERS`). That makes a PR that touches `.harbor/` need a human.
+A change that reaches `.harbor/` through rename detection may not trigger it
+(not verified on GitHub), and it still does not bound the device escapes. With
+a tracked `.harbor/`, Harbor's `pr-merge` refuses `--method rebase`, because
+rebase merges can't be checked for `.harbor/` changes. Its default, squash, is
+unaffected. The docs list the exact steps. An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
+builder the project could run.
+
+Claude Code's documentation describes these settings as macOS-only. Harbor
+was not tested with them on Linux, and doctor flags a non-macOS host. Codex
+builders are not changed: they already have local ports and cannot reach the
+simulator. See
+[Device and browser proof](docs/configurable-workflows.md#device-and-browser-proof-builder).
+
 heartbeat_seconds: 60
 poll_interval_seconds: 60
 deadline_minutes: 90
@@ -585,6 +640,15 @@ needs and keeps the delivery instructions opaque.
   local worktree. Unobserved claims remain fail-closed.
 - Pause stops new dispatch/resume and suspends deadlines; it does not erase
   the ledger or pretend the builder completed.
+- A Claude builder's sandbox reaches local ports or the iOS Simulator only
+  when the project lists them in `[builder] device_proof`. Each of those is a
+  path out of the sandbox: adb and simctl reach any host, and with `ios` the
+  builder can act as the host user and edit `.harbor/` directly. Branch
+  protection with Code Owner review on a tracked `.harbor/` makes PRs that
+  touch it need a human, but a rename-based change may slip past it. It does
+  nothing for an untracked `.harbor/` or for the device escapes. Harbor's own
+  merge checks are best effort and refuse rebase merges when `.harbor/` is
+  tracked.
 
 ## Test fixtures and external proof
 
