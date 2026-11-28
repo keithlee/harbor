@@ -189,7 +189,14 @@ def _pr_summary(pr: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, env: Mapping[str, str]) -> None:
+REBASE_REFUSED = (
+    "human merge required: rebase merges can't be checked for .harbor/ changes (this repository tracks "
+    ".harbor/); merge with --method squash or merge instead"
+)
+
+
+def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, env: Mapping[str, str],
+                                   method: str = "squash") -> None:
     """Refuse to merge a PR that changes ``.harbor/``, or whose diff cannot be read (fail closed).
 
     The base and head come from GitHub as full SHAs, never from local refs a
@@ -209,12 +216,17 @@ def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, e
     name = token_env_name(env, env.get("HARBOR_GITHUB_TOKEN_ENV"))
     token = env[name].strip() if name else None
     why: list[str] = []
+    facts: dict[str, Any] = {}
     change = builder_sandbox_change(git_dir, head, base, fetch_url=env.get("HARBOR_GIT_FETCH_URL"),
-                                    token=token, reasons=why)
+                                    token=token, reasons=why, facts=facts)
     reason = builder_sandbox_refusal(change)
     if reason:
         detail = f" ({'; '.join(why)})" if why else ""
         raise GitHubRestError(f"refusing to merge PR #{number}: {reason}{detail}")
+    if method == "rebase" and facts.get("harbor_tracked") is not False:
+        # A rebase replays commits with rename detection, which can land an edit to another
+        # path in .harbor/; Harbor does not model that, so it only rebases when .harbor/ is untracked.
+        raise GitHubRestError(f"refusing to merge PR #{number}: {REBASE_REFUSED}")
 
 
 def _guard_api_call(method: str, path: str, body: str | None, repository: str | None) -> None:
@@ -283,7 +295,7 @@ def run(argv: Sequence[str], env: Mapping[str, str] | None = None, client: Clien
             "combined_status": (status or {}).get("state"),
             "combined_status_count": (status or {}).get("total_count", 0),
         }
-    _refuse_builder_sandbox_change(gh, pulls, args.number, args.sha, environ)
+    _refuse_builder_sandbox_change(gh, pulls, args.number, args.sha, environ, args.method)
     payload = {"sha": args.sha, "merge_method": args.method}
     if args.subject:
         payload["commit_title"] = args.subject

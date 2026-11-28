@@ -321,7 +321,8 @@ def git_fetch_url(api_url: str | None, repository: str | None) -> str | None:
 
 
 def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_url: str | None = None,
-                           token: str | None = None, reasons: list[str] | None = None) -> bool | None:
+                           token: str | None = None, reasons: list[str] | None = None,
+                           facts: dict[str, Any] | None = None) -> bool | None:
     """Whether merging the PR head would change anything under ``.harbor/`` on the PR base.
 
     The merge result comes from ``git merge-tree --write-tree`` (the same ort
@@ -329,7 +330,10 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
     hide a change behind one convenient merge base; a conflict is unknown. On a
     git without ``--write-tree`` the head is compared with every merge base.
     Any single commit in ``base..head`` that touches ``.harbor/`` also counts,
-    because a rebase merge replays the commits one by one.
+    as a conservative extra. It does not model a rebase merge, whose rename
+    detection can redirect an edit into ``.harbor/``: ``facts["harbor_tracked"]``
+    (when ``facts`` is given) says whether anything under ``.harbor/`` is tracked
+    at the base, the head or the merge result, and pr-merge refuses rebase then.
 
     ``git_dir`` is the repository's common git directory, resolved by the
     caller from Harbor's project config (``main_git_dir``). git runs in a
@@ -392,14 +396,18 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
                 ends = (*merge_bases, head_sha)
             else:
                 return unknown(f"git merge-tree failed: {(merged.stderr or '').strip() or merged.returncode}")
-            # A rebase (or squash of a partial range) replays the PR's commits one by one, so a
-            # commit that touches .harbor/ counts even when the ort merge result shows no change.
+            tracked_anywhere = any(_harbor_tracked(repo, end) for end in ends)
+            if facts is not None:
+                facts["harbor_tracked"] = tracked_anywhere
+            # Any PR commit that touches .harbor/ counts even when the ort merge result shows no
+            # change. This does not model a rebase merge (rename detection can redirect an edit
+            # into .harbor/); pr-merge refuses rebase outright when .harbor/ is tracked.
             touched = _commits_touching_harbor(repo, base_sha, head_sha)
             if touched is None:
                 return unknown(f"could not list the commits in {base_sha}..{head_sha}")
             if touched:
                 return True
-            if not any(_harbor_tracked(repo, end) for end in ends):
+            if not tracked_anywhere:
                 return False
             if not all(_workflow_path_is_plain(repo, end) for end in ends):
                 return unknown("a tracked .harbor, .harbor/workflow or workflow.toml is a symlink, a submodule "

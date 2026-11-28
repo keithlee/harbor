@@ -23,7 +23,7 @@ _NUMBER = r"[1-9][0-9]{0,9}"
 REST_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (method, re.compile(pattern)) for method, pattern in (
         ("POST", r"pulls"),                                           # pr-create
-        ("PATCH", rf"pulls/{_NUMBER}"),                               # pr-edit (title, body, state)
+        ("PATCH", rf"pulls/{_NUMBER}"),                               # title and body only (_check_pr_edit)
         ("POST", rf"issues/{_NUMBER}/comments"),                      # PR conversation comments, verdicts
         ("PATCH", rf"issues/comments/{_NUMBER}"),                     # edit own comment
         ("POST", rf"pulls/{_NUMBER}/comments"),                       # inline review comment
@@ -53,6 +53,8 @@ def check_api_call(method: str, path: str, body: str | None, repository: str | N
     verb = method.upper()
     parts = urlsplit(path)
     if verb in READ_METHODS:
+        if body:
+            raise ApiRefused(f"{verb} {path}: a read may not carry a request body")
         return
     if parts.query or parts.fragment or "%2" in path.lower() or "\\" in path:
         raise ApiRefused(f"{verb} {path}: writes may not carry a query string, fragment or encoded separator")
@@ -68,11 +70,29 @@ def check_api_call(method: str, path: str, body: str | None, repository: str | N
     rest = match.group(2)
     if verb == "POST" and re.fullmatch(rf"pulls/{_NUMBER}/reviews", rest):
         _check_review(body)
+    if verb == "PATCH" and re.fullmatch(rf"pulls/{_NUMBER}", rest):
+        _check_pr_edit(body)
     if not any(verb == allowed and pattern.fullmatch(rest) for allowed, pattern in REST_WRITES):
         raise ApiRefused(
             f"{verb} {path} is not on Harbor's write allowlist (comments, replies, reviews, labels, PR create/edit). "
             "Merge with `pr-merge N --sha SHA`; refs, contents, branch protection and merges are refused"
         )
+
+
+PR_EDIT_FIELDS = {"title", "body"}
+
+
+def _check_pr_edit(body: str | None) -> None:
+    """``PATCH pulls/N`` may change the title and body only: never ``base``, ``state`` or anything else."""
+
+    try:
+        payload: Any = json.loads(body or "")
+    except ValueError as exc:
+        raise ApiRefused("PATCH pulls/N: the body must be JSON") from exc
+    if not isinstance(payload, dict) or not payload or set(payload) - PR_EDIT_FIELDS:
+        extra = sorted(set(payload) - PR_EDIT_FIELDS) if isinstance(payload, dict) else ["(not an object)"]
+        raise ApiRefused(f"PATCH pulls/N may set only {', '.join(sorted(PR_EDIT_FIELDS))}; refused: "
+                         f"{', '.join(extra) or '(empty)'}")
 
 
 REVIEW_EVENTS = {"COMMENT", "REQUEST_CHANGES"}

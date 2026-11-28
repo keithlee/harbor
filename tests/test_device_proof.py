@@ -1138,3 +1138,94 @@ def test_without_merge_tree_write_tree_every_merge_base_is_checked(tmp_path: Pat
     repo, base = _repo_with_workflow(tmp_path / "changed")
     _write(repo, WORKFLOW, IOS)
     assert dp.builder_sandbox_change(repo / ".git", _commit_all(repo, "grant"), base) is True
+
+
+# --- eighth review: rebase is refused when .harbor/ is tracked; tighter allowlist -------------
+
+W = 'version = 1\n[delivery]\nmerge_mode = "human"\n[builder]\ndevice_proof = []\n'
+
+
+def _rename_recipe(tmp_path: Path) -> tuple[Path, str, str]:
+    """The reviewer's recipe: a rebase lands c2's edit to docs/x.toml in .harbor/workflow/workflow.toml."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _write(repo, WORKFLOW, W)
+    a = _commit_all(repo, "A: tracks .harbor/workflow/workflow.toml = W")
+    _write(repo, "docs/x.toml", W)
+    _commit_all(repo, "PR1: docs/x.toml = W")
+    (repo / "docs" / "x.toml").unlink()
+    base = _commit_all(repo, "PR2: delete docs/x.toml")
+    _git(repo, "checkout", "-q", "-b", "attack", a)
+    _write(repo, "docs/x.toml", W)
+    _commit_all(repo, "c1: docs/x.toml = W (same patch as PR1)")
+    _write(repo, "docs/x.toml", W.replace("device_proof = []", 'device_proof = ["ios"]'))
+    head = _commit_all(repo, "c2: edit docs/x.toml to ios")
+    return repo, base, head
+
+
+def test_the_check_does_not_model_the_rename_recipe(tmp_path: Path) -> None:
+    """The check sees no .harbor/ change for the recipe: correct for squash/merge (the ort result leaves
+    .harbor/ alone), but it does not model a rebase's rename detection, so rebase is refused by policy."""
+    from harbor.device_proof import builder_sandbox_change
+    repo, base, head = _rename_recipe(tmp_path)
+    facts: dict = {}
+    assert builder_sandbox_change(repo / ".git", head, base, facts=facts) is False
+    assert facts["harbor_tracked"] is True
+
+
+def test_pr_merge_refuses_rebase_when_harbor_is_tracked(tmp_path: Path, monkeypatch) -> None:
+    from harbor.github_rest import GitHubRestError, run
+    repo, base, head = _rename_recipe(tmp_path)
+    monkeypatch.chdir(repo)
+    env = {"HARBOR_GITHUB_REPOSITORY": "o/r"}
+    gh = FakeGitHub(head, base)
+    with pytest.raises(GitHubRestError, match=r"human merge required: rebase merges can't be checked for \.harbor/ changes"):
+        run(["pr-merge", "4", "--sha", head, "--method", "rebase"], env=env, client=gh)
+    assert [m for m, _, _ in gh.requests] == ["GET"]  # no PUT
+    # The default (squash) merge lands the ort result, which leaves .harbor/ alone, so it still goes through.
+    gh = FakeGitHub(head, base)
+    assert run(["pr-merge", "4", "--sha", head], env=env, client=gh) == {"merged": True}
+    assert gh.requests[-1][:2] == ("PUT", "/repos/o/r/pulls/4/merge")
+    assert gh.requests[-1][2]["merge_method"] == "squash"
+
+
+def test_an_untracked_harbor_project_may_still_rebase(tmp_path: Path, monkeypatch) -> None:
+    from harbor.github_rest import run
+    repo, base = _repo_without_harbor(tmp_path)
+    _write(repo, "app.txt", "v2\n")
+    _git(repo, "add", "app.txt")
+    _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "app")
+    head = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.chdir(repo)
+    gh = FakeGitHub(head, base)
+    run(["pr-merge", "4", "--sha", head, "--method", "rebase"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert gh.requests[-1][2]["merge_method"] == "rebase"
+
+
+@pytest.mark.parametrize(("method", "path", "body"), [
+    ("GET", "/repos/o/r/pulls/4", '{"anything": 1}'),
+    ("HEAD", "/repos/o/r", "x"),
+    ("PATCH", "/repos/o/r/pulls/4", '{"base": "other"}'),
+    ("PATCH", "/repos/o/r/pulls/4", '{"state": "closed"}'),
+    ("PATCH", "/repos/o/r/pulls/4", '{"title": "t", "maintainer_can_modify": true}'),
+    ("PATCH", "/repos/o/r/pulls/4", "{}"),
+    ("PATCH", "/repos/o/r/pulls/4", "not json"),
+])
+def test_reads_carry_no_body_and_pr_edits_only_set_title_and_body(method, path, body, tmp_path) -> None:
+    from harbor.github_rest import GitHubRestError, run
+    (tmp_path / "body.json").write_text(body)
+    gh = FakeGitHub("a" * 40, "b" * 40)
+    with pytest.raises(GitHubRestError, match="refusing api call"):
+        run(["api", method, path, "--input", str(tmp_path / "body.json")],
+            env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert gh.requests == []
+
+
+def test_a_pr_edit_of_title_and_body_is_allowed(tmp_path) -> None:
+    from harbor.github_rest import run
+    (tmp_path / "body.json").write_text('{"title": "New title", "body": "New body"}')
+    gh = FakeGitHub("a" * 40, "b" * 40)
+    run(["api", "PATCH", "/repos/o/r/pulls/4", "--input", str(tmp_path / "body.json")],
+        env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert gh.requests[0][:2] == ("PATCH", "/repos/o/r/pulls/4")
