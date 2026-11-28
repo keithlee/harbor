@@ -154,7 +154,7 @@ model = "gpt-6-luna"
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
 | `[checks.*]` | none | optional repository commands the skill runs with `harbor workflow checks` |
 | `[github]` | `transport = "rest"` | how the builder reads and writes GitHub: `rest` (built-in helper) or opt-in `mcp` |
-| `[builder]` | absent (off) | opt-in `device_proof` platforms that give a Claude builder paths out of its sandbox for emulator, simulator and local web proof; protect `.harbor/` with Code Owner review on GitHub before enabling it |
+| `[builder]` | absent (off) | Claude builder sandbox opt-ins: `device_proof` platforms (paths out of the sandbox for emulator, simulator and local web proof), extra `allowed_domains`, and `allow_tmp` writes to the shared `/tmp`; protect `.harbor/` with Code Owner review on GitHub before enabling any |
 
 Readiness gates only on facts Harbor can verify itself: fresh evidence, hold
 state, PR identity, mergeability and CI (plus feedback when set to `required`).
@@ -296,10 +296,13 @@ GitHub Enterprise Server use the same code path but were not run.
 implementor and reviewer children. A Claude builder does this with Claude
 Code's `Agent` tool, which Harbor always enables; there is nothing to
 configure. Children run inside the builder's own Claude Code process, so they
-get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
-`Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
-writable paths and the same network allowlist below. They cannot use a tool or
-reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
+get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Edit`,
+`Write`, `Skill`, `Agent`), its permission rules and `dontAsk` mode, and the
+same Bash sandbox: the same writable paths and the same network allowlist
+below. They cannot use a tool, edit a file or reach a host the builder cannot.
+Verified on macOS with Claude Code 2.1.332: a child created and edited files in
+the worktree with `Write` and `Edit`, ran `cd sub && npm test`, and was refused
+a `Write` outside the worktree.
 
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:
@@ -360,6 +363,89 @@ verified, normal supervision re-reads that ticket's attachments from Linear, so
 it can still verify the merge on GitHub and remove the worktree. This read
 happens at most 3 times per run in each supervisor process, at least 60 seconds
 apart. The builder's `pr_url` counts only if Linear lists it as an attachment.
+
+### Claude builder file tools, extra hosts and `/tmp` (`[builder]`)
+
+**File tools.** A Claude builder has Claude Code's `Edit` and `Write` tools,
+approved for the ticket worktree only (`Edit(//<worktree>/**)`, which covers
+both). There is nothing to configure. These tools run inside Claude Code, not
+in the OS sandbox, so that rule is their whole boundary: `dontAsk` refuses an
+edit or write anywhere else: no rule allows the main checkout, the ledger
+directory or the repository's `.git` directory, and a `Write` through a symlink
+in the worktree that points outside it was refused live. The worktree was already writable to sandboxed Bash, so
+the rule makes nothing writable that was not before. Without these tools a
+builder and its children had to edit through Bash, and `dontAsk` refused some
+of those commands. On HAN-94 a child implementor's
+`mkdir -p tests && printf ... > tests/test_greet.py` was refused with
+"Permission to use Bash has been denied because Claude Code is running in don't
+ask mode", and it made no change.
+
+**Extra hosts (`allowed_domains`).** Builds that fetch from a host outside the
+[allowlist](#github-transport-github), such as `next build` downloading Google
+Fonts, fail with `deny network-outbound fonts.googleapis.com:443`. Opt in per
+project:
+
+```toml
+[builder]
+allowed_domains = ["fonts.googleapis.com", "fonts.gstatic.com"]   # absent or [] means none
+```
+
+Each entry is one exact, lower-case host name. A scheme, port, path, wildcard
+(`*.googleapis.com`), IP address, single-label name (`localhost`) or a
+duplicate fails `harbor doctor` and stops `harbor start` instead of being
+widened or dropped. Subdomains are not included: list each host. **What it
+widens:** every Bash command in the builder and its children can send data to
+those hosts and download from them. Code the builder runs (tests, build
+scripts, dependencies) can do so too, so a host that serves user content or
+accepts uploads is a way to exfiltrate the worktree, the GitHub token's reach
+aside. `harbor doctor` prints the merged list as `Builder sandbox network:` and
+names the extra hosts on the next line.
+
+**Shared `/tmp` (`allow_tmp`).** Claude Code points `TMPDIR` at its own
+writable directory (`/tmp/claude-<uid>` on macOS), so code that asks for a temp
+directory (`tempfile`, `os.tmpdir()`, `mktemp`) already works. A test that
+hardcodes `/tmp` does not: `sqlite3.connect('/tmp/x.db')` fails with `unable to
+open database file`. If you can, make the test use the temp directory. If not,
+opt in:
+
+```toml
+[builder]
+allow_tmp = true   # absent or false means off
+```
+
+This adds `/tmp` (and `/private/tmp`, its real path on macOS) to the Bash
+sandbox's writable paths. **What it widens:** `/tmp` is shared by every
+process and user on the host. A builder can then read and overwrite files
+other programs keep there, leave files that persist after the run and that
+later builders or other tools may trust, and replace a file another program is
+about to open. Harbor's ledger and the operator checkout stay read-only.
+Network and Unix-socket rules are unchanged, so writing a socket file in `/tmp`
+does not let the builder connect to it. A per-run `TMPDIR` would not have fixed
+the hardcoded-`/tmp` case, which is why this is a separate opt-in. `harbor
+doctor` prints `Builder sandbox writes: [builder] allow_tmp adds ...` when it
+is on.
+
+Both settings apply to Claude builders only and are read per launch, like the
+rest of the workflow. Codex builders are not changed: their sandbox does not
+filter hosts, and Codex's `workspace-write` sandbox already lets it write
+`/tmp` by default. A PR that changes `.harbor/` needs a
+human merge (see below), since it could grant these. Everything else stays as
+it was: `failIfUnavailable`, no unsandboxed commands, no excluded commands, and
+the `device_proof` rules.
+
+Verified on macOS with Claude Code 2.1.332 by running Harbor's exact builder
+argv (`sonnet`, low effort) against a throwaway repository and linked
+worktree. With neither opt-in, `fonts.googleapis.com`, `fonts.gstatic.com` and
+`example.com` were denied by the sandbox, and the `/tmp` database failed. With
+both, the fonts hosts answered (HTTP 400/404/200), the `/tmp` database was
+created, and `example.com` was still denied. In every run, `Write` outside the
+worktree, Bash `echo x > <outside>` and `Write` through a symlink in the
+worktree were refused. Not run on Linux.
+
+One limit of Claude Code itself remains: in `dontAsk` mode, a Bash command
+with a `?` in a URL argument (`curl 'https://example.com/?a=1'`) is refused as
+a permission, whatever the host. The same request made from a script, such as
+Python's `urllib`, is only checked by the network allowlist.
 
 ### Device and browser proof (`[builder]`)
 
@@ -894,8 +980,11 @@ pre-approved. Sandboxed Bash is approved automatically, except a command that
 sets `PYTHONPATH` or assigns a variable in front of an absolute executable path
 (directly or through `/usr/bin/env`), which is exactly what the runtime
 invocation does; Read, Glob and Grep only reach the ticket worktree,
-and the workflow package lives in your clone outside it. So Harbor pre-approves
-two things, and nothing else:
+and the workflow package lives in your clone outside it; and an edit is refused
+everywhere. So Harbor pre-approves three things, and nothing else:
+
+- `Edit` and `Write` in the ticket worktree (`Edit(//<worktree>/**)`); see
+  [Claude builder file tools](#claude-builder-file-tools-extra-hosts-and-tmp-builder).
 
 - Bash commands that start with the exact runtime invocation from the prompt
   (`Bash(<invocation>:*)`). They still run inside the OS sandbox, with the same
@@ -922,6 +1011,7 @@ against a throwaway repository and worktree; not run on Linux.
 | Bounded decisions | unblock.py, decision_policy.py, risk_evidence.py | test_decision_policy.py, test_blocker_recovery.py, test_workflow_evidence.py |
 | Cleanup | workflow_lifecycle.py, worktree.py | test_workflow_cleanup_policy.py, test_merge_cleanup.py |
 | Device and browser proof | config/workflow.py, runner/claude.py, device_proof.py, device_boot.py, readiness.py, cli.py | test_device_proof.py |
+| Claude builder file tools, extra hosts, `/tmp` | config/workflow.py, runner/claude.py, cli.py | test_claude_builder_file_tools.py, test_claude_workflow_permissions.py |
 
 Run `uv run pytest`, `uv run python -m compileall -q src tests` and `uv build`.
 The tests use mock external tickets and real local subprocesses and Git
