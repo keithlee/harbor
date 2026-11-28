@@ -373,6 +373,17 @@ class WorktreeManager:
         if not target.exists() and not target.is_symlink():
             return
         with git_lock(self.repo):
+            # Harbor's git never enters a submodule or nested repository (its
+            # config is the builder's), so it cannot tell whether one holds
+            # uncommitted work: ``status`` reports a committed gitlink as clean
+            # even when files inside it are modified.  Keep any worktree that
+            # has one rather than delete work unseen.
+            nested = self._nested_repositories(target)
+            if nested:
+                raise WorktreeError(
+                    f"cleanup retained a worktree containing a submodule or nested git repository ({nested}); "
+                    "Harbor does not look inside those, so check them for uncommitted work and remove the worktree by hand"
+                )
             # Modified or untracked files are work someone may want: keep the
             # worktree for inspection. Ignored files are install/build output
             # (node_modules, .next, ...) that every worktree accumulates; they
@@ -393,6 +404,19 @@ class WorktreeManager:
 
     def path_for(self, ticket: str) -> Path:
         return self._target(ticket)
+
+    def _nested_repositories(self, target: Path) -> str | None:
+        """The first gitlink in ``target``'s index, or nested ``.git`` under it, read without entering either."""
+
+        for line in self._git(target, ["ls-files", "--stage"]).stdout.splitlines():
+            if line.startswith("160000 "):
+                return line.split("\t", 1)[-1]
+        for directory, dirs, files in os.walk(target, followlinks=False):
+            here = Path(directory)
+            if here != target and (".git" in dirs or ".git" in files):
+                return str(here.relative_to(target))
+            dirs[:] = [name for name in dirs if name != ".git"]
+        return None
 
     def _git(self, target: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         """Git in a builder worktree, refused unless its metadata belongs to this repository."""
