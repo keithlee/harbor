@@ -1013,8 +1013,21 @@ cannot record the upstream in the shared config, and git prints an error for
 that part. Harbor's own git commands also run with repository hooks and
 `core.fsmonitor` turned off (`-c core.hooksPath=/dev/null -c
 core.fsmonitor=false`), so a hook you installed in the project repository does
-not run when Harbor creates, checks or removes a ticket worktree. No setup is
-needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
+not run when Harbor creates, checks or removes a ticket worktree. They also
+refuse `ext::` transports and replacement objects, run with every `GIT_*`
+variable removed and `GIT_CONFIG_NOSYSTEM=1`, and get none of Harbor's
+credentials (only `PATH`, `HOME`, the user name and the locale). The exceptions are
+`git fetch` and `git worktree add` in your checkout, which keep your system
+config and GitHub token so your credential helper and Git LFS still work.
+Before Harbor runs git inside a ticket worktree (the blocker ladder's diff,
+worktree checks and cleanup, the watchdog, `harbor workflow check`), it reads
+the worktree's `.git` file and fails closed unless it names
+`<repo>/.git/worktrees/<name>`, whose `commondir` leads back to the project's
+git directory and whose `gitdir` leads back to that worktree. It also fails
+closed if that admin directory has a `config.worktree` file. Git then runs with `GIT_DIR`,
+`GIT_COMMON_DIR` and `GIT_WORK_TREE` pinned to those checked paths, so a
+builder that points `.git` at a git directory of its own cannot make Harbor
+read that directory's config. No setup is needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
 against a throwaway repository; the Claude sandbox and Linux were checked
 through the generated settings only.
 
