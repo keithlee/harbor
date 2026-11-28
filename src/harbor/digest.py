@@ -259,6 +259,9 @@ def render_digest(source: Any, *, detailed: bool = True) -> str:
             when = datetime.fromtimestamp(quota["next_retry"], timezone.utc).isoformat()
             label = "confirmed reset" if quota["confirmed"] else "estimated retry"
             line += f"  {quota['provider']} usage limit ({label} {when})"
+        capped = _get(run, "redelivery_capped", default=None)
+        if capped:
+            line += f"  redelivery capped={len(capped)} input(s) not offered again"
         switched = _get(run, "provider_switch", default=None)
         if isinstance(switched, Mapping):
             line += f"  switched {switched.get('from')} -> {switched.get('to')} after usage limit"

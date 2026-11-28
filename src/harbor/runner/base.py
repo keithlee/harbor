@@ -1132,7 +1132,15 @@ class BaseRunner:
             # A schema-valid final result proves this provider is usable again.
             from harbor.recovery import clear_provider_quota
             clear_provider_quota(connection, getattr(self, "provider", "codex"))
-        queue_status = "waiting" if status == RunState.WAITING.value else "completed" if status == RunState.COMPLETED.value else "failed"
+        # The queue row is the wake's delivery receipt, not the run's outcome
+        # (that lives on the run row).  A builder that parks ``blocked`` with a
+        # structured blocker received and handled the wake; closing its receipt
+        # as ``failed`` would tell the WakeDecider the input never arrived, so
+        # every poll would replay the same comment into another paid turn.
+        # Only a turn that did not finish (crash, deadline, quota, invalid
+        # result) stays ``failed`` and retryable.
+        delivered = {RunState.COMPLETED.value, RunState.BLOCKED.value}
+        queue_status = "waiting" if status == RunState.WAITING.value else "completed" if status in delivered else "failed"
         self._queue_transition(context, queue_status, error=result.error)
         if (
             status == RunState.COMPLETED.value
