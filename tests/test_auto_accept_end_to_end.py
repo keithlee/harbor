@@ -14,6 +14,7 @@ from harbor.db import HarborDB
 from harbor.runner.codex import CodexRunner
 from harbor.unblock import UnblockLadder, touches_protected_paths
 from harbor.wake import Wake
+from test_auto_accept_first_option import git_worktree
 from test_first_mate_recovery import ledger, monitor_observed, supervisor_for
 
 QUESTION = "The empty state has no copy yet. Which wording should it use?"
@@ -42,6 +43,7 @@ def _factory(db, tmp_path, scenario):
 
 def _build(tmp_path):
     db = ledger(tmp_path, final=FINAL)
+    git_worktree(tmp_path / "wt" / "HAN-86")  # the run's worktree, so Harbor can observe changed paths
     supervisor, mate, linear = supervisor_for(tmp_path, db, {"action": "escalate", "reason": "product decision"})
 
     async def notify(reason):
@@ -412,3 +414,87 @@ def test_a_failing_hand_off_callback_leaves_the_queue_row_as_a_failed_ledger_ins
         assert runner.active is None
     finally:
         db.close()
+
+
+def _git(path, *args):
+    import subprocess
+
+    subprocess.run(["git", "-C", str(path), "-c", "user.name=Test", "-c", "user.email=test@example.test", *args],
+                   check=True, capture_output=True)
+
+
+def _non_ascii_untracked(worktree):
+    (worktree / "infra").mkdir(exist_ok=True)
+    (worktree / "infra" / "déploy.yml").write_text("replicas: 3\n")
+
+
+def _quoted_untracked(worktree):
+    (worktree / "infra").mkdir(exist_ok=True)
+    (worktree / "infra" / 'a"b.yml').write_text("replicas: 3\n")
+
+
+def _committed_rename_out_of_infra(worktree):
+    (worktree / "infra").mkdir(exist_ok=True)
+    (worktree / "infra" / "deploy.yml").write_text("replicas: 3\n")
+    _git(worktree, "add", "infra/deploy.yml")
+    _git(worktree, "commit", "-q", "-m", "base deploy file")  # on main, the base branch
+    _git(worktree, "checkout", "-q", "-b", "ticket")
+    (worktree / "docs").mkdir(exist_ok=True)
+    _git(worktree, "mv", "infra/deploy.yml", "docs/deploy.yml")
+    _git(worktree, "commit", "-q", "-m", "move it out of infra")
+
+
+@pytest.mark.parametrize("arrange", [_non_ascii_untracked, _quoted_untracked, _committed_rename_out_of_infra],
+                         ids=["non_ascii", "quote", "rename"])
+def test_observed_protected_paths_are_read_exactly(tmp_path, arrange):
+    """Review round 13, B1 (the reviewer's three repros, real git and runners):
+    quoted names and the old side of a rename are protected paths too, on
+    the ladder and on First Mate's following pass."""
+
+    db, supervisor, mate, linear, ladder, notices = _build(tmp_path)
+    ladder.protected_paths = ("infra/**",)
+    arrange(tmp_path / "wt" / "HAN-86")
+    invoked = []
+    inner = _factory(db, tmp_path, "starts")
+
+    async def factory(worktree, wake):
+        invoked.append(wake)
+        return await inner(worktree, wake)
+
+    supervisor.dispatcher.runner_factory = factory
+    try:
+        result = _ladder_pass(supervisor)
+        assert result is not None and result.action == "park", supervisor.last_error
+        assert invoked == [] and auto_accept.history(db, "HAN-86") == []
+        assert auto_accept.eligibility(db, db.escalations()[-1]["id"])["protected"] is True
+        _first_mate_pass(supervisor, db, ladder, mate, factory)
+        assert invoked == [] and auto_accept.history(db, "HAN-86") == []
+        assert db.escalations()[-1]["status"] == "open"
+        assert not any("auto-accepted option 1" in body for _, body in linear.comments)
+    finally:
+        db.close()
+
+
+def test_observed_changed_paths_use_nul_separated_unquoted_names(tmp_path):
+    from harbor.unblock import _observed_changed_paths
+
+    repo = git_worktree(tmp_path / "repo")
+    _non_ascii_untracked(repo)
+    _quoted_untracked(repo)
+    paths = set(_observed_changed_paths(repo, "main"))
+    assert {"infra/déploy.yml", 'infra/a"b.yml'} <= paths
+
+
+def test_auto_accept_fails_closed_without_an_observable_git_worktree(tmp_path):
+    from test_auto_accept_first_option import Harness, blocker
+
+    plain = tmp_path / "not-git"
+    plain.mkdir()
+    harness = Harness(tmp_path, repo_path=plain)
+    try:
+        result = harness.block(blocker("Option 1"))
+        assert result.action == "park" and harness.resumed == []
+        assert "could not observe the worktree's changed paths" in harness.linear.comments[0][1]
+        assert auto_accept.eligibility(harness.db, harness.db.escalations()[-1]["id"])["protected"] is True
+    finally:
+        harness.db.close()

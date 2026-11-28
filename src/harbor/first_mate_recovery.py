@@ -491,8 +491,10 @@ def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: 
     # Re-check the blocker First Mate is answering against the project's
     # protected paths (and the repository's AGENTS.md), as reported and as
     # mentioned, independently of the ladder's recorded facts.
-    from harbor.unblock import _mentions_protected_path, _paths, touches_protected_paths
-    patterns = list(protected_paths) + _paths(case.blocker.get("protected_paths") or case.blocker.get("protectedPaths"))
+    from harbor.unblock import _mentions_protected_path, touches_protected_paths
+    # A builder-reported ``protected_paths`` key never reaches here: the
+    # run-result validator rejects it.  Only the project's patterns apply.
+    patterns = list(protected_paths)
     protected_now = touches_protected_paths(case.blocker, protected_paths=patterns, repo_path=repo_path) \
         or _mentions_protected_path(case.blocker, patterns, repo_path)
     assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,

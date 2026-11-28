@@ -67,6 +67,19 @@ class LinearFake:
         return {"success": True}
 
 
+def git_worktree(path: Path) -> Path:
+    """A clean git repository on ``main`` with one commit."""
+
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    if not (path / ".git").exists():
+        for args in (("init", "-q", "-b", "main"), ("commit", "-q", "--allow-empty", "-m", "initial")):
+            subprocess.run(["git", "-C", str(path), "-c", "user.name=Test", "-c", "user.email=test@example.test",
+                            *args], check=True, capture_output=True)
+    return path
+
+
 class Harness:
     def __init__(self, tmp_path: Path, **ladder):
         self.db = HarborDB(tmp_path / "harbor.db")
@@ -84,6 +97,10 @@ class Harness:
         async def notify(reason):
             self.notices.append(reason)
 
+        # Auto-accept needs Harbor's own observation of the changed paths, so
+        # the ladder gets a real (clean) git worktree unless a test overrides it.
+        if "repo_path" not in ladder:
+            ladder["repo_path"] = git_worktree(tmp_path / "repo")
         self.ladder = UnblockLadder(self.db, linear=self.linear, resumer=resume, notifier=notify,
                                     remediation_executor=lambda command: False, **ladder)
 

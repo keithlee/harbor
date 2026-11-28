@@ -461,6 +461,48 @@ def _protected_from_agents(root: Path) -> tuple[str, ...]:
 PATH_FIELDS = ("path", "file", "paths", "files", "touched_paths", "touchedFiles")
 
 
+def _git_z(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run git with NUL-separated, unquoted path output."""
+
+    return subprocess.run(
+        ["git", "-c", "core.quotePath=false", *args], cwd=repo, capture_output=True, timeout=5, check=check,
+    )
+
+
+def _nul_paths(output: bytes) -> list[str]:
+    # A non-UTF-8 byte becomes U+FFFD: the directory part still matches a
+    # protected pattern, and the text stays encodable for prompts and JSON.
+    return [item for item in output.decode("utf-8", errors="replace").split("\0") if item]
+
+
+def _observed_changed_paths(repo: Path, base_branch: str) -> list[str]:
+    """Every changed, staged, untracked and branch path in ``repo``, exactly.
+
+    ``-z`` output is read as NUL-separated names (no quoting of non-ASCII or
+    special characters), and ``--no-renames`` lists both sides of a rename,
+    so a protected file moved elsewhere still counts.  Raises when git
+    cannot report them; the caller then never auto-accepts.
+    """
+
+    paths = _nul_paths(_git_z(repo, "diff", "--name-only", "-z", "--no-renames", "HEAD").stdout)
+    paths += _nul_paths(_git_z(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout)
+    # Linked worktrees are created from the configured remote branch;
+    # a matching local branch need not exist and may be stale.
+    base_sha = None
+    for ref in (f"refs/remotes/origin/{base_branch}", f"refs/heads/{base_branch}"):
+        resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+                                  cwd=repo, capture_output=True, text=True, timeout=5)
+        if resolved.returncode == 0:
+            base_sha = resolved.stdout.strip()
+            break
+    if base_sha is None:
+        raise ValueError("cannot inspect changed paths against configured base branch")
+    branch_diff = _git_z(repo, "diff", "--name-only", "-z", "--no-renames", f"{base_sha}...HEAD", check=False)
+    if branch_diff.returncode != 0:
+        raise ValueError("cannot inspect changed paths against configured base branch")
+    return paths + _nul_paths(branch_diff.stdout)
+
+
 def touches_protected_paths(
     blocker: Mapping[str, Any],
     *,
@@ -1313,25 +1355,14 @@ class UnblockLadder:
         run_repo = Path(str(run_repo_value)) if run_repo_value else None
         authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
 
+        # Whether Harbor itself observed the worktree's changed paths.  Without
+        # that observation protection is unknown, and auto-accept fails closed.
+        observed_paths = False
         if authority_repo is not None and (authority_repo / ".git").exists():
             # Use observed changes, not only the builder's path claims.
-            paths = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            paths += subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            # Linked worktrees are created from the configured remote branch;
-            # a matching local branch need not exist and may be stale.
-            base_sha = None
-            for ref in (f"refs/remotes/origin/{self.base_branch}", f"refs/heads/{self.base_branch}"):
-                resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
-                if resolved.returncode == 0:
-                    base_sha = resolved.stdout.strip()
-                    break
-            if base_sha is None:
-                raise ValueError("cannot inspect changed paths against configured base branch")
-            branch_diff = subprocess.run(["git", "diff", "--name-only", f"{base_sha}...HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
-            if branch_diff.returncode != 0:
-                raise ValueError("cannot inspect changed paths against configured base branch")
-            paths += branch_diff.stdout.splitlines()
-            blocker_value["touched_paths"] = list(set(paths + _paths(blocker_value.get("touched_paths"))))
+            paths = _observed_changed_paths(authority_repo, self.base_branch)
+            blocker_value["touched_paths"] = sorted(set(paths + _paths(blocker_value.get("touched_paths"))))
+            observed_paths = True
         protected = touches_protected_paths(blocker_value, protected_paths=self.protected_paths, repo_path=authority_repo)
         adapter = (
             deterministic_capability_adapter(blocker_value, authority_repo)
@@ -1515,20 +1546,24 @@ class UnblockLadder:
         # the answer and resume, unless a guardrail keeps it with a human.
         # Recompute protection here: triage can escalate (human decision mode,
         # conflicting instructions, the rung-1 cap) before its own check.
-        protected_patterns = list(self.protected_paths) + _paths(
-            _value(blocker_value, "protected_paths", "protectedPaths", default=None))
+        # (A builder-reported ``protected_paths`` key is rejected by the
+        # run-result validator, so only the project's patterns and AGENTS.md
+        # apply here.)
+        protected_patterns = list(self.protected_paths)
         protected_now = protected or triage_result.reason == "protected path" or touches_protected_paths(
             blocker_value, protected_paths=protected_patterns, repo_path=authority_repo,
         ) or _mentions_protected_path(blocker_value, protected_patterns, authority_repo)
         human_decisions = self.policy.decision_mode == "human"
         auto_accept_policy.record_eligibility(
-            self.db, escalation_id, reported_blocker, protected=protected_now, human_decisions=human_decisions,
+            self.db, escalation_id, reported_blocker, protected=protected_now or not observed_paths,
+            human_decisions=human_decisions,
         )
         assessment = auto_accept_policy.assess(
             self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
             parked_for_human=_is_parked_for_human(final),
             protected=protected_now,
             human_decisions=human_decisions,
+            paths_unknown=not observed_paths,
         )
         if assessment.accepted and escalation_id is not None and run_id:
             accepted = await self._auto_accept_first_option(

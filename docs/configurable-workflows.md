@@ -219,7 +219,18 @@ These check fields, characters and ledger state, not meaning.
   that is `null` or exactly `""` counts as no text (the index alone decides);
   one made only of whitespace is refused.
 - **Touched protected paths.** A blocker whose reported or observed changed
-  paths match a protected pattern is not auto-accepted.
+  paths match a protected pattern is not auto-accepted. Reported paths are the
+  union of `path`, `file`, `paths`, `files`, `touched_paths` and
+  `touchedFiles`. Observed paths come from git in the run's worktree, read as
+  NUL-separated, unquoted names (`-z`, `core.quotePath=false`), with renames
+  listed on both sides (`--no-renames`): uncommitted and staged changes,
+  untracked files, and the branch's changes since the base branch. If the
+  worktree is not a git repository, auto-accept is refused, because protection
+  is unknown. If git fails or the base branch is missing, the ladder stops
+  with an error, as before. Limits: what git does not report is not observed.
+  That covers files ignored by `.gitignore` or `.git/info/exclude`, and
+  changes hidden with `git update-index --skip-worktree` or
+  `--assume-unchanged`.
 - **Merge-ready runs.** A run parked as `outcome = "parked"`,
   `waiting_on = "human"` is not auto-accepted. The answer does not authorize a
   merge: `merge_mode` and `auto_merge_risks` in `pre_merge` readiness are

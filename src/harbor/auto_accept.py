@@ -507,6 +507,7 @@ def assess(
     parked_for_human: bool = False,
     protected: bool = False,
     human_decisions: bool = False,
+    paths_unknown: bool = False,
 ) -> Assessment:
     if not policy.enabled:
         return Assessment("not_applicable", reason=f"auto-accept is off ({policy.disabled_by or SETTING})")
@@ -523,6 +524,12 @@ def assess(
     if protected:
         return Assessment(
             "refused", option, choice.method, "the blocker touches a protected path, which always needs a human",
+        )
+    if paths_unknown:
+        return Assessment(
+            "refused", option, choice.method,
+            "Harbor could not observe the worktree's changed paths (no git worktree), so whether a protected "
+            "path is touched is unknown",
         )
     if parked_for_human:
         return Assessment(
@@ -795,7 +802,8 @@ def comment(
         f"Question: {question}\n"
         f"Answer (option 1): {option}\n"
         f"Builder recommendation: {recommendation or '(structured recommended_option_index = 0)'}\n"
-        f"Auto-accept {count + 1} of at most {policy.max_auto_accepts} for this builder run. {MERGE_NOTE}\n"
+        f"Auto-accept {count + 1} of at most {policy.max_auto_accepts} for this builder run, counted when Harbor "
+        f"decided (the launch re-checks only the opt-out, not the count). {MERGE_NOTE}\n"
         "The answer gives the builder no capability it did not already have; its exclusions for money, "
         "deletion, credentials and gates are best-effort keyword heuristics, not a review of this option.\n"
         "Harbor resumed the same builder session. To redirect it, reply on this ticket; to turn this off, set "
