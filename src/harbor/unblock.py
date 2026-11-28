@@ -458,6 +458,9 @@ def _protected_from_agents(root: Path) -> tuple[str, ...]:
     return ()
 
 
+PATH_FIELDS = ("path", "file", "paths", "files", "touched_paths", "touchedFiles")
+
+
 def touches_protected_paths(
     blocker: Mapping[str, Any],
     *,
@@ -466,9 +469,10 @@ def touches_protected_paths(
 ) -> bool:
     """Fail closed when observed paths overlap the configured protected set."""
 
+    # The union of every path-bearing field: no key (an empty reported
+    # ``paths``, say) may shadow the observed paths in ``touched_paths``.
     touched = _normalise_paths(
-        list(_paths(_value(blocker, "path", "file", default=None)))
-        + _paths(_value(blocker, "paths", "files", "touched_paths", "touchedFiles", default=None))
+        [item for name in PATH_FIELDS for item in _paths(_value(blocker, name, default=None))]
     )
     configured = _normalise_paths(protected_paths)
     if repo_path is not None:

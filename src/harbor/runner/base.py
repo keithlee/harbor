@@ -93,6 +93,9 @@ class SpawnObserver:
 SPAWN_OBSERVER: ContextVar[SpawnObserver | None] = ContextVar("harbor_spawn_observer", default=None)
 
 
+BLOCKER_FIELDS = frozenset({"kind", "question", "options", "recommendation", "recommended_option_index", "evidence"})
+
+
 class RunnerError(RuntimeError):
     """A runner could not be started or did not produce a valid result."""
 
@@ -149,6 +152,11 @@ def validate_result(payload: Any) -> list[str]:
         for key in ("kind", "question", "recommendation", "evidence"):
             if blocker.get(key) is not None and not isinstance(blocker[key], str):
                 errors.append(f"blocker.{key} must be a string")
+        unknown = sorted(set(blocker) - BLOCKER_FIELDS)
+        if unknown:
+            # The schema sets additionalProperties: false; an unexpected key
+            # (an empty ``paths``, say) could otherwise shadow Harbor's checks.
+            errors.append(f"blocker has unknown field(s): {', '.join(map(str, unknown))}")
         if blocker.get("options") is not None and (
             not isinstance(blocker["options"], list) or not all(isinstance(item, str) for item in blocker["options"])
         ):
@@ -1066,13 +1074,12 @@ class BaseRunner:
             context.process = None
             self.active = None
             raise
-        self._queue_transition(context, "running")
-        _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
         if observer is not None:
             # The builder process exists and its prompt is written next: the
-            # hand-off.  A failing callback (for example a locked ledger)
-            # must never leave an unsupervised builder behind: stop it and
-            # clear custody, exactly like a failed ledger insert.
+            # hand-off.  It runs before the queue row moves to ``running``, so
+            # a failing callback (for example a locked ledger) leaves exactly
+            # the state of a failed ledger insert: the builder stopped and
+            # reaped, custody cleared, and the queue row not ``running``.
             try:
                 observer.start()
             except Exception:
@@ -1086,6 +1093,8 @@ class BaseRunner:
             # context) must not inherit it.  The caller still holds the
             # observer and restores the variable with its own token.
             SPAWN_OBSERVER.set(None)
+        self._queue_transition(context, "running")
+        _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
         # Read the builder's output and watch the deadline before the prompt
         # is written.  A prompt larger than the pipe buffer only drains as
         # fast as the builder reads it: a builder that writes its own output

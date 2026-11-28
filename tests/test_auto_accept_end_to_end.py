@@ -279,3 +279,136 @@ def test_first_mate_does_not_auto_accept_a_blocker_that_later_reports_protected_
         assert not any("First Mate auto-accepted option 1" in body for _, body in linear.comments)
     finally:
         db.close()
+
+
+def _git_worktree_with_untracked_protected_file(path):
+    import subprocess
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(path), "-c", "user.name=Test", "-c", "user.email=test@example.test", *args],
+                       check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("commit", "-q", "--allow-empty", "-m", "initial")
+    (path / "infra").mkdir(exist_ok=True)
+    (path / "infra" / "deploy.yml").write_text("replicas: 3\n")  # untracked, observed by the ladder
+
+
+def test_an_empty_reported_paths_key_cannot_hide_observed_protected_paths(tmp_path):
+    """Review round 12, B1 (the reviewer's repro): the builder reports
+    "paths": [] while the worktree has an untracked infra/deploy.yml under
+    the protected infra/**.  The ladder's observed paths must still count."""
+
+    db, supervisor, mate, linear, ladder, notices = _build(tmp_path)
+    ladder.protected_paths = ("infra/**",)
+    _git_worktree_with_untracked_protected_file(tmp_path / "wt" / "HAN-86")
+    invoked = []
+    inner = _factory(db, tmp_path, "starts")
+
+    async def factory(worktree, wake):
+        invoked.append(wake)
+        return await inner(worktree, wake)
+
+    supervisor.dispatcher.runner_factory = factory
+    final = {**FINAL, "blocker": {**BLOCKER, "paths": []}}
+    try:
+        wake = Wake(ticket={"identifier": "HAN-86", "builder_run_id": "run-HAN-86", "run_id": "run-HAN-86",
+                            "id": "lin-86"}, action="reengage", resume="run-HAN-86")
+        asyncio.run(supervisor._handle_runner_result(wake, {**final, "run_id": "run-HAN-86"}))
+        result = supervisor.last_unblock
+        assert result is not None and result.action == "park", supervisor.last_error
+        assert invoked == [] and auto_accept.history(db, "HAN-86") == []
+        assert auto_accept.eligibility(db, db.escalations()[-1]["id"])["protected"] is True
+        assert not any("auto-accepted option 1" in body for _, body in linear.comments)
+    finally:
+        db.close()
+
+
+def test_touches_protected_paths_takes_the_union_of_path_fields():
+    for shadow in ("path", "file", "paths", "files"):
+        value = {shadow: [], "touched_paths": ["infra/deploy.yml"]}
+        assert touches_protected_paths(value, protected_paths=["infra/**"]), shadow
+    assert touches_protected_paths({"paths": ["docs/a.md"], "touchedFiles": ["infra/x.yml"]},
+                                   protected_paths=["infra/**"])
+
+
+def test_first_mate_recheck_is_not_shadowed_by_an_empty_paths_key(tmp_path):
+    db = HarborDB(tmp_path / "harbor.db")
+    try:
+        value = {**BLOCKER, "paths": [], "touched_paths": ["infra/deploy.yml"]}
+        row = db.record_escalation("HAN-86", "run-HAN-86", value["kind"], value["question"], 2, status="open")
+        auto_accept.record_eligibility(db, row["id"], value, protected=False, human_decisions=False)
+        case = recovery.Case("Demo", "HAN-86", "run-HAN-86", "blocked", "blocked", value)
+        decision = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy(),
+                                              protected_paths=("infra/**",))
+        assert decision["action"] == "escalate" and "protected path" in decision["reason"]
+    finally:
+        db.close()
+
+
+def test_builder_results_with_unknown_blocker_keys_are_invalid():
+    from harbor.runner.base import validate_result
+
+    payload = {"status": "blocked", "summary": "s", "blocker": {**BLOCKER, "paths": []}}
+    assert validate_result(payload) == ["blocker has unknown field(s): paths"]
+    assert validate_result({**payload, "blocker": BLOCKER}) == []
+
+
+def test_first_mate_with_no_retained_session_records_only_the_truthful_failure(tmp_path):
+    """Review round 12, B2: with the real WorktreeDispatcher, a session that is
+    not available returns before before_launch, so no resume row is written
+    or amended; only the "resume failed" escalate row and its notice."""
+
+    db, supervisor, mate, linear, ladder, notices = _build(tmp_path)
+    supervisor.dispatcher.runner_factory = _factory(db, tmp_path, "missing_executable")
+    _ladder_pass(supervisor)
+
+    async def unavailable(worktree, wake):
+        raise RuntimeError("factory refused: session not available")
+
+    try:
+        _first_mate_pass(supervisor, db, ladder, mate, unavailable)
+        rows = [tuple(r) for r in db.connection.execute("SELECT action, reason FROM first_mate_recoveries ORDER BY id")]
+        assert [action for action, _ in rows] == ["escalate"], rows
+        assert "resume failed" in rows[0][1]
+        assert any("could not resume" in n for n in notices), notices
+        assert not any("auto-accepted" in n for n in notices)
+        assert [row["source"] for row in auto_accept.history(db, "HAN-86")] == ["ladder"]
+        assert db.escalations()[-1]["status"] == "open"
+    finally:
+        db.close()
+
+
+def test_a_failing_hand_off_callback_leaves_the_queue_row_as_a_failed_ledger_insert(tmp_path):
+    """Review round 12, N1: the queue row never stays "running"."""
+
+    import sqlite3
+
+    from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+    from harbor.wake import apply_phase3_migration
+
+    db = ledger(tmp_path, final=FINAL)
+    apply_phase3_migration(db)
+    assert db.enqueue("HAN-86", "reengage", "idem-1")
+    sleeper = _fake_codex(tmp_path, "import sys, time\nsys.stdin.read()\ntime.sleep(30)\n")
+    runner = CodexRunner(tmp_path / "wt" / "HAN-86", db=db, ticket="HAN-86", run_id="run-HAN-86",
+                         executable=sleeper, deadline_seconds=60)
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    async def go():
+        token = SPAWN_OBSERVER.set(SpawnObserver(on_start=locked))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await runner.resume("run-HAN-86", "Answer")
+        finally:
+            SPAWN_OBSERVER.reset(token)
+
+    try:
+        asyncio.run(go())
+        [status] = [row[0] for row in db.connection.execute("SELECT status FROM work_queue WHERE ticket='HAN-86'")]
+        assert status == "dispatched"  # as after a failed ledger insert; never "running"
+        assert runner.active is None
+    finally:
+        db.close()

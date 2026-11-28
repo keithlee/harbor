@@ -845,7 +845,11 @@ async def _cancelled_after_start(before_launch):
 
 
 async def _resume_failed(before_launch):
-    # supervisor.resume_session: before_launch(), then "not available to resume".
+    # Models a NON-WorktreeDispatcher resume target (Supervisor.resume_session's
+    # ``resume_session``/``resume`` seams), which calls before_launch() and then
+    # fails, so _apply_recovery raises "not available to resume".  The real
+    # WorktreeDispatcher returns None BEFORE before_launch when no retained
+    # runner exists; see test_auto_accept_end_to_end for that case.
     before_launch()
     raise RuntimeError("retained builder session is not available to resume")
 
