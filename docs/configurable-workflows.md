@@ -197,7 +197,12 @@ These check fields, characters and ledger state, not meaning.
   schema kind (`env_blocker`, `github_transport`, `missing_proof_capability`,
   `conflicting_instruction`) and any unknown kind is not auto-accepted.
 - **Settings.** `auto_accept_first_option = false` or `decisions.mode = "human"`
-  turns it off.
+  turns it off. The workflow is re-read at launch on both paths (the ladder,
+  just before the resume and again when the runner begins its launch; First
+  Mate, in its launch callback), so an opt-out made while the builder is
+  being prepared abandons the launch: nothing is recorded, the escalation
+  stays open, and the park comment or operator notice says auto-accept was
+  turned off before the builder started.
 - **Structured index.** Only `recommended_option_index = 0` counts; a `null` or
   other index goes to a human. There is no free-text fallback.
 - **Characters.** Checked on the raw text, before any normalization. Option 1
@@ -225,7 +230,12 @@ These check fields, characters and ledger state, not meaning.
   decision-mode facts per escalation with a digest of the exact blocker
   (`auto_accept_assessments`). First Mate answers only the newest open
   escalation for the run, and only when its question, kind and digest match
-  the blocker it is looking at.
+  the blocker it is looking at. The digest covers the decision fields and
+  every path-bearing field (`path`, `file`, `paths`, `files`, `touched_paths`,
+  `touchedFiles`, `protected_paths`, `protectedPaths`) as the builder
+  reported them. First Mate also re-runs the touched and mentioned
+  protected-path checks on its blocker, with the project's protected paths
+  and the repository's `AGENTS.md`, and refuses if either matches.
 - **Delivery.** The answer and an in-flight receipt are recorded just before
   the launch (the ladder before its resume, First Mate in its launch
   callback). The receipt is marked delivered at the hand-off: when Harbor's

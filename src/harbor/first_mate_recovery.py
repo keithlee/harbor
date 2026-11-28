@@ -452,7 +452,8 @@ def latest_flag_id(connection) -> int | None:
 
 
 def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: Any, *,
-                      human_decisions: bool = False) -> dict:
+                      human_decisions: bool = False, protected_paths: Iterable[str] = (),
+                      repo_path: Any = None) -> dict:
     """Turn First Mate's escalate into a resume with option 1, when policy allows.
 
     Applies only to a blocked run whose blocker recommends its first option
@@ -487,9 +488,16 @@ def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: 
     elif facts["blocker_digest"] != auto_accept.blocker_digest(case.blocker):
         doubt = f"Harbor's assessment of escalation #{escalation_id} was recorded for a different blocker"
     trusted = facts if facts is not None and not doubt else None
+    # Re-check the blocker First Mate is answering against the project's
+    # protected paths (and the repository's AGENTS.md), as reported and as
+    # mentioned, independently of the ladder's recorded facts.
+    from harbor.unblock import _mentions_protected_path, _paths, touches_protected_paths
+    patterns = list(protected_paths) + _paths(case.blocker.get("protected_paths") or case.blocker.get("protectedPaths"))
+    protected_now = touches_protected_paths(case.blocker, protected_paths=patterns, repo_path=repo_path) \
+        or _mentions_protected_path(case.blocker, patterns, repo_path)
     assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,
                                     parked_for_human=case.parked_for_human,
-                                    protected=bool(trusted and trusted["protected"]),
+                                    protected=bool(protected_now or (trusted and trusted["protected"])),
                                     human_decisions=bool(human_decisions or (trusted and trusted["human_decisions"])))
     if assessment.status == "not_applicable":
         return decision

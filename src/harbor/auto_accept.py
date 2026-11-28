@@ -663,7 +663,34 @@ def mark_delivered(db: Any, escalation_id: Any) -> None:
         )
 
 
-_DIGEST_FIELDS = ("kind", "question", "options", "recommendation", "recommended_option_index")
+# The decision fields plus every path-bearing field ``touches_protected_paths``
+# reads, so an assessment never covers a blocker that later reports paths.
+_DIGEST_FIELDS = (
+    "kind", "question", "options", "recommendation", "recommended_option_index",
+    "path", "file", "paths", "files", "touched_paths", "touchedFiles", "protected_paths", "protectedPaths",
+)
+
+
+class AutoAcceptWithdrawn(RuntimeError):
+    """Auto-accept was turned off between the decision and the launch."""
+
+
+def withdraw(db: Any, escalation_id: Any) -> None:
+    """Undo an auto-accept abandoned before launch: no receipt, escalation open."""
+
+    connection = _connection(db)
+    if connection is None or escalation_id is None:
+        return
+    initialize(connection)
+    with connection:
+        connection.execute(
+            "UPDATE escalations SET status = 'open', answered_at = NULL, answer = NULL, citation = NULL "
+            "WHERE id = ? AND citation LIKE ?",
+            (int(escalation_id), f"{AUTO_ACCEPT_CITATION}:%"),
+        )
+        connection.execute(
+            "DELETE FROM auto_accepts WHERE escalation_id = ? AND delivered IS NULL", (int(escalation_id),),
+        )
 
 
 def blocker_digest(blocker: Mapping[str, Any]) -> str:

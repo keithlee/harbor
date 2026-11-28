@@ -66,11 +66,16 @@ class SpawnObserver:
     """
 
     on_start: Callable[[], None] | None = None
+    # Called as an invocation begins, before any ledger change or spawn; it
+    # may raise to abandon the launch (for example, auto-accept turned off).
+    on_attempt: Callable[[], None] | None = None
     attempted: bool = False
     started: bool = False
 
     def attempt(self) -> None:
         self.attempted = True
+        if self.on_attempt is not None:
+            self.on_attempt()
 
     def start(self) -> None:
         if not self.started:

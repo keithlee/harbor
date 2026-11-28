@@ -4670,7 +4670,11 @@ class Supervisor:
                     try:
                         policy = policy_from_config(self.dispatcher.workflow.config)
                         human = getattr(getattr(ladder, "policy", None), "decision_mode", "") == "human"
-                        decision = recovery.apply_auto_accept(self.db, case, decision, policy, human_decisions=human)
+                        decision = recovery.apply_auto_accept(
+                            self.db, case, decision, policy, human_decisions=human,
+                            protected_paths=tuple(getattr(ladder, "protected_paths", ()) or ()),
+                            repo_path=getattr(ladder, "repo_path", None),
+                        )
                     except Exception as exc:  # an unreadable policy auto-accepts nothing
                         self.last_error = f"First Mate auto-accept: {exc}"
                 if decision["action"] == "wait":
@@ -4685,8 +4689,28 @@ class Supervisor:
                 # Recovery runs as a tracked task so polling can continue.
                 self._schedule_recovery(case, decision)
 
+    def _auto_accept_withdrawn(self) -> str:
+        """Why auto-accept is off now (policy re-read at launch), or ``""``."""
+
+        from harbor.auto_accept import policy_from_config
+        ladder = self.unblock_ladder
+        if getattr(getattr(ladder, "policy", None), "decision_mode", "") == "human":
+            return "auto-accept was turned off before the builder started (the decision mode is human)"
+        try:
+            workflow = getattr(self.dispatcher, "workflow", None)
+            if workflow is None:
+                return ""
+            workflow = self.dispatcher.workflow = workflow.reload()
+            policy = policy_from_config(workflow.config)
+        except (OSError, ValueError) as exc:
+            return f"auto-accept was turned off before the builder started (the workflow is unreadable: {exc})"
+        if not policy.enabled:
+            return f"auto-accept was turned off before the builder started ({policy.disabled_by})"
+        return ""
+
     def _schedule_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
         from harbor import first_mate_recovery as recovery
+        from harbor.auto_accept import AutoAcceptWithdrawn
         connection = getattr(self.db, "connection", None)
         self._recovery_tickets.add(case.ticket)
         # Capture the delivery this recovery replaces BEFORE registering
@@ -4715,6 +4739,13 @@ class Supervisor:
                 if not self._first_mate_can_recover(case, reload_policy=True, attempted=attempted):
                     raise _RecoverySuperseded
                 if auto is not None and not answered:
+                    # Re-read the policy at launch: an operator may have opted
+                    # out (or set decisions.mode = "human") while the runner
+                    # was being prepared.  Then nothing is recorded.
+                    why = self._auto_accept_withdrawn()
+                    if why:
+                        from harbor.auto_accept import AutoAcceptWithdrawn
+                        raise AutoAcceptWithdrawn(why)
                     # Recorded just before the launch, so a re-block inside
                     # the builder's turn meets the loop guard.  The receipt is
                     # marked delivered only when the runner reports that the
@@ -4748,6 +4779,14 @@ class Supervisor:
                     # A resume seam that never reached a Harbor runner can
                     # only report success.
                     on_start()
+            except AutoAcceptWithdrawn as exc:
+                # Nothing was recorded and no builder started; the escalation
+                # is still open for a human.
+                await self._notify_operator(
+                    f"recovery-withdrawn:{case.run_id}:{len(case.history)}",
+                    f"First Mate auto-accept of option 1 for escalation #{auto.get('escalation_id')} on "
+                    f"{case.ticket} was not delivered: {exc}; the escalation stays open.")
+                return
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was

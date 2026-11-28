@@ -1135,6 +1135,16 @@ class UnblockLadder:
         resumed = await _invoke_resume(self.resumer, command)
         return resumed, command
 
+    def _auto_accept_withdrawn(self) -> str:
+        """Why auto-accept is now off (re-read at launch), or ``""``."""
+
+        if self.policy.decision_mode == "human":
+            return "auto-accept was turned off before the builder started (the decision mode is human)"
+        policy = self._auto_accept()
+        if not policy.enabled:
+            return f"auto-accept was turned off before the builder started ({policy.disabled_by or 'disabled'})"
+        return ""
+
     def _auto_accept(self) -> AutoAcceptPolicy:
         """The current auto-accept policy; an unreadable workflow disables it."""
 
@@ -1287,6 +1297,9 @@ class UnblockLadder:
         if ticket.get("blocked_by"):
             raise TicketNotUnblockable("blocked ticket has unresolved dependencies")
         blocker_value = dict(blocker or _blocker(final))
+        # The blocker exactly as the builder reported it, before Harbor adds
+        # observed paths: First Mate binds its answer to this digest.
+        reported_blocker = dict(blocker_value)
         ticket_id = _identifier(ticket)
         run_id = _run_id(run)
         kind = _kind(blocker_value)
@@ -1505,7 +1518,7 @@ class UnblockLadder:
         ) or _mentions_protected_path(blocker_value, protected_patterns, authority_repo)
         human_decisions = self.policy.decision_mode == "human"
         auto_accept_policy.record_eligibility(
-            self.db, escalation_id, blocker_value, protected=protected_now, human_decisions=human_decisions,
+            self.db, escalation_id, reported_blocker, protected=protected_now, human_decisions=human_decisions,
         )
         assessment = auto_accept_policy.assess(
             self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
@@ -1517,11 +1530,9 @@ class UnblockLadder:
             accepted = await self._auto_accept_first_option(
                 ticket, ticket_id, run_id, kind, question, blocker_value, escalation, assessment, remediation, searched,
             )
-            if accepted is not None:
+            if isinstance(accepted, UnblockResult):
                 return accepted
-            assessment = auto_accept_policy.Assessment(
-                "refused", assessment.option, assessment.method, "the retained builder session could not be resumed",
-            )
+            assessment = auto_accept_policy.Assessment("refused", assessment.option, assessment.method, accepted)
         elif assessment.accepted:
             assessment = auto_accept_policy.Assessment(
                 "refused", assessment.option, assessment.method, "the escalation has no ledger id or builder session",
@@ -1592,8 +1603,15 @@ class UnblockLadder:
         assessment: auto_accept_policy.Assessment,
         remediation: RemediationResult,
         searched: tuple[str, ...],
-    ) -> UnblockResult | None:
+    ) -> UnblockResult | str:
         """Answer an escalation with the builder's recommended first option.
+
+        Returns the result, or -- when nothing was handed over -- the reason
+        to show in the park comment.  The project policy is re-read right
+        before the resume and again when the runner begins its launch; if
+        auto-accept was turned off meanwhile (``auto_accept_first_option =
+        false`` or ``decisions.mode = "human"``) the launch is abandoned,
+        the receipt withdrawn and the escalation left open.
 
         The receipt is written before the resume, so a re-block inside the
         same resumed session sees it and the loop guard holds.  It is marked
@@ -1613,6 +1631,9 @@ class UnblockLadder:
         """
 
         escalation_id = _value(escalation, "id", default=None)
+        withdrawn = self._auto_accept_withdrawn()
+        if withdrawn:
+            return withdrawn  # nothing recorded; the escalation stays open
         policy = self._auto_accept()
         recommendation = _text(blocker_value.get("recommendation")).strip()
         auto_accept_policy.record(
@@ -1631,10 +1652,21 @@ class UnblockLadder:
 
         from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
 
-        observer = SpawnObserver(on_start=handed_over)
+        gate: dict[str, str] = {}
+
+        def still_enabled() -> None:
+            # Called by the runner as it begins the launch, before any spawn.
+            # Remembered here too, in case a layer between converts the error.
+            why = self._auto_accept_withdrawn()
+            if why:
+                gate["withdrawn"] = why
+                raise auto_accept_policy.AutoAcceptWithdrawn(why)
+
+        observer = SpawnObserver(on_start=handed_over, on_attempt=still_enabled)
         token = SPAWN_OBSERVER.set(observer)
         writes: list[str] = []
         resumed, command = False, None
+        withdrawn_reason = ""
         try:
             try:
                 resumed, command = await self._resume(
@@ -1642,8 +1674,11 @@ class UnblockLadder:
                     reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
                     next_action="Apply option 1, then verify the ticket acceptance criteria.",
                 )
+            except auto_accept_policy.AutoAcceptWithdrawn as exc:
+                withdrawn_reason = str(exc)
             finally:
                 SPAWN_OBSERVER.reset(token)
+            withdrawn_reason = withdrawn_reason or gate.get("withdrawn", "")
             # A resumer that never reached a Harbor runner (an embedded or
             # test seam) can only report success; a real runner reports the
             # actual process start through the observer.
@@ -1661,10 +1696,14 @@ class UnblockLadder:
                         writes.append("comment")
                 except Exception:
                     pass  # a comment failure never undoes a delivered answer
+            elif withdrawn_reason:
+                auto_accept_policy.withdraw(self.db, escalation_id)
             else:
                 auto_accept_policy.reopen(self.db, escalation_id)
+        if withdrawn_reason:
+            return withdrawn_reason
         if not launched:
-            return None
+            return "the retained builder session could not be resumed (no builder started), so it was not delivered"
         receipt = {
             "escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
             "count": assessment.count + 1, "limit": policy.max_auto_accepts,

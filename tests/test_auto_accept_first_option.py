@@ -775,9 +775,12 @@ class RecoveryHost:
     """Just the supervisor state ``Supervisor._schedule_recovery`` touches."""
 
     _schedule_recovery = Supervisor._schedule_recovery
+    _auto_accept_withdrawn = Supervisor._auto_accept_withdrawn
 
-    def __init__(self, db, *, eligible, apply):
+    def __init__(self, db, *, eligible, apply, dispatcher=None, unblock_ladder=None):
         self.db = db
+        self.dispatcher = dispatcher
+        self.unblock_ladder = unblock_ladder
         self._recovery_tickets: set[str] = set()
         self._dispatch_tasks: dict = {}
         self.eligible = list(eligible)  # successive _first_mate_can_recover answers
