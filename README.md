@@ -496,6 +496,61 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
+### Dependency installs before each builder turn
+
+A builder cannot reliably install dependencies itself. Claude Code's sandbox
+refuses to write or delete the files it protects (`.gitmodules`, `.idea/`,
+`.vscode/` and so on), even deep inside `node_modules`. So a sandboxed
+`pnpm install` can delete `node_modules` and then fail to write it back
+(`ERR_PNPM_EPERM ... .gitmodules, Operation not permitted`). The worktree then
+cannot run until a person reinstalls outside the sandbox.
+
+So Harbor installs. It runs the project's `install_command` (from
+`pipeline.md`) outside the sandbox when it creates a worktree. Before each
+builder turn after that, Claude and Codex alike, it runs the command again if
+either of these is true:
+
+- a dependency input at the worktree root changed since Harbor's last install.
+  The inputs are `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
+  `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `bun.lock(b)`,
+  `uv.lock`, `poetry.lock`, `Pipfile.lock`, `requirements.txt`,
+  `Gemfile.lock` and the command itself;
+- the install output is missing or unfinished: no `node_modules`, or no
+  `node_modules/.modules.yaml` (pnpm) or `node_modules/.package-lock.json`
+  (npm). For `uv` it checks for `.venv`.
+
+Harbor records the hashes per worktree in its own SQLite ledger
+(`dependency_installs`), never in the worktree. It logs each check
+(`Harbor: dependencies for <ticket>: ...`). The builder's prompt says what
+Harbor did. It also tells the builder not to run install commands itself. To
+change dependencies, the builder edits `package.json` and updates only the
+lockfile. If the lockfile changes mid-turn, the builder finishes the turn and
+Harbor installs before the next one.
+
+If the install fails, Harbor does not start the turn. The run is `blocked`
+with the install's literal error as the blocker evidence, and the unblock
+ladder escalates it to you once. The ticket's wake is not replayed every poll.
+Fix the cause, then answer the blocker (`/answer`, or a comment on the
+ticket). Harbor installs again before the resumed turn. With
+`install_command: none` nothing changes.
+
+**Safety.** `install_command` runs unsandboxed, as the user running Harbor,
+with Harbor's environment. At worktree creation it runs on the base branch's
+files and inherits Harbor's whole environment, credentials included.
+Before a turn it runs on files the builder can edit: `package.json` scripts,
+`.npmrc` and `.pnpmfile.cjs` all control what runs. So a builder can run code
+outside its sandbox on its next turn, with no PR or merge needed. For that
+reinstall Harbor removes its own credentials from the environment:
+`GITHUB_TOKEN`, `GH_TOKEN`, `LINEAR_API_KEY`, `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, the variable
+`HARBOR_GITHUB_TOKEN_ENV` names, and any `HARBOR_`, `LINEAR_`, `GITHUB_`,
+`GH_`, `ANTHROPIC_`, `OPENAI_`, `CLAUDE_` or `CODEX_` variable whose name
+contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD` or `CREDENTIAL`. An install does
+not need them. A registry token such as `NPM_TOKEN` belongs to the project, and
+is kept. This keeps Harbor's tokens away from the install. It is not a sandbox:
+the install can still read and write anything the Harbor user can. Use
+`install_command: none` on a project whose builder must not have that reach.
+
 ### File edits, extra hosts and `/tmp` for Claude builders
 
 A Claude builder and its child agents have the `Edit` and `Write` tools,
@@ -642,6 +697,7 @@ needs and keeps the delivery instructions opaque.
 | `src/harbor/pr_events.py` | PR-created and external-comment event receipts, risk/comment handoff, and mandatory reply contract. |
 | `src/harbor/unblock.py` | Rung 0 remediation, deterministic capability adapters, bounded restart retry, Terra cite-or-escalate, operator parking, and same-session resume. |
 | `src/harbor/worktree.py` | Fresh `origin/main` worktrees, disk/lock safety, install, and verified-merge cleanup. |
+| `src/harbor/dependencies.py` | The pre-turn reinstall: lockfile hashes in the ledger, install-output checks, credential-free install environment, builder note and blocker. |
 | `src/harbor/runner/base.py` | Runner lifecycle, deadlines, result normalization, liveness, and orphan handling. |
 | `src/harbor/runner/codex.py` | Persistent Luna `codex exec`/`resume` in the isolated worktree. |
 | `src/harbor/runner/stream.py` | JSONL event parsing and final run-result extraction. |
@@ -673,6 +729,11 @@ needs and keeps the delivery instructions opaque.
   worktree. Its Bash sandbox reaches hosts beyond the default allowlist only
   when listed in `[builder] allowed_domains`, and writes `/tmp` only with
   `[builder] allow_tmp = true`.
+- The project's `install_command` runs outside the sandbox when a worktree is
+  created, and again before a builder turn when the worktree's lockfile or
+  `package.json` changed or `node_modules` is missing. Before a turn it runs on
+  files the builder can edit, so it is a path out of the sandbox. Harbor's own
+  credentials are removed from its environment for that run.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
   path out of the sandbox: adb and simctl reach any host, and with `ios` the
