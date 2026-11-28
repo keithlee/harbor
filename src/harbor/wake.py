@@ -42,6 +42,11 @@ from harbor.reengagement import (
 
 DISPATCH_STATES = ("Todo",)
 LIVE_QUEUE_STATUSES = ("queued", "dispatched", "running", "waiting")
+# A failed delivery may be retried with the same idempotency key, but only
+# this many times.  A turn that crashes or reports ``failed`` would otherwise
+# replay the same input into a new paid builder turn on every poll.
+MAX_FAILED_DELIVERIES = 2
+REDELIVERY_CAP_REASON = "redelivery cap reached"
 # ``waiting`` is a completed runner invocation whose session is retained for
 # a later re-engagement.  It must not suppress that very re-engagement.
 ACTIVE_RUN_STATUSES = ("running",)
@@ -979,8 +984,12 @@ class WakeDecider:
         bot_rework_cap: int = 1,
         shadow: bool = False,
         ticket_scope: str | TicketScope | None = None,
+        max_failed_deliveries: int = MAX_FAILED_DELIVERIES,
     ) -> None:
         self.db = db
+        self.max_failed_deliveries = max(1, _as_int(max_failed_deliveries, MAX_FAILED_DELIVERIES))
+        # Keys this decision suppressed only because they hit the cap.
+        self._exhausted: list[str] = []
         self.dispatch_states = frozenset(str(value) for value in dispatch_states)
         self.bot_rework_cap = max(0, _as_int(bot_rework_cap, 1))
         self.shadow = shadow
@@ -1021,7 +1030,15 @@ class WakeDecider:
                     (key,),
                 ).fetchone()
                 if row is not None:
-                    return str(row[0]).casefold() != "failed"
+                    if str(row[0]).casefold() != "failed":
+                        return True
+                    failures = connection.execute(
+                        "SELECT COUNT(*) FROM work_queue WHERE idem_key=? AND status='failed'", (key,)
+                    ).fetchone()[0]
+                    if failures >= self.max_failed_deliveries:
+                        self._exhausted.append(key)
+                        return True
+                    return False
             elif _queue_has_idem(self.db, key, live_only=False):
                 return True
         # Re-engagement keys are facts offered to a specific retained run at a
@@ -1033,6 +1050,44 @@ class WakeDecider:
         self._shadow_idems.add(key)
 
     def decide(
+        self,
+        ticket: Mapping[str, Any],
+        facts: Mapping[str, Any] | None = None,
+    ) -> Wake | None:
+        self._exhausted = []
+        wake = self._decide(ticket, facts)
+        if wake is not None or not self._exhausted:
+            return wake
+        return self._redelivery_stop(ticket, self._exhausted[0])
+
+    def _redelivery_stop(self, ticket: Mapping[str, Any], key: str) -> Wake | None:
+        """Tell the operator once that Harbor stopped re-offering one input."""
+
+        identifier = _identifier(ticket)
+        stop_key = f"{key}@redelivery-cap"
+        if stop_key in self._shadow_stops or (self.db is not None and _queue_has_idem(self.db, stop_key, live_only=False)):
+            return None
+        self._shadow_stops.add(stop_key)
+        if not self.shadow and self.db is not None:
+            _enqueue_stop(self.db, identifier, stop_key, ())
+        run = _last_run(self.db, identifier) if self.db is not None else None
+        run_id = str((run or {}).get("id") or "") or None
+        return Wake(
+            ticket=ticket,
+            action="stop",
+            resume=run_id,
+            instruction="",
+            idem_key=stop_key,
+            facts={"idem_key": key, "failed_deliveries": self.max_failed_deliveries},
+            notify=True,
+            reason=(
+                f"{REDELIVERY_CAP_REASON}: {identifier} failed {self.max_failed_deliveries} turns on the same input "
+                f"({key}); Harbor will not offer it again. A new or edited comment is new input; "
+                f"/retry {identifier} resumes the retained session explicitly."
+            ),
+        )
+
+    def _decide(
         self,
         ticket: Mapping[str, Any],
         facts: Mapping[str, Any] | None = None,

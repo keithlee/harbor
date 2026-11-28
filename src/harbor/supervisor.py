@@ -33,6 +33,7 @@ from harbor.runner.base import (
     reap_orphan_runs,
 )
 from harbor.wake import (
+    REDELIVERY_CAP_REASON,
     Wake,
     WakeDecider,
     TicketScope,
@@ -2116,6 +2117,10 @@ class Supervisor:
             ):
                 mark_threads_seen(self.db, threads, str(head_sha) if head_sha else None)
             await self._handle_runner_result(wake, result)
+        elif wake.action == "stop" and wake.notify and str(wake.reason or "").startswith(REDELIVERY_CAP_REASON):
+            # Visible in /status even when no notifier is configured.
+            self.last_error = str(wake.reason)
+            await self._notify_operator(wake.idem_key, str(wake.reason))
         elif wake.action == "stop" and wake.notify:
             try:
                 await self._invoke(self.notifier, ("notify", "send", "publish"), wake)
@@ -2266,7 +2271,11 @@ class Supervisor:
         try:
             if callable(transition) and wake.idem_key:
                 transitioned = bool(transition("failed", idem_key=wake.idem_key, error=error))
-            if not transitioned:
+            # The ticket-wide fallback is only for a wake with no receipt of
+            # its own.  When this wake's row exists but is already terminal
+            # (the runner closed it), falling back would fail an older live
+            # row for the same ticket and replay that row's instruction.
+            if not transitioned and not self._queue_row_exists(wake.idem_key):
                 transition_ticket = getattr(self.db, "transition_ticket_queue", None)
                 if callable(transition_ticket) and identifier:
                     transition_ticket(
@@ -2280,6 +2289,21 @@ class Supervisor:
             # receipt must remain visible alongside the original dispatch
             # error.  Do not replace the literal delivery exception.
             self.last_error = f"{error} (queue transition failed: {exc})"
+
+    def _queue_row_exists(self, idem_key: str | None) -> bool:
+        """Whether this wake has its own queue receipt, in any status."""
+
+        if not idem_key:
+            return False
+        connection = getattr(self.db, "connection", None) if self.db is not None else None
+        if connection is None:
+            return False
+        try:
+            return connection.execute(
+                "SELECT 1 FROM work_queue WHERE idem_key = ? LIMIT 1", (str(idem_key),)
+            ).fetchone() is not None
+        except sqlite3.Error:
+            return False
 
     def _dispatch_has_no_run(self, identifier: str) -> bool:
         """Return whether a failed delivery created no durable run row."""
