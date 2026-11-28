@@ -413,9 +413,13 @@ goes straight to the operator. The protected list is the configured
 operator's checkout at the commit Harbor created the worktree from, never from
 the builder's worktree, so a builder cannot edit away its own protections.
 
-Harbor reads what changed itself, with hardened git in the run's recorded
-worktree, against that recorded base commit (local refs such as
-`origin/main` are builder-writable and are not trusted). It counts committed,
+Harbor reads what changed itself, with hardened git in the worktree it
+recorded creating for the ticket (never a path named in the builder's
+output), against that recorded base commit (local refs such as
+`origin/main` are builder-writable and are not trusted). The worktree's
+`HEAD` is the builder's to move, so Harbor also diffs the base against the
+head of every PR linked to the ticket, as GitHub reports it, fetching that
+commit from the configured remote when it is not local. It counts committed,
 staged, unstaged and untracked changes; both names of a rename; non-ASCII
 names exactly as stored; and untracked files under a protected pattern even
 when a `.gitignore` hides them. An index entry flagged `assume-unchanged` or
@@ -424,10 +428,11 @@ protected change, and cleanup keeps a worktree that has one. The builder's own
 path claims only add to this.
 
 The ladder fails closed, reporting to the operator, when it cannot observe the
-changes: a run with no recorded worktree, a missing worktree, a run naming the
-operator's checkout or another ticket's worktree, a worktree whose git
-metadata is not the project's, or one with no recorded base commit (for
-example, one created before Harbor recorded worktree custody).
+changes: no recorded worktree, a missing worktree, a run naming any other
+directory (the operator's checkout, another ticket's worktree), a worktree
+whose git metadata is not the project's, no recorded base commit (for
+example, a worktree created before Harbor recorded worktree custody), or a
+linked PR whose head GitHub cannot report or the remote cannot supply.
 
 Unexpected builder exits and failed First Mate invocations receive bounded
 retries. Harbor preserves the builder's native session, exact worktree and
