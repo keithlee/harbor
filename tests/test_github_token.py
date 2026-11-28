@@ -507,6 +507,35 @@ def test_the_rung_zero_probe_cannot_be_shadowed_by_the_worktree(tmp_path: Path, 
     assert "dummy-project-token" not in stderr
 
 
+def test_the_rung_zero_probe_passes_when_github_accepts_the_token(tmp_path: Path, clean_env) -> None:
+    """After main's #61 the helper's `api` needs HARBOR_GITHUB_REPOSITORY; the probe never set it.
+
+    Every check then failed with "no repository configured", and Harbor told the
+    operator GitHub had rejected a token it never sent.
+    """
+    from harbor.facts.remediation import execute_remediation
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text("#!/bin/sh\ncat >/dev/null\nprintf '{\"full_name\": \"owner/repo\"}\\n200'\n")
+    curl.chmod(0o755)
+    clean_env.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    clean_env.setenv("SAMPLE_GITHUB_TOKEN", "dummy-project-token-not-a-secret")
+    github = SimpleNamespace(github_token_env="SAMPLE_GITHUB_TOKEN", github_api_url="https://api.github.com/graphql",
+                             repository="owner/repo", repository_owner="owner", repository_name="repo")
+    result = asyncio.run(execute_remediation({"kind": "github_transport"}, cwd=tmp_path, github_profile=github))
+    assert result.fixed, result.error
+    [command] = result.plan.commands
+    assert "HARBOR_GITHUB_REPOSITORY=owner/repo" in command
+
+    linear_only = SimpleNamespace(github_token_env="SAMPLE_GITHUB_TOKEN", github_api_url="", repository="",
+                                  repository_owner="", repository_name="")
+    result = asyncio.run(execute_remediation({"kind": "github_transport"}, cwd=tmp_path, github_profile=linear_only))
+    assert not result.fixed and result.plan.commands == ()
+    assert "github_repository" in str(result.error)
+
+
 def test_the_builder_helper_command_runs_harbors_helper_from_any_cwd(tmp_path: Path) -> None:
     import subprocess
     from harbor.github_rest import helper_command

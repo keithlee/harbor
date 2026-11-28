@@ -142,14 +142,20 @@ def github_transport_plan(
     if name is None:
         return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
     repository = str(getattr(github_profile, "repository", "") or "")
-    path = f"/repos/{repository}" if repository.count("/") == 1 else "/rate_limit"
+    if repository.count("/") != 1 or not all(repository.split("/")):
+        # The helper acts only on the configured repository, so there is
+        # nothing to check, and nothing a builder could do on GitHub either.
+        fix = f"no github_repository is configured{label}, so builders have no GitHub API access; set github_repository"
+        return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
+    path = f"/repos/{repository}"
     try:
         api = rest_base_url(getattr(github_profile, "github_api_url", None))
     except ValueError as exc:
         fix = f"the GitHub API URL{label} is not usable ({exc}); fix github_api_url"
         return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
+    # The helper's api command acts only on HARBOR_GITHUB_REPOSITORY (#61).
     command = ("env", f"HARBOR_GITHUB_TOKEN_ENV={name}", f"HARBOR_GITHUB_API_URL={api}",
-               *helper_command(), "api", "GET", path)
+               f"HARBOR_GITHUB_REPOSITORY={repository}", *helper_command(), "api", "GET", path)
     return RemediationPlan(
         kind="github_transport",
         commands=(command,),
@@ -162,7 +168,7 @@ def github_transport_plan(
         ),
         failure_fix=(
             f"GitHub rejected the project's token in {name}{label}, or it cannot read "
-            f"{repository or 'the API'}: {missing_token_help(github_profile)}"
+            f"{repository}:{missing_token_help(github_profile)}"
         ),
     )
 
