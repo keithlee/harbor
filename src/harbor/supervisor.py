@@ -369,6 +369,29 @@ class WorktreeDispatcher:
             return False
         return bool(row and str(row[0] or "").casefold() == "running")
 
+    def _launch_authorization(
+        self, identifier: str, run_id: str | None, before: Callable[[], None] | None = None,
+        *, current: bool = True,
+    ) -> Callable[[], None]:
+        """The launch authorization every builder spawn goes through.
+
+        It re-checks, at spawn time, that the ticket is still in this
+        supervisor's scope and (with ``current``) that ``run_id`` is still its
+        current run, then runs the caller's own authorization
+        (``before_launch``). A new dispatch creates its run, so it checks scope
+        only. Runners install dependencies only after it passes
+        (harbor.runner.codex).
+        """
+
+        def authorize() -> None:
+            if not self._in_scope(identifier) or (current and not self._run_is_current(identifier, run_id)):
+                raise RuntimeError(f"the launch for {identifier} is no longer authorized: "
+                                   "the ticket left this scope or its run was superseded")
+            if before is not None:
+                before()
+
+        return authorize
+
     def _execution_lock(self, identifier: str) -> asyncio.Lock:
         """Return the per-ticket lock used by every builder handoff."""
 
@@ -547,7 +570,9 @@ class WorktreeDispatcher:
             self._clear_resume_error(identifier)
             self.worktrees[identifier] = worktree
             self.runners[identifier] = runner
-            result = await self._runner_call(runner, wake, resume=False)
+            result = await self._runner_call(runner, wake, resume=False,
+                                             before_spawn=self._launch_authorization(identifier, wake.run_id,
+                                                                                     current=False))
             await self._record_push_result(wake, result)
             return result
 
@@ -772,9 +797,12 @@ class WorktreeDispatcher:
             )
             if before_launch is None:
                 replace_session()
-                result = await self._runner_call(runner, wake, resume=False)
+                result = await self._runner_call(runner, wake, resume=False,
+                                                 before_spawn=self._launch_authorization(identifier, row["id"]))
             else:
-                result = await self._runner_call(runner, wake, resume=False, before_spawn=replace_session)
+                result = await self._runner_call(
+                    runner, wake, resume=False,
+                    before_spawn=self._launch_authorization(identifier, row["id"], replace_session))
         except BaseException:
             if restore is not None and not replaced:
                 restore()
@@ -948,7 +976,8 @@ class WorktreeDispatcher:
                 workflow = self.workflow = workflow.reload()
                 bind(self.db.connection, self.project, identifier, wake.run_id, workflow)
             wake = replace(wake, instruction=self._with_handoff_gate(identifier, wake.instruction))
-            result = await self._runner_call(runner, wake, resume=True, before_spawn=before_launch)
+            result = await self._runner_call(runner, wake, resume=True,
+                                             before_spawn=self._launch_authorization(identifier, wake.run_id, before_launch))
             await self._record_push_result(wake, result)
             return result
 
@@ -1007,7 +1036,8 @@ class WorktreeDispatcher:
                 instruction=self._with_handoff_gate(ticket, instruction),
                 facts=facts if isinstance(facts, Mapping) else {},
             )
-            result = await self._runner_call(runner, wake, resume=True)
+            result = await self._runner_call(runner, wake, resume=True,
+                                             before_spawn=self._launch_authorization(ticket, run_id))
             await self._record_push_result(wake, result)
             return result
 

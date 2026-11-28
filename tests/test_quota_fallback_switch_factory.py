@@ -61,7 +61,7 @@ def switch(config, db, policy):
     dispatcher, _, _ = build_production_dispatcher(config, db, worktree_manager=object(), quota_policy=policy)
     built = []
 
-    async def runner_call(runner, wake, *, resume):
+    async def runner_call(runner, wake, *, resume, before_spawn=None):
         built.append(runner)
         return {"status": "completed"}
 

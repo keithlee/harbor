@@ -1,4 +1,4 @@
-"""Reinstall a worktree's dependencies outside the builder sandbox before each turn.
+"""Reinstall a worktree's dependencies outside the builder sandbox, before each turn.
 
 A builder cannot reliably install dependencies itself. Claude Code's sandbox
 refuses writes to, and deletion of, files it protects (``.gitmodules``,
@@ -9,21 +9,21 @@ node_modules/eslint-plugin-react/node_modules/resolve_tmp_13868_2/.gitmodules,
 Operation not permitted``). The worktree is then unrunnable until a person
 reinstalls outside the sandbox.
 
-So before every builder turn, after the launch is authorized, Harbor compares
+So before every builder turn, once the launch is authorized, Harbor compares
 the worktree's dependency inputs (``scan_inputs``) with what it recorded at its
 last install, and checks that the install output is present. If either
-changed, it re-runs the project's configured ``install_command`` outside the
-sandbox, as an argument list, never a shell.
+changed, it re-runs the project's configured ``install_command``.
 
-The install runs code the inputs control (lifecycle scripts, ``.pnpmfile.cjs``,
-``.npmrc``), and the builder can edit them. So install scripts run only when
-every input is byte-identical to the base branch tip (read by Harbor from its
-own remote into a private repository, never from refs in the worktree) or to
-the inputs of Harbor's last trusted install. Otherwise Harbor installs with
-scripts and hooks switched off (``without_scripts``), or refuses when it cannot
-switch them off for that package manager, unless the project opted in with
-``[builder] dependency_scripts = "always"``. Either way Harbor's own
-credentials are removed from the environment (``install_environment``).
+That install runs code the worktree chooses, and the builder can edit the
+worktree. Harbor does not try to tell reviewed code from builder code. Every
+install it runs goes through Harbor's own install sandbox
+(``harbor.install_sandbox``), where that code cannot read credentials, write
+outside the worktree and Harbor's private caches, touch git metadata, or reach
+the keychain, LaunchServices or launchd. Harbor's credentials and the SSH
+agent are also removed from its environment, the package manager is resolved
+by absolute path from Harbor's own ``PATH``, and pnpm may not switch to the
+package-manager version the worktree names. Where there is no install sandbox
+(Linux), the pre-turn reinstall is refused with a blocker instead.
 
 What Harbor recorded lives in its SQLite ledger, keyed by worktree path, never
 in the worktree, where the builder could edit it.
@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,28 +48,31 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
-# The blocker kind of a turn Harbor refused to start because its install failed.
-# Rung-0 remediation never acts on it (harbor.facts.remediation), so the raw
-# install output it carries can never trigger another unsandboxed command.
+# The blocker kind of a turn Harbor refused to start because its install failed
+# or could not be contained. Rung-0 remediation never acts on it
+# (harbor.facts.remediation): its evidence is install output the worktree controls.
 BLOCKER_KIND = "dependency_install"
 
-# Inputs, matched by file name at any depth (outside PRUNED directories).
-INPUT_NAMES = frozenset({
+# Inputs, matched by file name (case-insensitively, as macOS resolves them) at
+# any depth outside PRUNED directories. They decide when to reinstall; the
+# install sandbox, not this list, is what contains the install's code.
+INPUT_NAMES = frozenset(name.casefold() for name in (
     "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "package-lock.json", "npm-shrinkwrap.json",
     "yarn.lock", "bun.lock", "bun.lockb", "bunfig.toml",
     ".npmrc", ".pnpmfile.cjs", ".pnpmfile.mjs", ".yarnrc", ".yarnrc.yml",
     "uv.lock", "uv.toml", "pyproject.toml", "setup.py", "setup.cfg", "poetry.lock", "Pipfile", "Pipfile.lock",
     "Gemfile", "Gemfile.lock",
-})
-# Also inputs: every file under top-level patches/, and Yarn's patches, plugins and releases (code Yarn runs).
+))
+# Also inputs: every file under top-level patches/, and Yarn's patches, plugins and releases.
 YARN_CODE_DIRS = frozenset({"patches", "plugins", "releases"})
 # Install output and git metadata are never inputs, and are not walked.
 PRUNED = frozenset({"node_modules", ".git", ".venv", ".pnpm-store"})
 
 DEFAULT_TIMEOUT_SECONDS = 15 * 60.0
+_KILL_GRACE_SECONDS = 10.0
 _ERROR_CHARS = 2000
 _COMMAND_KEY = "(install_command)"
-_SAFE_BRANCH = re.compile(r"[A-Za-z0-9._/-]+")
+SCRIPTS_SETTINGS = ("on", "off")
 
 # Credentials Harbor itself holds. An install does not need them. A package
 # registry token (NPM_TOKEN, NODE_AUTH_TOKEN) is the project's, and is kept.
@@ -82,39 +86,52 @@ _SECRET_PREFIXES = ("HARBOR_", "LINEAR_", "ANTHROPIC_", "OPENAI_", "CLAUDE_", "C
 _SECRET_WORDS = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
 # HARBOR_GITHUB_TOKEN_ENV names the variable that holds the GitHub token.
 _TOKEN_POINTER = "HARBOR_GITHUB_TOKEN_ENV"
+# Pinned for every install: no package-manager version switching (pnpm 10
+# downloads and runs the version package.json names, from the registry the
+# worktree's .npmrc names), no interactive purge prompt, no git config.
+PINNED_ENV = {
+    "npm_config_manage_package_manager_versions": "false",
+    "npm_config_confirm_modules_purge": "false",
+    "npm_config_update_notifier": "false",
+    "npm_config_fund": "false",
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+    "COREPACK_ENABLE_STRICT": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 
 
 def install_environment(environ: Mapping[str, str] | None = None, *, extra_secrets: Iterable[str] = (),
-                        scripts: bool = True) -> dict[str, str]:
-    """``environ`` (default: Harbor's own) without Harbor's credentials.
+                        worktree: str | Path | None = None, scripts: bool = True) -> dict[str, str]:
+    """``environ`` (default: Harbor's own) prepared for an install.
 
     Removed: the names in ``HARBOR_SECRET_NAMES``; any Harbor, Linear, GitHub
     or model-provider variable whose name contains TOKEN, KEY, SECRET,
-    PASSWORD or CREDENTIAL; the variable ``HARBOR_GITHUB_TOKEN_ENV`` names; and
-    ``extra_secrets``. With ``scripts=False`` (inputs the builder changed) the
-    SSH agent socket is removed too, and npm, pnpm and Yarn are told through
-    their environment not to run scripts, in addition to the command's flags.
-
-    ``HOME`` is kept on purpose: version-manager shims (volta, asdf, mise,
-    nvm, corepack), the pnpm store, the npm cache and the user's registry
-    ``.npmrc`` all resolve from it, so a private ``HOME`` breaks or silently
-    changes ordinary installs. It would not confine anything either: an
-    install can read ``~/.ssh`` by absolute path. The protection for
-    builder-changed inputs is that their scripts do not run.
+    PASSWORD or CREDENTIAL; the variable ``HARBOR_GITHUB_TOKEN_ENV`` names;
+    ``extra_secrets``; every ``GIT_*`` variable; and ``SSH_AUTH_SOCK``. ``PATH``
+    loses empty, relative and worktree entries (``harbor.safe_git.safe_path``).
+    ``PINNED_ENV`` is set. With ``scripts=False`` npm, pnpm and Yarn are also
+    told not to run scripts.
     """
 
+    from harbor.safe_git import safe_path
+
     source = dict(os.environ if environ is None else environ)
-    drop = set(HARBOR_SECRET_NAMES) | {str(name) for name in extra_secrets if name}
+    drop = set(HARBOR_SECRET_NAMES) | {str(name) for name in extra_secrets if name} | {"SSH_AUTH_SOCK"}
     pointer = source.get(_TOKEN_POINTER)
     if pointer:
         drop.add(pointer)
     for name in source:
         upper = name.upper()
-        if upper in drop or (upper.startswith(_SECRET_PREFIXES) and _SECRET_WORDS.search(upper)):
+        if (upper in drop or upper.startswith("GIT_")
+                or (upper.startswith(_SECRET_PREFIXES) and _SECRET_WORDS.search(upper))):
             drop.add(name)
     env = {name: value for name, value in source.items() if name not in drop}
+    outside = Path(worktree).expanduser().resolve() if worktree is not None else None
+    env["PATH"] = safe_path(source.get("PATH", ""), outside=outside)
+    env.update(PINNED_ENV)
     if not scripts:
-        env.pop("SSH_AUTH_SOCK", None)
         env.update(npm_config_ignore_scripts="true", YARN_ENABLE_SCRIPTS="0")
     return env
 
@@ -141,17 +158,47 @@ def _program(command: Sequence[str]) -> tuple[str, int]:
     return Path(command[index]).name, index
 
 
-def _is_input(path: str) -> bool:
+def resolve_command(command: Sequence[str], worktree: str | Path, environ: Mapping[str, str] | None = None
+                    ) -> tuple[tuple[str, ...] | None, str]:
+    """``command`` with its executable as an absolute path from Harbor's own ``PATH``, or ``(None, why)``.
+
+    Empty, relative and worktree ``PATH`` entries are ignored, so a ``pnpm``
+    the builder planted in ``node_modules/.bin`` or the worktree root is never
+    the one that runs. A configured absolute path inside the worktree is refused.
+    """
+
+    from harbor.safe_git import safe_path
+
+    if not command:
+        return None, "the install command is empty"
+    root = Path(worktree).expanduser().resolve()
+    name = command[0]
+    if os.path.isabs(name):
+        found = name
+    else:
+        path = safe_path((os.environ if environ is None else environ).get("PATH", ""), outside=root)
+        found = shutil.which(name, path=path) or ""
+    if not found:
+        return None, f"`{name}` is not on Harbor's PATH (outside the worktree)"
+    real = Path(found).resolve()
+    if real == root or root in real.parents:
+        return None, f"`{found}` is inside the worktree"
+    return (found, *command[1:]), ""
+
+
+def _is_input(path: str, extra: frozenset[str] = frozenset()) -> bool:
     parts = PurePosixPath(path).parts
     if not parts or any(part in PRUNED for part in parts):
         return False
-    name = parts[-1]
+    if path in extra:
+        return True
+    name = parts[-1].casefold()
     if name in INPUT_NAMES or (name.startswith("requirements") and name.endswith(".txt")):
         return True
-    if parts[0] == "patches":
+    first = parts[0].casefold()
+    if first == "patches":
         return len(parts) > 1
-    # Yarn runs .yarn/releases (yarnPath) and .yarn/plugins; .yarn/cache is package data, not hashed.
-    return parts[0] == ".yarn" and len(parts) > 2 and parts[1] in YARN_CODE_DIRS
+    return first == ".yarn" and len(parts) > 2 and parts[1].casefold() in YARN_CODE_DIRS
 
 
 def _blob(data: bytes) -> str:
@@ -160,21 +207,35 @@ def _blob(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def scan_inputs(worktree: str | Path) -> dict[str, str]:
-    """Every dependency input in ``worktree``, tracked or not: ``path -> "file:<blob id>"`` or ``"link:<blob id>"``.
+def _patched_dependencies(root: Path) -> frozenset[str]:
+    """Patch files that package.json's ``pnpm.patchedDependencies`` points at, wherever they are."""
 
-    The walk does not follow directory symlinks. A symlinked input is recorded
-    by its link text, as git records it, so it can only match a symlink.
-    """
+    try:
+        manifest = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        patches = (manifest.get("pnpm") or {}).get("patchedDependencies") or {}
+    except (OSError, ValueError, AttributeError):
+        return frozenset()
+    found = set()
+    for value in patches.values() if isinstance(patches, dict) else ():
+        if isinstance(value, str):
+            candidate = PurePosixPath(os.path.normpath(value))
+            if not candidate.is_absolute() and ".." not in candidate.parts:
+                found.add(candidate.as_posix())
+    return frozenset(found)
+
+
+def scan_inputs(worktree: str | Path) -> dict[str, str]:
+    """Every dependency input in ``worktree``, tracked or not: ``path -> "file:<blob id>"`` or ``"link:<blob id>"``."""
 
     root = Path(worktree)
+    extra = _patched_dependencies(root)
     found: dict[str, str] = {}
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(name for name in dirnames if name not in PRUNED)
         for name in filenames + [name for name in dirnames if (Path(directory) / name).is_symlink()]:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
-            if not _is_input(relative):
+            if not _is_input(relative, extra):
                 continue
             try:
                 if path.is_symlink():
@@ -222,8 +283,7 @@ def missing_output(worktree: str | Path, command: Sequence[str]) -> str | None:
 
     The marker checked is the one the configured package manager writes when
     an install finishes: ``node_modules/.modules.yaml`` for pnpm,
-    ``node_modules/.package-lock.json`` for npm. A sandboxed install that failed
-    half way (HAN-94) leaves ``node_modules`` without it.
+    ``node_modules/.package-lock.json`` for npm.
     """
 
     root = Path(worktree)
@@ -243,7 +303,12 @@ def missing_output(worktree: str | Path, command: Sequence[str]) -> str | None:
 
 
 def without_scripts(command: Sequence[str], inputs: Mapping[str, str]) -> tuple[tuple[str, ...] | None, str]:
-    """``command`` with install scripts and hooks switched off, or ``(None, why it cannot be)``."""
+    """``command`` with install scripts and hooks switched off, or ``(None, why it cannot be)``.
+
+    Used only for ``[builder] dependency_scripts = "off"``. It is a project
+    preference, not a security boundary: the install sandbox contains the
+    install either way.
+    """
 
     command = tuple(command)
     program, index = _program(command)
@@ -256,104 +321,29 @@ def without_scripts(command: Sequence[str], inputs: Mapping[str, str]) -> tuple[
     if program == "bun" and sub in {"install", "i"}:
         return command + ("--ignore-scripts",), ""
     if program == "yarn" and sub in {"", "install"}:
-        rc = sorted(path for path in inputs if PurePosixPath(path).name in {".yarnrc", ".yarnrc.yml"}
-                    or path.startswith(".yarn/"))
+        rc = sorted(path for path in inputs if PurePosixPath(path).name.casefold() in {".yarnrc", ".yarnrc.yml"}
+                    or path.casefold().startswith(".yarn/"))
         if rc:
             return None, (f"Yarn loads {', '.join(rc[:3])} (yarnPath, plugins), which run code "
                           "that no Yarn flag switches off")
         return command + ("--ignore-scripts",), ""
     if program == "uv" and sub == "sync":
-        # Never build the project, workspace members, local paths or source distributions:
-        # each runs a build backend that the inputs choose.
         return command + ("--no-install-project", "--no-install-workspace", "--no-install-local", "--no-build"), ""
     return None, f"Harbor knows no way to switch off install scripts for `{shlex.join(command)}`"
 
 
-@dataclass(frozen=True)
-class BaseSource:
-    """Where Harbor reads the base branch: its own remote, never the worktree's refs.
+def _pinned(command: tuple[str, ...]) -> tuple[str, ...]:
+    """pnpm never switches to the package-manager version the worktree names (also pinned by environment)."""
 
-    ``token_env`` names the variable holding Harbor's GitHub token; it is read
-    when needed and only ever reaches Harbor's own git fetch.
-    """
-
-    fetch_url: str
-    branch: str
-    token_env: str = ""
-
-
-def _git_env(home: str, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1",
-               GIT_CEILING_DIRECTORIES=home)
-    env.update(extra or {})
-    return env
-
-
-def base_inputs(source: BaseSource, *, environ: Mapping[str, str] | None = None,
-                timeout: float = 120) -> tuple[dict[str, str] | None, str]:
-    """The base branch tip's dependency inputs, ``path -> "file:<blob id>"``, and a description.
-
-    git runs in a fresh private bare repository with no alternates, so nothing
-    the builder can write (the project's refs, objects or config) is read. The
-    tip is fetched from ``source.fetch_url`` with only trees (``--depth=1
-    --filter=blob:none``); git verifies every fetched object against its id, so
-    the blob ids in its trees are the base branch's. On failure the dict is
-    None and the description says why.
-    """
-
-    from harbor.device_proof import HARDENING, _auth_env, redact
-
-    branch = source.branch
-    label = f"origin/{branch}"
-    if not _SAFE_BRANCH.fullmatch(branch or "") or branch.startswith("-") or ".." in branch:
-        return None, f"the base branch name {branch!r} is not a plain branch name"
-    environ = os.environ if environ is None else environ
-    token = environ.get(source.token_env) if source.token_env else None
-    with tempfile.TemporaryDirectory(prefix="harbor-deps-") as home:
-        repo = str(Path(home) / "base.git")
-
-        def git(*args: str, extra: Mapping[str, str] | None = None) -> subprocess.CompletedProcess:
-            return subprocess.run(["git", "--no-replace-objects", *HARDENING, "--git-dir", repo, *args],
-                                  capture_output=True, text=True, timeout=timeout, cwd=home,
-                                  env=_git_env(home, extra))
-
-        try:
-            init = subprocess.run(["git", *HARDENING, "init", "--bare", "--quiet", repo], capture_output=True,
-                                  text=True, timeout=timeout, cwd=home, env=_git_env(home))
-            if init.returncode != 0:
-                return None, f"could not create a private repository: {init.stderr.strip()}"
-            fetched = git("fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "--depth=1", "--filter=blob:none",
-                          "--upload-pack=git-upload-pack", "--end-of-options", source.fetch_url,
-                          f"+refs/heads/{branch}:refs/harbor/base", extra=_auth_env(source.fetch_url, token))
-            if fetched.returncode != 0:
-                detail = redact((fetched.stderr or fetched.stdout or "").strip(), token).splitlines()
-                return None, f"could not fetch {label} from {source.fetch_url}: {detail[-1] if detail else 'unknown error'}"
-            sha = git("rev-parse", "--verify", "--end-of-options", "refs/harbor/base^{commit}").stdout.strip()
-            listed = git("ls-tree", "-r", "-z", "--full-tree", "--end-of-options", "refs/harbor/base")
-        except (OSError, subprocess.SubprocessError) as exc:
-            return None, f"could not read {label}: {exc}"
-        if listed.returncode != 0 or not sha:
-            return None, f"could not list {label}: {listed.stderr.strip()}"
-    inputs: dict[str, str] = {}
-    for record in listed.stdout.split("\0"):
-        meta, _, path = record.partition("\t")
-        fields = meta.split()
-        if len(fields) != 3 or not _is_input(path):
-            continue
-        mode, _, object_id = fields
-        if mode == "120000":
-            inputs[path] = "link:" + object_id
-        elif mode in {"100644", "100755"}:
-            inputs[path] = "file:" + object_id
-    return inputs, f"{label} at {sha[:12]}"
+    program, _ = _program(command)
+    return command + ("--config.manage-package-manager-versions=false",) if program == "pnpm" else command
 
 
 def _schema(connection: Any) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS dependency_installs ("
-        "worktree TEXT PRIMARY KEY, project TEXT, fingerprint TEXT, inputs TEXT, trusted_inputs TEXT, "
-        "status TEXT, scripts INTEGER, output_missing TEXT, command TEXT, error TEXT, updated_at TEXT)"
+        "worktree TEXT PRIMARY KEY, project TEXT, fingerprint TEXT, inputs TEXT, status TEXT, "
+        "output_missing TEXT, command TEXT, error TEXT, updated_at TEXT)"
     )
 
 
@@ -380,7 +370,6 @@ class InstallRecord:
     fingerprint: str
     inputs: dict[str, str]
     status: str
-    trusted_inputs: dict[str, str] | None = None
     output_missing: str = ""
 
 
@@ -389,72 +378,59 @@ def recorded(connection: Any, worktree: str | Path) -> InstallRecord | None:
 
     _schema(connection)
     row = connection.execute(
-        "SELECT fingerprint, inputs, status, trusted_inputs, output_missing FROM dependency_installs WHERE worktree=?",
+        "SELECT fingerprint, inputs, status, output_missing FROM dependency_installs WHERE worktree=?",
         (_key(worktree),),
     ).fetchone()
     if row is None:
         return None
-    return InstallRecord(str(row[0] or ""), _json_map(row[1]) or {}, str(row[2] or ""), _json_map(row[3]),
-                         str(row[4] or ""))
+    return InstallRecord(str(row[0] or ""), _json_map(row[1]) or {}, str(row[2] or ""), str(row[3] or ""))
 
 
 def record(connection: Any, worktree: str | Path, command: Sequence[str], *, status: str,
-           inputs: Mapping[str, str] | None = None, trusted: bool = False,
-           trusted_inputs: Mapping[str, str] | None = None, scripts: bool = True,
-           error: str = "", project: str = "") -> None:
-    """Record an install of ``worktree``.
-
-    ``inputs`` defaults to its current input hashes. ``trusted`` marks those
-    inputs as safe to run scripts on later (a worktree made from the base
-    branch, or inputs that matched it); otherwise ``trusted_inputs`` carries the
-    previous trusted set forward.
-    """
+           inputs: Mapping[str, str] | None = None, error: str = "", project: str = "") -> None:
+    """Record an install of ``worktree`` (``inputs`` defaults to its current input hashes)."""
 
     _schema(connection)
     hashes = dict(inputs) if inputs is not None else input_hashes(worktree, command)
-    trust = hashes if trusted else (dict(trusted_inputs) if trusted_inputs is not None else None)
-    missing = missing_output(worktree, command) or "" if status == "installed" else ""
+    missing = (missing_output(worktree, command) or "") if status == "installed" else ""
     with connection:
         connection.execute(
-            "INSERT OR REPLACE INTO dependency_installs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (_key(worktree), project, _digest(hashes), json.dumps(hashes, sort_keys=True),
-             json.dumps(trust, sort_keys=True) if trust is not None else None, status, int(bool(scripts)),
-             missing, json.dumps(list(command)), error, _now()),
+            "INSERT OR REPLACE INTO dependency_installs VALUES (?,?,?,?,?,?,?,?,?)",
+            (_key(worktree), project, _digest(hashes), json.dumps(hashes, sort_keys=True), status, missing,
+             json.dumps(list(command)), error, _now()),
         )
 
 
 STALE = "stale"
 
 
-def schedule_reinstall(connection: Any, worktree: str | Path) -> None:
+def schedule_reinstall(connection: Any, worktree: str | Path, *, lock: Any = None) -> None:
     """Make the next pre-turn check reinstall ``worktree``; nothing runs now.
 
     Rung-0 remediation calls this for a builder-reported ``Cannot find module``
-    instead of running a package manager itself, so that reinstall goes through
-    ``prepare_dependencies``: the project's install_command, its environment
-    and process group, and install scripts only on base-matching or trusted
-    inputs. The trusted inputs are kept. A worktree with no record already
-    reinstalls on its next turn.
+    instead of running a package manager itself, so the reinstall goes through
+    ``prepare_dependencies`` and its sandbox. ``lock`` is the ledger's lock.
     """
 
-    _schema(connection)
-    with connection:
-        connection.execute("UPDATE dependency_installs SET status=?, updated_at=? WHERE worktree=?",
-                           (STALE, _now(), _key(worktree)))
+    with lock if lock is not None else contextlib.nullcontext():
+        _schema(connection)
+        with connection:
+            connection.execute("UPDATE dependency_installs SET status=?, updated_at=? WHERE worktree=?",
+                               (STALE, _now(), _key(worktree)))
 
 
 @dataclass(frozen=True)
 class DependencyCheck:
     """What the pre-turn check found and did."""
 
-    action: str  # "current", "installed" or "failed"
+    action: str  # "current", "installed", "failed" or "skipped"
     command: tuple[str, ...]
     reasons: tuple[str, ...] = ()
     error: str = ""
     returncode: int | None = None
     ran: bool = True
     scripts: bool | None = None  # whether install scripts were allowed; None when nothing ran
-    trust: str = ""  # why scripts were or were not allowed
+    isolation: str = ""
     ran_command: tuple[str, ...] = field(default=())
 
     @property
@@ -469,21 +445,19 @@ class DependencyCheck:
     def ran_text(self) -> str:
         return shlex.join(self.ran_command or self.command)
 
-    def _scripts_text(self) -> str:
-        if self.scripts is None:
-            return ""
-        state = "on" if self.scripts else "OFF"
-        return f" with install scripts {state} ({self.trust})"
-
     def line(self) -> str:
         """One clause, starting with a verb, for the log and the builder's prompt."""
 
         why = "; ".join(self.reasons)
         if self.action == "current":
             return f"found the dependencies up to date, so no install was needed (`{self.command_text}` last ran on these inputs)"
+        if self.action == "skipped":
+            return f"did not check the dependencies: {self.error}"
         if not self.ran:
             return f"refused to run `{self.command_text}` because {why}: {self.error}"
-        ran = f"ran `{self.ran_text}` outside the sandbox{self._scripts_text()} because {why}"
+        where = f" in {self.isolation}" if self.isolation else ""
+        scripts = "" if self.scripts is None else f" with install scripts {'on' if self.scripts else 'OFF'}"
+        ran = f"ran `{self.ran_text}`{where}{scripts} because {why}"
         if self.action == "installed":
             return f"{ran}; it succeeded"
         return f"{ran}; it FAILED with exit code {self.returncode}: {self.error}"
@@ -505,76 +479,93 @@ def _changed_reasons(previous: InstallRecord | None, current: Mapping[str, str])
     return [f"{shown} changed since Harbor's last install"]
 
 
-def _trust(previous: InstallRecord | None, current: Mapping[str, str], base: BaseSource | None,
-           environ: Mapping[str, str] | None) -> tuple[bool, str]:
-    """Whether every input is one Harbor may run install scripts on, and why (not)."""
-
-    if previous is not None and previous.trusted_inputs == dict(current):
-        return True, "the inputs match Harbor's last trusted install"
-    if base is None:
-        return False, "the inputs changed and Harbor has no base branch to compare them with"
-    tip, description = base_inputs(base, environ=environ)
-    if tip is None:
-        return False, f"the inputs changed and Harbor could not read the base branch: {description}"
-    files = {path: value for path, value in current.items() if path != _COMMAND_KEY}
-    if files == tip:
-        return True, f"every input matches {description}"
-    differ = sorted(path for path in set(files) | set(tip) if files.get(path) != tip.get(path))
-    shown = ", ".join(differ[:6]) + (f" and {len(differ) - 6} more" if len(differ) > 6 else "")
-    return False, f"the builder's inputs differ from {description}: {shown}"
-
-
 def _kill_group(process: subprocess.Popen) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(process.pid, signal.SIGKILL)
 
 
-def _communicate(process: subprocess.Popen, timeout: float) -> tuple[int, str]:
-    try:
-        out, err = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # The install may have started children (postinstall, node-gyp): stop them all.
-        _kill_group(process)
-        process.communicate()
-        return 124, f"timed out after {timeout:.0f}s"
-    return int(process.returncode), (err or out or "").strip()
-
-
-def _spawn(command: Sequence[str], cwd: str | Path, env: Mapping[str, str]) -> subprocess.Popen:
+def _spawn(command: Sequence[str], cwd: str | Path, env: Mapping[str, str], output: Any) -> subprocess.Popen:
+    # Output goes to a file, never a pipe: a descendant that keeps a pipe open
+    # (a daemon a postinstall started) could otherwise hold Harbor past its deadline.
     return subprocess.Popen(list(command), cwd=str(cwd), env=dict(env), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _wait(process: subprocess.Popen, timeout: float) -> int:
+    """The exit code, or 124 after killing the whole group at ``timeout``; never waits past the grace period."""
+
+    try:
+        code = int(process.wait(timeout=timeout))
+    except subprocess.TimeoutExpired:
+        _kill_group(process)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=_KILL_GRACE_SECONDS)
+        return 124
+    # Leftover children in the install's group (a watcher a script started) are stopped too.
+    _kill_group(process)
+    return code
+
+
+def _read_output(handle: Any) -> str:
+    handle.flush()
+    handle.seek(0)
+    return handle.read().decode("utf-8", errors="replace").strip()
 
 
 def run_hardened(command: Sequence[str], cwd: str | Path, env: Mapping[str, str],
                  timeout: float = DEFAULT_TIMEOUT_SECONDS) -> tuple[int, str]:
-    """Run ``command`` in its own process group; on timeout kill the whole group. ``(returncode, output)``."""
+    """Run ``command`` in its own process group with a hard deadline. ``(returncode, output)``."""
 
-    try:
-        process = _spawn(command, cwd, env)
-    except FileNotFoundError as exc:
-        return 127, str(exc)
-    except OSError as exc:
-        return 126, str(exc)
-    try:
-        return _communicate(process, timeout)
-    except BaseException:
-        _kill_group(process)
-        raise
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = _spawn(command, cwd, env, output)
+        except FileNotFoundError as exc:
+            return 127, str(exc)
+        except OSError as exc:
+            return 126, str(exc)
+        try:
+            code = _wait(process, timeout)
+        except BaseException:
+            _kill_group(process)
+            raise
+        text = _read_output(output)
+    return code, (f"timed out after {timeout:.0f}s" + (f": {text[-500:]}" if text else "")) if code == 124 else text
 
 
 async def _run_async(command: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float) -> tuple[int, str]:
-    try:
-        process = _spawn(command, cwd, env)
-    except FileNotFoundError as exc:
-        return 127, str(exc)
-    except OSError as exc:
-        return 126, str(exc)
-    try:
-        return await asyncio.to_thread(_communicate, process, timeout)
-    except BaseException:
-        # Operator exit or supervisor shutdown: never leave an unsandboxed install running.
-        _kill_group(process)
-        raise
+    with tempfile.TemporaryFile() as output:
+        try:
+            process = _spawn(command, cwd, env, output)
+        except FileNotFoundError as exc:
+            return 127, str(exc)
+        except OSError as exc:
+            return 126, str(exc)
+        try:
+            code = await asyncio.to_thread(_wait, process, timeout)
+        except BaseException:
+            # Operator exit or supervisor shutdown: never leave an install running.
+            _kill_group(process)
+            raise
+        text = _read_output(output)
+    return code, (f"timed out after {timeout:.0f}s" + (f": {text[-500:]}" if text else "")) if code == 124 else text
+
+
+def _git_dirs(worktree: Path) -> list[Path]:
+    from harbor.safe_git import main_git_dir
+
+    dirs = []
+    with contextlib.suppress(OSError, ValueError):
+        common = main_git_dir(worktree)
+        if common is not None:
+            dirs.append(common)
+    return dirs
+
+
+def isolated_command(isolation: Any, command: Sequence[str], worktree: Path, env: Mapping[str, str],
+                     repo_git: Sequence[Path] = ()) -> tuple[list[str], dict[str, str], Callable[[], None]]:
+    """``command`` and ``env`` wrapped by ``isolation`` (``harbor.install_sandbox.MacSandbox``)."""
+
+    return isolation.prepare(command, worktree, env, git_dirs=[*_git_dirs(worktree), *repo_git])
 
 
 async def prepare_dependencies(
@@ -588,14 +579,15 @@ async def prepare_dependencies(
     extra_secrets: Iterable[str] = (),
     environ: Mapping[str, str] | None = None,
     lock: Any = None,
-    base: BaseSource | None = None,
-    scripts_policy: str = "base",
+    isolation: Any = None,
+    scripts: str = "on",
 ) -> DependencyCheck:
-    """Reinstall ``worktree`` when its dependency inputs changed or its output is missing.
+    """Reinstall ``worktree``, in ``isolation``, when its inputs changed or its output is missing.
 
-    Ledger access stays on the caller's thread (Harbor's SQLite connection
-    belongs to the supervisor's event loop); the install and the base branch
-    read run in worker threads, so the loop is never stalled.
+    ``isolation`` is Harbor's install sandbox; ``None`` means this host has
+    none, and a needed reinstall is refused rather than run uncontained.
+    Ledger access stays on the caller's thread; the install runs in a worker
+    thread, so the supervisor's loop is never stalled.
     """
 
     command = tuple(command)
@@ -613,47 +605,72 @@ async def prepare_dependencies(
         previous = recorded(connection, target)
     reasons = _changed_reasons(previous, current)
     missing = missing_output(target, command)
-    # A marker the package manager never writes (npm without dependencies, a pnpm
-    # project that ships package-lock.json) was already absent after Harbor's own
-    # successful install; it is not a reason to reinstall every turn.
+    # A marker the package manager never writes was already absent after Harbor's
+    # own successful install: not a reason to reinstall every turn.
     if missing and not (previous is not None and previous.status == "installed" and previous.output_missing == missing):
         reasons.append(missing)
     if not reasons:
         return DependencyCheck("current", command)
-    if scripts_policy == "always":
-        trusted, why = False, '[builder] dependency_scripts = "always" allows scripts on any inputs'
-        scripts = True
-    else:
-        trusted, why = await asyncio.to_thread(_trust, previous, current, base, environ)
-        scripts = trusted
-    carried = previous.trusted_inputs if previous is not None else None
-    effective: tuple[str, ...] | None = command
-    if not scripts:
-        effective, refusal = without_scripts(command, current)
+
+    def refuse(error: str) -> DependencyCheck:
+        with lock:
+            record(connection, target, command, status="refused", inputs=current, error=error, project=project)
+        return DependencyCheck("failed", command, tuple(reasons), error, 126, ran=False)
+
+    if isolation is None:
+        return refuse("this host has no install sandbox (Harbor's is macOS sandbox-exec), and Harbor does not "
+                      "run an install of builder-editable files uncontained. Run it by hand outside the sandbox, "
+                      "then answer this blocker, or set install_command: none")
+    resolved, why = resolve_command(command, target, environ)
+    if resolved is None:
+        return refuse(why)
+    effective: tuple[str, ...] | None = resolved
+    if scripts == "off":
+        effective, why = without_scripts(resolved, current)
         if effective is None:
-            error = (f"{why}, and {refusal}. Harbor will not run builder-changed install inputs outside the sandbox. "
-                     "Make the inputs match the base branch, install by hand, or set "
-                     '[builder] dependency_scripts = "always" in .harbor/workflow/workflow.toml '
-                     "(that runs builder-written code outside the sandbox)")
-            with lock:
-                record(connection, target, command, status="refused", inputs=current, trusted_inputs=carried,
-                       scripts=False, error=error, project=project)
-            return DependencyCheck("failed", command, tuple(reasons), error, 126, ran=False, scripts=False, trust=why)
-    env = install_environment(environ, extra_secrets=extra_secrets, scripts=scripts)
-    returncode, output = await _run_async(effective, target, env, timeout_seconds)
-    check = dict(command=command, reasons=tuple(reasons), scripts=scripts, trust=why, ran_command=effective)
+            return refuse(f'[builder] dependency_scripts = "off", but {why}')
+    effective = _pinned(effective)
+    env = install_environment(environ, extra_secrets=extra_secrets, worktree=target, scripts=scripts != "off")
+    argv, env, cleanup = isolated_command(isolation, effective, target, env)
+    try:
+        returncode, output = await _run_async(argv, target, env, timeout_seconds)
+    finally:
+        cleanup()
+    check = dict(command=command, reasons=tuple(reasons), scripts=scripts != "off",
+                 isolation=getattr(isolation, "name", "an install sandbox"), ran_command=effective)
     if returncode == 0:
         with lock:
             # Hash again: the install may rewrite its own lockfile (pnpm, uv).
-            record(connection, target, command, status="installed", trusted=trusted, trusted_inputs=carried,
-                   scripts=scripts, project=project)
+            record(connection, target, command, status="installed", project=project)
         return DependencyCheck("installed", returncode=0, **check)
     from harbor.url_credentials import redact_userinfo
     error = redact_userinfo(output[-_ERROR_CHARS:]) or f"exit code {returncode} with no output"
     with lock:
-        record(connection, target, command, status="failed", inputs=current, trusted_inputs=carried,
-               scripts=scripts, error=error, project=project)
+        record(connection, target, command, status="failed", inputs=current, error=error, project=project)
     return DependencyCheck("failed", error=error, returncode=returncode, **check)
+
+
+def creation_install(command: Sequence[str], worktree: Path, *, repo: Path, timeout: float,
+                     isolation: Any = None) -> tuple[int, str]:
+    """The install ``WorktreeManager`` runs in a new worktree: sandboxed where Harbor can, credentials removed.
+
+    Without an install sandbox (Linux) it runs as before, unsandboxed on the
+    base branch's files, but still without Harbor's credentials.
+    """
+
+    target = Path(worktree).expanduser().resolve()
+    resolved, why = resolve_command(command, target)
+    if resolved is None:
+        return 127, why
+    env = install_environment(worktree=target)
+    argv: Sequence[str] = _pinned(resolved)
+    cleanup: Callable[[], None] = lambda: None
+    if isolation is not None:
+        argv, env, cleanup = isolated_command(isolation, argv, target, env, repo_git=[repo / ".git"])
+    try:
+        return run_hardened(argv, target, env, timeout)
+    finally:
+        cleanup()
 
 
 def builder_note(check: DependencyCheck) -> str:
@@ -663,31 +680,24 @@ def builder_note(check: DependencyCheck) -> str:
         "Harbor dependencies: before each turn Harbor checks whether the dependency inputs (lockfiles, "
         "package.json, .npmrc, .pnpmfile.cjs, patches) changed since its last install, or the install output "
         "(node_modules) is missing, and if so runs the project's install command "
-        f"(`{check.command_text}`) outside your sandbox. Before this turn Harbor {check.line()}.",
+        f"(`{check.command_text}`) outside your sandbox, in its own install sandbox. "
+        f"Before this turn Harbor {check.line()}.",
         "Do not run install or reinstall commands yourself (pnpm install, npm ci, npm install, yarn install, "
         "or anything else that deletes or rewrites node_modules): the sandbox cannot write some files inside "
         "node_modules, so an install from inside it can leave this worktree unrunnable. To change dependencies, "
         "edit package.json and update only the lockfile (for example `pnpm install --lockfile-only` or "
         "`npm install --package-lock-only`). If the lockfile changes during this turn, including through a "
-        "merge, finish the turn: Harbor installs before the next one.",
+        "merge, finish the turn: Harbor installs before the next one. Install scripts run without network "
+        "credentials, without git metadata and with writes limited to this worktree, so a script that needs "
+        "more fails; report that as a blocker.",
     ]
     if check.scripts is False:
-        lines.append(
-            "Install scripts were switched off for that install (postinstall, prepare and similar did not run, "
-            "and neither did .pnpmfile.cjs), because the inputs differ from the base branch. Harbor runs them "
-            "again once the inputs match the base branch. If the work needs them, report that as a blocker; "
-            "do not run them yourself."
-        )
+        lines.append("Install scripts were switched off for that install ([builder] dependency_scripts = \"off\").")
     return "\n".join(lines)
 
 
 def blocker(check: DependencyCheck, worktree: str | Path, ticket: str) -> dict[str, str]:
-    """The structured blocker for a turn Harbor refused to start.
-
-    Its kind is ``BLOCKER_KIND``, which rung-0 remediation never acts on: the
-    evidence is the install's raw output, which the inputs (and so the builder)
-    control.
-    """
+    """The structured blocker for a turn Harbor refused to start (kind ``BLOCKER_KIND``)."""
 
     command = check.ran_text if check.ran else check.command_text
     did = "failed" if check.ran else "was refused"
@@ -704,21 +714,24 @@ def blocker(check: DependencyCheck, worktree: str | Path, ticket: str) -> dict[s
 
 
 def pre_turn_installer(manager: Any, db: Any, *, project: str = "", extra_secrets: Iterable[str] = (),
-                       base: BaseSource | None = None,
-                       scripts_policy: str = "base") -> Callable[[Path], Awaitable[DependencyCheck]] | None:
+                       isolation: Any = "default", scripts: str = "on"
+                       ) -> Callable[[Path], Awaitable[DependencyCheck]] | None:
     """A per-turn installer bound to ``manager``'s install command, or ``None`` when it has none.
 
     ``manager.install_command`` is already normalized: an unset
     ``install_command`` means ``pnpm install`` there, so only an explicit
-    ``none`` (or empty) command turns this off. ``db`` is Harbor's ledger
-    (``harbor.db.HarborDB``) or a bare connection; ledger access takes the
-    database's own lock when it has one.
+    ``none`` (or empty) command turns this off. ``isolation`` defaults to
+    Harbor's install sandbox for this host (``None`` on Linux). ``db`` is
+    Harbor's ledger or a bare connection; ledger access takes its lock.
     """
 
     command = normalize_command(getattr(manager, "install_command", None))
     connection = getattr(db, "connection", db)
     if not command or connection is None:
         return None
+    if isolation == "default":
+        from harbor.install_sandbox import default_isolation
+        isolation = default_isolation(getattr(manager, "repo", None))
     root = getattr(manager, "root", None)
     timeout = float(getattr(manager, "install_timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
     secrets = tuple(name for name in extra_secrets if name)
@@ -727,7 +740,7 @@ def pre_turn_installer(manager: Any, db: Any, *, project: str = "", extra_secret
     async def prepare(worktree: Path) -> DependencyCheck:
         return await prepare_dependencies(worktree, command=command, connection=connection, project=project,
                                           root=root, timeout_seconds=timeout, extra_secrets=secrets, lock=lock,
-                                          base=base, scripts_policy=scripts_policy)
+                                          isolation=isolation, scripts=scripts)
 
     return prepare
 
@@ -737,8 +750,8 @@ def log(ticket: str, check: DependencyCheck) -> None:
 
 
 __all__ = [
-    "BLOCKER_KIND", "BaseSource", "DependencyCheck", "HARBOR_SECRET_NAMES", "INPUT_NAMES", "InstallRecord",
-    "base_inputs", "blocker", "builder_note", "fingerprint", "input_hashes", "install_environment",
+    "BLOCKER_KIND", "DependencyCheck", "HARBOR_SECRET_NAMES", "INPUT_NAMES", "InstallRecord", "PINNED_ENV",
+    "blocker", "builder_note", "creation_install", "fingerprint", "input_hashes", "install_environment",
     "missing_output", "normalize_command", "pre_turn_installer", "prepare_dependencies", "record", "recorded",
-    "run_hardened", "scan_inputs", "schedule_reinstall", "without_scripts",
+    "resolve_command", "run_hardened", "scan_inputs", "schedule_reinstall", "without_scripts",
 ]

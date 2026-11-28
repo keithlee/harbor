@@ -87,20 +87,20 @@ def builder_allow_tmp(data) -> bool:
     return value
 
 
-DEPENDENCY_SCRIPTS = ("base", "always")
+DEPENDENCY_SCRIPTS = ("on", "off")
 
 
 def builder_dependency_scripts(data) -> str:
-    """When Harbor's pre-turn reinstall may run install scripts (harbor.dependencies).
+    """Whether Harbor's sandboxed installs run install scripts (harbor.dependencies).
 
-    ``"base"`` (the default): only when every dependency input matches the base
-    branch or Harbor's last trusted install. ``"always"``: also on inputs the
-    builder changed, which runs builder-written code outside the sandbox.
+    ``"on"`` (the default) or ``"off"`` (adds ``--ignore-scripts`` and the like).
+    A project preference, not a security boundary: Harbor's install sandbox
+    (harbor.install_sandbox) contains the install either way.
     """
     section = dict((data or {}).get("builder") or {})
-    value = section.get("dependency_scripts", "base")
+    value = section.get("dependency_scripts", "on")
     if value not in DEPENDENCY_SCRIPTS:
-        raise ValueError('builder.dependency_scripts must be "base" or "always"')
+        raise ValueError('builder.dependency_scripts must be "on" or "off"')
     return value
 GITHUB_TRANSPORTS = {"rest", "mcp"}
 DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"

@@ -8,8 +8,10 @@ not permitted``), leaving the worktree unrunnable. Harbor now runs the
 project's install_command before the turn whenever the dependency inputs
 changed or node_modules is missing, and tells the builder not to install.
 
-The install scripts policy (base-identical inputs only) and the remediation
-hardening are covered in test_pre_turn_install_scripts.py.
+These tests check when and how Harbor installs, with a pass-through
+isolation so they run on any host. The macOS install sandbox itself, and what
+it stops builder-written install code from doing, is proven against real npm
+and pnpm in test_pre_turn_install_scripts.py.
 """
 from __future__ import annotations
 
@@ -39,6 +41,31 @@ SECRETS = {
     "OPENAI_API_KEY": "sk-openai-harbor", "CLAUDE_CODE_OAUTH_TOKEN": "oauth-harbor",
     "HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_GH_PAT", "SAMPLE_GH_PAT": "ghp-named-by-pointer",
 }
+
+
+class PassThrough:
+    """A stand-in for Harbor's install sandbox that runs the command as given (tests only)."""
+
+    name = "pass-through test isolation"
+
+    def prepare(self, command, worktree, env, git_dirs=()):
+        return list(command), dict(env), lambda: None
+
+
+PASS = PassThrough()
+ALLOW = lambda: None  # a launch authorization that always passes
+
+
+def dispatcher_supervisor(linear, db, worktree: Path, runner, ladder):
+    """A Supervisor whose builder is reached through a real WorktreeDispatcher, as in production."""
+
+    from harbor.supervisor import Supervisor, WorktreeDispatcher
+
+    manager = SimpleNamespace(create=lambda ticket, **_: worktree, attach=lambda ticket: worktree)
+    dispatcher = WorktreeDispatcher(manager, lambda path, wake: runner, db=db, project="SampleProject")
+    supervisor = Supervisor(linear, db=db, dispatcher=dispatcher, unblock_ladder=ladder)
+    supervisor._background_dispatch = True
+    return supervisor
 
 
 def fake_manager(tmp_path: Path, name: str = "pnpm", marker: str | None = ".modules.yaml") -> Path:
@@ -115,22 +142,22 @@ def _ledger() -> sqlite3.Connection:
 
 
 class Setup:
-    def __init__(self, tmp_path: Path, command: object = None, *, base=None, scripts_policy: str = "base") -> None:
+    def __init__(self, tmp_path: Path, command: object = None, *, scripts: str = "on", isolation=PASS) -> None:
         self.tmp = tmp_path
         self.worktree = _worktree(tmp_path)
         self.command = (str(fake_manager(tmp_path)), "install") if command is None else command
         self.ledger = _ledger()
         self.manager = SimpleNamespace(install_command=self.command, root=tmp_path / "wt", install_timeout_seconds=60)
-        self.base = base
-        self.scripts_policy = scripts_policy
+        self.scripts = scripts
+        self.isolation = isolation
 
     def installed(self) -> None:
-        """The state ``WorktreeManager.create`` leaves: installed from the base branch, recorded as trusted."""
+        """The state ``WorktreeManager.create`` leaves: installed, and recorded in Harbor's ledger."""
 
         modules = self.worktree / "node_modules"
         modules.mkdir(exist_ok=True)
         (modules / ".modules.yaml").write_text("layoutVersion: 5\n")
-        record(self.ledger, self.worktree, self.command, status="installed", trusted=True)
+        record(self.ledger, self.worktree, self.command, status="installed")
 
     def runner(self, kind: type = CodexRunner, **extra: object) -> CodexRunner:
         options = dict(db=self.ledger, ticket="SAMPLE-1", run_id="run-1", deadline_seconds=30,
@@ -138,8 +165,8 @@ class Setup:
         if kind is ClaudeRunner:
             options.update(model="claude-sonnet-5-5", reasoning_effort="medium")
         runner = kind(self.worktree, **{**options, **extra})
-        runner.dependency_preparer = pre_turn_installer(self.manager, self.ledger, project="Sample", base=self.base,
-                                                        scripts_policy=self.scripts_policy)
+        runner.dependency_preparer = pre_turn_installer(self.manager, self.ledger, project="Sample",
+                                                        isolation=self.isolation, scripts=self.scripts)
         return runner
 
     def events(self) -> list[str]:
@@ -155,7 +182,7 @@ class Setup:
 
     def turn(self, runner: CodexRunner | None = None):
         runner = runner or self.runner()
-        return asyncio.run(runner.start("Build SAMPLE-1", run_id="run-1"))
+        return asyncio.run(runner.start("Build SAMPLE-1", run_id="run-1", before_spawn=ALLOW))
 
 
 def test_a_changed_lockfile_reinstalls_before_the_builder_launches(tmp_path: Path) -> None:
@@ -221,9 +248,8 @@ def test_missing_or_incomplete_node_modules_reinstalls(tmp_path: Path, damage: s
     assert result.status == "completed", result.error
     assert setup.events() == ["install", "launch"]
     assert why in setup.prompt()
-    # The inputs are the ones Harbor installed from the base branch, so scripts stay on.
-    assert setup.args() == [["install"]]
-    assert "install scripts on (the inputs match Harbor's last trusted install)" in setup.prompt()
+    assert setup.args() == [["install", "--config.manage-package-manager-versions=false"]]
+    assert "in pass-through test isolation with install scripts on" in setup.prompt()
 
 
 def test_a_marker_the_package_manager_never_writes_does_not_reinstall_every_turn(tmp_path: Path) -> None:
@@ -247,7 +273,7 @@ def test_a_failed_install_blocks_with_the_literal_error_and_launches_nothing(tmp
     (setup.worktree / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\npackages: {is-odd@3.0.1: {}}\n")
     (tmp_path / "fail-install").write_text("")
     runner = setup.runner()
-    result = asyncio.run(runner.resume("run-1", "Review feedback arrived"))
+    result = asyncio.run(runner.resume("run-1", "Review feedback arrived", before_spawn=ALLOW))
     assert setup.events() == ["install"]  # the builder was never launched
     assert result.status == "blocked" and result.waiting_on == "human"
     assert result.blocker["kind"] == dependencies.BLOCKER_KIND == "dependency_install"
@@ -260,7 +286,7 @@ def test_a_failed_install_blocks_with_the_literal_error_and_launches_nothing(tmp
     # The failure is recorded, so the next turn tries again rather than trusting the new lockfile.
     assert dependencies.recorded(setup.ledger, setup.worktree).status == "failed"
     (tmp_path / "fail-install").unlink()
-    result = asyncio.run(runner.resume("run-1", "Install fixed"))
+    result = asyncio.run(runner.resume("run-1", "Install fixed", before_spawn=ALLOW))
     assert setup.events() == ["install", "install", "launch"]
     assert "because the previous install did not succeed; it succeeded" in setup.prompt()
 
@@ -292,6 +318,42 @@ def test_an_authorized_launch_installs_after_authorizing_once(tmp_path: Path) ->
     assert setup.events() == ["install", "launch"]
 
 
+def test_a_launch_without_authorization_never_installs(tmp_path: Path) -> None:
+    setup = Setup(tmp_path)
+    (setup.worktree / "pnpm-lock.yaml").write_text("changed\n")
+    asyncio.run(setup.runner().start("Build SAMPLE-1", run_id="run-1"))  # no before_spawn: fail closed
+    assert setup.events() == ["launch"]
+
+
+def test_a_dispatcher_launch_for_a_superseded_run_never_installs(tmp_path: Path) -> None:
+    from harbor.supervisor import WorktreeDispatcher
+
+    dispatcher = WorktreeDispatcher(SimpleNamespace(), lambda *a: None, project="Sample")
+    dispatcher._run_is_current = lambda identifier, run_id: False  # another run took over the ticket
+    with pytest.raises(RuntimeError, match="no longer authorized"):
+        dispatcher._launch_authorization("SAMPLE-1", "run-1")()
+
+
+def test_a_descendant_holding_the_output_open_cannot_outlast_the_deadline(tmp_path: Path) -> None:
+    """N5: a daemon a postinstall starts in its own session keeps stdout open; Harbor still returns on time."""
+
+    daemon = (
+        "import subprocess, sys, time\n"
+        # Escapes the install's process group, and inherits its stdout.
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+        "print('installed', flush=True)\n"
+    )
+    quick, script = tmp_path / "quick-install.py", tmp_path / "hung-install.py"
+    quick.write_text(daemon)
+    script.write_text(daemon + "time.sleep(120)\n")
+    started = time.monotonic()
+    code, output = dependencies.run_hardened([sys.executable, str(quick)], tmp_path, dict(os.environ), timeout=60)
+    assert code == 0 and "installed" in output and time.monotonic() - started < 15
+    started = time.monotonic()
+    code, output = dependencies.run_hardened([sys.executable, str(script)], tmp_path, dict(os.environ), timeout=2)
+    assert code == 124 and time.monotonic() - started < 20
+
+
 def test_harbor_secrets_do_not_reach_the_pre_turn_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in SECRETS.items():
         monkeypatch.setenv(name, value)
@@ -304,15 +366,17 @@ def test_harbor_secrets_do_not_reach_the_pre_turn_install(tmp_path: Path, monkey
     assert leaked == set()
     for name in ("GITHUB_TOKEN", "LINEAR_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAMPLE_GH_PAT"):
         assert name not in env
-    # Unrecorded inputs are not trusted, so the agent socket is gone and scripts are off.
-    assert "SSH_AUTH_SOCK" not in env and env["npm_config_ignore_scripts"] == "true"
+    assert "SSH_AUTH_SOCK" not in env and "GIT_DIR" not in env
+    # pnpm may not switch to a package-manager version the worktree names.
+    assert env["npm_config_manage_package_manager_versions"] == "false"
     # The install's own needs stay: PATH, HOME, and the project's registry token.
     assert env["PATH"] and env["HOME"] and env["NPM_TOKEN"] == "the-project-registry-token"
 
 
 def test_the_github_token_named_by_the_transport_is_scrubbed() -> None:
     env = install_environment({"PATH": "/bin", "ACME_GH": "secret", "OTHER": "kept"}, extra_secrets=("ACME_GH",))
-    assert env == {"PATH": "/bin", "OTHER": "kept"}
+    assert {name: env[name] for name in ("PATH", "OTHER")} == {"PATH": "/bin", "OTHER": "kept"}
+    assert "ACME_GH" not in env
 
 
 def test_an_explicit_none_install_command_changes_nothing(tmp_path: Path) -> None:
@@ -350,12 +414,13 @@ def test_claude_builders_get_the_same_pre_turn_install(tmp_path: Path, monkeypat
     setup.installed()
     (setup.worktree / "package.json").write_text(json.dumps({"name": "sample", "dependencies": {"is-odd": "3.0.1"}}))
     runner = setup.runner(ClaudeRunner)
-    asyncio.run(runner._execute(runner._new_context("run-1"), "Build SAMPLE-1", resume=False))
+    asyncio.run(runner._execute(runner._new_context("run-1"), "Build SAMPLE-1", resume=False, before_spawn=ALLOW))
     assert setup.events() == ["install"] and len(seen) == 1
     assert "package.json changed since Harbor's last install" in seen[0]
     (tmp_path / "fail-install").write_text("")
     (setup.worktree / "pnpm-lock.yaml").write_text("changed\n")
-    result = asyncio.run(runner._execute(runner._new_context("run-1"), "Build SAMPLE-1", resume=False))
+    result = asyncio.run(runner._execute(runner._new_context("run-1"), "Build SAMPLE-1", resume=False,
+                                         before_spawn=ALLOW))
     assert result.status == "blocked" and EPERM in result.blocker["evidence"]
     assert len(seen) == 1  # no Claude turn was launched
 
@@ -389,26 +454,29 @@ def test_worktree_creation_records_its_install_so_the_first_turn_does_not_repeat
     git(checkout, "push", "-u", "origin", "main")
     ledger = sqlite3.connect(":memory:")
     command = (str(fake_manager(tmp_path)), "install")
+
+    def installer(path: Path, configured) -> None:
+        subprocess.run(list(configured), cwd=path, check=True)
+
     manager = WorktreeManager(checkout, root=tmp_path / "wt", disk_usage=lambda _: 100.0,
-                              install_command=list(command), custody=ledger)
+                              install_command=list(command), custody=ledger, installer=installer)
     worktree = manager.create("SAMPLE-1")
     assert (tmp_path / "events.log").read_text().splitlines() == ["install"]
-    prepare = pre_turn_installer(manager, ledger)
+    prepare = pre_turn_installer(manager, ledger, isolation=PASS)
     assert asyncio.run(prepare(worktree.path)).action == "current"
     assert (tmp_path / "events.log").read_text().splitlines() == ["install"]
-    # Creation-time inputs are trusted: rebuilding a deleted node_modules runs scripts.
     import shutil
     shutil.rmtree(worktree.path / "node_modules")
     check = asyncio.run(prepare(worktree.path))
     assert check.action == "installed" and check.scripts is True
-    assert json.loads((tmp_path / "args.log").read_text().splitlines()[-1]) == ["install"]
 
 
 def test_prepare_refuses_a_worktree_outside_harbors_root(tmp_path: Path) -> None:
     setup = Setup(tmp_path)
     outside = tmp_path / "elsewhere"
     outside.mkdir()
-    check = asyncio.run(prepare_dependencies(outside, command=setup.command, connection=setup.ledger, root=tmp_path / "wt"))
+    check = asyncio.run(prepare_dependencies(outside, command=setup.command, connection=setup.ledger,
+                                             root=tmp_path / "wt", isolation=PASS))
     assert check.failed and "refusing to install outside" in check.error
     assert setup.events() == []
 
@@ -441,7 +509,6 @@ def test_a_failed_install_escalates_once_and_is_not_retried_every_poll(tmp_path:
     """End to end through the supervisor and unblock ladder: one install attempt, no launch, one escalation."""
 
     from test_blocked_relaunch_loop import _db, _escalations, _human, _LinearWithComments, _poll_and_settle, _ticket
-    from harbor.supervisor import Supervisor
     from harbor.unblock import UnblockLadder
 
     worktree = tmp_path / "wt"
@@ -460,10 +527,9 @@ def test_a_failed_install_escalates_once_and_is_not_retried_every_poll(tmp_path:
     runner = CodexRunner(worktree, db=db, ticket="SAMPLE-7", executable=str(_builder_script(tmp_path)), deadline_seconds=30)
     manager = SimpleNamespace(install_command=(str(fake_manager(tmp_path)), "install"), root=tmp_path,
                               install_timeout_seconds=60)
-    runner.dependency_preparer = pre_turn_installer(manager, db, project="SampleProject")
-    supervisor = Supervisor(linear, db=db, runner=runner,
-                            unblock_ladder=UnblockLadder(db, linear=linear, first_mate=first_mate, repo_path=worktree))
-    supervisor._background_dispatch = True
+    runner.dependency_preparer = pre_turn_installer(manager, db, project="SampleProject", isolation=PASS)
+    supervisor = dispatcher_supervisor(linear, db, worktree, runner,
+                                       UnblockLadder(db, linear=linear, first_mate=first_mate, repo_path=worktree))
     events = tmp_path / "events.log"
     try:
         async def scenario() -> None:

@@ -242,12 +242,21 @@ class CodexRunner(BaseRunner):
             env[ENDPOINT_ENV] = self._playwright_endpoint
         return env
 
-    async def _prepare_dependencies(self, context) -> tuple[str, RunResult | None]:
-        """Run the pre-turn install: the prompt note, or the result of a turn Harbor refused to start."""
+    async def _prepare_dependencies(self, context, *, authorized: bool) -> tuple[str, RunResult | None]:
+        """Run the pre-turn install: the prompt note, or the result of a turn Harbor refused to start.
+
+        Only an authorized launch installs: without a launch authorization
+        (``before_spawn``) the check is skipped, never run (fail closed).
+        """
 
         if self.dependency_preparer is None:
             return "", None
         from harbor import dependencies
+        if not authorized:
+            check = dependencies.DependencyCheck(
+                "skipped", (), error="this launch carried no authorization, so Harbor ran no install")
+            dependencies.log(self.ticket or context.run_id, check)
+            return "", None
         # The preparer runs the install itself in a worker thread, keeping the loop free.
         check = self.dependency_preparer(context.worktree)
         if inspect.isawaitable(check):
@@ -287,7 +296,7 @@ class CodexRunner(BaseRunner):
                     pending = False
                     return
                 authorize()
-        note, refused = await self._prepare_dependencies(context)
+        note, refused = await self._prepare_dependencies(context, authorized=before_spawn is not None)
         if refused is not None:
             return refused
         if note:

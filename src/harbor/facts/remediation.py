@@ -214,7 +214,7 @@ def _host_program(name: str, worktree: Path | None) -> tuple[str, str]:
     return found, path
 
 
-async def _default_executor(command: Sequence[str], cwd: Path | None, ledger: Any) -> Any:
+async def _default_executor(command: Sequence[str], cwd: Path | None, ledger: Any, lock: Any = None) -> Any:
     from harbor.dependencies import run_hardened, schedule_reinstall
 
     if tuple(command) == REINSTALL_ACTION:
@@ -222,7 +222,7 @@ async def _default_executor(command: Sequence[str], cwd: Path | None, ledger: An
         # ledger, and the resumed turn's pre-turn install does the work.
         if ledger is None:
             raise ValueError("Harbor has no ledger to schedule a dependency reinstall in")
-        schedule_reinstall(ledger, _confined_worktree(cwd))
+        schedule_reinstall(ledger, _confined_worktree(cwd), lock=lock)
         return True
     # A host tool (`gh auth status`, `adb start-server`): it must see the
     # credentials Harbor itself uses, so it keeps Harbor's environment. It runs
@@ -236,12 +236,13 @@ async def _default_executor(command: Sequence[str], cwd: Path | None, ledger: An
     return subprocess.CompletedProcess([program, *command[1:]], returncode, "", output)
 
 
-async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None, *, ledger: Any = None) -> Any:
+async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None, *, ledger: Any = None,
+                           ledger_lock: Any = None) -> Any:
     target = executor
     if target is None:
         # Shell-free invocation is important: blocker text never becomes part
         # of a shell command. A non-zero exit is a failed repair (rung-1 escalation).
-        return await _default_executor(command, cwd, ledger)
+        return await _default_executor(command, cwd, ledger, ledger_lock)
     for name in ("run", "execute", "invoke"):
         candidate = getattr(target, name, None)
         if callable(candidate):
@@ -279,11 +280,13 @@ async def execute_remediation(
     executor: Callable[..., Any] | Any | None = None,
     cwd: str | Path | None = None,
     ledger: Any = None,
+    ledger_lock: Any = None,
 ) -> RemediationResult:
     """Execute a known plan and report whether every command succeeded.
 
     ``ledger`` is Harbor's SQLite connection, where the default executor
-    schedules a dependency reinstall (``REINSTALL_ACTION``).
+    schedules a dependency reinstall (``REINSTALL_ACTION``), under ``ledger_lock``
+    (the ledger's own lock) when given.
     """
 
     plan = remediation_plan(blocker)
@@ -293,7 +296,7 @@ async def execute_remediation(
     outputs: list[Any] = []
     try:
         for command in plan.commands:
-            value = await _invoke_executor(executor, command, workdir, ledger=ledger)
+            value = await _invoke_executor(executor, command, workdir, ledger=ledger, ledger_lock=ledger_lock)
             outputs.append(value)
             if not _successful(value):
                 return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error="remediation command failed")
