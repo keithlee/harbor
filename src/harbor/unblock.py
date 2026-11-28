@@ -860,12 +860,7 @@ def build_resume_command(run_id: str, prompt: str, *, output_schema: str | None 
 resume_command = build_resume_command
 
 
-async def _invoke_resume(resumer: Any, command: ResumeCommand, *, before_launch: Any | None = None) -> bool:
-    """Resume through ``resumer``; ``before_launch`` is passed on when the resumer accepts it.
-
-    ``Supervisor.resume_session`` calls it right before the builder starts
-    with the prompt (the hand-off).
-    """
+async def _invoke_resume(resumer: Any, command: ResumeCommand) -> bool:
     if resumer is None:
         return False
     target = resumer
@@ -889,9 +884,7 @@ async def _invoke_resume(resumer: Any, command: ResumeCommand, *, before_launch:
             if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
         names = {parameter.name for parameter in signature.parameters.values()}
-        if {"run_id", "prompt"} <= names and before_launch is not None and "before_launch" in names:
-            value = target(run_id=command.run_id, prompt=command.prompt, before_launch=before_launch)
-        elif {"run_id", "prompt"} <= names:
+        if {"run_id", "prompt"} <= names:
             value = target(run_id=command.run_id, prompt=command.prompt)
         elif {"command", "prompt"} <= names:
             value = target(command=list(command.command), prompt=command.prompt)
@@ -1126,7 +1119,6 @@ class UnblockLadder:
         citation: str = "",
         reason: str = "",
         next_action: str = "",
-        before_launch: Any | None = None,
     ) -> tuple[bool, ResumeCommand | None]:
         if not run_id:
             return False, None
@@ -1140,7 +1132,7 @@ class UnblockLadder:
         prompt += "\nNext step: " + (next_action or "Rerun the previously blocked operation, then verify the ticket acceptance criteria.")
         prompt += "\nContinue your workflow; do not load the skill again and do not create a replacement session."
         command = build_resume_command(run_id, prompt)
-        resumed = await _invoke_resume(self.resumer, command, before_launch=before_launch)
+        resumed = await _invoke_resume(self.resumer, command)
         return resumed, command
 
     def _auto_accept(self) -> AutoAcceptPolicy:
@@ -1605,13 +1597,19 @@ class UnblockLadder:
 
         The receipt is written before the resume, so a re-block inside the
         same resumed session sees it and the loop guard holds.  It is marked
-        delivered at the hand-off: when the resumer calls ``before_launch``
-        (the builder is about to start with option 1), or when a resumer
-        without that hook returns success.  From then on the builder has the
-        answer, so the Linear comment is posted even if the turn is later
-        cancelled or fails, and the escalation is NOT reopened.  Only an exit
-        before the hand-off reopens it; then ``None`` is returned and the
-        escalation is parked for a human as usual.
+        delivered at the hand-off: when a Harbor runner has actually started
+        the builder process with option 1 (``SpawnObserver``), or -- for a
+        resumer that never reaches a runner -- when it returns success.  A
+        runner's early failure (deadline exhausted, executable missing,
+        session unavailable) is not a hand-off.  From the hand-off on, the
+        Linear comment is posted even if the turn is later cancelled or fails,
+        and the escalation is NOT reopened.  Without a hand-off the
+        escalation is reopened, the receipt marked undelivered, and ``None``
+        returned so the escalation is parked for a human as usual.
+
+        Ordering: on the nested ``WorktreeDispatcher`` path the resume returns
+        only after the builder's whole turn, so this comment is posted after
+        any comments that turn produced.
         """
 
         escalation_id = _value(escalation, "id", default=None)
@@ -1631,16 +1629,25 @@ class UnblockLadder:
                 auto_accept_policy.mark_delivered(self.db, escalation_id)
                 launched = True
 
+        from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+        observer = SpawnObserver(on_start=handed_over)
+        token = SPAWN_OBSERVER.set(observer)
         writes: list[str] = []
         resumed, command = False, None
         try:
-            resumed, command = await self._resume(
-                ticket_id, run_id, answer=answer, citation=citation,
-                reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
-                next_action="Apply option 1, then verify the ticket acceptance criteria.",
-                before_launch=handed_over,
-            )
-            if resumed:
+            try:
+                resumed, command = await self._resume(
+                    ticket_id, run_id, answer=answer, citation=citation,
+                    reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
+                    next_action="Apply option 1, then verify the ticket acceptance criteria.",
+                )
+            finally:
+                SPAWN_OBSERVER.reset(token)
+            # A resumer that never reached a Harbor runner (an embedded or
+            # test seam) can only report success; a real runner reports the
+            # actual process start through the observer.
+            if resumed and not observer.attempted:
                 handed_over()
         finally:
             if launched:

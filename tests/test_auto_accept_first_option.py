@@ -795,19 +795,51 @@ async def _launched(before_launch):
     before_launch()
 
 
-async def _superseded_after_launch(before_launch):
+def _builder_started():
+    """What a Harbor runner reports once the builder process exists."""
+
+    from harbor.runner.base import SPAWN_OBSERVER
+
+    observer = SPAWN_OBSERVER.get()
+    observer.attempt()
+    observer.start()
+
+
+def _runner_failed_before_start():
+    """A runner invocation that fails before creating the process."""
+
+    from harbor.runner.base import SPAWN_OBSERVER
+
+    SPAWN_OBSERVER.get().attempt()
+
+
+async def _superseded_after_start(before_launch):
     before_launch()
+    _builder_started()
     raise _RecoverySuperseded
 
 
+async def _failed_after_start(before_launch):
+    before_launch()
+    _builder_started()
+    raise RuntimeError("builder crashed mid-turn")
+
+
+async def _cancelled_after_start(before_launch):
+    before_launch()
+    _builder_started()
+    raise asyncio.CancelledError
+
+
 async def _resume_failed(before_launch):
+    # supervisor.resume_session: before_launch(), then "not available to resume".
     before_launch()
     raise RuntimeError("retained builder session is not available to resume")
 
 
-async def _cancelled(before_launch):
+async def _runner_could_not_start(before_launch):
     before_launch()
-    raise asyncio.CancelledError
+    _runner_failed_before_start()  # deadline exhausted / executable missing; resume_session still returns True
 
 
 def _schedule(tmp_path, *, eligible=(), apply=_launched, before=None):
@@ -856,10 +888,31 @@ def test_first_mate_leaves_the_escalation_open_when_nothing_is_handed_over(tmp_p
         db.close()
 
 
-@pytest.mark.parametrize("apply", [_superseded_after_launch, _resume_failed, _cancelled])
+@pytest.mark.parametrize("apply", [_resume_failed, _runner_could_not_start])
+def test_first_mate_reopens_when_no_builder_started(tmp_path, apply):
+    """Review round 8, B1: before_launch ran, but no builder process started
+    (session unavailable, deadline exhausted, executable missing).  The
+    answer never reached a builder: reopened, receipt undelivered, no
+    comment, and no false "blocked again" on the next pass."""
+
+    db, host = _schedule(tmp_path, apply=apply)
+    try:
+        escalation = db.escalations()[-1]
+        assert escalation["status"] == "open" and escalation["answer"] is None
+        assert [row["delivered"] for row in auto_accept.history(db, "SAMPLE-7")] == [0]
+        assert host.comments == []
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", blocker("Option 1"),
+                             linear_id="linear-7")
+        again = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert again["action"] == "resume" and "blocked again" not in again["reason"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("apply", [_superseded_after_start, _failed_after_start, _cancelled_after_start])
 def test_first_mate_keeps_an_answer_the_builder_already_received(tmp_path, apply):
-    """Review round 7, B3: once before_launch handed option 1 to the builder,
-    a later failure or cancellation (/exit) does not make it "undelivered":
+    """Review round 7, B3: once a builder process started with option 1, a
+    later failure or cancellation (/exit) does not make it "undelivered":
     the escalation stays answered, the receipt is delivered (so the loop guard
     holds), and the Linear comment is posted."""
 
@@ -879,13 +932,13 @@ def test_first_mate_keeps_an_answer_the_builder_already_received(tmp_path, apply
 
 
 def test_ladder_keeps_an_answer_the_builder_received_before_a_cancellation(tmp_path):
-    """Review round 7, B3, ladder path: the resumer hands over (before_launch),
+    """Review round 7, B3, ladder path: a builder process starts with option 1,
     then the turn is cancelled."""
 
     harness = Harness(tmp_path)
 
-    async def launch_then_cancel(run_id, prompt, *, before_launch=None):
-        before_launch()
+    async def launch_then_cancel(run_id, prompt):
+        _builder_started()
         harness.resumed.append((run_id, prompt))
         raise asyncio.CancelledError
 
@@ -914,6 +967,88 @@ def test_ladder_reopens_only_when_nothing_was_handed_over(tmp_path):
         assert [row["delivered"] for row in harness.receipts()] == [0]
     finally:
         harness.db.close()
+
+
+# --------------------------------------------------------------------------
+# Review round 8, B1: a real CodexRunner decides whether the builder started
+# --------------------------------------------------------------------------
+
+def _codex(tmp_path, scenario):
+    from harbor.runner.codex import CodexRunner
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir(exist_ok=True)
+    if scenario == "missing_executable":
+        return CodexRunner(worktree, ticket="SAMPLE-7", executable=str(tmp_path / "no-such-codex"))
+    if scenario == "deadline_zero":
+        return CodexRunner(worktree, ticket="SAMPLE-7", executable="/bin/sh", deadline_seconds=0)
+    script = tmp_path / "fake-codex"
+    script.write_text("#!/bin/sh\ncat > /dev/null\nexit 0\n")
+    script.chmod(0o755)
+    return CodexRunner(worktree, ticket="SAMPLE-7", executable=str(script), deadline_seconds=30)
+
+
+@pytest.mark.parametrize("scenario", ["missing_executable", "deadline_zero"])
+def test_ladder_with_a_real_runner_that_cannot_start_does_not_claim_delivery(tmp_path, scenario):
+    runner = _codex(tmp_path, scenario)
+    harness = Harness(tmp_path)
+
+    async def resume_session(run_id, prompt):
+        result = await runner.resume(run_id, prompt)
+        assert result.status == "failed"
+        return True  # Supervisor.resume_session returns True for any runner payload
+
+    harness.ladder.resumer = resume_session
+    try:
+        result = harness.block(blocker("Option 1"))
+        assert result.action == "park"
+        escalation = harness.db.escalations()[-1]
+        assert escalation["status"] == "open" and escalation["answer"] is None
+        assert [row["delivered"] for row in harness.receipts()] == [0]
+        assert not any("auto-accepted option 1" in body for _, body in harness.linear.comments)
+        # The next pass does not claim the builder "blocked again".
+        case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", blocker("Option 1"),
+                             linear_id="linear-7")
+        again = recovery.apply_auto_accept(harness.db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
+        assert "blocked again" not in again["reason"]
+    finally:
+        harness.db.close()
+
+
+def test_ladder_with_a_real_runner_that_starts_marks_delivery(tmp_path):
+    runner = _codex(tmp_path, "starts")
+    harness = Harness(tmp_path)
+
+    async def resume_session(run_id, prompt):
+        await runner.resume(run_id, prompt)
+        return True
+
+    harness.ladder.resumer = resume_session
+    try:
+        assert harness.block(blocker("Option 1")).action == "resume"
+        assert [row["delivered"] for row in harness.receipts()] == [1]
+        assert harness.db.escalations()[-1]["status"] == "answered"
+        assert any("Harbor auto-accepted option 1" in body for _, body in harness.linear.comments)
+    finally:
+        harness.db.close()
+
+
+@pytest.mark.parametrize("scenario,delivered", [("missing_executable", 0), ("deadline_zero", 0), ("starts", 1)])
+def test_first_mate_with_a_real_runner(tmp_path, scenario, delivered):
+    runner = _codex(tmp_path, scenario)
+
+    async def apply(before_launch):
+        await runner.resume("builder-session", "Answer: option 1", before_spawn=before_launch)
+        # Supervisor.resume_session returns True for any payload, so _apply_recovery does not raise.
+
+    db, host = _schedule(tmp_path, apply=apply)
+    try:
+        escalation = db.escalations()[-1]
+        assert [row["delivered"] for row in auto_accept.history(db, "SAMPLE-7")] == [delivered]
+        assert escalation["status"] == ("answered" if delivered else "open")
+        assert bool(host.comments) is bool(delivered)
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("recommendation", ["\t", "\n", "　", " ", "\x1c\x1d", "   "])

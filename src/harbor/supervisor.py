@@ -4697,31 +4697,41 @@ class Supervisor:
 
         async def run() -> None:
             attempted = False
-            answered = False  # option 1 was recorded and handed to the builder at launch
+            answered = False  # option 1 was recorded (receipt in flight) just before the launch
+            handed_over = False  # a builder process actually started with it
+            from harbor.auto_accept import mark_delivered
+            from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+            def on_start() -> None:
+                nonlocal handed_over
+                if answered and not handed_over:
+                    mark_delivered(self.db, auto.get("escalation_id"))
+                    handed_over = True
+
+            observer = SpawnObserver(on_start=on_start)
 
             def before_launch() -> None:
                 nonlocal attempted, answered
                 if not self._first_mate_can_recover(case, reload_policy=True, attempted=attempted):
                     raise _RecoverySuperseded
                 if auto is not None and not answered:
-                    # The hand-off: the builder starts with option 1 right
-                    # after this returns, so the answer is recorded and the
-                    # receipt marked delivered now -- before the turn, so a
-                    # re-block inside it meets the loop guard, and so a later
-                    # cancellation cannot make a received answer look
-                    # undelivered.  An escalation a human answered meanwhile
-                    # is left alone.
-                    from harbor.auto_accept import EscalationNotOpen, mark_delivered
+                    # Recorded just before the launch, so a re-block inside
+                    # the builder's turn meets the loop guard.  The receipt is
+                    # marked delivered only when the runner reports that the
+                    # builder process started (``on_start``); a runner that
+                    # fails before starting it leaves the answer undelivered.
+                    # An escalation a human answered meanwhile is left alone.
+                    from harbor.auto_accept import EscalationNotOpen
                     try:
                         recovery.record_auto_accept(self.db, case, decision)
                     except EscalationNotOpen:
                         raise _RecoverySuperseded from None
-                    mark_delivered(self.db, auto.get("escalation_id"))
                     answered = True
                 if not attempted:
                     recovery.record(connection, case, decision)
                     attempted = True
 
+            token = SPAWN_OBSERVER.set(observer) if auto is not None else None
             try:
                 if not self._first_mate_can_recover(case):
                     return
@@ -4733,6 +4743,10 @@ class Supervisor:
                     if not self._first_mate_can_recover(case):
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
+                if answered and not observer.attempted:
+                    # A resume seam that never reached a Harbor runner can
+                    # only report success.
+                    on_start()
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was
@@ -4752,17 +4766,24 @@ class Supervisor:
                                             f"First Mate could not {decision['action']} {case.ticket}: {exc}")
                 return
             finally:
+                if token is not None:
+                    SPAWN_OBSERVER.reset(token)
                 self._recovery_tickets.discard(case.ticket)
-                if answered:
-                    # The builder received option 1 at launch; announce it on
+                if handed_over:
+                    # A builder process started with option 1: announce it on
                     # every exit, including a failure or cancellation later in
-                    # the turn.  Exits before the hand-off recorded nothing,
-                    # so there is nothing to reopen.
+                    # the turn.
                     try:
                         await self._post_recovery_comment(
                             case, {**decision, "comment": recovery.auto_accept_comment(case, decision)})
                     except Exception as exc:
                         self.last_error = f"First Mate comment: {exc}"
+                elif answered:
+                    # Recorded at launch, but no builder started (deadline
+                    # exhausted, executable missing, session unavailable,
+                    # superseded): hand it back, receipt marked undelivered.
+                    from harbor.auto_accept import reopen
+                    reopen(self.db, auto.get("escalation_id"))
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
 

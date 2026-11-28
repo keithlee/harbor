@@ -57,12 +57,14 @@ Lexical checks (word matching; they cannot detect meaning):
 
 Delivery:
 
-* The answer is recorded before the resume and the receipt is marked
-  delivered at the hand-off (the builder is about to start with option 1).
-  From then on the Linear comment is posted on every exit, cancellation
-  included, and the escalation stays answered.  Only an exit before the
-  hand-off reopens it with its answer cleared and marks the receipt
-  undelivered.
+* The answer is recorded just before the launch and the receipt is marked
+  delivered at the hand-off: when Harbor's runner has created the builder
+  process (``harbor.runner.base.SpawnObserver``).  A runner failing before
+  that (deadline exhausted, executable missing, session unavailable) is not
+  a hand-off.  From the hand-off on, the Linear comment is posted on every
+  exit, cancellation included, and the escalation stays answered.  Without
+  it the escalation is reopened with its answer cleared and the receipt
+  marked undelivered.
 * Each auto-accept is recorded in ``auto_accepts`` (distinct from operator
   answers, which go to ``resolutions``) and announced on Linear.
 

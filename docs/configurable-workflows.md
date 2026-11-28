@@ -226,15 +226,20 @@ These check fields, characters and ledger state, not meaning.
   (`auto_accept_assessments`). First Mate answers only the newest open
   escalation for the run, and only when its question, kind and digest match
   the blocker it is looking at.
-- **Delivery.** The receipt is marked delivered at the hand-off: when the
-  resume or spawn is about to start the builder with option 1 (or, for a
-  resumer without that hook, when it returns success). From then on the
-  builder has the answer, so the Linear comment is posted on every exit,
-  including a cancellation or failure later in the turn, and the escalation
-  stays answered. An exit before the hand-off (held, superseded, resume
-  unavailable) reopens the escalation, clears the answer and marks the
-  receipt undelivered. An escalation that is no longer open (for example, a
-  human answered it first) is not overwritten.
+- **Delivery.** The answer and an in-flight receipt are recorded just before
+  the launch (the ladder before its resume, First Mate in its launch
+  callback). The receipt is marked delivered at the hand-off: when Harbor's
+  runner has actually created the builder process with option 1. A runner
+  that fails before that (deadline exhausted, executable missing, session not
+  available to resume) is not a hand-off. From the hand-off on, the Linear
+  comment is posted on every exit, including a cancellation or failure later
+  in the turn, and the escalation stays answered. Without a hand-off the
+  escalation is reopened, its answer cleared, the receipt marked undelivered
+  and no auto-accept comment posted. A First Mate exit before its launch
+  callback (held or superseded first) writes no receipt at all. An escalation
+  that is no longer open (for example, a human answered it first) is not
+  overwritten. On the ladder path the resume returns only after the builder's
+  turn, so its comment can follow comments that turn produced.
 - **Records.** Receipts go in `auto_accepts` with a `delivered` flag. The
   escalation is `answered` with the citation
   `harbor:auto-accept-first-option:escalation-<id>` and no `resolutions` row,

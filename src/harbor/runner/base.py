@@ -17,6 +17,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from contextvars import ContextVar
+
 from harbor.runner.stream import StreamEvent, extract_final, iter_stream
 from harbor.db import apply_phase9_migration, sql_statements
 from harbor.resources import runtime_asset
@@ -49,6 +51,35 @@ BLOCKER_KINDS = frozenset(
         "conflicting_instruction",
     }
 )
+
+
+@dataclass
+class SpawnObserver:
+    """Observe whether a builder process actually started (context-local).
+
+    A caller that must know if its prompt reached a builder -- the
+    auto-accept hand-off -- sets ``SPAWN_OBSERVER`` around the resume.
+    ``attempted`` is set when a runner begins an invocation; ``started`` (and
+    ``on_start``) only after the builder process was created.  The runner's
+    early failure exits (deadline exhausted, executable missing) therefore
+    leave ``started`` false.
+    """
+
+    on_start: Callable[[], None] | None = None
+    attempted: bool = False
+    started: bool = False
+
+    def attempt(self) -> None:
+        self.attempted = True
+
+    def start(self) -> None:
+        if not self.started:
+            self.started = True
+            if self.on_start is not None:
+                self.on_start()
+
+
+SPAWN_OBSERVER: ContextVar[SpawnObserver | None] = ContextVar("harbor_spawn_observer", default=None)
 
 
 class RunnerError(RuntimeError):
@@ -961,6 +992,9 @@ class BaseRunner:
     ) -> RunResult:
         # Provider-specific startup may await external services before reaching
         # this point. Authorize here, before ledger changes and subprocess spawn.
+        observer = SPAWN_OBSERVER.get()
+        if observer is not None:
+            observer.attempt()
         if before_spawn is not None:
             before_spawn()
         from harbor.recovery import retained_budget
@@ -1023,6 +1057,9 @@ class BaseRunner:
             raise
         self._queue_transition(context, "running")
         _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
+        if observer is not None:
+            # The builder process exists and its prompt is written next: the hand-off.
+            observer.start()
         # Read the builder's output and watch the deadline before the prompt
         # is written.  A prompt larger than the pipe buffer only drains as
         # fast as the builder reads it: a builder that writes its own output
