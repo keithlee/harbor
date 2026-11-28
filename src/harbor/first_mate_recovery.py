@@ -404,10 +404,11 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
     return {"action": action, "instruction": instruction[:4000], "reason": reason[:1000]}
 
 
-def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
+def record(connection, case: Case, decision: Mapping[str, Any]) -> int | None:
+    """Insert one recovery row; returns its id."""
     initialize(connection)
     with connection:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO first_mate_recoveries(project,ticket,run_id,trigger,action,instruction,reason,old_session_id,at) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (case.project, case.ticket, case.run_id, case.trigger, decision["action"], decision.get("instruction"),
@@ -415,6 +416,23 @@ def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
         )
     for event_id in case.flag_ids or [case.flag_id]:
         mark_flag(connection, event_id)
+    return cursor.lastrowid
+
+
+def undelivered_reason(decision: Mapping[str, Any]) -> str:
+    """The truthful outcome of an auto-accept whose builder never started."""
+    escalation_id = (decision.get("auto_accept") or {}).get("escalation_id")
+    return (f"First Mate auto-accept of option 1 for escalation #{escalation_id} was not delivered "
+            "(builder did not start); escalation reopened")
+
+
+def amend_reason(connection, row_id: int | None, reason: str) -> None:
+    """Correct a recovery row recorded at launch once its real outcome is known."""
+    if connection is None or row_id is None:
+        return
+    initialize(connection)
+    with connection:
+        connection.execute("UPDATE first_mate_recoveries SET reason=? WHERE id=?", (reason, row_id))
 
 
 def latest_flag_id(connection) -> int | None:

@@ -74,9 +74,9 @@ class SpawnObserver:
 
     def start(self) -> None:
         if not self.started:
-            self.started = True
             if self.on_start is not None:
-                self.on_start()
+                self.on_start()  # may raise; the runner then stops the builder
+            self.started = True
 
 
 SPAWN_OBSERVER: ContextVar[SpawnObserver | None] = ContextVar("harbor_spawn_observer", default=None)
@@ -1058,8 +1058,18 @@ class BaseRunner:
         self._queue_transition(context, "running")
         _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
         if observer is not None:
-            # The builder process exists and its prompt is written next: the hand-off.
-            observer.start()
+            # The builder process exists and its prompt is written next: the
+            # hand-off.  A failing callback (for example a locked ledger)
+            # must never leave an unsupervised builder behind: stop it and
+            # clear custody, exactly like a failed ledger insert.
+            try:
+                observer.start()
+            except Exception:
+                await self.terminate(context, reason="hand-off record failed")
+                await process.wait()
+                context.process = None
+                self.active = None
+                raise
         # Read the builder's output and watch the deadline before the prompt
         # is written.  A prompt larger than the pipe buffer only drains as
         # fast as the builder reads it: a builder that writes its own output

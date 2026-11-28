@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -558,6 +560,14 @@ def test_docs_describe_the_rules_as_the_code_enforces_them():
         assert kind in skill and kind in section
     assert "(no commands, paths, numbers or identifiers)" not in skill  # review round 6, B4
     assert "docs/configurable-workflows.md" in skill
+    # Review round 9, N2: the skill states the "option 1" exception, and its own
+    # example recommendation passes the rules it describes.
+    flat_skill = " ".join(skill.split())
+    assert "the literal phrase `option 1` or `option #1`" in flat_skill
+    example = '"Take option 1 because it matches the ticket criteria"'
+    assert example in flat_skill
+    assert auto_accept.plain_prose_reason(example.strip('"'), recommendation=True) is None
+    assert recommended_first_option(blocker(example.strip('"'))).first
     template = (root / "workflows" / "work-pipeline" / "workflow.toml").read_text()
     assert "twice for the same question" not in template
 
@@ -901,6 +911,7 @@ def test_first_mate_reopens_when_no_builder_started(tmp_path, apply):
         assert escalation["status"] == "open" and escalation["answer"] is None
         assert [row["delivered"] for row in auto_accept.history(db, "SAMPLE-7")] == [0]
         assert host.comments == []
+        _assert_truthful_undelivered_records(db, host, expect_undelivered_notice=apply is _runner_could_not_start)
         case = recovery.Case("Sample", "SAMPLE-7", "builder-session", "blocked", "blocked", blocker("Option 1"),
                              linear_id="linear-7")
         again = recovery.apply_auto_accept(db, case, {"action": "escalate", "reason": "r"}, AutoAcceptPolicy())
@@ -1047,8 +1058,55 @@ def test_first_mate_with_a_real_runner(tmp_path, scenario, delivered):
         assert [row["delivered"] for row in auto_accept.history(db, "SAMPLE-7")] == [delivered]
         assert escalation["status"] == ("answered" if delivered else "open")
         assert bool(host.comments) is bool(delivered)
+        if delivered:
+            assert any("auto-accepted the recommended first option" in notice for notice in host.notices)
+        else:
+            _assert_truthful_undelivered_records(db, host, expect_undelivered_notice=True)
     finally:
         db.close()
+
+
+def _assert_truthful_undelivered_records(db, host, *, expect_undelivered_notice):
+    """Review round 9, B1: nothing says "auto-accepted" when no builder started."""
+
+    assert not any("auto-accepted" in notice for notice in host.notices), host.notices
+    if expect_undelivered_notice:
+        assert any("was not delivered (builder did not start); escalation reopened" in notice
+                   for notice in host.notices), host.notices
+    reasons = [row[0] for row in db.connection.execute(
+        "SELECT reason FROM first_mate_recoveries WHERE action = 'resume' ORDER BY id")]
+    assert reasons and all("was not delivered (builder did not start)" in reason for reason in reasons), reasons
+    assert not any("auto-accepted" in reason for reason in reasons)
+
+
+def test_a_failing_hand_off_callback_never_leaves_a_builder_running(tmp_path):
+    """Review round 9, N1: on_start raising (e.g. a locked ledger) must stop the
+    builder process and clear the runner's custody."""
+
+    from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+    runner = _codex(tmp_path, "starts")
+    script = tmp_path / "fake-codex"
+    script.write_text("#!/bin/sh\nsleep 30\n")  # would outlive the test if orphaned
+    seen = {}
+
+    def locked():
+        seen["pid"] = runner.active.pid if runner.active else None
+        raise sqlite3.OperationalError("database is locked")
+
+    async def go():
+        token = SPAWN_OBSERVER.set(SpawnObserver(on_start=locked))
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await runner.resume("builder-session", "Answer: option 1")
+        finally:
+            SPAWN_OBSERVER.reset(token)
+
+    run(go())
+    assert seen["pid"]
+    assert runner.active is None
+    with pytest.raises(ProcessLookupError):
+        os.kill(seen["pid"], 0)  # the builder was stopped and reaped
 
 
 @pytest.mark.parametrize("recommendation", ["\t", "\n", "　", " ", "\x1c\x1d", "   "])

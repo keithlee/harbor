@@ -4728,9 +4728,10 @@ class Supervisor:
                         raise _RecoverySuperseded from None
                     answered = True
                 if not attempted:
-                    recovery.record(connection, case, decision)
+                    recovery_row[0] = recovery.record(connection, case, decision)
                     attempted = True
 
+            recovery_row: list[int | None] = [None]
             token = SPAWN_OBSERVER.set(observer) if auto is not None else None
             try:
                 if not self._first_mate_can_recover(case):
@@ -4781,9 +4782,16 @@ class Supervisor:
                 elif answered:
                     # Recorded at launch, but no builder started (deadline
                     # exhausted, executable missing, session unavailable,
-                    # superseded): hand it back, receipt marked undelivered.
+                    # superseded): hand it back, receipt marked undelivered,
+                    # and correct the recovery row recorded at launch.
                     from harbor.auto_accept import reopen
                     reopen(self.db, auto.get("escalation_id"))
+                    recovery.amend_reason(connection, recovery_row[0], recovery.undelivered_reason(decision))
+            if answered and not handed_over:
+                await self._notify_operator(
+                    f"recovery-undelivered:{case.run_id}:{len(case.history)}",
+                    f"{recovery.undelivered_reason(decision)} ({case.ticket}).")
+                return
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
 

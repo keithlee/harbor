@@ -70,10 +70,11 @@ model settings. Include concrete options and a recommendation, and ALWAYS set
 `recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
 option; `null` for none). Harbor decides from that index, and the prose can only veto it: when it
 is `0`, Harbor may accept the first option automatically and resume you with it as the answer, but
-only for a `product_decision` or `ambiguous_ac` blocker
-whose first option and recommendation use only letters, spaces and `, . ' " ! ? ( )`, with no
-identifier-shaped words; the exact rules are in Harbor's `docs/configurable-workflows.md`
-("Auto-accepting the builder's first option"). Put a costly,
+only for a `product_decision` or `ambiguous_ac` blocker whose first option and recommendation use
+only ASCII letters, spaces and `, . ' " ! ? ( )` (no digits, hyphens, colons or identifier-shaped
+words). The one exception is that the recommendation may contain the literal phrase `option 1` or
+`option #1`, followed by a colon only when it starts the recommendation. The exact rules are in
+Harbor's `docs/configurable-workflows.md` ("Auto-accepting the builder's first option"). Put a costly,
 destructive or access-related choice anywhere but first, since Harbor's keyword checks for those
 match words, not meaning. Keep `recommendation` short and plain, for example "Take option 1
 because it matches the ticket criteria"; conditions, caveats or mentions of other options send the
