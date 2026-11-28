@@ -2985,12 +2985,12 @@ class Supervisor:
             if row is not None:
                 observed_run = dict(row)
                 run.update({key: observed_run.get(key) for key in ("session_id", "worktree", "terminal_reason", "deadline_seconds")})
-        if isinstance(result.get("worktree"), str):
-            run["worktree"] = result["worktree"]
-        elif run_id and self.db is not None:
-            # Runner finals intentionally contain only result metadata.  The
-            # retained worktree is durable run state, so recover it by the
-            # exact run id before resolving repository-local authority.
+        # Never take the worktree from the result: it carries the builder's
+        # own final, and a builder that names another directory would move
+        # the ladder's changed-path check and authority reads there.  The
+        # retained worktree is durable run state, so recover it by the exact
+        # run id (the ladder then checks it against worktree custody).
+        if not run.get("worktree") and run_id and self.db is not None:
             connection = getattr(self.db, "connection", None)
             try:
                 row = connection.execute(

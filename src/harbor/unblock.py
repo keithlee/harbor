@@ -178,8 +178,17 @@ def _paths(value: Any) -> list[str]:
         return [str(value).strip()] if str(value).strip() else []
 
 
+def _normalise_path(item: str) -> str:
+    """Forward slashes, without a leading ``./`` or ``/``.  A leading dot is part of the name (``.github``)."""
+
+    path = item.replace("\\", "/")
+    while path.startswith("./") or path.startswith("/"):
+        path = path[1:] if path.startswith("/") else path[2:]
+    return path
+
+
 def _normalise_paths(value: Any) -> tuple[str, ...]:
-    return tuple(item.replace("\\", "/").lstrip("./") for item in _paths(value))
+    return tuple(path for path in (_normalise_path(item) for item in _paths(value)) if path)
 
 
 class BlockerContextUnavailable(LinearClientError):
@@ -497,6 +506,70 @@ def recorded_base_sha(db: Any, repo_path: str | Path, worktree: str | Path, tick
     return head if _FULL_SHA.fullmatch(head) else None
 
 
+def recorded_worktree(db: Any, repo_path: str | Path, ticket: str) -> Path | None:
+    """The worktree ``WorktreeManager.create`` made for ``ticket`` in ``repo_path``, from Harbor's custody."""
+
+    connection = getattr(db, "connection", db)
+    execute = getattr(connection, "execute", None)
+    if not callable(execute) or not ticket:
+        return None
+    try:
+        rows = execute(
+            "SELECT path FROM worktree_setup WHERE repo=? AND ticket=?",
+            (str(Path(repo_path).expanduser().resolve()), ticket),
+        ).fetchall()
+    except Exception:  # no custody table: nothing was recorded
+        return None
+    paths = {str(row[0]) for row in rows if row and row[0]}
+    if len(paths) != 1:
+        # None recorded, or (across projects sharing a checkout) ambiguous.
+        return None
+    return Path(paths.pop())
+
+
+def _ticket_pr_links(ticket: Mapping[str, Any]) -> list[str]:
+    from harbor.poll.github_poller import _ticket_attachments
+
+    links: list[str] = []
+    for attachment in _ticket_attachments(ticket):
+        url = (attachment.get("url") or attachment.get("href")) if isinstance(attachment, Mapping) else attachment
+        if isinstance(url, str) and url.strip():
+            links.append(url.strip())
+    return links
+
+
+PUSHED_REF_PREFIX = "refs/harbor/unblock/"
+
+
+def pushed_changed_paths(repo_path: str | Path, base_sha: str, head_sha: str, *, remote: str = "origin",
+                         timeout: float = 120) -> list[str]:
+    """Paths that differ between Harbor's recorded base and a pull request head GitHub reported.
+
+    Runs in the operator's checkout, comparing two commits named by SHA, so
+    nothing the builder controls in its worktree (``HEAD``, branches, refs)
+    is consulted.  A head that is not in the local object store is fetched
+    from the operator's configured remote into a private ref.  Fails closed
+    when either commit cannot be read.
+    """
+
+    for sha in (base_sha, head_sha):
+        if not _FULL_SHA.fullmatch(sha or ""):
+            raise ChangedPathsUnobservable(f"not a full commit SHA: {sha!r}")
+    present = run_git(repo_path, "cat-file", "-e", f"{head_sha}^{{commit}}", timeout=timeout)
+    if present.returncode != 0:
+        fetched = run_git(repo_path, "fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "--end-of-options",
+                          remote, f"+{head_sha}:{PUSHED_REF_PREFIX}{head_sha}", timeout=timeout)
+        if fetched.returncode != 0:
+            raise ChangedPathsUnobservable(
+                f"cannot fetch pull request head {head_sha} from {remote}: {(fetched.stderr or '').strip()[-300:]}"
+            )
+    diffed = run_git(repo_path, "diff", "--name-only", "-z", "--no-renames", "--ignore-submodules=dirty",
+                     base_sha, head_sha, "--", timeout=timeout)
+    if diffed.returncode != 0:
+        raise ChangedPathsUnobservable(f"cannot diff pull request head {head_sha} against base {base_sha}: {diffed.stderr.strip()}")
+    return nul_paths(diffed.stdout)
+
+
 def protected_paths_at_base(repo_path: str | Path, base_sha: str, *, timeout: float | None = 10) -> tuple[str, ...]:
     """The AGENTS.md ``protected_paths`` of the operator's repository at ``base_sha``.
 
@@ -535,15 +608,7 @@ def _protected_pathspecs(patterns: Iterable[str]) -> list[str]:
     """
 
     specs: list[str] = []
-    for raw in _paths(list(patterns)):
-        # Not ``_normalise_paths``: its ``lstrip("./")`` turns ``.github/**``
-        # into ``github/**``, which names no file on disk.
-        pattern = raw.replace("\\", "/")
-        while pattern.startswith("./"):
-            pattern = pattern[2:]
-        pattern = pattern.lstrip("/")
-        if not pattern:
-            continue
+    for pattern in _normalise_paths(list(patterns)):
         directory = pattern.rstrip("/")
         for spec in (pattern, f"*/{pattern}", directory, f"{directory}/*", f"*/{directory}", f"*/{directory}/*"):
             if spec and f":(top){spec}" not in specs:
@@ -1095,6 +1160,10 @@ class UnblockLadder:
         policy: BlockerPolicy | None = None,
         base_branch: str = "main",
         linear_projects: Iterable[str] = (),
+        github: Any | None = None,
+        github_repository: str | None = None,
+        github_web_host: str | None = None,
+        git_remote: str = "origin",
     ) -> None:
         self.db = db
         if db is not None:
@@ -1117,7 +1186,14 @@ class UnblockLadder:
         self.human_review_state_id = human_review_state_id
         self.base_branch = base_branch
         self.linear_projects = tuple(linear_projects)
-        self.policy = policy or BlockerPolicy(decision_mode="cite_only", unblock_attempts=rung_one_cap)
+        # Read-only GitHub access (``pull_requests(owner, repo, numbers)``) for
+        # the heads of the ticket's PRs; see ``_pull_request_heads``.
+        from harbor.poll.github_poller import DEFAULT_WEB_HOST
+        self.github = github
+        self.github_repository = github_repository if github_repository and github_repository.count("/") == 1 else None
+        self.github_web_host = github_web_host or DEFAULT_WEB_HOST
+        self.git_remote = git_remote
+        self.policy =policy or BlockerPolicy(decision_mode="cite_only", unblock_attempts=rung_one_cap)
         self.rung_one_cap = self.policy.unblock_attempts
 
     def _prior_rung_one(self, ticket_id: str, kind: str) -> int:
@@ -1317,8 +1393,34 @@ class UnblockLadder:
         progress["triage"] = True
         return escalation
 
-    def _protected_gate(
-        self, ticket_id: str, run_repo: Path | None, blocker_value: dict[str, Any],
+    def _git_project(self) -> bool:
+        return self.repo_path is not None and main_git_dir(self.repo_path) is not None
+
+    def _run_worktree(self, ticket_id: str, run: Mapping[str, Any]) -> Path | None:
+        """The worktree to inspect: Harbor's custody record for the ticket, never a path the builder named.
+
+        In a git project the ``worktree_setup`` row ``WorktreeManager.create``
+        wrote is authoritative.  A run that names a different directory is
+        refused rather than followed.  Without a custody row the run's own
+        value is returned, and the gate then fails closed for want of a
+        recorded base commit.
+        """
+
+        reported_value = _value(run, "worktree", "cwd", default=None)
+        reported = Path(str(reported_value)) if reported_value else None
+        if not self._git_project():
+            return reported
+        recorded = recorded_worktree(self.db, self.repo_path, ticket_id)
+        if recorded is None:
+            return reported
+        if reported is not None and reported.expanduser().resolve() != recorded:
+            raise ChangedPathsUnobservable(
+                f"the blocked run names {reported} as its worktree, but Harbor created {recorded} for {ticket_id}"
+            )
+        return recorded
+
+    async def _protected_gate(
+        self, ticket: Mapping[str, Any], ticket_id: str, run_repo: Path | None, blocker_value: dict[str, Any],
     ) -> tuple[tuple[str, ...], bool]:
         """Return ``(protected patterns, whether the builder touched one)``, from observed changes.
 
@@ -1328,15 +1430,17 @@ class UnblockLadder:
         unrecorded, missing, the operator's own checkout, unverifiable or
         without a recorded base commit raises (``ChangedPathsUnobservable`` or
         ``UnsafeGitDirectory``), so the blocker is reported to the operator and
-        never auto-resolved.  The protected list is the configured one plus
-        the AGENTS.md profile of the operator's checkout at that base, never
-        the builder's copy.  The builder's own path claims only add to what is
-        observed.
+        never auto-resolved.  The worktree's ``HEAD`` is the builder's to
+        move, so the head of each of the ticket's pull requests, read from
+        GitHub, is diffed against the base as well.  The protected list is the
+        configured one plus the AGENTS.md profile of the operator's checkout
+        at that base, never the builder's copy.  The builder's own path claims
+        only add to what is observed.
         """
 
         configured = tuple(self.protected_paths)
         repo = self.repo_path
-        if repo is not None and main_git_dir(repo) is not None:
+        if repo is not None and self._git_project():
             if run_repo is None:
                 raise ChangedPathsUnobservable("the blocked run has no recorded worktree, so its changes cannot be checked")
             if not run_repo.is_dir():
@@ -1353,7 +1457,12 @@ class UnblockLadder:
                 )
             patterns = tuple(_paths(list(configured) + list(protected_paths_at_base(repo, base_sha))))
             observed = observed_changed_paths(run_repo, repo, base_sha, patterns)
-            blocker_value["touched_paths"] = list(dict.fromkeys(list(observed.paths) + _paths(blocker_value.get("touched_paths"))))
+            pushed: list[str] = []
+            for head_sha in await self._pull_request_heads(ticket, ticket_id):
+                pushed += pushed_changed_paths(repo, base_sha, head_sha, remote=self.git_remote)
+            blocker_value["touched_paths"] = list(dict.fromkeys(
+                list(observed.paths) + pushed + _paths(blocker_value.get("touched_paths"))
+            ))
             return patterns, bool(observed.hidden) or touches_protected_paths(blocker_value, protected_paths=patterns)
         if run_repo is not None and run_repo.is_dir() and os.path.lexists(run_repo / ".git"):
             # Git metadata Harbor cannot verify against a project repository.
@@ -1362,6 +1471,58 @@ class UnblockLadder:
             worktree_git_dirs(run_repo, repo)
         patterns = tuple(_paths(list(configured) + list(_protected_from_agents(repo) if repo is not None else ())))
         return patterns, touches_protected_paths(blocker_value, protected_paths=patterns)
+
+    async def _pull_request_heads(self, ticket: Mapping[str, Any], ticket_id: str) -> list[str]:
+        """The current head SHA, from GitHub, of every pull request of this project linked to the ticket.
+
+        PRs come from the ticket's Linear attachments and from Harbor's own
+        ``prs`` ledger.  Fails closed when the ticket has a PR but GitHub is
+        not configured, cannot be read, or reports no usable head.
+        """
+
+        from harbor.poll.github_poller import _head_sha, attached_pull_requests, pull_number
+
+        urls: list[Any] = list(_ticket_pr_links(ticket))
+        connection = getattr(self.db, "connection", self.db) if self.db is not None else None
+        if connection is not None and callable(getattr(connection, "execute", None)) and ticket_id:
+            try:
+                urls += [row[0] for row in connection.execute("SELECT url FROM prs WHERE ticket=?", (ticket_id,)).fetchall()]
+            except Exception:
+                pass  # no PR ledger yet: nothing recorded
+        links = [url for url in urls if isinstance(url, str) and pull_number(url, web_host=self.github_web_host)]
+        if not links:
+            return []
+        repository = self.github_repository
+        if not repository or self.github is None:
+            # Without a configured repository a link cannot be told apart from
+            # another repository's, and without a client no head can be read.
+            raise ChangedPathsUnobservable(
+                f"{ticket_id} has a pull request, but Harbor has no GitHub client to read its head commit"
+            )
+        numbers = tuple(number for number, _ in attached_pull_requests(
+            {"identifier": ticket_id, "pr_urls": links}, repository=repository, web_host=self.github_web_host,
+        ))
+        if not numbers:
+            return []
+        owner, name = repository.split("/", 1)
+        method = getattr(self.github, "pull_requests", None) or getattr(self.github, "fetch_pull_requests", None)
+        if not callable(method):
+            raise ChangedPathsUnobservable("the configured GitHub client cannot read pull requests")
+        try:
+            response = method(owner, name, numbers)
+            response = await response if inspect.isawaitable(response) else response
+        except Exception as exc:
+            raise ChangedPathsUnobservable(f"cannot read {ticket_id}'s pull requests from GitHub: {exc}") from exc
+        nodes: Any = response.get("data", response) if isinstance(response, Mapping) else {}
+        nodes = nodes.get("repository", nodes) if isinstance(nodes, Mapping) else {}
+        heads: list[str] = []
+        for number in numbers:
+            node = nodes.get(f"pr_{number}") if isinstance(nodes, Mapping) else None
+            head = _head_sha(node) if isinstance(node, Mapping) else None
+            if not head or not _FULL_SHA.fullmatch(head):
+                raise ChangedPathsUnobservable(f"GitHub reported no head commit for {ticket_id}'s pull request #{number}")
+            heads.append(head)
+        return list(dict.fromkeys(heads))
 
     async def _handle(
         self,
@@ -1409,10 +1570,10 @@ class UnblockLadder:
         kind = _kind(blocker_value)
         question = _question(blocker_value) or _text(_value(final, "summary", "next_action", default="")).strip()
         question = question or f"How should Harbor unblock {ticket_id or 'this ticket'}?"
-        run_repo_value = _value(run, "worktree", "cwd", default=None)
-        run_repo = Path(str(run_repo_value)) if run_repo_value else None
+        run_repo = self._run_worktree(ticket_id, run)
+        run_repo_value = str(run_repo) if run_repo is not None else None
         authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
-        protected_patterns, protected = self._protected_gate(ticket_id, run_repo, blocker_value)
+        protected_patterns, protected = await self._protected_gate(ticket, ticket_id, run_repo, blocker_value)
         adapter = (
             deterministic_capability_adapter(blocker_value, authority_repo)
             if not protected and self._prior_rung_zero(ticket_id, kind) < self.policy.unblock_attempts
