@@ -507,8 +507,10 @@ depends on whether the project tracks `.harbor/`:
   - git hooks (#59);
   - the `ios` and `android` escapes above.
 - **`.harbor/` tracked.** GitHub branch protection with required Code Owner
-  review on `/.harbor/` makes every repo-level change to it need a human
-  approval. This is the recommended setup for a project that enables
+  review on `/.harbor/` makes a PR that touches `.harbor/` need a human
+  approval. A change that lands in `.harbor/` through rename detection, from a
+  PR whose diff touches only other paths, may not trigger Code Owner review.
+  This has not been verified on GitHub. This is the recommended setup for a project that enables
   `device_proof`. It still does not stop the unsandboxed writes listed above,
   and it does not bound the device escapes.
 
@@ -545,11 +547,17 @@ commands. They do not stop a builder that means to get around them.
     from `git merge-tree --write-tree`. That is the same ort merge GitHub runs,
     over every merge base. On a git without `--write-tree`, the PR head is
     compared with every merge base.
-  - every commit in the PR (`base..head`), because a rebase merge replays the
-    commits one at a time. For a merge commit, only the content it introduces
-    itself counts.
+  - every commit in the PR (`base..head`), as a conservative extra. For a
+    merge commit, only the content it introduces itself counts.
 
-  A merge conflict counts as unreadable.
+  A merge conflict counts as unreadable. Neither comparison models a rebase
+  merge: rebase replays commits with rename detection, which can land an edit
+  to another path in `.harbor/`. So `pr-merge --method rebase` is refused with
+  "human merge required: rebase merges can't be checked for .harbor/ changes"
+  whenever anything under `.harbor/` is tracked at the base, the head or the
+  merge result. Projects that keep `.harbor/` untracked may still rebase.
+  `pr-merge` defaults to `--method squash`, which lands the merge result the
+  check reads.
 - **An untracked `.harbor/`.** Harbor reads the workflow from the main
   checkout, so a project may keep `.harbor/` untracked. When neither the merge
   base nor the PR head tracks anything under `.harbor/`, the PR cannot change
@@ -591,10 +599,11 @@ commands. They do not stop a builder that means to get around them.
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
   - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
 - **The helper's `api` command is an allowlist.**
-  - Reads (`GET`, `HEAD`) go through.
-  - Writes are allowed only for PR create and edit, issue and review comments,
+  - Reads (`GET`, `HEAD`) go through when they carry no request body.
+  - Writes are allowed only for PR create, PR edit, issue and review comments,
     replies, reviews and labels, under `/repos/<owner>/<repo>/` for the
-    configured repository.
+    configured repository. A PR edit (`PATCH pulls/N`) may set only `title`
+    and `body`; `base`, `state` and every other field are refused.
   - GraphQL mutations are allowed only for `addPullRequestReviewThreadReply`,
     `resolveReviewThread`, `unresolveReviewThread` and `addComment`. The query
     is parsed: escapes are decoded, comments stripped and aliases resolved to
@@ -610,14 +619,17 @@ commands. They do not stop a builder that means to get around them.
   - Merges, refs, contents and branch protection are refused there.
 
 **Known ways around Harbor's checks.** For a tracked `.harbor/`, branch
-protection stops the first four. None of them is stopped for an untracked
-`.harbor/`:
+protection with Code Owner review stops the first four when the PR touches
+`.harbor/` itself (see the rename caveat above). None of them is stopped for an
+untracked `.harbor/`:
 - the GitHub token used directly, for example `curl` to the REST or GraphQL API;
 - the GitHub MCP server's merge tool when `[github] transport = "mcp"`;
 - `git push` to the base branch;
 - the repository's git directory, which the builder can write. Harbor reads
-  its objects but no config, refs or hooks, so a forged object is still a way
-  around the check;
+  its objects but no config, refs or hooks. git does not verify that a loose
+  object's content matches its name when it reads it, so the builder could
+  write content under an existing commit's or tree's ID that hides a
+  `.harbor/` change from the check;
 - the builder's own environment: `PATH`, `PYTHONPATH`, `HARBOR_GIT_DIR` and
   `HOME`. Wherever the check runs inside the builder, the builder chooses
   which `git` and which Harbor code run, and which git dir they read;

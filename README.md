@@ -537,9 +537,12 @@ untracked, CODEOWNERS does not apply to it, and anything Harbor runs outside
 the sandbox can write it: `install_command`, git hooks, and the device escapes.
 The recommended setup is to track `.harbor/` and protect the base branch with
 required Code Owner review (`/.harbor/ @your-org/harbor-admins` in
-`.github/CODEOWNERS`). That makes repo-level changes need a human, but it
-still does not bound the device escapes. The docs list the exact steps. An
-unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
+`.github/CODEOWNERS`). That makes a PR that touches `.harbor/` need a human.
+A change that reaches `.harbor/` through rename detection may not trigger it
+(not verified on GitHub), and it still does not bound the device escapes. With
+a tracked `.harbor/`, Harbor's `pr-merge` refuses `--method rebase`, because
+rebase merges can't be checked for `.harbor/` changes. Its default, squash, is
+unaffected. The docs list the exact steps. An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
 builder the project could run.
 
 Claude Code's documentation describes these settings as macOS-only. Harbor
@@ -641,9 +644,11 @@ needs and keeps the delivery instructions opaque.
   when the project lists them in `[builder] device_proof`. Each of those is a
   path out of the sandbox: adb and simctl reach any host, and with `ios` the
   builder can act as the host user and edit `.harbor/` directly. Branch
-  protection with Code Owner review on a tracked `.harbor/` makes PR changes to
-  it need a human. It does nothing for an untracked `.harbor/` or for the
-  device escapes, and Harbor's own merge checks are best effort.
+  protection with Code Owner review on a tracked `.harbor/` makes PRs that
+  touch it need a human, but a rename-based change may slip past it. It does
+  nothing for an untracked `.harbor/` or for the device escapes. Harbor's own
+  merge checks are best effort and refuse rebase merges when `.harbor/` is
+  tracked.
 
 ## Test fixtures and external proof
 
