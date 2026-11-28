@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +71,14 @@ class RemediationPlan:
     commands: tuple[tuple[str, ...], ...]
     reason: str
     retry_same_session: bool = True
+    # Set when nothing can be repaired here and only the operator can fix it
+    # (for example a GitHub project whose token variable is not set). The
+    # text is the exact fix; it never contains a secret.
+    operator_fix: str | None = None
+    # Shown to the operator when a command fails (the check ran and failed).
+    failure_fix: str | None = None
+    # Run in a fresh empty directory instead of the builder's worktree.
+    neutral_cwd: bool = False
 
     @property
     def command(self) -> tuple[str, ...] | None:
@@ -105,7 +115,71 @@ class RemediationResult:
         }
 
 
-def remediation_plan(blocker: Any) -> RemediationPlan | None:
+def github_transport_plan(
+    github_profile: Any = None,
+    *,
+    project: str = "",
+    environ: Mapping[str, str] | None = None,
+) -> RemediationPlan:
+    """Check the project's own GitHub token; never the GitHub CLI.
+
+    Harbor never reads the operator's ``gh`` login, and ``gh`` hangs inside
+    Claude Code's macOS sandbox, so the only repair is the project's token
+    (``github_token_env``, else ``GITHUB_TOKEN``/``GH_TOKEN``). Missing: the
+    operator must set it. Present: one read-only REST request through Harbor's
+    helper proves GitHub accepts it, and the builder resumes with the helper.
+    Only variable *names* ever appear in the command; the value stays in the
+    environment the helper inherits.
+    """
+
+    from harbor.github_rest import helper_command, helper_invocation, rest_base_url
+    from harbor.github_token import missing_token_help, project_token_env
+
+    env = os.environ if environ is None else environ
+    label = f" for project {project}" if project else ""
+    fix = f"no GitHub token{label}: {missing_token_help(github_profile)}"
+    name = project_token_env(github_profile, env)
+    if name is None:
+        return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
+    repository = str(getattr(github_profile, "repository", "") or "")
+    if repository.count("/") != 1 or not all(repository.split("/")):
+        # The helper acts only on the configured repository, so there is
+        # nothing to check, and nothing a builder could do on GitHub either.
+        fix = f"no github_repository is configured{label}, so builders have no GitHub API access; set github_repository"
+        return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
+    path = f"/repos/{repository}"
+    try:
+        api = rest_base_url(getattr(github_profile, "github_api_url", None))
+    except ValueError as exc:
+        fix = f"the GitHub API URL{label} is not usable ({exc}); fix github_api_url"
+        return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
+    # The helper's api command acts only on HARBOR_GITHUB_REPOSITORY (#61).
+    command = ("env", f"HARBOR_GITHUB_TOKEN_ENV={name}", f"HARBOR_GITHUB_API_URL={api}",
+               f"HARBOR_GITHUB_REPOSITORY={repository}", *helper_command(), "api", "GET", path)
+    return RemediationPlan(
+        kind="github_transport",
+        commands=(command,),
+        # Runs on the host with the token in its env: never in the worktree.
+        neutral_cwd=True,
+        reason=(
+            f"The project's GitHub token ({name}) is set and GitHub accepts it. Use Harbor's REST helper "
+            f"(`{helper_invocation()} <op>`) for every GitHub read and write, as your "
+            "launch prompt describes; never the gh CLI, which hangs inside Claude Code's sandbox on macOS."
+        ),
+        failure_fix=(
+            f"GitHub rejected the project's token in {name}{label}, or it cannot read "
+            f"{repository}:{missing_token_help(github_profile)}"
+        ),
+    )
+
+
+def remediation_plan(
+    blocker: Any,
+    *,
+    github_profile: Any = None,
+    project: str = "",
+    environ: Mapping[str, str] | None = None,
+) -> RemediationPlan | None:
     """Return the one safe playbook matching ``blocker`` or ``None``.
 
     ``Cannot find module`` is intentionally matched case-insensitively and
@@ -116,11 +190,7 @@ def remediation_plan(blocker: Any) -> RemediationPlan | None:
     text = blocker_text(blocker).casefold()
     kind = str(_value(blocker, "kind", "type", "category", default="")).casefold().replace("-", "_")
     if kind == "github_transport" or any(marker in text for marker in GITHUB_TRANSPORT_MARKERS):
-        return RemediationPlan(
-            kind="github_transport",
-            commands=(("gh", "auth", "status", "--hostname", "github.com"),),
-            reason="GitHub CLI authentication is verified with gh auth status; use gh for GitHub mutations.",
-        )
+        return github_transport_plan(github_profile, project=project, environ=environ)
     if any(marker in text for marker in MODULE_NOT_FOUND_MARKERS):
         return RemediationPlan(
             kind="missing_module",
@@ -211,14 +281,22 @@ async def execute_remediation(
     *,
     executor: Callable[..., Any] | Any | None = None,
     cwd: str | Path | None = None,
+    github_profile: Any = None,
+    project: str = "",
 ) -> RemediationResult:
     """Execute a known plan and report whether every command succeeded."""
 
-    plan = remediation_plan(blocker)
+    plan = remediation_plan(blocker, github_profile=github_profile, project=project)
     if plan is None:
         return RemediationResult(None, attempted=False, fixed=False, error="no deterministic remediation")
+    if plan.operator_fix is not None:
+        # Nothing to run: only the operator can fix this.
+        return RemediationResult(plan, attempted=True, fixed=False, error=plan.operator_fix)
     workdir = Path(cwd) if cwd is not None else None
     outputs: list[Any] = []
+    neutral = tempfile.TemporaryDirectory(prefix="harbor-remediation-") if plan.neutral_cwd else None
+    if neutral is not None:
+        workdir = Path(neutral.name)
     try:
         for command in plan.commands:
             value = await _invoke_executor(executor, command, workdir)
@@ -227,6 +305,9 @@ async def execute_remediation(
                 return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error="remediation command failed")
     except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
         return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error=str(exc))
+    finally:
+        if neutral is not None:
+            neutral.cleanup()
     return RemediationResult(plan, attempted=True, fixed=True, outputs=tuple(outputs))
 
 

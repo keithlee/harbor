@@ -12,6 +12,23 @@ from harbor.config.workflow import load_workflow
 from harbor.hooks import execute_event
 from harbor.workflow_store import bind, record
 
+WORKFLOW_CHECK_TOKEN_HELP = (
+    "workflow check cannot read GitHub: {problem}. It uses the project's GitHub token: inside a "
+    "builder, the variable harbor start named; from a terminal, export the variable named by the "
+    "project's github_token_env (or GITHUB_TOKEN or GH_TOKEN when github_token_env is not set), "
+    "then run it again."
+)
+
+
+def _http_status(exc):
+    """The HTTP status of an httpx status error, directly or as a chained cause; else None."""
+    seen = 0
+    while exc is not None and seen < 5:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code
+        exc, seen = exc.__cause__, seen + 1
+    return None
+
 
 def _one_line(exc):
     """An exception's message on one line (httpx status errors span several)."""
@@ -96,9 +113,13 @@ async def fresh_context(config, db, ticket_id, run, event):
     # Build the GitHub client from the project's profile, as every other
     # consumer does, so the token only goes to the configured GitHub host,
     # and refuse a non-https endpoint before any request is made.
+    from harbor.github_token import preferred_token_env, token_env_candidates
     profile = PipelineProfile.from_project(config)
     require_https_api_url(profile.github_api_url)
-    github = GitHubClient.from_profile(profile)
+    # The project's token: inside a builder, the variable Harbor named in
+    # HARBOR_GITHUB_TOKEN_ENV; from a terminal, github_token_env (strict) or
+    # GITHUB_TOKEN/GH_TOKEN. Never gh, which hangs in the builder sandbox.
+    github = GitHubClient.from_profile(profile, token_env=preferred_token_env(profile))
     linear = LinearClient(endpoint=config.linear_api_url)
     try:
         try:
@@ -124,11 +145,15 @@ async def fresh_context(config, db, ticket_id, run, event):
         try:
             facts = await poller.poll([ticket])
         except (GitHubError, httpx.HTTPError) as exc:
+            if _http_status(exc) == 401:
+                raise ValueError(WORKFLOW_CHECK_TOKEN_HELP.format(
+                    problem="GitHub answered 401 Unauthorized (the token is missing, expired or revoked)")) from exc
             # The default client lets transport failures through as httpx
             # errors, so both are a GitHub outage, never a "blocked" verdict.
+            token_names = " or ".join(token_env_candidates(preferred_token_env(profile)))
             raise ValueError(
                 f"GitHub could not provide the linked PR for {ticket_id} ({_one_line(exc)}); "
-                f"check github_api_url, network access, and that the token in {profile.github_token_env} "
+                f"check github_api_url, network access, and that the token in {token_names} "
                 f"can read {profile.repository_owner}/{profile.repository_name}"
             ) from exc
         matches = [f for f in facts if f.get("url") == run.get("pr_url")] if run.get("pr_url") else facts
@@ -152,8 +177,8 @@ async def fresh_context(config, db, ticket_id, run, event):
             # The git dir, fetch URL and token come from Harbor's project config and
             # environment, never from the worktree, whose .git file and config the builder can rewrite.
             from harbor.device_proof import builder_sandbox_change, git_fetch_url, main_git_dir
-            from harbor.github_rest import token_env_name
-            token_env = token_env_name(os.environ, profile.github_token_env)
+            from harbor.github_token import preferred_token_env, token_name
+            token_env = token_name(preferred_token_env(profile))
             sandbox_change = builder_sandbox_change(
                 main_git_dir(getattr(config, "repo_path", None)), fact.get("head_sha"), fact.get("base_sha"),
                 fetch_url=git_fetch_url(profile.github_api_url, profile.repository if profile.repository_owner else None),

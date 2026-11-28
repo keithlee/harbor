@@ -267,6 +267,10 @@ def build_production_dispatcher(
 
         builder_provider = getattr(config, "builder_provider", "codex")
         github = builder_github(config, workflow, builder_provider)
+        if not github["token_env"] and github["repository"]:
+            # Fail closed: builders on a GitHub project without the project's
+            # token would only stall or report a blocker.
+            raise ValueError(github["missing_token"])
         if github["linear_sandbox_warning"]:
             print(f"Harbor: warning: {github['linear_sandbox_warning']}; {LINEAR_URL_RESTART}", file=sys.stderr)
         claude_cli = os.environ.get("HARBOR_CLAUDE_EXECUTABLE", "claude")
@@ -502,7 +506,8 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
 
     import shlex
     from harbor.config.workflow import github_settings
-    from harbor.github_rest import rest_base_url, token_env_name
+    from harbor.github_rest import rest_base_url
+    from harbor.github_token import missing_token_help, project_token_env, token_env_candidates
 
     environ = os.environ if env is None else env
     settings = github_settings(workflow.config)
@@ -514,17 +519,22 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
     if settings["transport"] == "mcp" and rest_url != "https://api.github.com" and not explicit_mcp_url:
         # The default hosted MCP server is GitHub.com only; never send an Enterprise token there.
         raise ValueError("github.mcp_url is required for GitHub Enterprise Server; the default MCP server serves GitHub.com only")
-    token_env = token_env_name(environ, profile.github_token_env)
-    token_names = " or ".join(dict.fromkeys((profile.github_token_env, "GITHUB_TOKEN", "GH_TOKEN")))
+    # The project's token is the single source for the builder, its child
+    # agents and the REST helper; see harbor.github_token for the precedence.
+    token_env = project_token_env(profile, environ)
+    token_names = " or ".join(token_env_candidates(profile.github_token_env))
     # The same resolved repository the GitHub poller reads, so the builder
     # never acts on a different repository than Harbor observes.
     repository = profile.repository if profile.repository_owner else ""
-    helper = shlex.join([sys.executable, "-m", "harbor.github_rest"])
+    from harbor.github_rest import helper_invocation
+    helper = helper_invocation()
     child_env = {"HARBOR_GITHUB_API_URL": rest_url}
     if repository:
         child_env["HARBOR_GITHUB_REPOSITORY"] = repository
-    if token_env:
-        child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env
+    # Name the variable even when it is unset, so the helper never falls back
+    # to a broader GITHUB_TOKEN/GH_TOKEN the project did not choose.
+    if token_env or profile.github_token_env:
+        child_env["HARBOR_GITHUB_TOKEN_ENV"] = token_env or profile.github_token_env
     # pr-merge's .harbor/ check reads these from Harbor's config, not from the worktree.
     from harbor.device_proof import git_fetch_url, main_git_dir
     git_dir = main_git_dir(getattr(config, "repo_path", None))
@@ -544,6 +554,11 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "mcp_url": settings["mcp_url"],
         "token_env": token_env,
         "token_names": token_names,
+        "missing_token": (
+            f"no GitHub token for project {getattr(config, 'name', '')}: {missing_token_help(profile)}"
+            if repository else
+            "no token (none needed: no github_repository is configured, so builders get no GitHub API access)"
+        ),
         "env": child_env,
         "mcp": mcp,
         "sandbox_hosts": hosts,
@@ -551,6 +566,7 @@ def builder_github(config: Any, workflow: Any, provider: str, env: Any = None) -
         "repository": repository,
         "fact": github_transport_fact(
             settings["transport"], helper=helper, repository=repository, token_available=token_env is not None,
+            token_names=token_names,
         ),
     }
 
@@ -589,11 +605,11 @@ async def _doctor(project_name: str) -> int:
         print(f"GitHub transport: invalid ({exc})")
         scope_ok = False
     else:
-        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (python -m harbor.github_rest)"
+        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (harbor/github_rest.py, run with python -I)"
         if github["token_env"]:
             print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
         else:
-            print(f"GitHub transport: {github['transport']} · {where} · no token: set {github['token_names']}")
+            print(f"GitHub transport: {github['transport']} · {where} · {github['missing_token']}")
             if github["repository"]:
                 scope_ok = False
         if github["sandbox_hosts"] is not None:
@@ -828,6 +844,7 @@ async def _start(
             policy=config.blocker_policy,
             base_branch=config.base_branch,
             linear_projects=config.linear_project_scope,
+            github_profile=profile,
         )
     workflow = getattr(production_dispatcher, "workflow", None)
     if workflow is not None:
@@ -988,9 +1005,13 @@ async def _answer(escalation_id: str, text: str, *, project_name: str | None = N
         # is still required so the explicit resume inside answer_escalation can
         # hydrate the retained builder from the ledger and continue the SAME
         # session, which is the whole point of answering an escalation.
-        dispatcher, _, _ = build_production_dispatcher(
-            config, db, builder_prompt=_pipeline_text(config)
-        )
+        try:
+            dispatcher, _, _ = build_production_dispatcher(config, db, builder_prompt=_pipeline_text(config))
+        except ValueError as exc:
+            # For example a GitHub project without its token: the resumed
+            # builder could not reach GitHub, so say what to set instead.
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
         supervisor = Supervisor(poller, db=db, dispatcher=dispatcher, shadow=True)
         try:
             result = await supervisor.answer_escalation(escalation_id, text, background=True, enqueue_only=True)

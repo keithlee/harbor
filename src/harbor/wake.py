@@ -838,6 +838,7 @@ def github_transport_fact(
     helper: str = "",
     repository: str = "",
     token_available: bool = True,
+    token_names: str = "",
 ) -> str:
     """Tell the builder which GitHub transport this run actually has.
 
@@ -861,14 +862,30 @@ def github_transport_fact(
     )
     rest = f"`{helper} <op>`{target} ({ops}). It prints JSON."
     if not token_available:
+        # Inside Claude Code's macOS sandbox gh hangs rather than failing, so
+        # never steer a builder to it. Say only what Harbor actually checked.
+        no_gh = (
+            "Do not try the gh CLI: inside Claude Code's sandbox on macOS it hangs instead of failing. "
+            "`git push` may still work. Do not use MCP or gh-axi."
+        )
+        if not repository:
+            return (
+                "GitHub transport: this project configures no github_repository and no GitHub token is "
+                "set, so this run has no GitHub API access. If the ticket needs a GitHub API change "
+                "(a PR, a comment, a merge), report a delivery-transport blocker saying the project has "
+                "no GitHub repository configured. " + no_gh
+            )
+        names = f" ({token_names} is not set)" if token_names else ""
         return (
-            "GitHub transport: no GitHub token is set in this run's environment, so the REST helper "
-            f"`{helper}` cannot authenticate. If the gh CLI works in your sandbox you may use it; "
-            "if it fails or hangs, report a delivery-transport blocker. Do not use MCP or gh-axi."
+            f"GitHub transport: the project's GitHub token is not available to this run{names}, so the REST helper "
+            f"`{helper}`{target} cannot authenticate. Do your local work, then report a "
+            "delivery-transport blocker saying a GitHub token is missing. " + no_gh
         )
     common = (
-        "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
-        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual."
+        "Never print or echo the token. Never use the gh CLI, not even for a read: inside Claude Code's "
+        "sandbox on macOS it hangs or fails with `x509: OSStatus -26276`. `git push` works as usual. "
+        "Your child agents (planner, implementor, reviewer) inherit this environment and the same "
+        "project token; have them use this helper too."
     )
     if transport == "mcp":
         return (

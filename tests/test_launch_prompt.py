@@ -83,6 +83,27 @@ def test_fresh_session_receives_full_delivery_prompt(tmp_path, monkeypatch):
     db.close()
 
 
+def test_fresh_session_is_told_its_github_transport(tmp_path, monkeypatch):
+    """A First Mate or quota-fallback session starts with no memory of the REST helper.
+
+    Without the transport fact it fell back to `gh`, which fails in the sandbox
+    (HAN-94: "gh pr list fails with x509: OSStatus -26276").
+    """
+    dispatcher, runner, path, db = setup(tmp_path, monkeypatch)
+    dispatcher.github_fact = "GitHub transport: REST helper. TRANSPORT-SENTINEL"
+    db.replace_tickets("Demo", [{"identifier": "DEM-1", "state": "Blocked", "title": "t", "owned": True, "hold": False}],
+                       emit_events=False)
+    db.connection.execute("INSERT INTO runs(id,ticket,status,session_id,worktree,started_at,finished_at) VALUES "
+                          "('run-1','DEM-1','blocked','old-session',?,'2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00')",
+                          (str(tmp_path / "wt" / "DEM-1"),))
+    db.connection.commit()
+    asyncio.run(dispatcher.fresh_session("DEM-1", "FIRST-MATE-HANDOFF"))
+    sent = runner.instructions[0]
+    assert "TRANSPORT-SENTINEL" in sent
+    assert sent.index("Authoritative runtime invocation") < sent.index("TRANSPORT-SENTINEL") < sent.index("FIRST-MATE-HANDOFF")
+    db.close()
+
+
 def test_prompt_renderer_failure_is_reported_not_silent(tmp_path, monkeypatch):
     def broken(current):
         raise ValueError("workflow delivery requires its authoritative project registry")

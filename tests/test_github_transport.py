@@ -198,7 +198,7 @@ def test_rest_transport_passes_names_and_endpoints_never_the_token(tmp_path: Pat
         "HARBOR_GIT_FETCH_URL": "https://github.com/owner/repo.git",
     }
     assert github["mcp"] is None
-    assert "-m harbor.github_rest" in github["fact"] and "owner/repo" in github["fact"]
+    assert "-I " in github["fact"] and "harbor/github_rest.py" in github["fact"] and "owner/repo" in github["fact"]
     assert TOKEN not in json.dumps(github)
 
 
@@ -216,15 +216,21 @@ def test_mcp_transport_configures_the_server_with_a_token_reference(tmp_path: Pa
 def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path) -> None:
     github = builder_github(project(tmp_path), workflow(), "claude", env={"HARBOR_GITHUB_REPOSITORY": "o/r"})
     assert github["token_env"] is None and "HARBOR_GITHUB_TOKEN_ENV" not in github["env"]
-    assert "no GitHub token" in github["fact"] and "blocker" in github["fact"]
-    assert "If the gh CLI works" in github["fact"]  # keychain-only gh users are not stranded
+    assert "GitHub token is not available" in github["fact"] and "blocker" in github["fact"]
+    # Regression: this used to say "If the gh CLI works in your sandbox you may
+    # use it", and a Claude builder on macOS then hung on `gh pr view` until its
+    # time limit.
+    assert "may use it" not in github["fact"]
+    assert "Do not try the gh CLI" in github["fact"] and "hangs" in github["fact"]
+    assert "github_token_env" in github["missing_token"] and "gh " not in github["missing_token"]
 
 
 # --------------------------------------------------------------- builder view
 
 def test_the_fact_never_advertises_gh_and_reaches_the_instruction() -> None:
     fact = github_transport_fact("rest", helper="python -m harbor.github_rest", repository="o/r")
-    assert "Prefer this over the gh CLI" in fact and "pr-create" in fact
+    assert "Never use the gh CLI, not even for a read" in fact and "pr-create" in fact
+    assert "Prefer" not in fact  # a mere preference let builders still try gh
     assert "Available and authenticated" not in fact
     text = build_instruction({"identifier": "SAMPLE-1", "title": "t", "state": "Todo"}, github_fact=fact)
     assert fact in text
@@ -251,7 +257,8 @@ def test_mcp_on_github_enterprise_requires_an_explicit_endpoint(tmp_path: Path) 
 
 # ------------------------------------------------- production wiring (HAN-87)
 
-def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model"):
+def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = "codex", model: str = "test-model",
+               repository: str = "owner/repo", token: str | None = None, token_env: str = ""):
     import subprocess
     from harbor.cli import build_production_dispatcher
     from harbor.config.projects import ProjectConfig
@@ -260,13 +267,17 @@ def production(tmp_path: Path, monkeypatch, *, extra: str = "", provider: str = 
 
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
     path = materialize(tmp_path, extra=extra, models={"controller": {"model": model, "reasoning_effort": "medium"}})
-    monkeypatch.setenv("GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("GITHUB_TOKEN", TOKEN if token is None else token)
     monkeypatch.setenv("HARBOR_CLAUDE_EXECUTABLE", "/bin/echo")
     config = ProjectConfig(name="SampleProject", linear_project_slug="sample", repo_path=tmp_path,
-                           workflow_path=str(path), install_command="none", github_repository="owner/repo",
-                           builder_provider=provider, builder_model=model)
+                           workflow_path=str(path), install_command="none", github_repository=repository,
+                           builder_provider=provider, builder_model=model, github_token_env=token_env)
     db = HarborDB(tmp_path / "state.db")
-    dispatcher, _, factory = build_production_dispatcher(config, db)
+    try:
+        dispatcher, _, factory = build_production_dispatcher(config, db)
+    except BaseException:
+        db.close()
+        raise
     return dispatcher, factory, db
 
 
@@ -597,6 +608,7 @@ def test_the_production_factory_refuses_a_malformed_github_endpoint(tmp_path: Pa
 
 def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
                linear_api_url: str = "https://linear.invalid/graphql", *, registry: dict[str, str] | None = None,
+               github_env: dict[str, str] | None = None, pipeline_extra: str = "",
                workflow_extra: str = ""):
     import os
     import subprocess
@@ -615,7 +627,8 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
     pipeline.write_text("# Pipeline\nlinear_project_slug: sample\nlinear_team: SAMPLE\ninstall_command: none\n"
                         f"builder_provider: {provider}\nlinear_api_url: {linear_api_url}\n"
                         f"worktree_root: {worktree_root}\n"
-                        + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else ""))
+                        + (f"github_api_url: {github_api_url}\n" if github_api_url is not None else "")
+                        + pipeline_extra)
     extra = registry or {}
     projects = tmp_path / "projects.md"
     projects.write_text(
@@ -626,9 +639,10 @@ def run_doctor(tmp_path: Path, provider: str, github_api_url: str | None,
         + "".join(f" {value} |" for value in extra.values()) + "\n"
     )
     env = {k: v for k, v in os.environ.items() if k not in ("LINEAR_API_KEY", "HARBOR_LINEAR_API_KEY")}
+    env = {k: v for k, v in env.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN", "HARBOR_GITHUB_TOKEN_ENV")}
     env.update(HARBOR_PROJECTS_FILE=str(projects), HARBOR_DB_PATH=str(tmp_path / "harbor.db"),
-               GITHUB_TOKEN="dummy-token-value", HARBOR_CLAUDE_EXECUTABLE="/bin/echo",
-               HARBOR_CODEX_EXECUTABLE="/bin/echo")
+               HARBOR_CLAUDE_EXECUTABLE="/bin/echo", HARBOR_CODEX_EXECUTABLE="/bin/echo")
+    env.update({"GITHUB_TOKEN": "dummy-token-value"} if github_env is None else github_env)
     result = subprocess.run([sys.executable, "-c", "import sys; from harbor.cli import main; sys.exit(main())",
                              "doctor", "SampleProject"], env=env, capture_output=True, text=True, timeout=60)
     assert "dummy-token-value" not in result.stdout + result.stderr

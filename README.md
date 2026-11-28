@@ -95,8 +95,28 @@ environment and must never be written into either Markdown file.
 ```bash
 export HARBOR_PROJECTS_FILE="$HOME/.harbor/projects.md"
 export LINEAR_API_KEY="<linear-api-key>"
-export GH_TOKEN="<github-token>" # only when GitHub facts are configured
+export SAMPLE_GITHUB_TOKEN="<fine-grained-github-token>" # per project; see below
 ```
+
+**One GitHub token per project.** Give each project that sets a
+`github_repository` its own fine-grained GitHub token, limited to that repository,
+with **Contents** and **Pull requests** read and write, and **Checks** and
+**Commit statuses** read. Put the token in an environment variable. Name that
+variable, never the token itself, with `github_token_env`, either as a column in
+the project's registry row or in `.harbor/pipeline.md`:
+
+```markdown
+github_token_env: SAMPLE_GITHUB_TOKEN
+```
+
+Harbor's GitHub poller, the builder, the builder's child agents (planner,
+implementor, reviewer), the builder's REST helper, `harbor workflow check` and
+the blocker check that resumes a builder all use this one token. With `github_token_env` set, only that
+variable is read. Without it, Harbor reads `GITHUB_TOKEN`, then `GH_TOKEN`.
+Harbor never uses your `gh` login. `harbor doctor` fails, and `harbor start`
+refuses to start builders, for a GitHub project with no token, and both name the
+variable to set. A project without a `github_repository` (for example Linear
+only) needs no GitHub token.
 
 Each named project has separate repository, pipeline, Linear scope, GitHub
 facts, worktree root, and SQLite custody. `linear_projects` widens one named
@@ -123,7 +143,8 @@ while an agent works.
 
 Linear and GitHub API credentials are external-service credentials, not model
 calls. Linear uses `LINEAR_API_KEY` or `HARBOR_LINEAR_API_KEY`; the GitHub
-poller uses `GITHUB_TOKEN` or `GH_TOKEN` when GitHub facts are configured. The
+poller uses the project's token (the variable named by `github_token_env`, or
+`GITHUB_TOKEN`/`GH_TOKEN`) when GitHub facts are configured. The
 builder uses the same token for its own GitHub work through Harbor's REST
 helper (default) or an opt-in GitHub MCP server; see
 [GitHub transport](docs/configurable-workflows.md#github-transport-github).

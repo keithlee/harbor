@@ -224,13 +224,13 @@ auto-merge.
 ### GitHub transport (`[github]`)
 
 The builder needs GitHub to open, update, comment on, check and (when the
-workflow allows) merge its PR. Harbor does not rely on the GitHub CLI for this:
-inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake and
-hangs, while plain HTTPS to the API works. The builder is told to prefer the
-configured transport; where `gh` does work (for example Codex, or Linux) it may
-still use it, and with no token in the environment it is told to try `gh` before
-reporting a blocker. Harbor tells the builder which transport it
-has in the launch prompt.
+workflow allows) merge its PR. Harbor never steers a builder to the GitHub CLI:
+inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake (it
+hangs or fails with `x509: OSStatus -26276`), while plain HTTPS to the API
+works. Harbor names the builder's transport and its exact command in the launch
+prompt, including for First Mate and quota-fallback fresh sessions, and tells it
+never to use `gh`. With no token in the environment the builder is told to
+report a delivery-transport blocker, not to try `gh`.
 
 ```toml
 [github]
@@ -239,10 +239,13 @@ transport = "rest"   # default; or "mcp" (Claude builders only)
 ```
 
 **`rest` (default, no extra setup).** The builder runs Harbor's helper,
-`python -m harbor.github_rest`, which calls the GitHub REST API through `curl`.
+`<python> -I <harbor source>/harbor/github_rest.py` (the launch prompt gives the
+exact command), which calls the GitHub REST API through `curl`. `-I` and the
+absolute path mean the cwd, `PYTHONPATH` and any `harbor/` directory in the
+worktree cannot replace Harbor's own helper.
 Operations: `pr-view`, `pr-create`, `pr-edit`, `pr-comment`, `pr-checks`,
 `pr-merge` (pinned to a head SHA) and `api METHOD /path` for anything else. It
-uses the token you already export for Harbor (`GITHUB_TOKEN` or `GH_TOKEN`),
+uses the project's GitHub token (see **The project's GitHub token** below),
 targets the project's `github_repository`, and derives the REST base from
 `github_api_url` (`https://host/api/graphql` becomes `https://host/api/v3` on
 GitHub Enterprise Server). The token is passed to `curl` on stdin, so it is never
@@ -285,10 +288,79 @@ required, so an Enterprise token is never sent to the GitHub.com server. Codex b
 are refused at startup, because a non-interactive Codex run refuses MCP calls
 that need approval. The REST helper stays available as a fallback.
 
-Token scopes: the builder pushes branches and edits PRs, so a fine-grained token
-needs repository **Contents** and **Pull requests** read/write, plus **Checks**
-and **Commit statuses** read. `harbor doctor` prints the transport and which
-variable the token comes from, and fails when GitHub is configured with no token.
+**The project's GitHub token.** Each project with a `github_repository` uses
+one GitHub API token for all of its GitHub work: Harbor's GitHub poller, the
+builder, the builder's child agents (planner, implementor and reviewer, which run
+inside the builder and inherit its environment), the builder's REST helper,
+`harbor workflow check`, and the check Harbor runs when a builder reports a GitHub
+transport blocker (First Mate does no GitHub work). Create a fine-grained personal access
+token limited to the project's repository, with these permissions:
+
+- **Contents:** read and write (push branches)
+- **Pull requests:** read and write (open, edit and comment on PRs)
+- **Checks:** read
+- **Commit statuses:** read
+
+Put it in an environment variable, and name that variable with
+`github_token_env`, either as a column in the project's registry row or in
+`.harbor/pipeline.md` (a non-empty registry value wins):
+
+```markdown
+github_token_env: SAMPLE_GITHUB_TOKEN
+```
+
+```bash
+export SAMPLE_GITHUB_TOKEN="<fine-grained-github-token>"
+```
+
+`github_token_env` holds a variable name, never the token. Harbor refuses a value
+that is not a variable name, or that looks like a GitHub token (`ghp_…`,
+`github_pat_…`, and so on), and does not echo it. The token stays in the
+environment and is never written to config, MCP config, the ledger, logs,
+prompts or PR text. Harbor passes builders only the variable's name
+(`HARBOR_GITHUB_TOKEN_ENV`).
+
+Precedence:
+
+1. `github_token_env` is set: only that variable is read. If it is unset or
+   blank, the project has no token. Harbor does not fall back to a broader
+   `GITHUB_TOKEN` or `GH_TOKEN` that happens to be exported.
+2. `github_token_env` is not set: `GITHUB_TOKEN`, then `GH_TOKEN`. This is how
+   Harbor behaved before the key existed.
+
+A whitespace-only value counts as unset in every reader.
+
+If a project with a `github_repository` has no token, `harbor doctor` fails and
+`harbor start` refuses to start builders (as does `harbor answer`, which resumes
+one). Both say which key and variable to set, and the permissions listed above.
+A project without a `github_repository` (for example Linear only) needs no GitHub
+token and gets no warning. `harbor doctor` prints which variable the token comes
+from, and never its value.
+
+Harbor never uses the GitHub CLI's login (`gh auth token`). Your `gh` login is
+usually a broad OAuth token for every repository you can reach, not the
+project's token. Builders are also told never to fall back to `gh`: inside Claude
+Code's sandbox on macOS, `gh` cannot reach the keychain or complete TLS, so
+`gh pr view` and `gh pr list` hang until the run's time limit instead of failing.
+If the project's token is missing, the builder is told to report a
+delivery-transport blocker. Harbor then checks the project's token itself, and
+never consults `gh`:
+
+- The variable is unset or blank: Harbor escalates to you with the same fix
+  `doctor` prints.
+- It is set: Harbor makes one read-only request through the REST helper (the
+  project's repository, or `/rate_limit` when none is configured). If GitHub
+  accepts the token, Harbor resumes the same builder session and tells it to use
+  the REST helper. If GitHub rejects it, Harbor escalates with the fix.
+
+Only the variable's name appears in that command; the value stays in the
+environment.
+
+`harbor workflow check` reads the same token. Inside a builder it uses the
+variable `harbor start` named. From a terminal, export the variable named by
+`github_token_env` (or `GITHUB_TOKEN`/`GH_TOKEN` when it is not set). Without
+it, GitHub answers 401, and the command says so and names this fix.
+`harbor workflow checks` runs repository commands only and needs no GitHub token.
 Verified on macOS with Claude Code 2.1.330 and GitHub.com; Linux, Codex and
 GitHub Enterprise Server use the same code path but were not run.
 
@@ -300,6 +372,9 @@ get exactly the builder's tools (`Bash`, `Read`, `Glob`, `Grep`, `Skill`,
 `Agent`), its `dontAsk` permission mode and the same Bash sandbox: the same
 writable paths and the same network allowlist below. They cannot use a tool or
 reach a host the builder cannot. Verified on macOS with Claude Code 2.1.332.
+They also share the builder's environment, so they use the project's GitHub
+token (the variable `HARBOR_GITHUB_TOKEN_ENV` names) through the same REST
+helper; see **The project's GitHub token** above.
 
 **Claude builder sandbox network.** A Claude builder's Bash commands (the REST
 helper, `git push`, `curl`) can reach only an allowlist of hosts:
@@ -603,7 +678,7 @@ commands. They do not stop a builder that means to get around them.
     runtime would follow those links to files outside `.harbor/`.
 - **Where it runs:**
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
-  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
+  - the builder's merge command, `<helper> pr-merge N --sha SHA`, where `<helper>` is the REST helper command above.
 - **The helper's `api` command is an allowlist.**
   - Reads (`GET`, `HEAD`) go through when they carry no request body, except
     on `/graphql`: GraphQL is POST only, so its mutation allowlist always
@@ -645,11 +720,6 @@ untracked `.harbor/`:
   `install_command`, git hooks), and the `ios` and `android` escapes. These
   can edit the main checkout directly, so branch protection does not stop
   them either;
-- Harbor's own owner-approved-merge instruction
-  (`src/harbor/pr_events.py`), which tells the builder to merge with
-  `gh pr merge --match-head-commit`. That command does not go through
-  `pr-merge` or its `.harbor/` check. This predates device proof and is not
-  changed here.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`

@@ -77,7 +77,16 @@ def test_rung_zero_repairs_missing_module_and_resumes_same_session(tmp_path: Pat
         db.close()
 
 
-def test_rung_zero_verifies_github_transport_and_resumes_same_session(tmp_path: Path):
+def _github_profile(token_env: str = "SAMPLE_GITHUB_TOKEN"):
+    from types import SimpleNamespace
+    return SimpleNamespace(github_token_env=token_env, github_api_url="https://api.github.com/graphql",
+                           repository="owner/repo", repository_owner="owner", repository_name="repo")
+
+
+def test_rung_zero_verifies_the_project_token_and_resumes_with_the_rest_helper(tmp_path: Path, monkeypatch):
+    # Regression: this used to run `gh auth status` on the host and resume the
+    # builder with "use gh for GitHub mutations", which hangs in the sandbox.
+    monkeypatch.setenv("SAMPLE_GITHUB_TOKEN", "dummy-project-token-not-a-secret")
     db = HarborDB(tmp_path / "harbor.db")
     commands = []
     resumed = []
@@ -92,7 +101,8 @@ def test_rung_zero_verifies_github_transport_and_resumes_same_session(tmp_path: 
 
     try:
         result = run(
-            UnblockLadder(db, resumer=resume, remediation_executor=execute).handle(
+            UnblockLadder(db, resumer=resume, remediation_executor=execute,
+                          github_profile=_github_profile()).handle(
                 ticket(),
                 {"id": "builder-session"},
                 {"blocker": {"kind": "github_transport", "question": "Which approved GitHub mutation transport should be used?"}},
@@ -101,14 +111,51 @@ def test_rung_zero_verifies_github_transport_and_resumes_same_session(tmp_path: 
         assert result.rung == 0 and result.action == "resume" and result.resumed
         assert result.remediation is not None and result.remediation.plan is not None
         assert result.remediation.plan.kind == "github_transport"
-        assert commands == [["gh", "auth", "status", "--hostname", "github.com"]]
+        [command] = commands
+        assert "gh" not in command and command[0] == "env"
+        assert "HARBOR_GITHUB_TOKEN_ENV=SAMPLE_GITHUB_TOKEN" in command
+        from harbor.github_rest import helper_command
+        assert "HARBOR_GITHUB_REPOSITORY=owner/repo" in command
+        assert command[4:] == [*helper_command(), "api", "GET", "/repos/owner/repo"]
+        assert "-I" in command and "-m" not in command
+        assert "dummy-project-token-not-a-secret" not in " ".join(command)
         assert resumed[0][0] == "builder-session"
-        assert "use gh for GitHub mutations" in resumed[0][1]
+        assert "REST helper" in resumed[0][1] and "never the gh CLI" in resumed[0][1]
+        assert "use gh" not in resumed[0][1]
     finally:
         db.close()
 
 
-def test_github_transport_auth_failure_skips_first_mate_and_linear_parking(tmp_path: Path):
+def test_github_transport_missing_token_escalates_with_the_doctor_fix_and_never_asks_gh(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("SAMPLE_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "dummy-broader-token-not-a-secret")
+    db = HarborDB(tmp_path / "harbor.db")
+    commands = []
+    notifications = []
+
+    async def notify(message):
+        notifications.append(message)
+
+    try:
+        result = run(
+            UnblockLadder(db, notifier=notify, remediation_executor=lambda command: commands.append(command),
+                          github_profile=_github_profile()).handle(
+                ticket(),
+                {"id": "builder-session"},
+                {"blocker": {"kind": "github_transport", "question": "GitHub token missing"}},
+            )
+        )
+        assert result.rung == 0 and result.action == "escalate" and not result.resumed
+        assert commands == []  # nothing runs: there is no token to check, and never gh
+        assert "export SAMPLE_GITHUB_TOKEN" in result.reason and "Contents: read and write" in result.reason
+        assert "gh auth" not in result.reason and "dummy-broader-token" not in result.reason
+        assert notifications and "needs the project's GitHub token" in notifications[0]
+    finally:
+        db.close()
+
+
+def test_github_transport_auth_failure_skips_first_mate_and_linear_parking(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SAMPLE_GITHUB_TOKEN", "dummy-project-token-not-a-secret")
     db = HarborDB(tmp_path / "harbor.db")
     linear = LinearFake()
     first_mate_calls = []
@@ -129,6 +176,7 @@ def test_github_transport_auth_failure_skips_first_mate_and_linear_parking(tmp_p
                 first_mate=first_mate,
                 notifier=notify,
                 remediation_executor=lambda command: {"returncode": 1},
+                github_profile=_github_profile(),
             ).handle(
                 ticket(),
                 {"id": "builder-session"},
@@ -136,10 +184,11 @@ def test_github_transport_auth_failure_skips_first_mate_and_linear_parking(tmp_p
             )
         )
         assert result.rung == 0 and result.action == "escalate" and not result.resumed
-        assert "gh auth login --hostname github.com" in result.reason
+        assert "GitHub rejected the project's token in SAMPLE_GITHUB_TOKEN" in result.reason
+        assert "export SAMPLE_GITHUB_TOKEN" in result.reason and "gh auth" not in result.reason
         assert first_mate_calls == []
         assert linear.comments == [] and linear.states == []
-        assert notifications and "GitHub CLI authentication" in notifications[0]
+        assert notifications and "needs the project's GitHub token" in notifications[0]
     finally:
         db.close()
 

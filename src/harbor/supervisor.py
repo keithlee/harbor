@@ -736,6 +736,11 @@ class WorktreeDispatcher:
                 raise RuntimeError(f"retained worktree for {identifier} cannot be attached")
             worktree, runner = prepared
             prompt = self._launch_prompt(self._current_workflow(identifier, row["id"]))
+            # A fresh session remembers nothing, so it needs the GitHub
+            # transport fact a first build gets; without it builders reach for
+            # gh, which fails inside the sandbox.
+            if self.github_fact:
+                prompt = f"{prompt}\n\n{self.github_fact}" if prompt else self.github_fact
 
             def replace_session() -> None:
                 nonlocal replaced

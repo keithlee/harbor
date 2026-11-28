@@ -946,8 +946,12 @@ class UnblockLadder:
         policy: BlockerPolicy | None = None,
         base_branch: str = "main",
         linear_projects: Iterable[str] = (),
+        github_profile: Any | None = None,
     ) -> None:
         self.db = db
+        # The project's PipelineProfile: names the GitHub token variable a
+        # github_transport blocker is checked against (never the gh login).
+        self.github_profile = github_profile
         if db is not None:
             try:
                 # The comment receipt table is owned by Phase 3 and is kept
@@ -1259,6 +1263,8 @@ class UnblockLadder:
             blocker_value,
             executor=self.remediation_executor,
             cwd=run_repo_value,
+            github_profile=self.github_profile,
+            project=str(getattr(self, "workflow_project", "") or ""),
         )
         if remediation.attempted and not remediation.fixed:
             self._record(ticket_id, run_id, kind, question, 0, status="resume_pending", reason="deterministic remediation did not clear the blocker")
@@ -1286,18 +1292,19 @@ class UnblockLadder:
             )
 
         # GitHub delivery transport is an observed runtime capability, never
-        # a repository-policy question.  A failed read-only `gh auth status`
-        # check has one deterministic operator remedy, and must not consume a
-        # First Mate turn or rewrite the ticket as a product blocker.
+        # a repository-policy question.  A missing or rejected project token
+        # has one deterministic operator remedy (the same fix doctor gives),
+        # and must not consume a First Mate turn or rewrite the ticket as a
+        # product blocker.  Harbor never consults the gh CLI here.
         if remediation.plan is not None and remediation.plan.kind == "github_transport":
+            plan = remediation.plan
             reason = (
-                "GitHub CLI authentication is unavailable. Run `gh auth login --hostname github.com` "
-                "in the environment that starts Harbor before retrying this builder session."
-            )
+                plan.operator_fix or plan.failure_fix or "the project's GitHub token could not be verified"
+            ) + "; then retry this builder session."
             escalation = self._decide(progress, ticket_id, run_id, kind, question, 0, answer=reason, status="open", reason=reason)
             escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
             label = f" (escalation #{escalation_id})" if escalation_id is not None else ""
-            notified = await self._notify(f"{ticket_id} requires GitHub CLI authentication{label}: {reason}")
+            notified = await self._notify(f"{ticket_id} needs the project's GitHub token{label}: {reason}")
             if notified:
                 self._mark_notified(escalation)
             return UnblockResult(

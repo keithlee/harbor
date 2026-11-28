@@ -17,6 +17,19 @@ Configuration comes from the builder environment Harbor sets:
 """
 from __future__ import annotations
 
+if __name__ == "__main__" and not __package__:
+    # Run as ``python -I <this file>`` (see helper_command): -I ignores the cwd
+    # and PYTHON* variables, and sys.path[0] is this file's directory. Point it
+    # at Harbor's own source instead, before any other import, so a ``harbor``
+    # package in the worktree or on PYTHONPATH can never stand in for it.
+    import sys as _sys
+    from os import path as _path
+
+    _sys.path[0] = _path.dirname(_path.dirname(_path.abspath(__file__)))
+    from harbor.github_rest import main as _main
+
+    raise SystemExit(_main())
+
 import argparse
 import json
 import os
@@ -83,6 +96,27 @@ def require_https_api_url(graphql_url: str | None) -> str:
     return url
 
 
+def helper_command() -> list[str]:
+    """argv that runs this helper from Harbor's own source, whatever the cwd or env.
+
+    ``python -m harbor.github_rest`` put the cwd (a builder's worktree) first
+    on sys.path, so a ``harbor/`` package written there ran instead, and the
+    rung-0 token check runs on the host with the token in its environment.
+    """
+
+    from pathlib import Path
+
+    return [sys.executable, "-I", str(Path(__file__).resolve())]
+
+
+def helper_invocation() -> str:
+    """The exact command builders run for this helper (one source for every prompt)."""
+
+    import shlex
+
+    return shlex.join(helper_command())
+
+
 def token_env_name(env: Mapping[str, str], preferred: str | None = None) -> str | None:
     """Name of the first token variable that is set, without reading its value out."""
 
@@ -123,9 +157,22 @@ class Client:
     def __init__(self, env: Mapping[str, str] | None = None, *, curl: str = "curl", timeout: int = 60) -> None:
         self.env = dict(os.environ if env is None else env)
         self.base = rest_base_url(self.env.get("HARBOR_GITHUB_API_URL") or DEFAULT_REST_URL)
-        name = token_env_name(self.env, self.env.get("HARBOR_GITHUB_TOKEN_ENV"))
+        # Harbor names the project's token variable; then only that one is
+        # used. Run by hand without it, GITHUB_TOKEN, then GH_TOKEN.
+        from harbor.github_token import validate_token_env
+        try:
+            named = validate_token_env(self.env.get("HARBOR_GITHUB_TOKEN_ENV"), where="HARBOR_GITHUB_TOKEN_ENV")
+        except ValueError as exc:  # the message never echoes the value
+            raise GitHubRestError(str(exc)) from None
+        if named:
+            name = named if self.env.get(named, "").strip() else None
+        else:
+            name = token_env_name(self.env)
         if name is None:
-            raise GitHubRestError("no GitHub token in the environment (GITHUB_TOKEN or GH_TOKEN)")
+            raise GitHubRestError(
+                f"no GitHub token in the environment ({named or 'GITHUB_TOKEN or GH_TOKEN'}); "
+                "the project's github_token_env names the variable to export"
+            )
         self._token = self.env[name].strip()
         self.curl = curl
         self.timeout = timeout
@@ -213,7 +260,12 @@ def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, e
     if not head or head != sha:
         raise GitHubRestError(f"refusing to merge PR #{number}: --sha {sha} is not the PR's current head {head or '(unknown)'}")
     git_dir = env.get("HARBOR_GIT_DIR") or main_git_dir(os.getcwd())
-    name = token_env_name(env, env.get("HARBOR_GITHUB_TOKEN_ENV"))
+    # The same strict rule as Client: once Harbor names a variable, only it.
+    from harbor.github_token import token_name
+    try:
+        name = token_name(env.get("HARBOR_GITHUB_TOKEN_ENV"), env)
+    except ValueError as exc:  # the message never echoes the value
+        raise GitHubRestError(str(exc)) from None
     token = env[name].strip() if name else None
     why: list[str] = []
     facts: dict[str, Any] = {}
