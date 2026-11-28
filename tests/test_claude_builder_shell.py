@@ -98,3 +98,37 @@ def test_builder_github_names_the_exact_helper_and_never_the_token(tmp_path: Pat
     assert github["helper"] == builder_helper_invocation(github["env"])
     assert f"`{github['helper']} <op>`" in github["fact"]
     assert TOKEN not in json.dumps(github)
+
+
+# ------------------------------------------------------- per-turn shell note
+
+def test_the_shell_note_names_the_exact_helper_and_the_env_var_forms() -> None:
+    from harbor.runner.claude import builder_shell_note
+    helper = builder_helper_invocation(ENV)
+    note = builder_shell_note(helper)
+    assert f"`{helper} <op>`" in note
+    assert "export" in note and ".env.local" in note
+    for refused in ("`FOO=1 cmd`", "`env FOO=1 cmd`", "`/usr/bin/env FOO=1 cmd`", "`export FOO=1`"):
+        assert refused in note
+    assert "node --env-file=.env.local" in note and "never commit" in note
+    assert "script file" in note  # live: `node -e "console.log('FOO=' + x)"` is refused too
+    # Without a helper (Codex-only wiring, MCP-less tests) the note still carries the env-var rules.
+    bare = builder_shell_note("")
+    assert bare.startswith("Harbor shell note") and "GitHub helper: run it exactly" not in bare
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_every_turn_fresh_or_resumed_carries_the_shell_note(tmp_path: Path, monkeypatch, resume: bool) -> None:
+    import asyncio
+    from harbor.runner.codex import CodexRunner
+    runner = wired(tmp_path)
+    seen: list[str] = []
+
+    async def fake_execute(self, context, instruction, *, resume, before_spawn=None):
+        seen.append(instruction)
+
+    monkeypatch.setattr(CodexRunner, "_execute", fake_execute)
+    asyncio.run(runner._execute(None, "resume prompt" if resume else "launch prompt", resume=resume))
+    assert seen and seen[0].startswith("resume prompt" if resume else "launch prompt")
+    assert f"`{runner.github_helper_invocation} <op>`" in seen[0]
+    assert "export" in seen[0]

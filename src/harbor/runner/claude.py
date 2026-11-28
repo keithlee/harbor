@@ -238,6 +238,49 @@ def workflow_permissions(invocation: str, package: str | Path | None, helper: st
     return allow
 
 
+def builder_shell_note(helper: str = "") -> str:
+    """What a dontAsk Claude builder's Bash may and may not run, appended to every turn.
+
+    Found live with ``ClaudeRunner.command`` (Claude Code 2.1.332): sandboxed
+    Bash is auto-allowed, but every command that sets an environment variable
+    is refused with "Claude Code is running in don't ask mode", and an allow
+    rule does not help ``export``. Refused: ``FOO=1 cmd``, ``env FOO=1 cmd``,
+    ``/usr/bin/env FOO=1 cmd``, ``cd sub && FOO=1 npm test``, ``export FOO=1``
+    alone or chained, ``set -a; . ./.env.local``, ``sh -c 'FOO=1 cmd'``, and
+    even ``node -e "console.log('FOO=' + x)"``. ``Bash(export:*)`` does not
+    make ``export`` pass; ``Bash(env:*)`` would make ``env FOO=1 cmd`` pass but
+    approves every command behind ``env``, so Harbor does not add it.
+    Allowed: a variable read from a file in the worktree (``node
+    --env-file=.env.local``, or a framework's own ``.env.local``), which the
+    Write tool may create there. A resumed session never sees the launch
+    prompt again, so the exact GitHub helper command is repeated here.
+    """
+
+    lines = [
+        "Harbor shell note (Claude Code in dontAsk mode): sandboxed Bash runs without asking, but Claude Code "
+        "refuses every command that sets an environment variable, and a refused form never works on retry. Refused: "
+        "`FOO=1 cmd`, `env FOO=1 cmd`, `/usr/bin/env FOO=1 cmd`, `cd dir && FOO=1 cmd`, `export FOO=1` (alone or "
+        "chained), `set -a; . ./.env.local` and `sh -c 'FOO=1 cmd'`; the only exceptions are Harbor's runtime "
+        "invocation and GitHub helper command, run exactly as given. To give your own build, test or dev-server command a variable, write it to an "
+        "env file in the ticket worktree with the Write tool and let the tool read it: `.env.local` (read by Next.js, "
+        "Vite and dotenv; Next.js also reads `.env.development.local`, `.env.production.local` and `.env.test.local`), "
+        "or `node --env-file=.env.local script.js` for plain Node. Text that looks like an assignment inside inline "
+        "code is refused as well (`node -e \"console.log('FOO=' + x)\"`), so put such code in a script file. "
+        "Use placeholder or scratch values only (for example a scratch database path inside the worktree), never "
+        "a real secret, and never commit the file: "
+        "check `git status` before each commit. If a command needs a variable and reads no env file, report a "
+        "blocker that names the variable instead of working around the refusal.",
+    ]
+    if helper:
+        lines.append(
+            f"GitHub helper: run it exactly as `{helper} <op>`; that exact prefix is pre-approved, and its "
+            "configuration is already in it. Do not add `/usr/bin/env`, `PYTHONPATH`, `python -m` or any variable in "
+            "front of it, and do not change its interpreter or path, or Claude Code refuses it. The token is already "
+            "in your environment under the variable that HARBOR_GITHUB_TOKEN_ENV names; never print or echo it."
+        )
+    return "\n".join(lines)
+
+
 # The builder's file tools. Edit and Write run inside Claude Code, outside the
 # OS sandbox, so the ``Edit(...)`` rule below (which covers every file-editing
 # tool) is their only boundary; dontAsk refuses an edit anywhere else.
@@ -301,6 +344,9 @@ class ClaudeRunner(CodexRunner):
             note = device_note(statuses, web="web" in self.device_proof)
             if note:
                 instruction = f"{instruction}\n\n{note}" if instruction else note
+        # Every turn, fresh or resumed: a resumed session never sees the launch prompt again.
+        shell = builder_shell_note(self.github_helper_invocation)
+        instruction = f"{instruction}\n\n{shell}" if instruction else shell
         return await super()._execute(context, instruction, resume=resume, before_spawn=before_spawn)
 
     def _workflow_permissions(self) -> list[str]:
