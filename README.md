@@ -527,13 +527,19 @@ What each platform turns on:
   Docker TCP socket, databases.
 
 Enable it only on a machine or user account where the builder may have that
-reach. A builder could open a PR that grants itself these rules. Harbor's
-merge checks are best-effort guards on its own commands: a builder holding a
-GitHub token, or able to write its repo's git directory, can get around them.
-A project that enables device proof SHOULD protect the base branch on GitHub
-with required Code Owner review. Put `/.harbor/ @your-org/harbor-admins` in
-`.github/CODEOWNERS`, and do not let the builder's account bypass the rule; the
-docs list the exact steps. An unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
+reach. With `ios` (and, through adb, `android`) the builder can effectively
+act as the user who runs Harbor on the host, so no repository-level control
+bounds it. That includes rewriting the main checkout's `.harbor/` directly.
+
+A builder could also open a PR that grants itself these rules. Harbor's merge
+checks are best-effort guards on its own commands. If `.harbor/` is
+untracked, CODEOWNERS does not apply to it, and anything Harbor runs outside
+the sandbox can write it: `install_command`, git hooks, and the device escapes.
+The recommended setup is to track `.harbor/` and protect the base branch with
+required Code Owner review (`/.harbor/ @your-org/harbor-admins` in
+`.github/CODEOWNERS`). That makes repo-level changes need a human, but it
+still does not bound the device escapes. The docs list the exact steps. An
+unknown platform fails closed. `harbor doctor` prints what is granted to any Claude
 builder the project could run.
 
 Claude Code's documentation describes these settings as macOS-only. Harbor
@@ -633,10 +639,11 @@ needs and keeps the delivery instructions opaque.
   the ledger or pretend the builder completed.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
-  path out of the sandbox (adb and simctl reach any host). Only GitHub branch
-  protection with Code Owner review on `.harbor/` reliably stops a builder from
-  merging a change that widens its own grant. Harbor's own merge checks are
-  best effort.
+  path out of the sandbox: adb and simctl reach any host, and with `ios` the
+  builder can act as the host user and edit `.harbor/` directly. Branch
+  protection with Code Owner review on a tracked `.harbor/` makes PR changes to
+  it need a human. It does nothing for an untracked `.harbor/` or for the
+  device escapes, and Harbor's own merge checks are best effort.
 
 ## Test fixtures and external proof
 

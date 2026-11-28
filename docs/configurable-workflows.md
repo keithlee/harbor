@@ -469,21 +469,50 @@ rules can reach hosts and files the sandbox would otherwise block:
 - the machine running Harbor holds nothing the builder must not reach, such
   as other projects' credentials, a Docker daemon or browsers with debugging
   ports open;
-- you would accept the builder acting with your user's network access.
+- you would accept the builder acting as your user: with its network access
+  and, with `ios`, with its file access.
 
 A dedicated machine or user account for Harbor is the safe setup. Do not
 enable it on a shared workstation, on a machine with production credentials,
 or for repositories whose tickets come from people you do not trust to steer
 the builder.
 
-**Protect `.harbor/` on GitHub before you enable device proof.** A builder
-could open a PR that grants itself `device_proof`, or widens which builders
-get it through `[quota_fallback]`. Harbor cannot stop that PR merging on its
-own. The builder holds a GitHub token and can write its worktree's git
-directory, so it can get around any check that runs on the builder's machine.
-The only hard guarantee is GitHub branch protection on the base branch with
-required Code Owner review. A project that enables `device_proof` SHOULD set
-it up:
+**No repository control bounds a device-proof builder.** Treat enabling
+`ios` or `android` as letting the builder act as the user who runs Harbor:
+- **`ios`.** `simctl spawn` runs builder-compiled code outside the sandbox with
+  that user's file access. It can rewrite any file the user can, including
+  the main checkout's `.harbor/workflow/workflow.toml`, which widens the grant
+  for every later launch. GitHub branch protection never sees that change.
+- **`android`.** adb gives a path out of the sandbox to the network and to
+  files moved on and off the device.
+
+So no Harbor check and no GitHub setting bounds a builder with these
+platforms. Only enable them where that is acceptable (see "Who should enable
+it").
+
+**Changes that come through a PR.** A builder could also open a PR that grants
+itself `device_proof`, or widens which builders get it through
+`[quota_fallback]`. Harbor's own checks (below) are best effort: the builder
+holds a GitHub token and can write its worktree's git directory, so it can get
+around any check that runs on the builder's machine. What GitHub can enforce
+depends on whether the project tracks `.harbor/`:
+- **`.harbor/` untracked** (Harbor reads it from the main checkout). CODEOWNERS
+  and branch protection on `/.harbor/` do not apply, because no PR touches
+  `.harbor/`. The main checkout, `.harbor/` included, can be written by any
+  code Harbor runs outside the sandbox:
+  - the project's `install_command`, which runs unsandboxed in every new
+    worktree. A low-risk PR that only adds a `postinstall` to `package.json`
+    can edit `<repo_path>/.harbor/workflow/workflow.toml`, auto-merge, and
+    widen the grant on the next worktree;
+  - git hooks (#59);
+  - the `ios` and `android` escapes above.
+- **`.harbor/` tracked.** GitHub branch protection with required Code Owner
+  review on `/.harbor/` makes every repo-level change to it need a human
+  approval. This is the recommended setup for a project that enables
+  `device_proof`. It still does not stop the unsandboxed writes listed above,
+  and it does not bound the device escapes.
+
+To set it up for a tracked `.harbor/`:
 
 1. Add `.github/CODEOWNERS` on the base branch with a line that gives `.harbor/`
    to a person or team, never to the account whose token the builder uses:
@@ -566,7 +595,9 @@ commands. They do not stop a builder that means to get around them.
     repository.
   - Merges, refs, contents and branch protection are refused there.
 
-**Known ways around Harbor's checks**, which only branch protection stops:
+**Known ways around Harbor's checks.** For a tracked `.harbor/`, branch
+protection stops the first four. None of them is stopped for an untracked
+`.harbor/`:
 - the GitHub token used directly, for example `curl` to the REST or GraphQL API;
 - the GitHub MCP server's merge tool when `[github] transport = "mcp"`;
 - `git push` to the base branch;
@@ -575,7 +606,11 @@ commands. They do not stop a builder that means to get around them.
   around the check;
 - the builder's own environment: `PATH`, `PYTHONPATH`, `HARBOR_GIT_DIR` and
   `HOME`. Wherever the check runs inside the builder, the builder chooses
-  which `git` and which Harbor code run, and which git dir they read.
+  which `git` and which Harbor code run, and which git dir they read;
+- anything Harbor runs outside the sandbox that a merged PR controls (the
+  `install_command`, git hooks), and the `ios` and `android` escapes. These
+  can edit the main checkout directly, so branch protection does not stop
+  them either.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`
