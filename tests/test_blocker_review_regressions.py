@@ -150,63 +150,60 @@ def test_deterministic_remedy_resume_includes_authority_and_next_action():
     assert 'Next step: Rerun pnpm test --filter checkout' in prompts[0]
     assert 'Answer: '+result.answer in prompts[0]
 
-@pytest.mark.parametrize('base_state', ['remote_only', 'stale_local', 'missing'])
-def test_blocker_path_audit_uses_configured_remote_base(tmp_path, base_state):
+def _recorded_worktree(tmp_path, db):
+    """An operator checkout plus a Harbor-created worktree whose base commit is recorded in ``db``."""
     import subprocess
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    def git(*args):
-        return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
-    git('init', '-b', 'main')
-    git('-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '--allow-empty', '-m', 'base')
-    base = git('rev-parse', 'HEAD').stdout.strip()
-    git('checkout', '-b', 'feature')
-    if base_state != 'missing':
-        git('update-ref', 'refs/remotes/origin/main', base)
-    if base_state != 'stale_local':
-        git('branch', '-D', 'main')
-    # A stale local branch must not hide a protected-path change from audit.
-    (repo / 'secret-policy.py').write_text('protected change\n')
-    git('add', 'secret-policy.py')
-    git('-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'change')
-    if base_state == 'stale_local':
-        git('branch', '-f', 'main', 'HEAD')
+    from harbor.worktree import WorktreeManager
+    remote, checkout = tmp_path / 'remote.git', tmp_path / 'checkout'
+    def git(cwd, *args):
+        return subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.test', *args],
+                              cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    git(tmp_path, 'init', '-q', '--bare', '-b', 'main', str(remote))
+    git(tmp_path, 'clone', '-q', str(remote), str(checkout))
+    git(checkout, 'commit', '-q', '--allow-empty', '-m', 'base')
+    git(checkout, 'push', '-q', 'origin', 'HEAD:main')
+    manager = WorktreeManager(checkout, root=tmp_path / 'wt', install_command='none', custody=db.connection)
+    return checkout, manager.create('MOCK-BASE').path, git
+
+
+@pytest.mark.parametrize('base_state', ['remote_moved', 'local_moved', 'remote_deleted'])
+def test_blocker_path_audit_uses_the_recorded_base_not_local_refs(tmp_path, base_state):
+    # Every ref under refs/ is builder-writable; none of them may hide a
+    # committed protected-path change from the audit.
+    db = HarborDB(':memory:')
+    repo, worktree, git = _recorded_worktree(tmp_path, db)
+    (worktree / 'secret-policy.py').write_text('protected change\n')
+    git(worktree, 'add', 'secret-policy.py')
+    git(worktree, 'commit', '-q', '-m', 'change')
+    if base_state == 'remote_moved':
+        git(worktree, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+    elif base_state == 'local_moved':
+        git(worktree, 'update-ref', 'refs/heads/main', 'HEAD')
+    else:
+        git(worktree, 'update-ref', '-d', 'refs/remotes/origin/main')
     calls = []
     async def mate(*args, **kwargs):
         calls.append(args)
         raise AssertionError('protected changes must not reach model resolution')
-    ladder = UnblockLadder(first_mate=mate, repo_path=repo, protected_paths=('secret-policy.py',))
-    args = ({'identifier':'MOCK-BASE','description':'Preapproved wording.'}, {'id':'retained','worktree':str(repo)},
-            {'blocker':{'kind':'product_decision','question':'Which wording?','options':['A','B']}})
-    if base_state == 'missing':
-        with pytest.raises(ValueError, match='configured base branch'):
-            asyncio.run(ladder.handle(*args))
-    else:
-        result = asyncio.run(ladder.handle(*args))
-        assert not result.resumed and result.rung == 2 and result.reason == 'protected path'
+    ladder = UnblockLadder(db, first_mate=mate, repo_path=repo, protected_paths=('secret-policy.py',))
+    result = asyncio.run(ladder.handle({'identifier':'MOCK-BASE','description':'Preapproved wording.'}, {'id':'retained','worktree':str(worktree)},
+                                       {'blocker':{'kind':'product_decision','question':'Which wording?','options':['A','B']}}))
+    assert not result.resumed and result.rung == 2 and result.reason == 'protected path'
     assert not calls
 
 
-def test_remote_only_base_allows_cited_wording_resume(tmp_path):
-    import subprocess
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    def git(*args):
-        return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True)
-    git('init', '-b', 'main')
-    git('-c','user.name=Test','-c','user.email=test@example.test','commit','--allow-empty','-m','base')
-    git('update-ref','refs/remotes/origin/main',git('rev-parse','HEAD').stdout.strip())
-    git('checkout','-b','feature')
-    git('branch','-D','main')
+def test_recorded_base_allows_cited_wording_resume(tmp_path):
+    db = HarborDB(':memory:')
+    repo, worktree, git = _recorded_worktree(tmp_path, db)
     resumes=[]
     async def mate(*args, **kwargs):
         return {'disposition':'resolve','answer':'A','citation':'project:bounded-decision','reason':'Preapproved reversible wording within the existing AC.'}
     async def resume(run_id, prompt):
         resumes.append((run_id, prompt))
         return True
-    ladder=UnblockLadder(first_mate=mate,resumer=resume,repo_path=repo,policy=BlockerPolicy())
+    ladder=UnblockLadder(db,first_mate=mate,resumer=resume,repo_path=repo,policy=BlockerPolicy())
     result=asyncio.run(ladder.handle({'identifier':'MOCK-BASE','description':'Use A or B; both preapproved. Risk: medium.'},
-        {'id':'retained','worktree':str(repo)}, {'next_action':'Apply wording and preserve medium risk.',
+        {'id':'retained','worktree':str(worktree)}, {'next_action':'Apply wording and preserve medium risk.',
         'blocker':{'kind':'product_decision','question':'Which wording?','options':['A','B']}}))
     assert result.resumed and result.answer=='A' and result.reason
     assert len(resumes)==1 and resumes[0][0]=='retained'

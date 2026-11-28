@@ -265,17 +265,21 @@ def test_committed_protected_path_parks_with_full_context(tmp_path):
     import subprocess
     from harbor.db import HarborDB
     from harbor.unblock import UnblockLadder
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    from harbor.worktree import WorktreeManager
+    remote, repo = tmp_path / "remote.git", tmp_path / "repo"
+    def git(cwd, *args):
+        return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.test", *args], cwd=cwd, capture_output=True, text=True, check=True)
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    git(tmp_path, "clone", "-q", str(remote), str(repo))
     materialize(repo)
-    def git(*args):
-        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.test", *args], capture_output=True, text=True, check=True)
-    git("init", "-b", "main")
-    git("commit", "--allow-empty", "-m", "initial")
-    git("checkout", "-b", "ticket")
-    (repo / "secret-policy.py").write_text("# protected auth code\n")
-    git("add", "secret-policy.py")
-    git("commit", "-m", "partial change")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "initial")
+    git(repo, "push", "-q", "origin", "HEAD:main")
+    db = HarborDB(tmp_path / "ledger.sqlite")
+    worktree = WorktreeManager(repo, root=tmp_path / "wt", install_command="none", custody=db.connection).create("MOCK-5").path
+    (worktree / "secret-policy.py").write_text("# protected auth code\n")
+    git(worktree, "add", "secret-policy.py")
+    git(worktree, "commit", "-q", "-m", "partial change")
     comments = []
     class Linear:
         async def create_comment(self, issue_id, body):
@@ -285,10 +289,9 @@ def test_committed_protected_path_parks_with_full_context(tmp_path):
             return True
     async def forbidden(*args, **kwargs):
         raise AssertionError("protected path must not invoke model or resume")
-    db = HarborDB(tmp_path / "ledger.sqlite")
     ladder = UnblockLadder(db, linear=Linear(), first_mate=forbidden, resumer=forbidden, repo_path=repo,
                            protected_paths=("secret-policy.py",), policy=BlockerPolicy())
-    result = asyncio.run(ladder.handle({"identifier":"MOCK-5", "id":"uuid-5"}, {"id":"retained-5", "worktree":str(repo)},
+    result = asyncio.run(ladder.handle({"identifier":"MOCK-5", "id":"uuid-5"}, {"id":"retained-5", "worktree":str(worktree)},
                                       {"blocker":{"kind":"product_decision", "question":"Which option?", "options":["A","B"], "recommendation":"A", "evidence":"Partial auth code committed"}}))
     assert not result.resumed and result.reason == "protected path"
     assert comments and all(word in comments[0] for word in ["Options:","Recommendation:","Evidence:","Prior attempts:"])
