@@ -39,15 +39,34 @@ HARDENING: tuple[str, ...] = (
     "-c", "core.hooksPath=/dev/null",
     "-c", "core.fsmonitor=false",
     "-c", "protocol.ext.allow=never",
+    # A submodule is a repository whose config, attributes and hooks are all
+    # the builder's.  Harbor never recurses into one: not to check it out,
+    # not to fetch it.
+    "-c", "submodule.recurse=false",
+    "-c", "fetch.recurseSubmodules=false",
 )
-# Programs git only runs for network or pack transfers.  Blanking them for
-# commands that never connect anywhere costs nothing.  ``fetch`` keeps the
-# operator's own ``core.sshCommand``: an empty one would break ssh remotes.
+# For commands that never connect anywhere.  Blanking transport programs
+# costs nothing there; ``fetch`` keeps the operator's own ``core.sshCommand``,
+# because an empty one would break ssh remotes.
+#
+# Submodules: to tell whether a submodule's work tree is dirty, ``status`` and
+# ``diff`` run git inside it, where the builder's own config (filter drivers,
+# fsmonitor) applies.  ``diff.ignoreSubmodules=dirty`` makes that the default,
+# but a builder's ``.gitmodules`` can override it per submodule
+# (``ignore = none``), so every ``status`` and ``diff`` Harbor runs in a
+# worktree must also pass :data:`IGNORE_SUBMODULES` on its command line,
+# which nothing in the repository overrides.  ``dirty`` rather than ``all``:
+# a changed or added gitlink is still reported (so the protected-path check
+# and the cleanup dirty check still see it), without git entering the
+# submodule.
 LOCAL_HARDENING: tuple[str, ...] = (
     "-c", "core.sshCommand=",
     "-c", "uploadpack.packObjectsHook=",
     "-c", "core.alternateRefsCommand=",
+    "-c", "diff.ignoreSubmodules=dirty",
+    "-c", "status.submoduleSummary=false",
 )
+IGNORE_SUBMODULES = "--ignore-submodules=dirty"
 
 # What a local git command needs from the environment: where to find git and
 # the operator's global config, and the locale.  Nothing else is passed, so no
@@ -66,6 +85,27 @@ def git_argv(*args: str, network: bool = False) -> list[str]:
     """Return ``git <args>`` with repository hooks, fsmonitor and other repository programs disabled."""
 
     return ["git", *HARDENING, *(() if network else LOCAL_HARDENING), *args]
+
+
+def safe_path(value: str, *, outside: Path | None = None) -> str:
+    """``PATH`` without empty or relative entries, and without entries inside ``outside``.
+
+    Git runs with a builder's worktree as its working directory, and Python
+    looks ``git`` up on the child's ``PATH``.  An empty entry or ``.`` would
+    find a ``git`` the builder planted there, and so would an absolute entry
+    inside the worktree (``node_modules/.bin`` for example).
+    """
+
+    kept = []
+    for entry in value.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            continue
+        if outside is not None:
+            resolved = Path(entry).resolve()
+            if resolved == outside or outside in resolved.parents:
+                continue
+        kept.append(entry)
+    return os.pathsep.join(kept) or os.defpath
 
 
 def git_env(*, network: bool = False, environ: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -88,6 +128,8 @@ def git_env(*, network: bool = False, environ: Mapping[str, str] | None = None) 
                 env[key] = value
         elif key in _LOCAL_ENV_KEYS or key.startswith("LC_"):
             env[key] = value
+    if "PATH" in env:
+        env["PATH"] = safe_path(env["PATH"])
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1")
     if network:
         # The system config is root-owned and is where macOS sets
@@ -195,7 +237,11 @@ def run_worktree_git(worktree: str | Path, repo: str | Path, *args: str, timeout
 
     work, git_dir, common = worktree_git_dirs(worktree, repo)
     env = git_env(environ=environ)
+    env["PATH"] = safe_path(env.get("PATH", os.defpath), outside=work)
     env.update(GIT_DIR=str(git_dir), GIT_COMMON_DIR=str(common), GIT_WORK_TREE=str(work))
+    if args and args[0] in {"status", "diff"}:
+        # Whatever the caller passed, never let git enter a submodule.
+        args = (args[0], IGNORE_SUBMODULES, *(a for a in args[1:] if not a.startswith("--ignore-submodules")))
     return subprocess.run(
         git_argv(*args), cwd=str(work), env=env,
         capture_output=True, text=True, timeout=timeout, check=check,
@@ -203,6 +249,6 @@ def run_worktree_git(worktree: str | Path, repo: str | Path, *args: str, timeout
 
 
 __all__ = [
-    "HARDENING", "LOCAL_HARDENING", "UnsafeGitDirectory", "git_argv", "git_env", "main_git_dir",
-    "run_git", "run_worktree_git", "worktree_git_dirs",
+    "HARDENING", "IGNORE_SUBMODULES", "LOCAL_HARDENING", "UnsafeGitDirectory", "git_argv", "git_env", "main_git_dir",
+    "run_git", "run_worktree_git", "safe_path", "worktree_git_dirs",
 ]

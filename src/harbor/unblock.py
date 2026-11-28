@@ -27,7 +27,7 @@ from typing import Any, Literal
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
-from harbor.safe_git import run_worktree_git
+from harbor.safe_git import IGNORE_SUBMODULES, run_worktree_git
 from harbor.wake import apply_phase3_migration
 
 
@@ -1232,7 +1232,7 @@ class UnblockLadder:
             def git(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
                 return run_worktree_git(authority_repo, self.repo_path, *args, timeout=5, check=check)
 
-            paths = git("diff", "--name-only", "HEAD", check=True).stdout.splitlines()
+            paths = git("diff", IGNORE_SUBMODULES, "--name-only", "HEAD", check=True).stdout.splitlines()
             paths += git("ls-files", "--others", "--exclude-standard", check=True).stdout.splitlines()
             # Linked worktrees are created from the configured remote branch;
             # a matching local branch need not exist and may be stale.
@@ -1244,7 +1244,7 @@ class UnblockLadder:
                     break
             if base_sha is None:
                 raise ValueError("cannot inspect changed paths against configured base branch")
-            branch_diff = git("diff", "--name-only", f"{base_sha}...HEAD")
+            branch_diff = git("diff", IGNORE_SUBMODULES, "--name-only", f"{base_sha}...HEAD")
             if branch_diff.returncode != 0:
                 raise ValueError("cannot inspect changed paths against configured base branch")
             paths += branch_diff.stdout.splitlines()

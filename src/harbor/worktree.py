@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from harbor.safe_git import UnsafeGitDirectory, run_git, run_worktree_git
+from harbor.safe_git import IGNORE_SUBMODULES, UnsafeGitDirectory, run_git, run_worktree_git
 
 
 DEFAULT_DISK_FLOOR_GB = 5.0
@@ -358,7 +358,7 @@ class WorktreeManager:
             raise WorktreeError(
                 f"worktree is not based on fresh {worktree.base_ref} ({target_head} != {base_head})"
             )
-        if self._git(target, ["status", "--porcelain"]).stdout:
+        if self._git(target, ["status", "--porcelain", IGNORE_SUBMODULES]).stdout:
             raise WorktreeError("new worktree is unexpectedly dirty")
 
     def remove(self, worktree: Worktree | str | Path) -> None:
@@ -378,9 +378,9 @@ class WorktreeManager:
             # (node_modules, .next, ...) that every worktree accumulates; they
             # never block cleanup, or no worktree could ever be removed.
             # ``_git`` first proves the worktree's metadata is this repository's.
-            if self._git(target, ["status", "--porcelain", "--untracked-files=all"]).stdout:
+            if self._git(target, ["status", "--porcelain", IGNORE_SUBMODULES, "--untracked-files=all"]).stdout:
                 raise WorktreeError("cleanup retained modified or untracked files")
-            for line in self._git(target, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).stdout.splitlines():
+            for line in self._git(target, ["status", "--porcelain", IGNORE_SUBMODULES, "--ignored", "--untracked-files=all"]).stdout.splitlines():
                 if not line.startswith("!! "):
                     continue
                 ignored = (target / line[3:].rstrip("/")).resolve() if not (target / line[3:]).is_symlink() else target / line[3:]

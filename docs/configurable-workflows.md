@@ -1027,7 +1027,14 @@ git directory and whose `gitdir` leads back to that worktree. It also fails
 closed if that admin directory has a `config.worktree` file. Git then runs with `GIT_DIR`,
 `GIT_COMMON_DIR` and `GIT_WORK_TREE` pinned to those checked paths, so a
 builder that points `.git` at a git directory of its own cannot make Harbor
-read that directory's config. No setup is needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
+read that directory's config. Harbor's git also never enters a submodule
+(`--ignore-submodules=dirty` on every `status` and `diff`, plus
+`submodule.recurse=false` and `fetch.recurseSubmodules=false`), because a
+submodule a builder adds is a repository whose config is the builder's. An
+added or changed submodule commit is still reported; changes inside a
+submodule's files are not. Empty and relative `PATH` entries, and entries
+inside the worktree, are dropped from git's environment, so a `git` the
+builder planted is never the one that runs. No setup is needed. Verified on macOS with Codex CLI 0.170.0's seatbelt (`codex sandbox`)
 against a throwaway repository; the Claude sandbox and Linux were checked
 through the generated settings only.
 
