@@ -24,6 +24,7 @@ import pytest
 
 import harbor.safe_git as safe_git
 from harbor.safe_git import UnsafeGitDirectory, git_env, run_worktree_git, worktree_git_dirs
+from harbor.db import HarborDB
 from harbor.unblock import UnblockLadder
 from harbor.worktree import WorktreeConfinementError, WorktreeError, WorktreeManager
 
@@ -56,7 +57,10 @@ def project(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     git(checkout, "add", "README.md")
     git(checkout, *IDENTITY, "commit", "-q", "-m", "initial")
     git(checkout, "push", "-q", "origin", "HEAD:main")
-    manager = WorktreeManager(checkout, root=tmp_path / "wt", install_command="none")
+    # Durable custody, as ``harbor start`` has: the ladder reads each
+    # worktree's recorded base commit from it.
+    db = HarborDB(":memory:")
+    manager = WorktreeManager(checkout, root=tmp_path / "wt", install_command="none", custody=db.connection)
     worktree = manager.create("SAMPLE-1")
     marker = tmp_path / "PAYLOAD-RAN"
     payload = tmp_path / "payload.sh"
@@ -65,7 +69,7 @@ def project(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     payload.write_text(f"#!/bin/sh\necho \"$1 token=${{GITHUB_TOKEN:-absent}} linear=${{LINEAR_API_KEY:-absent}}\" >> '{marker}'\ncat\n",
                        encoding="utf-8")
     payload.chmod(0o755)
-    return SimpleNamespace(tmp=tmp_path, home=home, checkout=checkout, manager=manager, worktree=worktree,
+    return SimpleNamespace(tmp=tmp_path, home=home, checkout=checkout, manager=manager, worktree=worktree, db=db,
                            head=git(worktree.path, "rev-parse", "HEAD"), marker=marker, payload=payload)
 
 
@@ -144,7 +148,7 @@ def test_reviewers_planted_gitdir_runs_code_with_the_token_in_unhardened_git(pro
 
 
 def _ladder_args(worktree: Path):
-    return ({"identifier": "MOCK-1", "description": "Preapproved wording."}, {"id": "r", "worktree": str(worktree)},
+    return ({"identifier": "SAMPLE-1", "description": "Preapproved wording."}, {"id": "r", "worktree": str(worktree)},
             {"blocker": {"kind": "product_decision", "question": "Which wording?", "options": ["A", "B"]}})
 
 
@@ -154,7 +158,7 @@ async def _forbidden(*args, **kwargs):
 
 def test_unblock_ladder_refuses_a_planted_gitdir_without_running_it(project) -> None:
     plant_gitdir(project)
-    ladder = UnblockLadder(first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
+    ladder = UnblockLadder(project.db, first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
     with pytest.raises(UnsafeGitDirectory, match="points outside"):
         asyncio.run(ladder.handle(*_ladder_args(project.worktree.path)))
     assert ran(project) == ""
@@ -167,11 +171,15 @@ def test_unblock_ladder_git_gets_no_secrets_even_for_the_operators_own_filters(p
     (project.home / ".gitconfig").write_text(f"[filter \"probe\"]\n\tclean = {project.payload} clean\n")
     (project.worktree.path / ".gitattributes").write_text("* filter=probe\n")
     (project.worktree.path / "README.md").write_text("builder edit\n")
-    ladder = UnblockLadder(first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
+    ladder = UnblockLadder(project.db, first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
     result = asyncio.run(ladder.handle(*_ladder_args(project.worktree.path)))
     assert result.reason == "protected path" and not result.resumed
     assert "clean token=absent linear=absent" in ran(project) and TOKEN not in ran(project)
-    assert_clean_env(spy)
+    # Git in the worktree is pinned to its verified git dirs; reading the
+    # protected list from the operator's checkout at the base is not in a
+    # worktree, but is just as credential-free.
+    assert_clean_env([call for call in spy if "-C" not in call["argv"]])
+    assert_clean_env([call for call in spy if "-C" in call["argv"]], pinned=False)
 
 
 @pytest.mark.parametrize("tamper", ["commondir", "other_ticket", "config_worktree", "symlink"])
@@ -190,7 +198,7 @@ def test_unblock_ladder_refuses_tampered_worktree_pointers(project, tamper) -> N
     else:
         (wt / ".git").unlink()
         (wt / ".git").symlink_to(admin)
-    ladder = UnblockLadder(first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
+    ladder = UnblockLadder(project.db, first_mate=_forbidden, repo_path=project.checkout, protected_paths=("README.md",))
     with pytest.raises(UnsafeGitDirectory):
         asyncio.run(ladder.handle(*_ladder_args(wt)))
     assert ran(project) == ""
@@ -400,7 +408,7 @@ def test_verify_and_remove_never_enter_a_planted_submodule(project) -> None:
 
 def test_unblock_ladder_sees_a_submodule_at_a_protected_path_without_entering_it(project) -> None:
     plant_submodule(project, committed=True)
-    ladder = UnblockLadder(first_mate=_forbidden, repo_path=project.checkout, protected_paths=("sub",))
+    ladder = UnblockLadder(project.db, first_mate=_forbidden, repo_path=project.checkout, protected_paths=("sub",))
     result = asyncio.run(ladder.handle(*_ladder_args(project.worktree.path)))
     assert result.reason == "protected path" and not result.resumed
     assert ran(project) == ""
@@ -460,7 +468,7 @@ def test_unblock_ladder_fails_closed_when_the_builder_breaks_its_git_file(projec
     async def resume(run_id, prompt):
         return True
 
-    ladder = UnblockLadder(first_mate=mate, resumer=resume, repo_path=project.checkout, protected_paths=("PROTECTED.md",))
+    ladder = UnblockLadder(project.db, first_mate=mate, resumer=resume, repo_path=project.checkout, protected_paths=("PROTECTED.md",))
     try:
         with pytest.raises(UnsafeGitDirectory):
             asyncio.run(ladder.handle(*_ladder_args(wt)))

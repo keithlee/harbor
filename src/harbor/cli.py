@@ -986,6 +986,16 @@ async def _start(
             policy=config.blocker_policy,
             base_branch=config.base_branch,
             linear_projects=config.linear_project_scope,
+            # The protected-path gate reads each linked PR's head from
+            # GitHub, with the same read-only client and repository the PR
+            # poller uses.
+            github=getattr(github_poller, "client", None),
+            github_repository=(
+                f"{github_poller.owner}/{github_poller.repo}"
+                if getattr(github_poller, "owner", None) and getattr(github_poller, "repo", None) else None
+            ),
+            github_web_host=getattr(github_poller, "web_host", None),
+            git_remote=_pipeline_setting(config, "git_remote", "origin"),
         )
     workflow = getattr(production_dispatcher, "workflow", None)
     if workflow is not None:
