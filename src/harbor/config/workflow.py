@@ -21,7 +21,7 @@ MIGRATION_HINT = ("see docs/configurable-workflows.md#migrating: copy workflows/
 SECTIONS = {
     "delivery": {"merge_mode", "auto_merge_risks"},
     "recovery": {"enabled", "delays_seconds", "max_attempts"},
-    "decisions": {"mode", "require_citation", "require_rationale"},
+    "decisions": {"mode", "require_citation", "require_rationale", "auto_accept_first_option", "max_auto_accepts"},
     "cleanup": {"mode", "delay_seconds"},
     "execution": {"deadline_minutes"},
     "evidence": {"feedback", "ci"},
@@ -288,6 +288,8 @@ def load_workflow(path: Path) -> Workflow:
         raise ValueError("invalid cleanup mode")
     if data["decisions"]["mode"] not in {"human", "cite_only", "bounded"}:
         raise ValueError("invalid decision mode")
+    from harbor.auto_accept import validate_settings as validate_auto_accept
+    validate_auto_accept(data["decisions"])
     for value in [data["cleanup"]["delay_seconds"], *data["recovery"]["delays_seconds"]]:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError("delays must be finite nonnegative numbers")

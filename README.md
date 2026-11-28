@@ -402,7 +402,21 @@ up answers from the same project. Bounded mode permits a supplied reversible
 implementation option within AC; it records the option, rationale and next
 step on Linear. It cannot change protected paths or reconcile conflicting
 instructions automatically. Escalations include evidence, options,
-recommendation and prior attempts. Empty `decision_authors` accepts visible
+recommendation and prior attempts. When the builder recommends its first
+option, Harbor accepts it automatically and resumes the builder (on by default;
+`[decisions] auto_accept_first_option = false` or `mode = "human"` opts out).
+It only does so for a decision kind whose `recommended_option_index` is 0 and
+whose option is plain-prose ASCII. It does not do so for a blocker that touches
+a protected path, a merge-ready run, or past `max_auto_accepts` per run, and
+the answer does not authorize a merge. Word-matching checks also send a
+question to a human when it mentions a protected name, repeats an earlier
+auto-accepted question (80% word overlap), sounds conditional, or uses
+keywords suggesting money, deletion, credentials or gate changes. They match
+words, not meaning, so synonyms and rewordings get through. An
+auto-answer gives the builder no capability it did not already have; the
+builder sandbox, the merge gate and branch protection are the boundaries.
+Projects where product decisions carry cost or data risk should opt out; see
+`docs/configurable-workflows.md`. Empty `decision_authors` accepts visible
 ticket participants; configure Linear user IDs to restrict comment authority.
 
 Unexpected builder exits and failed First Mate invocations receive bounded

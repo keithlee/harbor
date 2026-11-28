@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from harbor import auto_accept as auto_accept_policy
+from harbor.auto_accept import AutoAcceptPolicy
 from harbor.db import apply_phase7_migration
 from harbor.facts.remediation import RemediationResult, execute_remediation
 from harbor.resources import runtime_asset
@@ -291,6 +293,7 @@ class UnblockResult:
     linear_writes: tuple[str, ...] = ()
     reason: str = ""
     escalation: Mapping[str, Any] | None = None
+    auto_accept: Mapping[str, Any] | None = None
 
     @property
     def same_session(self) -> bool:
@@ -320,6 +323,7 @@ class UnblockResult:
             "linear_writes": list(self.linear_writes),
             "reason": self.reason,
             "escalation": dict(self.escalation) if self.escalation else None,
+            "auto_accept": dict(self.auto_accept) if self.auto_accept else None,
         }
 
 
@@ -454,6 +458,51 @@ def _protected_from_agents(root: Path) -> tuple[str, ...]:
     return ()
 
 
+PATH_FIELDS = ("path", "file", "paths", "files", "touched_paths", "touchedFiles")
+
+
+def _git_z(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run git with NUL-separated, unquoted path output."""
+
+    return subprocess.run(
+        ["git", "-c", "core.quotePath=false", *args], cwd=repo, capture_output=True, timeout=5, check=check,
+    )
+
+
+def _nul_paths(output: bytes) -> list[str]:
+    # A non-UTF-8 byte becomes U+FFFD: the directory part still matches a
+    # protected pattern, and the text stays encodable for prompts and JSON.
+    return [item for item in output.decode("utf-8", errors="replace").split("\0") if item]
+
+
+def _observed_changed_paths(repo: Path, base_branch: str) -> list[str]:
+    """Every changed, staged, untracked and branch path in ``repo``, exactly.
+
+    ``-z`` output is read as NUL-separated names (no quoting of non-ASCII or
+    special characters), and ``--no-renames`` lists both sides of a rename,
+    so a protected file moved elsewhere still counts.  Raises when git
+    cannot report them; the caller then never auto-accepts.
+    """
+
+    paths = _nul_paths(_git_z(repo, "diff", "--name-only", "-z", "--no-renames", "HEAD").stdout)
+    paths += _nul_paths(_git_z(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout)
+    # Linked worktrees are created from the configured remote branch;
+    # a matching local branch need not exist and may be stale.
+    base_sha = None
+    for ref in (f"refs/remotes/origin/{base_branch}", f"refs/heads/{base_branch}"):
+        resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+                                  cwd=repo, capture_output=True, text=True, timeout=5)
+        if resolved.returncode == 0:
+            base_sha = resolved.stdout.strip()
+            break
+    if base_sha is None:
+        raise ValueError("cannot inspect changed paths against configured base branch")
+    branch_diff = _git_z(repo, "diff", "--name-only", "-z", "--no-renames", f"{base_sha}...HEAD", check=False)
+    if branch_diff.returncode != 0:
+        raise ValueError("cannot inspect changed paths against configured base branch")
+    return paths + _nul_paths(branch_diff.stdout)
+
+
 def touches_protected_paths(
     blocker: Mapping[str, Any],
     *,
@@ -462,9 +511,10 @@ def touches_protected_paths(
 ) -> bool:
     """Fail closed when observed paths overlap the configured protected set."""
 
+    # The union of every path-bearing field: no key (an empty reported
+    # ``paths``, say) may shadow the observed paths in ``touched_paths``.
     touched = _normalise_paths(
-        list(_paths(_value(blocker, "path", "file", default=None)))
-        + _paths(_value(blocker, "paths", "files", "touched_paths", "touchedFiles", default=None))
+        [item for name in PATH_FIELDS for item in _paths(_value(blocker, name, default=None))]
     )
     configured = _normalise_paths(protected_paths)
     if repo_path is not None:
@@ -490,6 +540,60 @@ def touches_protected_paths(
             ):
                 return True
     return False
+
+
+def _mentions_protected_path(
+    blocker: Mapping[str, Any], protected_paths: Iterable[str], repo_path: str | Path | None,
+) -> bool:
+    """Whether the question, options or recommendation MENTION a protected path.
+
+    A path the builder has not touched yet is still protected: "Edit
+    infra/deploy.yml" names it before any diff exists.  Matching is
+    case-folded, and a bare word equal to a protected pattern's leading
+    directory ("infra" for ``infra/**``) counts too.
+    """
+
+    from harbor.auto_accept import mentioned_paths
+
+    patterns = list(protected_paths)
+    if repo_path is not None:
+        patterns += list(_protected_from_agents(Path(repo_path)))
+    folded = [pattern.casefold() for pattern in _normalise_paths(patterns)]
+    if not folded:
+        return False
+    mentioned = mentioned_paths(blocker)
+    if touches_protected_paths({"touched_paths": mentioned}, protected_paths=folded):
+        return True
+    words = set(mentioned)
+    return any(name in words for pattern in folded for name in _protected_names(pattern))
+
+
+# Path segments too generic to identify a protected area by name.
+_GENERIC_SEGMENTS = frozenset(
+    {"src", "lib", "libs", "app", "apps", "test", "tests", "spec", "specs", "doc", "docs", "pkg", "packages",
+     "internal", "cmd", "bin", "source", "sources", "main", "core", "common", "utils", "util"}
+)
+
+
+def _protected_names(pattern: str) -> set[str]:
+    """Whole-word names that identify a protected pattern: every non-wildcard
+    segment (except generic ones such as ``src``), plus a file pattern's stem.
+
+    ``src/harbor/security/**`` yields ``harbor`` and ``security``;
+    ``src/harbor/worktree.py`` yields ``harbor``, ``worktree.py`` and
+    ``worktree``.  A near-name such as "infrastructure" for ``infra/**`` is not
+    matched (a documented limitation).
+    """
+
+    names: set[str] = set()
+    for segment in pattern.strip("/").split("/"):
+        if not segment or any(char in segment for char in "*?[") or segment in _GENERIC_SEGMENTS:
+            continue
+        names.add(segment)
+        stem = segment.rsplit(".", 1)[0] if "." in segment.strip(".") else ""
+        if stem and stem not in _GENERIC_SEGMENTS:
+            names.add(stem)
+    return names
 
 
 def is_product_decision(blocker: Mapping[str, Any]) -> bool:
@@ -946,8 +1050,12 @@ class UnblockLadder:
         policy: BlockerPolicy | None = None,
         base_branch: str = "main",
         linear_projects: Iterable[str] = (),
+        auto_accept: AutoAcceptPolicy | None = None,
     ) -> None:
         self.db = db
+        # ``None`` reads the project's workflow ([decisions]) on every blocker,
+        # falling back to the default policy (on) when no workflow is attached.
+        self.auto_accept_policy = auto_accept
         if db is not None:
             try:
                 # The comment receipt table is owned by Phase 3 and is kept
@@ -1072,6 +1180,32 @@ class UnblockLadder:
         command = build_resume_command(run_id, prompt)
         resumed = await _invoke_resume(self.resumer, command)
         return resumed, command
+
+    def _auto_accept_withdrawn(self) -> str:
+        """Why auto-accept is now off (re-read at launch), or ``""``."""
+
+        if self.policy.decision_mode == "human":
+            return "auto-accept was turned off before the builder started (the decision mode is human)"
+        policy = self._auto_accept()
+        if not policy.enabled:
+            return f"auto-accept was turned off before the builder started ({policy.disabled_by or 'disabled'})"
+        return ""
+
+    def _auto_accept(self) -> AutoAcceptPolicy:
+        """The current auto-accept policy; an unreadable workflow disables it."""
+
+        if self.auto_accept_policy is not None:
+            return self.auto_accept_policy
+        workflow = getattr(self, "workflow", None)
+        if workflow is None:
+            return AutoAcceptPolicy()
+        try:
+            reload = getattr(workflow, "reload", None)
+            if callable(reload):
+                workflow = self.workflow = reload()
+            return auto_accept_policy.policy_from_config(workflow.config)
+        except (OSError, ValueError):
+            return AutoAcceptPolicy(enabled=False)
 
     async def _notify(self, reason: str) -> bool:
         if self.notifier is None:
@@ -1209,6 +1343,9 @@ class UnblockLadder:
         if ticket.get("blocked_by"):
             raise TicketNotUnblockable("blocked ticket has unresolved dependencies")
         blocker_value = dict(blocker or _blocker(final))
+        # The blocker exactly as the builder reported it, before Harbor adds
+        # observed paths: First Mate binds its answer to this digest.
+        reported_blocker = dict(blocker_value)
         ticket_id = _identifier(ticket)
         run_id = _run_id(run)
         kind = _kind(blocker_value)
@@ -1218,25 +1355,14 @@ class UnblockLadder:
         run_repo = Path(str(run_repo_value)) if run_repo_value else None
         authority_repo = run_repo if run_repo is not None and run_repo.is_dir() else self.repo_path
 
+        # Whether Harbor itself observed the worktree's changed paths.  Without
+        # that observation protection is unknown, and auto-accept fails closed.
+        observed_paths = False
         if authority_repo is not None and (authority_repo / ".git").exists():
             # Use observed changes, not only the builder's path claims.
-            paths = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            paths += subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=authority_repo, capture_output=True, text=True, timeout=5, check=True).stdout.splitlines()
-            # Linked worktrees are created from the configured remote branch;
-            # a matching local branch need not exist and may be stale.
-            base_sha = None
-            for ref in (f"refs/remotes/origin/{self.base_branch}", f"refs/heads/{self.base_branch}"):
-                resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
-                if resolved.returncode == 0:
-                    base_sha = resolved.stdout.strip()
-                    break
-            if base_sha is None:
-                raise ValueError("cannot inspect changed paths against configured base branch")
-            branch_diff = subprocess.run(["git", "diff", "--name-only", f"{base_sha}...HEAD"], cwd=authority_repo, capture_output=True, text=True, timeout=5)
-            if branch_diff.returncode != 0:
-                raise ValueError("cannot inspect changed paths against configured base branch")
-            paths += branch_diff.stdout.splitlines()
-            blocker_value["touched_paths"] = list(set(paths + _paths(blocker_value.get("touched_paths"))))
+            paths = _observed_changed_paths(authority_repo, self.base_branch)
+            blocker_value["touched_paths"] = sorted(set(paths + _paths(blocker_value.get("touched_paths"))))
+            observed_paths = True
         protected = touches_protected_paths(blocker_value, protected_paths=self.protected_paths, repo_path=authority_repo)
         adapter = (
             deterministic_capability_adapter(blocker_value, authority_repo)
@@ -1416,6 +1542,40 @@ class UnblockLadder:
         )
         escalation_id = _value(escalation, "id", default=None) if isinstance(escalation, Mapping) else None
         label = f"escalation #{escalation_id}" if escalation_id is not None else "escalation"
+        # The builder recommended its own first option: record that option as
+        # the answer and resume, unless a guardrail keeps it with a human.
+        # Recompute protection here: triage can escalate (human decision mode,
+        # conflicting instructions, the rung-1 cap) before its own check.
+        # (A builder-reported ``protected_paths`` key is rejected by the
+        # run-result validator, so only the project's patterns and AGENTS.md
+        # apply here.)
+        protected_patterns = list(self.protected_paths)
+        protected_now = protected or triage_result.reason == "protected path" or touches_protected_paths(
+            blocker_value, protected_paths=protected_patterns, repo_path=authority_repo,
+        ) or _mentions_protected_path(blocker_value, protected_patterns, authority_repo)
+        human_decisions = self.policy.decision_mode == "human"
+        auto_accept_policy.record_eligibility(
+            self.db, escalation_id, reported_blocker, protected=protected_now or not observed_paths,
+            human_decisions=human_decisions,
+        )
+        assessment = auto_accept_policy.assess(
+            self.db, ticket_id, run_id, blocker_value, self._auto_accept(),
+            parked_for_human=_is_parked_for_human(final),
+            protected=protected_now,
+            human_decisions=human_decisions,
+            paths_unknown=not observed_paths,
+        )
+        if assessment.accepted and escalation_id is not None and run_id:
+            accepted = await self._auto_accept_first_option(
+                ticket, ticket_id, run_id, kind, question, blocker_value, escalation, assessment, remediation, searched,
+            )
+            if isinstance(accepted, UnblockResult):
+                return accepted
+            assessment = auto_accept_policy.Assessment("refused", assessment.option, assessment.method, accepted)
+        elif assessment.accepted:
+            assessment = auto_accept_policy.Assessment(
+                "refused", assessment.option, assessment.method, "the escalation has no ledger id or builder session",
+            )
         body = (
             f"[harbor] Blocked {ticket_id} after deterministic remediation and rung-1 triage ({label}).\n"
             f"Question: {question}\n"
@@ -1425,6 +1585,7 @@ class UnblockLadder:
             f"Recommendation: {blocker_value.get('recommendation') or 'No supported recommendation'}\n"
             f"Evidence: {json.dumps(blocker_value.get('evidence', []))}\n"
             f"Prior attempts: {self._prior_rung_zero(ticket_id, kind) + self._prior_rung_one(ticket_id, kind)}\n"
+            + (auto_accept_policy.refusal_line(assessment) if assessment.status == "refused" else "")
             + _reply_instruction(escalation_id)
         )
         writes: list[str] = []
@@ -1467,6 +1628,136 @@ class UnblockLadder:
             linear_writes=tuple(writes),
             reason=reason,
             escalation=escalation,
+        )
+
+    async def _auto_accept_first_option(
+        self,
+        ticket: Mapping[str, Any],
+        ticket_id: str,
+        run_id: str,
+        kind: str,
+        question: str,
+        blocker_value: Mapping[str, Any],
+        escalation: Mapping[str, Any] | None,
+        assessment: auto_accept_policy.Assessment,
+        remediation: RemediationResult,
+        searched: tuple[str, ...],
+    ) -> UnblockResult | str:
+        """Answer an escalation with the builder's recommended first option.
+
+        Returns the result, or -- when nothing was handed over -- the reason
+        to show in the park comment.  The project policy is re-read right
+        before the resume and again when the runner begins its launch; if
+        auto-accept was turned off meanwhile (``auto_accept_first_option =
+        false`` or ``decisions.mode = "human"``) the launch is abandoned,
+        the receipt withdrawn and the escalation left open.
+
+        The receipt is written before the resume, so a re-block inside the
+        same resumed session sees it and the loop guard holds.  It is marked
+        delivered at the hand-off: when a Harbor runner has actually started
+        the builder process with option 1 (``SpawnObserver``), or -- for a
+        resumer that never reaches a runner -- when it returns success.  A
+        runner's early failure (deadline exhausted, executable missing,
+        session unavailable) is not a hand-off.  From the hand-off on, the
+        Linear comment is posted even if the turn is later cancelled or fails,
+        and the escalation is NOT reopened.  Without a hand-off the
+        escalation is reopened, the receipt marked undelivered, and ``None``
+        returned so the escalation is parked for a human as usual.
+
+        Ordering: on the nested ``WorktreeDispatcher`` path the resume returns
+        only after the builder's whole turn, so this comment is posted after
+        any comments that turn produced.
+        """
+
+        escalation_id = _value(escalation, "id", default=None)
+        withdrawn = self._auto_accept_withdrawn()
+        if withdrawn:
+            return withdrawn  # nothing recorded; the escalation stays open
+        policy = self._auto_accept()
+        recommendation = _text(blocker_value.get("recommendation")).strip()
+        auto_accept_policy.record(
+            self.db, escalation_id=escalation_id, ticket=ticket_id, run_id=run_id, source="ladder", kind=kind,
+            question=question, option=assessment.option, recommendation=recommendation, method=assessment.method,
+        )
+        answer = auto_accept_policy.answer_text(escalation_id, assessment.option)
+        citation = f"{auto_accept_policy.AUTO_ACCEPT_CITATION}:escalation-{escalation_id}"
+        launched = False
+
+        def handed_over() -> None:
+            nonlocal launched
+            if not launched:
+                auto_accept_policy.mark_delivered(self.db, escalation_id)
+                launched = True
+
+        from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+        gate: dict[str, str] = {}
+
+        def still_enabled() -> None:
+            # Called by the runner as it begins the launch, before any spawn.
+            # Remembered here too, in case a layer between converts the error.
+            if launched:
+                return  # this launch already handed option 1 over
+            why = self._auto_accept_withdrawn()
+            if why:
+                gate["withdrawn"] = why
+                raise auto_accept_policy.AutoAcceptWithdrawn(why)
+
+        observer = SpawnObserver(on_start=handed_over, on_attempt=still_enabled)
+        token = SPAWN_OBSERVER.set(observer)
+        writes: list[str] = []
+        resumed, command = False, None
+        withdrawn_reason = ""
+        try:
+            try:
+                resumed, command = await self._resume(
+                    ticket_id, run_id, answer=answer, citation=citation,
+                    reason=f"Harbor auto-accepted option 1 for escalation #{escalation_id}",
+                    next_action="Apply option 1, then verify the ticket acceptance criteria.",
+                )
+            except auto_accept_policy.AutoAcceptWithdrawn as exc:
+                withdrawn_reason = str(exc)
+            finally:
+                SPAWN_OBSERVER.reset(token)
+            # Once the builder started with option 1 the answer is delivered;
+            # a later opt-out cannot withdraw it.
+            withdrawn_reason = "" if launched else (withdrawn_reason or gate.get("withdrawn", ""))
+            # A resumer that never reached a Harbor runner (an embedded or
+            # test seam) can only report success; a real runner reports the
+            # actual process start through the observer.
+            if resumed and not observer.attempted:
+                handed_over()
+        finally:
+            if launched:
+                # The builder has option 1: announce it whatever happens next.
+                body = auto_accept_policy.comment(
+                    ticket_id, escalation_id, question=question, option=assessment.option,
+                    recommendation=recommendation, count=assessment.count, policy=policy,
+                )
+                try:
+                    if await _linear_comment(self.linear, self.db, _issue_id(ticket), body):
+                        writes.append("comment")
+                except Exception:
+                    pass  # a comment failure never undoes a delivered answer
+            elif withdrawn_reason:
+                auto_accept_policy.withdraw(self.db, escalation_id)
+            else:
+                auto_accept_policy.reopen(self.db, escalation_id)
+        if withdrawn_reason:
+            return withdrawn_reason
+        if not launched:
+            return "the retained builder session could not be resumed (no builder started), so it was not delivered"
+        receipt = {
+            "escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
+            "count": assessment.count + 1, "limit": policy.max_auto_accepts,
+        }
+        return UnblockResult(
+            ticket_id, run_id, kind, question, 2, "resume", resumed,
+            answer=answer, citation=citation, searched=searched, remediation=remediation,
+            resume_command=command, linear_writes=tuple(writes),
+            reason="auto-accepted the recommended first option",
+            escalation={**escalation, "status": "answered"} if isinstance(escalation, Mapping) else escalation,
+            auto_accept=receipt,
         )
 
     unblock = handle

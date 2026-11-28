@@ -4663,35 +4663,107 @@ class Supervisor:
                     self.last_error = f"First Mate monitor: {exc}"
                     continue
                 decision = recovery.validate(proposal, case, settings)
+                if decision["action"] == "escalate":
+                    # The builder may have recommended its own first option;
+                    # the project's auto-accept policy answers it instead.
+                    from harbor.auto_accept import policy_from_config
+                    try:
+                        policy = policy_from_config(self.dispatcher.workflow.config)
+                        human = getattr(getattr(ladder, "policy", None), "decision_mode", "") == "human"
+                        decision = recovery.apply_auto_accept(
+                            self.db, case, decision, policy, human_decisions=human,
+                            protected_paths=tuple(getattr(ladder, "protected_paths", ()) or ()),
+                            repo_path=getattr(ladder, "repo_path", None),
+                        )
+                    except Exception as exc:  # an unreadable policy auto-accepts nothing
+                        self.last_error = f"First Mate auto-accept: {exc}"
                 if decision["action"] == "wait":
                     recovery.record(connection, case, decision)
                     continue
-                await self._post_recovery_comment(case, decision)
+                if not isinstance(decision.get("auto_accept"), Mapping):
+                    # An auto-accept is announced only once it is delivered.
+                    await self._post_recovery_comment(case, decision)
             finally:
                 self._recovery_tickets.discard(case.ticket)
             if self._first_mate_can_recover(case):
                 # Recovery runs as a tracked task so polling can continue.
                 self._schedule_recovery(case, decision)
 
+    def _auto_accept_withdrawn(self) -> str:
+        """Why auto-accept is off now (policy re-read at launch), or ``""``."""
+
+        from harbor.auto_accept import policy_from_config
+        ladder = self.unblock_ladder
+        if getattr(getattr(ladder, "policy", None), "decision_mode", "") == "human":
+            return "auto-accept was turned off before the builder started (the decision mode is human)"
+        try:
+            workflow = getattr(self.dispatcher, "workflow", None)
+            if workflow is None:
+                return ""
+            workflow = self.dispatcher.workflow = workflow.reload()
+            policy = policy_from_config(workflow.config)
+        except (OSError, ValueError) as exc:
+            return f"auto-accept was turned off before the builder started (the workflow is unreadable: {exc})"
+        if not policy.enabled:
+            return f"auto-accept was turned off before the builder started ({policy.disabled_by})"
+        return ""
+
     def _schedule_recovery(self, case: Any, decision: Mapping[str, Any]) -> None:
         from harbor import first_mate_recovery as recovery
+        from harbor.auto_accept import AutoAcceptWithdrawn
         connection = getattr(self.db, "connection", None)
         self._recovery_tickets.add(case.ticket)
         # Capture the delivery this recovery replaces BEFORE registering
         # ourselves under the same ticket key.
         previous = self._dispatch_tasks.get(case.ticket)
 
+        auto = decision.get("auto_accept") if isinstance(decision.get("auto_accept"), Mapping) else None
+
         async def run() -> None:
             attempted = False
+            answered = False  # option 1 was recorded (receipt in flight) just before the launch
+            handed_over = False  # a builder process actually started with it
+            from harbor.auto_accept import mark_delivered
+            from harbor.runner.base import SPAWN_OBSERVER, SpawnObserver
+
+            def on_start() -> None:
+                nonlocal handed_over
+                if answered and not handed_over:
+                    mark_delivered(self.db, auto.get("escalation_id"))
+                    handed_over = True
+
+            observer = SpawnObserver(on_start=on_start)
 
             def before_launch() -> None:
-                nonlocal attempted
+                nonlocal attempted, answered
                 if not self._first_mate_can_recover(case, reload_policy=True, attempted=attempted):
                     raise _RecoverySuperseded
+                if auto is not None and not answered:
+                    # Re-read the policy at launch: an operator may have opted
+                    # out (or set decisions.mode = "human") while the runner
+                    # was being prepared.  Then nothing is recorded.
+                    why = self._auto_accept_withdrawn()
+                    if why:
+                        from harbor.auto_accept import AutoAcceptWithdrawn
+                        raise AutoAcceptWithdrawn(why)
+                    # Recorded just before the launch, so a re-block inside
+                    # the builder's turn meets the loop guard.  The receipt is
+                    # marked delivered only when the runner reports that the
+                    # builder process started (``on_start``); a runner that
+                    # fails before starting it leaves the answer undelivered.
+                    # An escalation a human answered meanwhile is left alone.
+                    from harbor.auto_accept import EscalationNotOpen
+                    try:
+                        recovery.record_auto_accept(self.db, case, decision)
+                    except EscalationNotOpen:
+                        raise _RecoverySuperseded from None
+                    answered = True
                 if not attempted:
-                    recovery.record(connection, case, decision)
+                    recovery_row[0] = recovery.record(connection, case, decision)
                     attempted = True
 
+            recovery_row: list[int | None] = [None]
+            token = SPAWN_OBSERVER.set(observer) if auto is not None else None
             try:
                 if not self._first_mate_can_recover(case):
                     return
@@ -4703,6 +4775,18 @@ class Supervisor:
                     if not self._first_mate_can_recover(case):
                         return
                 await self._apply_recovery(case, decision, before_launch=before_launch)
+                if answered and not observer.attempted:
+                    # A resume seam that never reached a Harbor runner can
+                    # only report success.
+                    on_start()
+            except AutoAcceptWithdrawn as exc:
+                # Nothing was recorded and no builder started; the escalation
+                # is still open for a human.
+                await self._notify_operator(
+                    f"recovery-withdrawn:{case.run_id}:{len(case.history)}",
+                    f"First Mate auto-accept of option 1 for escalation #{auto.get('escalation_id')} on "
+                    f"{case.ticket} was not delivered: {exc}; the escalation stays open.")
+                return
             except _RecoverySuperseded:
                 if attempted:
                     # The committed attempt failed and its model fallback was
@@ -4722,7 +4806,31 @@ class Supervisor:
                                             f"First Mate could not {decision['action']} {case.ticket}: {exc}")
                 return
             finally:
+                if token is not None:
+                    SPAWN_OBSERVER.reset(token)
                 self._recovery_tickets.discard(case.ticket)
+                if handed_over:
+                    # A builder process started with option 1: announce it on
+                    # every exit, including a failure or cancellation later in
+                    # the turn.
+                    try:
+                        await self._post_recovery_comment(
+                            case, {**decision, "comment": recovery.auto_accept_comment(case, decision)})
+                    except Exception as exc:
+                        self.last_error = f"First Mate comment: {exc}"
+                elif answered:
+                    # Recorded at launch, but no builder started (deadline
+                    # exhausted, executable missing, session unavailable,
+                    # superseded): hand it back, receipt marked undelivered,
+                    # and correct the recovery row recorded at launch.
+                    from harbor.auto_accept import reopen
+                    reopen(self.db, auto.get("escalation_id"))
+                    recovery.amend_reason(connection, recovery_row[0], recovery.undelivered_reason(decision))
+            if answered and not handed_over:
+                await self._notify_operator(
+                    f"recovery-undelivered:{case.run_id}:{len(case.history)}",
+                    f"{recovery.undelivered_reason(decision)} ({case.ticket}).")
+                return
             await self._notify_operator(f"recovery:{case.run_id}:{len(case.history)}",
                                         f"First Mate {decision['action']} {case.ticket} ({case.trigger}): {decision['reason']}")
 

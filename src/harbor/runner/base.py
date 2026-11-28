@@ -17,6 +17,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from contextvars import ContextVar
+
 from harbor.runner.stream import StreamEvent, extract_final, iter_stream
 from harbor.db import apply_phase9_migration, sql_statements
 from harbor.resources import runtime_asset
@@ -49,6 +51,49 @@ BLOCKER_KINDS = frozenset(
         "conflicting_instruction",
     }
 )
+
+
+@dataclass
+class SpawnObserver:
+    """Observe whether a builder process actually started (context-local).
+
+    A caller that must know if its prompt reached a builder -- the
+    auto-accept hand-off -- sets ``SPAWN_OBSERVER`` around the resume.
+    ``attempted`` is set when a runner begins an invocation; ``started`` (and
+    ``on_start``) only after the builder process was created.  The runner's
+    early failure exits (deadline exhausted, executable missing) therefore
+    leave ``started`` false.
+    """
+
+    on_start: Callable[[], None] | None = None
+    # Called as an invocation begins, before any ledger change or spawn; it
+    # may raise to abandon the launch (for example, auto-accept turned off).
+    on_attempt: Callable[[], None] | None = None
+    attempted: bool = False
+    started: bool = False
+
+    def attempt(self) -> None:
+        # Scoped to the one launch it observes: once the builder started,
+        # later invocations in the same context (a model-fallback
+        # re-execute, a nested ladder's ordinary resumes) neither re-run the
+        # gate nor change the outcome.
+        if self.started:
+            return
+        self.attempted = True
+        if self.on_attempt is not None:
+            self.on_attempt()
+
+    def start(self) -> None:
+        if not self.started:
+            if self.on_start is not None:
+                self.on_start()  # may raise; the runner then stops the builder
+            self.started = True
+
+
+SPAWN_OBSERVER: ContextVar[SpawnObserver | None] = ContextVar("harbor_spawn_observer", default=None)
+
+
+BLOCKER_FIELDS = frozenset({"kind", "question", "options", "recommendation", "recommended_option_index", "evidence"})
 
 
 class RunnerError(RuntimeError):
@@ -107,10 +152,18 @@ def validate_result(payload: Any) -> list[str]:
         for key in ("kind", "question", "recommendation", "evidence"):
             if blocker.get(key) is not None and not isinstance(blocker[key], str):
                 errors.append(f"blocker.{key} must be a string")
+        unknown = sorted(set(blocker) - BLOCKER_FIELDS)
+        if unknown:
+            # The schema sets additionalProperties: false; an unexpected key
+            # (an empty ``paths``, say) could otherwise shadow Harbor's checks.
+            errors.append(f"blocker has unknown field(s): {', '.join(map(str, unknown))}")
         if blocker.get("options") is not None and (
             not isinstance(blocker["options"], list) or not all(isinstance(item, str) for item in blocker["options"])
         ):
             errors.append("blocker.options must be an array of strings")
+        index = blocker.get("recommended_option_index")
+        if index is not None and (isinstance(index, bool) or not isinstance(index, int)):
+            errors.append("blocker.recommended_option_index must be an integer or null")
     return errors
 
 
@@ -958,6 +1011,9 @@ class BaseRunner:
     ) -> RunResult:
         # Provider-specific startup may await external services before reaching
         # this point. Authorize here, before ledger changes and subprocess spawn.
+        observer = SPAWN_OBSERVER.get()
+        if observer is not None:
+            observer.attempt()
         if before_spawn is not None:
             before_spawn()
         from harbor.recovery import retained_budget
@@ -1018,6 +1074,25 @@ class BaseRunner:
             context.process = None
             self.active = None
             raise
+        if observer is not None:
+            # The builder process exists and its prompt is written next: the
+            # hand-off.  It runs before the queue row moves to ``running``, so
+            # a failing callback (for example a locked ledger) leaves exactly
+            # the state of a failed ledger insert: the builder stopped and
+            # reaped, custody cleared, and the queue row not ``running``.
+            try:
+                observer.start()
+            except Exception:
+                await self.terminate(context, reason="hand-off record failed")
+                await process.wait()
+                context.process = None
+                self.active = None
+                raise
+            # The observed launch is over: work nested inside this turn (the
+            # supervisor routes the result through the ladder in the same
+            # context) must not inherit it.  The caller still holds the
+            # observer and restores the variable with its own token.
+            SPAWN_OBSERVER.set(None)
         self._queue_transition(context, "running")
         _update_run_sql(self.db, context.run_id, {"pid": context.pid, "pgid": context.pgid, "session_id": context.session_id})
         # Read the builder's output and watch the deadline before the prompt

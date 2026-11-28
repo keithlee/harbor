@@ -66,8 +66,21 @@ never push to the base branch. Stop at the PR, move the ticket to review, and re
 ## Blockers
 Report a blocker only for a real product/design question, ambiguous acceptance criteria, or an
 environment failure you cannot work around. Never block on Harbor bookkeeping, agent names or
-model settings. Include concrete options and a recommendation. First Mate monitors blocked runs
-and may resume you with an instruction or start a fresh session.
+model settings. Include concrete options and a recommendation, and ALWAYS set
+`recommended_option_index` to the zero-based index of the option you recommend (`0` is the first
+option; `null` for none). Harbor decides from that index, and the prose can only veto it: when it
+is `0`, Harbor may accept the first option automatically and resume you with it as the answer, but
+only for a `product_decision` or `ambiguous_ac` blocker whose first option and recommendation use
+only ASCII letters, spaces and `, . ' " ! ? ( )` (no digits, hyphens, colons or identifier-shaped
+words). The one exception is that the recommendation may contain the literal phrase `option 1` or
+`option #1`, followed by a colon only when it starts the recommendation. The exact rules are in
+Harbor's `docs/configurable-workflows.md` ("Auto-accepting the builder's first option"). Put a costly,
+destructive or access-related choice anywhere but first, since Harbor's keyword checks for those
+match words, not meaning. Keep `recommendation` short and plain, for example "Take option 1
+because it matches the ticket criteria"; conditions, caveats or mentions of other options send the
+question to a human. An auto-accepted answer does not authorize a merge, so `delivery.merge_mode`
+still decides merges.
+First Mate monitors blocked runs and may resume you with an instruction or start a fresh session.
 
 Return the run-result schema with the actual PR URL, status, waiting_on and a concrete next_action.
 Stop child agents and commands before reporting completion. Harbor owns worktree cleanup; never force-remove it.

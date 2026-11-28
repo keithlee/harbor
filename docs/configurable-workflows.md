@@ -148,7 +148,7 @@ model = "gpt-6-luna"
 | --- | --- | --- |
 | `[delivery]` | `merge_mode = "human"` | `workflow_checked` allows merges for `auto_merge_risks` when `pre_merge` readiness passes |
 | `[recovery]` | enabled, 30/120/300 s, 3 attempts | crash retries after an unexpected builder exit |
-| `[decisions]` | `cite_only` | how First Mate answers blockers: `human`, `cite_only`, `bounded` |
+| `[decisions]` | `cite_only`, `auto_accept_first_option = true` | how First Mate answers blockers: `human`, `cite_only`, `bounded`; whether a recommended first option is accepted automatically |
 | `[evidence]` | `ci = "required"`, `feedback = "advisory"` | what readiness gates on |
 | `[cleanup]` | `after_merge` | worktree cleanup after an observed merge |
 | `[hooks.*]` | readiness at `pre_handoff`/`pre_merge`, decision policy at `blocker` | script or skill hooks |
@@ -163,6 +163,159 @@ receipts for them, and a human still merges by default.
 
 `pipeline.md` keeps `unblock_attempts` and `decision_authors`. Decision mode
 and crash-retry delays come from `workflow.toml`.
+
+### Auto-accepting the builder's first option
+
+A blocked builder returns `options`, a `recommendation` and
+`recommended_option_index` (zero-based). When that index is `0` and the
+blocker passes the checks below, Harbor records option 1 as the escalation's
+answer and resumes the same builder session, instead of parking the ticket for
+a human. First Mate's recovery pass applies the same policy when it would
+otherwise escalate a blocked run. This is on by default:
+
+```toml
+[decisions]
+auto_accept_first_option = true   # false: always wait for a human
+max_auto_accepts = 2              # per builder run, 0-10
+```
+
+`decisions.mode = "human"` also turns auto-accept off.
+
+**What this is, and what it is not.** An auto-answer gives the builder no
+capability it did not already have: it is the builder's own recommendation,
+delivered without waiting. It is not a security boundary. The real boundaries
+are the builder's sandbox, the merge gate (with the reviewer and the risk
+rating) and server-side branch protection. **Projects where product decisions
+carry cost or data risk should set `auto_accept_first_option = false` or
+`decisions.mode = "human"`.** Expect few auto-accepts.
+
+#### Structural checks (exact)
+
+These check fields, characters and ledger state, not meaning.
+
+- **Kind.** Only the reported kinds `product_decision` and `ambiguous_ac` (the
+  decision kinds the run-result schema can express) are eligible. Every other
+  schema kind (`env_blocker`, `github_transport`, `missing_proof_capability`,
+  `conflicting_instruction`) and any unknown kind is not auto-accepted.
+- **Settings.** `auto_accept_first_option = false` or `decisions.mode = "human"`
+  turns it off. The workflow is re-read at launch on both paths (the ladder,
+  just before the resume and again when the runner begins its launch; First
+  Mate, in its launch callback), so an opt-out made while the builder is
+  being prepared abandons the launch: nothing is recorded, the escalation
+  stays open, and the park comment or operator notice says auto-accept was
+  turned off before the builder started.
+- **Structured index.** Only `recommended_option_index = 0` counts; a `null` or
+  other index goes to a human. There is no free-text fallback.
+- **Characters.** Checked on the raw text, before any normalization. Option 1
+  and the recommendation may contain only the ASCII letters `A-Z a-z`, the
+  space character (0x20) and `, . ' " ! ? ( )`. Every other character is
+  refused, including digits, `-` (so no flags, wrapped or not), `:`, `#`,
+  `/`, `\`, `_`, backticks, tabs, newlines, control characters and any
+  non-ASCII character. Option 1 is checked unstripped, so leading or trailing
+  tabs, newlines or control characters are refused too. The one exception, in
+  the recommendation only, is the literal phrase `option 1` or `option #1`
+  (ASCII letters in any case, exactly one space); when that phrase starts the
+  recommendation, a colon may follow it directly (`Option 1: ...`). A colon
+  anywhere else, and `#` outside that phrase, is refused. A recommendation
+  that is `null` or exactly `""` counts as no text (the index alone decides);
+  one made only of whitespace is refused.
+- **Touched protected paths.** A blocker whose reported or observed changed
+  paths match a protected pattern is not auto-accepted. Reported paths are the
+  union of `path`, `file`, `paths`, `files`, `touched_paths` and
+  `touchedFiles`. Observed paths come from git in the run's worktree, read as
+  NUL-separated, unquoted names (`-z`, `core.quotePath=false`), with renames
+  listed on both sides (`--no-renames`): uncommitted and staged changes,
+  untracked files, and the branch's changes since the base branch. If the
+  worktree is not a git repository, auto-accept is refused, because protection
+  is unknown. If git fails or the base branch is missing, the ladder stops
+  with an error, as before. Limits: what git does not report is not observed.
+  That covers files ignored by `.gitignore` or `.git/info/exclude`, and
+  changes hidden with `git update-index --skip-worktree` or
+  `--assume-unchanged`.
+- **Merge-ready runs.** A run parked as `outcome = "parked"`,
+  `waiting_on = "human"` is not auto-accepted. The answer does not authorize a
+  merge: `merge_mode` and `auto_merge_risks` in `pre_merge` readiness are
+  unchanged, and the answer text says so.
+- **Per-run cap.** At most `max_auto_accepts` auto-accepts per builder run,
+  counting attempts that were not delivered.
+- **First Mate binding.** The ladder records its protected-path and
+  decision-mode facts per escalation with a digest of the exact blocker
+  (`auto_accept_assessments`). First Mate answers only the newest open
+  escalation for the run, and only when its question, kind and digest match
+  the blocker it is looking at. The digest covers the decision fields and
+  every path-bearing field (`path`, `file`, `paths`, `files`, `touched_paths`,
+  `touchedFiles`, `protected_paths`, `protectedPaths`) as the builder
+  reported them. First Mate also re-runs the touched and mentioned
+  protected-path checks on its blocker, with the project's protected paths
+  and the repository's `AGENTS.md`, and refuses if either matches.
+- **Delivery.** The answer and an in-flight receipt are recorded just before
+  the launch (the ladder before its resume, First Mate in its launch
+  callback). The receipt is marked delivered at the hand-off: when Harbor's
+  runner has actually created the builder process with option 1. A runner
+  that fails before that (deadline exhausted, executable missing, session not
+  available to resume) is not a hand-off. From the hand-off on, the Linear
+  comment is posted on every exit, including a cancellation or failure later
+  in the turn, and the escalation stays answered. Without a hand-off the
+  escalation is reopened, its answer cleared, the receipt marked undelivered
+  and no auto-accept comment posted. A First Mate exit before its launch
+  callback (held or superseded first) writes no receipt at all. An escalation
+  that is no longer open (for example, a human answered it first) is not
+  overwritten. On the ladder path the resume returns only after the builder's
+  turn, so its comment can follow comments that turn produced.
+- **Records.** Receipts go in `auto_accepts` with a `delivered` flag. The
+  escalation is `answered` with the citation
+  `harbor:auto-accept-first-option:escalation-<id>` and no `resolutions` row,
+  so it is not reused as authority for later blockers.
+
+#### Lexical checks (word matching; they cannot detect meaning)
+
+These compare words. They catch common phrasings and miss synonyms and
+paraphrases.
+
+- **Recommendation word allowlist.** The recommendation must be empty, equal
+  option 1 after normalization, or use only option 1's own words plus a fixed
+  affirmative list (take, choose, pick, go, with, recommend, use, the, first,
+  option, one, because, it, is, simplest, safest, matches, ticket, criteria,
+  keep, ...). This cannot tell whether the text agrees with option 1: "Use the
+  existing date picker" passes for option 1 "Build a new date picker", because
+  every word is allowed.
+- **Other-option references.** Text naming another option by digit (any digit
+  but a lone "1"), number word, single letter b-z except "i" (skipped
+  because it is the pronoun "I"; as a label it would mean option 1 anyway, so
+  "Take option i." is accepted), roman numeral from ii,
+  ordinal, or "other", "instead", "vs", "or", and text whose non-filler words
+  overlap another option at least as much as option 1, are refused. Negation
+  and qualifier words ("not", "unsafe", "if", "but", "only", "after",
+  "except", "confirm", "ask", "a human", ...) are refused.
+- **Identifier shapes.** A word (split on spaces, surrounding `, ' " ! ? ( )`
+  removed) is refused when it starts with two capitals (`ALL_CAPS`, `PRs`),
+  contains a lowercase letter followed by a capital (camelCase,
+  `fetchUserData`), starts with `.` (`.gitignore`), or contains a `.` that is
+  not at its end (`deploy.yml`, `e.g.`). A file name without a dot is just a
+  word, so `Dockerfile` or `Makefile` passes.
+- **Mentioned protected paths.** The question, options and recommendation are
+  scanned for path tokens and for whole-word names taken from the protected
+  patterns: every non-wildcard segment except generic ones (`src`, `lib`,
+  `app`, `tests`, `docs`, ...) and a file pattern's stem, case-folded
+  ("security" for `src/harbor/security/**`). Near-names such as
+  "infrastructure" for `infra/**` are not matched.
+- **Loop guard.** Harbor refuses when, for the same ticket, an earlier
+  delivered (or in-flight) auto-accept had the same option text or a question
+  with at least 80% word overlap. A reworded question with lower overlap is
+  bounded only by the per-run cap. An undelivered receipt does not trigger the
+  guard.
+- **Keyword heuristics (best-effort).** Words suggesting secrets or
+  credentials, money, deleting data, merging or lowering a gate (push, merge,
+  land, ship, deploy, release, reset, force, delete, drop, wipe, purge,
+  truncate, pay, buy, billing, production, branch, secret, key, token,
+  password, credential, env, ci, test, check, coverage, risk, review, protect,
+  codeowners and more; names are split on `_ - . /`, so `STRIPE_SECRET_KEY`
+  counts) send the question to a human. A plain-English synonym ("Empty the
+  orders table", "Add a service fee to every order") is not recognised and can
+  be auto-accepted. That is why the opt-out above exists.
+
+`harbor doctor` prints the effective setting. An invalid value fails workflow
+loading.
 
 ### Merge risk (`auto_merge_risks`)
 

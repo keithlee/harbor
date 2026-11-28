@@ -117,6 +117,7 @@ class Case:
     flag_id: int | None = None
     flag_ids: list = field(default_factory=list)  # every pending watchdog flag folded into this case
     provider: str = ""  # the run's recorded builder provider (normally "codex" or "claude"); "" when unknown
+    parked_for_human: bool = False  # the final was parked waiting on a human merge
 
     @property
     def attempts(self) -> int:
@@ -154,6 +155,11 @@ def _final(raw: Any) -> dict:
     except (TypeError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _parked_for_human(final: Mapping[str, Any]) -> bool:
+    return (str(final.get("outcome") or "").casefold() == "parked"
+            and str(final.get("waiting_on") or "").casefold() == "human")
 
 
 def builder_provider(connection, run_id: str) -> str:
@@ -238,7 +244,8 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
             continue
         cases[run_id] = Case(project, ticket, run_id, trigger, status, blocker,
                              str(final.get("summary") or ""), str(session or ""), str(linear_id or ""), str(title or ""),
-                             history(connection, run_id), provider=builder_provider(connection, run_id))
+                             history(connection, run_id), provider=builder_provider(connection, run_id),
+                             parked_for_human=_parked_for_human(final))
     for event_id, ticket, payload in connection.execute(
         "SELECT e.id, e.identifier, e.payload_json FROM events e LEFT JOIN first_mate_flags_seen s ON s.event_id = e.id "
         "WHERE e.project = ? AND e.event_type = 'watchdog.flag' AND s.event_id IS NULL ORDER BY e.id", (project,)
@@ -263,7 +270,8 @@ def find_cases(connection, project: str, settings: Mapping[str, Any], *, now: fl
         case = cases.get(run[0]) or Case(project, str(ticket), run[0], f"watchdog:{flag.get('kind', 'flag')}", str(run[1] or "").casefold(),
                                           final.get("blocker") if isinstance(final.get("blocker"), dict) else {},
                                           str(final.get("summary") or ""), str(run[3] or ""), str(run[4] or ""), str(run[5] or ""),
-                                          history(connection, run[0]), provider=builder_provider(connection, run[0]))
+                                          history(connection, run[0]), provider=builder_provider(connection, run[0]),
+                                          parked_for_human=_parked_for_human(final))
         case.detail = "; ".join(filter(None, [case.detail, str(flag.get("detail") or flag.get("kind") or "")]))
         case.flag_id = event_id
         case.flag_ids.append(event_id)
@@ -396,10 +404,11 @@ def validate(decision: Mapping[str, Any], case: Case, settings: Mapping[str, Any
     return {"action": action, "instruction": instruction[:4000], "reason": reason[:1000]}
 
 
-def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
+def record(connection, case: Case, decision: Mapping[str, Any]) -> int | None:
+    """Insert one recovery row; returns its id."""
     initialize(connection)
     with connection:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO first_mate_recoveries(project,ticket,run_id,trigger,action,instruction,reason,old_session_id,at) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
             (case.project, case.ticket, case.run_id, case.trigger, decision["action"], decision.get("instruction"),
@@ -407,6 +416,23 @@ def record(connection, case: Case, decision: Mapping[str, Any]) -> None:
         )
     for event_id in case.flag_ids or [case.flag_id]:
         mark_flag(connection, event_id)
+    return cursor.lastrowid
+
+
+def undelivered_reason(decision: Mapping[str, Any]) -> str:
+    """The truthful outcome of an auto-accept whose builder never started."""
+    escalation_id = (decision.get("auto_accept") or {}).get("escalation_id")
+    return (f"First Mate auto-accept of option 1 for escalation #{escalation_id} was not delivered "
+            "(builder did not start); escalation reopened")
+
+
+def amend_reason(connection, row_id: int | None, reason: str) -> None:
+    """Correct a recovery row recorded at launch once its real outcome is known."""
+    if connection is None or row_id is None:
+        return
+    initialize(connection)
+    with connection:
+        connection.execute("UPDATE first_mate_recoveries SET reason=? WHERE id=?", (reason, row_id))
 
 
 def latest_flag_id(connection) -> int | None:
@@ -425,8 +451,102 @@ def latest_flag_id(connection) -> int | None:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def apply_auto_accept(db: Any, case: Case, decision: Mapping[str, Any], policy: Any, *,
+                      human_decisions: bool = False, protected_paths: Iterable[str] = (),
+                      repo_path: Any = None) -> dict:
+    """Turn First Mate's escalate into a resume with option 1, when policy allows.
+
+    Applies only to a blocked run whose blocker recommends its first option
+    and whose escalation is still open (Harbor's ladder records it at rung 2).
+    It shares the ladder's guardrails and ``auto_accepts`` receipts, so a
+    recommendation the ladder already auto-accepted is never accepted twice.
+    A guardrail refusal keeps the escalation and says why in the comment.
+    """
+    from harbor import auto_accept
+
+    decision = dict(decision)
+    if decision.get("action") != "escalate" or case.status != "blocked" or not case.blocker:
+        return decision
+    finder = getattr(db, "open_escalations", None)
+    rows = [row for row in (finder([case.ticket]) if callable(finder) else [])
+            if str(row.get("run_id") or "") == case.run_id]
+    # A resumed session keeps its run id, so an older open escalation for the
+    # same run is normal.  Only an escalation recorded for THIS blocker (same
+    # question and kind, and the same blocker digest in the ladder's
+    # assessment) may be answered; anything else is doubt, and doubt refuses.
+    row = rows[-1] if rows else None
+    escalation_id = row.get("id") if row else None
+    facts = auto_accept.eligibility(db, escalation_id)
+    doubt = ""
+    if row is None:
+        doubt = "no open escalation is recorded for this run"
+    elif (" ".join(str(row.get("question") or "").split()) != " ".join(str(case.blocker.get("question") or "").split())
+          or " ".join(str(row.get("kind") or "").split()) != " ".join(case.kind.casefold().replace("-", "_").split())):
+        doubt = f"the open escalation #{escalation_id} was recorded for a different question"
+    elif facts is None:
+        doubt = "Harbor recorded no protected-path assessment for this escalation"
+    elif facts["blocker_digest"] != auto_accept.blocker_digest(case.blocker):
+        doubt = f"Harbor's assessment of escalation #{escalation_id} was recorded for a different blocker"
+    trusted = facts if facts is not None and not doubt else None
+    # Re-check the blocker First Mate is answering against the project's
+    # protected paths (and the repository's AGENTS.md), as reported and as
+    # mentioned, independently of the ladder's recorded facts.
+    from harbor.unblock import _mentions_protected_path, touches_protected_paths
+    # A builder-reported ``protected_paths`` key never reaches here: the
+    # run-result validator rejects it.  Only the project's patterns apply.
+    patterns = list(protected_paths)
+    protected_now = touches_protected_paths(case.blocker, protected_paths=patterns, repo_path=repo_path) \
+        or _mentions_protected_path(case.blocker, patterns, repo_path)
+    assessment = auto_accept.assess(db, case.ticket, case.run_id, case.blocker, policy,
+                                    parked_for_human=case.parked_for_human,
+                                    protected=bool(protected_now or (trusted and trusted["protected"])),
+                                    human_decisions=bool(human_decisions or (trusted and trusted["human_decisions"])))
+    if assessment.status == "not_applicable":
+        return decision
+    if assessment.accepted and doubt:
+        assessment = auto_accept.Assessment("refused", assessment.option, assessment.method, doubt)
+    if not assessment.accepted:
+        decision["reason"] = f"{decision.get('reason') or 'escalated'}; auto-accept of option 1 not applied: {assessment.reason}"
+        return decision
+    question = str(case.blocker.get("question") or "")
+    recommendation = str(case.blocker.get("recommendation") or "").strip()
+    # Nothing is written yet: the supervisor records the answer when the
+    # resume launches (``record_auto_accept``), posts the comment only after
+    # it is delivered, and reopens the escalation on any other exit.
+    return {
+        "action": "resume",
+        "instruction": "Answer: " + auto_accept.answer_text(escalation_id, assessment.option),
+        "reason": f"auto-accepted the recommended first option for escalation #{escalation_id} "
+                  f"(First Mate proposed escalate: {decision.get('reason') or 'no reason given'})",
+        "auto_accept": {"escalation_id": escalation_id, "option": assessment.option, "method": assessment.method,
+                        "question": question, "recommendation": recommendation, "kind": case.kind,
+                        "count": assessment.count, "max_auto_accepts": policy.max_auto_accepts},
+    }
+
+
+def record_auto_accept(db: Any, case: Case, decision: Mapping[str, Any]) -> None:
+    """Write the auto-accept receipt and mark the escalation answered (at launch)."""
+    from harbor import auto_accept
+    payload = decision["auto_accept"]
+    auto_accept.record(db, escalation_id=payload["escalation_id"], ticket=case.ticket, run_id=case.run_id,
+                       source="first_mate", kind=payload["kind"], question=payload["question"],
+                       option=payload["option"], recommendation=payload["recommendation"], method=payload["method"])
+
+
+def auto_accept_comment(case: Case, decision: Mapping[str, Any]) -> str:
+    """The Linear comment for a delivered First Mate auto-accept."""
+    from harbor import auto_accept
+    payload = decision["auto_accept"]
+    policy = auto_accept.AutoAcceptPolicy(max_auto_accepts=int(payload["max_auto_accepts"]))
+    return auto_accept.comment(case.ticket, payload["escalation_id"], question=payload["question"],
+                               option=payload["option"], recommendation=payload["recommendation"],
+                               count=int(payload["count"]), policy=policy, source="First Mate")
+
+
 def comment(case: Case, decision: Mapping[str, Any]) -> str:
-    lines = [f"[First Mate recovery] {decision['action']} ({case.trigger})", f"Reason: {decision['reason']}"]
+    if decision.get("comment"):
+        return str(decision["comment"])
+    lines =[f"[First Mate recovery] {decision['action']} ({case.trigger})", f"Reason: {decision['reason']}"]
     if decision.get("instruction"):
         lines.append(f"Instruction: {decision['instruction']}")
     lines.append(f"Recovery {case.attempts + 1} of the configured budget.")
