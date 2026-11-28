@@ -33,7 +33,10 @@ from harbor.runner.base import (
     reap_orphan_runs,
 )
 from harbor.wake import (
+    MAX_FAILED_DELIVERIES,
     REDELIVERY_CAP_REASON,
+    capped_inputs,
+    record_redelivery_stop,
     Wake,
     WakeDecider,
     TicketScope,
@@ -2117,10 +2120,6 @@ class Supervisor:
             ):
                 mark_threads_seen(self.db, threads, str(head_sha) if head_sha else None)
             await self._handle_runner_result(wake, result)
-        elif wake.action == "stop" and wake.notify and str(wake.reason or "").startswith(REDELIVERY_CAP_REASON):
-            # Visible in /status even when no notifier is configured.
-            self.last_error = str(wake.reason)
-            await self._notify_operator(wake.idem_key, str(wake.reason))
         elif wake.action == "stop" and wake.notify:
             try:
                 await self._invoke(self.notifier, ("notify", "send", "publish"), wake)
@@ -2290,8 +2289,31 @@ class Supervisor:
             # error.  Do not replace the literal delivery exception.
             self.last_error = f"{error} (queue transition failed: {exc})"
 
+    async def _notify_redelivery_cap(self, stop: Wake) -> None:
+        """Tell the operator one input is no longer offered; record it once sent.
+
+        The stop row is written only after the notice is accepted, so a
+        missing or failing notifier leaves it to be offered again on the next
+        poll.  /status shows the cap from the queue either way.
+        """
+
+        if not self._in_scope(stop.ticket) or self.shadow or self.read_only or self.db is None:
+            return
+        self.last_wakes.append(stop)
+        if len(self.last_wakes) > 20:
+            del self.last_wakes[:-20]
+        reason = str(stop.reason or REDELIVERY_CAP_REASON)
+        self.last_error = reason
+        if await self._notify_operator(stop.idem_key, reason):
+            record_redelivery_stop(self.db, self._wake_ticket_identifier(stop), stop.idem_key)
+
     def _queue_row_exists(self, idem_key: str | None) -> bool:
-        """Whether this wake has its own queue receipt, in any status."""
+        """Whether this wake has its own queue receipt, in any status.
+
+        Fails closed: when the ledger cannot answer, report that a row exists
+        so the caller skips the ticket-wide fallback, which could otherwise
+        fail an unrelated live row and replay its instruction.
+        """
 
         if not idem_key:
             return False
@@ -2303,7 +2325,7 @@ class Supervisor:
                 "SELECT 1 FROM work_queue WHERE idem_key = ? LIMIT 1", (str(idem_key),)
             ).fetchone() is not None
         except sqlite3.Error:
-            return False
+            return True
 
     def _dispatch_has_no_run(self, identifier: str) -> bool:
         """Return whether a failed delivery created no durable run row."""
@@ -3775,6 +3797,9 @@ class Supervisor:
             pending_run = self._latest_run(identifier) or {}
             quota_wait = pending_run.get("terminal_reason") == "usage_limit_exceeded"
             wake = self.decider.decide(ticket, facts) if self.decider is not None and not quota_wait else None
+            take_stops = getattr(self.decider, "take_stops", None)
+            for stop in (take_stops() if callable(take_stops) else ()):
+                await self._notify_redelivery_cap(stop)
             if wake is not None:
                 await self._emit_wake(wake)
         if not is_current():
@@ -4298,6 +4323,12 @@ class Supervisor:
                                 ).fetchone()
                                 if receipt:
                                     item["quota_recovery"] = dict(receipt)
+                            capped = capped_inputs(
+                                self.db, item["ticket"],
+                                getattr(self.decider, "max_failed_deliveries", MAX_FAILED_DELIVERIES),
+                            )
+                            if capped:
+                                item["redelivery_capped"] = capped
                             if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='first_mate_recoveries'").fetchone():
                                 switched = connection.execute(
                                     "SELECT reason FROM first_mate_recoveries WHERE run_id=? AND action='quota_fallback' ORDER BY id DESC LIMIT 1",

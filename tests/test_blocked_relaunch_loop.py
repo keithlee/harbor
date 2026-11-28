@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pytest
 
 from harbor.config.projects import ProjectConfig
 from harbor.db import HarborDB
+from harbor.digest import render_digest
 from harbor.poll.linear_poller import PollResult
 from harbor.runner.base import apply_phase4_migration
 from harbor.runner.codex import CodexRunner
@@ -30,6 +32,7 @@ from harbor.wake import (
     WakeDecider,
     apply_phase3_migration,
     record_comment_receipt,
+    record_redelivery_stop,
 )
 
 RUN_ID = "run-7"
@@ -288,14 +291,23 @@ def test_failed_turns_on_the_same_comment_stop_at_the_redelivery_cap(tmp_path: P
             # One delivery plus one retry, then Harbor stops offering it.
             assert _launches(tmp_path) == MAX_FAILED_DELIVERIES
             cap = [text for text in notices if REDELIVERY_CAP_REASON in text]
-            assert len(cap) == 1 and "/retry SAMPLE-7" in cap[0]
+            assert len(cap) == 1
+            assert f"{MAX_FAILED_DELIVERIES} delivery attempts" in cap[0] and "/retry SAMPLE-7" in cap[0]
+            # The cap stays visible in /status after later clean polls.
+            await _poll_and_settle(supervisor)
+            assert len(_capped_in_status(supervisor)) == 1
+            assert "redelivery capped=1" in render_digest(supervisor.status(), detailed=True)
 
-            # A new human comment is new input with its own budget.
+            # A new human comment is new input with its own budget, and its
+            # own notice when it also runs out.
             reply = _human("human-2", "try again now", "2026-09-09T00:00:00+00:00")
             linear.ticket = {**linear.ticket, "linear_comments": [*linear.ticket["linear_comments"], reply]}
             for _ in range(4):
                 await _poll_and_settle(supervisor)
             assert _launches(tmp_path) == 2 * MAX_FAILED_DELIVERIES
+            cap = [text for text in notices if REDELIVERY_CAP_REASON in text]
+            assert len(cap) == 2 and cap[0] != cap[1]
+            assert len(_capped_in_status(supervisor)) == 2
 
         asyncio.run(scenario())
         rows = db.connection.execute("SELECT status FROM work_queue WHERE action='reengage' ORDER BY id").fetchall()
@@ -304,20 +316,120 @@ def test_failed_turns_on_the_same_comment_stop_at_the_redelivery_cap(tmp_path: P
         db.close()
 
 
-def test_one_failed_delivery_is_still_retried_once(tmp_path: Path) -> None:
+def _capped_in_status(supervisor: Supervisor) -> list[str]:
+    return [key for run in supervisor.status().runs for key in run.get("redelivery_capped", ())]
+
+
+def _fail_twice(db: HarborDB, decider: WakeDecider, ticket: dict[str, object]) -> str:
+    wake = decider.decide(ticket, {})
+    assert wake is not None and wake.action == "reengage"
+    for attempt in range(MAX_FAILED_DELIVERIES):
+        if attempt:
+            again = decider.decide(ticket, {})
+            assert again is not None and again.idem_key == wake.idem_key
+        assert db.transition_queue("failed", idem_key=wake.idem_key, error="resume refused")
+    return wake.idem_key
+
+
+def test_one_failed_delivery_is_still_retried_once_then_stops(tmp_path: Path) -> None:
     comment = _human("human-1", "please continue", "2026-09-02T00:00:00+00:00")
     ticket = _ticket([comment])
     db = _db(tmp_path, ticket)
     try:
-        first = WakeDecider(db).decide(ticket, {})
-        assert first is not None
-        assert db.transition_queue("failed", idem_key=first.idem_key, error="resume refused")
-        retry = WakeDecider(db).decide(ticket, {})
-        assert retry is not None and retry.idem_key == first.idem_key
-        assert db.transition_queue("failed", idem_key=first.idem_key, error="resume refused")
-        stop = WakeDecider(db).decide(ticket, {})
-        assert stop is not None and stop.action == "stop" and REDELIVERY_CAP_REASON in str(stop.reason)
-        assert WakeDecider(db).decide(ticket, {}) is None
+        decider = WakeDecider(db)
+        key = _fail_twice(db, decider, ticket)
+        decider.take_stops()
+        assert decider.decide(ticket, {}) is None
+        [stop] = decider.take_stops()
+        assert stop.action == "stop" and stop.facts["idem_key"] == key
+        # No turn ran and the run is blocked: /retry would refuse, so the
+        # notice must not offer it.
+        assert f"{MAX_FAILED_DELIVERIES} delivery attempts" in str(stop.reason)
+        assert "The run is blocked, so /retry does not apply" in str(stop.reason)
+        assert "/retry SAMPLE-7 resumes" not in str(stop.reason)
+        # Fits the operator notice limit, so the next step is never truncated.
+        assert len(str(stop.reason)) <= 300 and str(stop.reason).endswith("answer its open escalation.")
+        # Unrecorded (notice not yet accepted): offered again.
+        assert decider.decide(ticket, {}) is None
+        assert [item.idem_key for item in decider.take_stops()] == [stop.idem_key]
+        record_redelivery_stop(db, "SAMPLE-7", stop.idem_key)
+        assert decider.decide(ticket, {}) is None and decider.take_stops() == []
+    finally:
+        db.close()
+
+
+def test_cap_notice_is_kept_when_another_wake_is_returned(tmp_path: Path) -> None:
+    first = _human("human-1", "please continue", "2026-09-02T00:00:00+00:00")
+    db = _db(tmp_path, _ticket([first]))
+    try:
+        decider = WakeDecider(db)
+        key = _fail_twice(db, decider, _ticket([first]))
+        decider.take_stops()
+        second = _human("human-2", "another instruction", "2026-09-03T00:00:00+00:00")
+        wake = decider.decide(_ticket([first, second]), {})
+        assert wake is not None and wake.facts["linear_comment"]["id"] == "human-2"
+        assert [stop.facts["idem_key"] for stop in decider.take_stops()] == [key]
+    finally:
+        db.close()
+
+
+def test_failed_notifier_keeps_the_cap_notice_pending(tmp_path: Path) -> None:
+    comment = _human("human-1", "please continue", "2026-09-02T00:00:00+00:00")
+    db = _db(tmp_path, _ticket([comment]))
+    linear = _LinearWithComments(_ticket([comment]))
+    supervisor = _supervisor(tmp_path, db, linear, "crash")
+    notices: list[str] = []
+    broken = {"value": True}
+
+    async def notify(message: str) -> None:
+        if broken["value"]:
+            raise RuntimeError("notifier down")
+        notices.append(message)
+
+    supervisor.notifier = notify
+    try:
+        async def scenario() -> None:
+            for _ in range(4):
+                await _poll_and_settle(supervisor)
+            assert _launches(tmp_path) == MAX_FAILED_DELIVERIES and notices == []
+            stops = db.connection.execute("SELECT COUNT(*) FROM work_queue WHERE action='stop'").fetchone()[0]
+            assert stops == 0
+            broken["value"] = False
+            await _poll_and_settle(supervisor)
+            await _poll_and_settle(supervisor)
+            assert len([text for text in notices if REDELIVERY_CAP_REASON in text]) == 1
+            assert _launches(tmp_path) == MAX_FAILED_DELIVERIES
+
+        asyncio.run(scenario())
+    finally:
+        db.close()
+
+
+def test_queue_check_error_skips_the_ticket_wide_fallback(tmp_path: Path) -> None:
+    db = _db(tmp_path, _ticket([]))
+    supervisor = Supervisor(_Linear(_ticket([])), db=db)
+    fallbacks: list[str] = []
+
+    class _BrokenConnection:
+        def execute(self, *args: object) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+    class _Ledger:
+        connection = _BrokenConnection()
+
+        def transition_queue(self, *args: object, **kwargs: object) -> bool:
+            return False
+
+        def transition_ticket_queue(self, identifier: str, *args: object, **kwargs: object) -> bool:
+            fallbacks.append(identifier)
+            return True
+
+    try:
+        supervisor.db = _Ledger()
+        wake = Wake(ticket={"identifier": "SAMPLE-7"}, action="reengage", resume=RUN_ID,
+                    idem_key="SAMPLE-7@reengage@newer")
+        supervisor._record_dispatch_failure(wake, "post-turn handling failed")
+        assert fallbacks == []
     finally:
         db.close()
 

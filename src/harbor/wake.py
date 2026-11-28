@@ -47,6 +47,9 @@ LIVE_QUEUE_STATUSES = ("queued", "dispatched", "running", "waiting")
 # replay the same input into a new paid builder turn on every poll.
 MAX_FAILED_DELIVERIES = 2
 REDELIVERY_CAP_REASON = "redelivery cap reached"
+REDELIVERY_STOP_SUFFIX = "@redelivery-cap"
+# Run statuses an operator ``/retry`` accepts (see the dispatcher's retry).
+RETRYABLE_RUN_STATUSES = frozenset({"failed", "terminated", "orphaned"})
 # ``waiting`` is a completed runner invocation whose session is retained for
 # a later re-engagement.  It must not suppress that very re-engagement.
 ACTIVE_RUN_STATUSES = ("running",)
@@ -990,6 +993,7 @@ class WakeDecider:
         self.max_failed_deliveries = max(1, _as_int(max_failed_deliveries, MAX_FAILED_DELIVERIES))
         # Keys this decision suppressed only because they hit the cap.
         self._exhausted: list[str] = []
+        self.pending_stops: list[Wake] = []
         self.dispatch_states = frozenset(str(value) for value in dispatch_states)
         self.bot_rework_cap = max(0, _as_int(bot_rework_cap, 1))
         self.shadow = shadow
@@ -1056,34 +1060,63 @@ class WakeDecider:
     ) -> Wake | None:
         self._exhausted = []
         wake = self._decide(ticket, facts)
-        if wake is not None or not self._exhausted:
-            return wake
-        return self._redelivery_stop(ticket, self._exhausted[0])
+        # Every input that reached the cap gets its own notice, whether or
+        # not this decision also returned a wake for some other input.
+        for key in dict.fromkeys(self._exhausted):
+            stop = self._redelivery_stop(ticket, key)
+            if stop is not None:
+                self.pending_stops.append(stop)
+        return wake
+
+    def take_stops(self) -> list[Wake]:
+        """Return and clear the redelivery-cap notices found by ``decide``.
+
+        The caller records each one with :func:`record_redelivery_stop` only
+        after the operator notice is accepted, so an undelivered notice is
+        offered again on the next decision.
+        """
+
+        stops, self.pending_stops = self.pending_stops, []
+        return stops
 
     def _redelivery_stop(self, ticket: Mapping[str, Any], key: str) -> Wake | None:
-        """Tell the operator once that Harbor stopped re-offering one input."""
+        """Describe, truthfully, that Harbor stopped re-offering one input."""
 
         identifier = _identifier(ticket)
-        stop_key = f"{key}@redelivery-cap"
+        stop_key = f"{key}{REDELIVERY_STOP_SUFFIX}"
         if stop_key in self._shadow_stops or (self.db is not None and _queue_has_idem(self.db, stop_key, live_only=False)):
             return None
-        self._shadow_stops.add(stop_key)
-        if not self.shadow and self.db is not None:
-            _enqueue_stop(self.db, identifier, stop_key, ())
+        if self.shadow:
+            self._shadow_stops.add(stop_key)
+        connection = _db_connection(self.db) if self.db is not None else None
+        attempts = self.max_failed_deliveries
+        if connection is not None:
+            attempts = connection.execute(
+                "SELECT COUNT(*) FROM work_queue WHERE idem_key=? AND status='failed'", (key,)
+            ).fetchone()[0]
         run = _last_run(self.db, identifier) if self.db is not None else None
         run_id = str((run or {}).get("id") or "") or None
+        status = str((run or {}).get("status") or "unknown").casefold()
+        # Kept under the operator notice limit, so the next step is never cut.
+        label = key.split("@reengage@", 1)[-1][:40]
+        if status in RETRYABLE_RUN_STATUSES:
+            next_step = f"/retry {identifier} resumes the retained session; a new or edited Linear comment is new input."
+        else:
+            next_step = (
+                f"The run is {status}, so /retry does not apply: post a new or edited Linear comment, "
+                "or answer its open escalation."
+            )
         return Wake(
             ticket=ticket,
             action="stop",
             resume=run_id,
             instruction="",
             idem_key=stop_key,
-            facts={"idem_key": key, "failed_deliveries": self.max_failed_deliveries},
+            facts={"idem_key": key, "failed_deliveries": attempts, "run_status": status},
             notify=True,
             reason=(
-                f"{REDELIVERY_CAP_REASON}: {identifier} failed {self.max_failed_deliveries} turns on the same input "
-                f"({key}); Harbor will not offer it again. A new or edited comment is new input; "
-                f"/retry {identifier} resumes the retained session explicitly."
+                f"{REDELIVERY_CAP_REASON}: {attempts} delivery attempts of {identifier} input {label} "
+                f"did not complete; Harbor will not offer it again. {next_step}"
             ),
         )
 
@@ -1383,6 +1416,31 @@ def _enqueue_stop(db: Any, identifier: str, idem_key: str, threads: Iterable[Map
             connection.rollback()
         else:
             connection.commit()
+
+
+def record_redelivery_stop(db: Any, identifier: str, stop_key: str) -> None:
+    """Remember that the operator was told about one capped input."""
+
+    _enqueue_stop(db, identifier, stop_key, ())
+
+
+def capped_inputs(db: Any, identifier: str, cap: int = MAX_FAILED_DELIVERIES) -> list[str]:
+    """Idempotency keys Harbor stopped offering after ``cap`` failed deliveries.
+
+    Derived from the durable queue, so it stays visible in /status whether or
+    not the operator notice was delivered.
+    """
+
+    connection = _db_connection(db)
+    if connection is None or not _table_exists(connection, "work_queue"):
+        return []
+    rows = connection.execute(
+        "SELECT idem_key, SUM(status='failed'), "
+        "(SELECT q2.status FROM work_queue q2 WHERE q2.idem_key = q.idem_key ORDER BY q2.id DESC LIMIT 1) "
+        "FROM work_queue q WHERE ticket = ? AND action != 'stop' GROUP BY idem_key ORDER BY MIN(id)",
+        (identifier,),
+    ).fetchall()
+    return [str(row[0]) for row in rows if row[2] == "failed" and int(row[1] or 0) >= max(1, cap)]
 
 
 def mark_threads_seen(db: Any, threads: Iterable[Mapping[str, Any]], head_sha: str | None) -> None:
