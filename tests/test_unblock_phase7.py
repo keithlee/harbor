@@ -114,7 +114,9 @@ def test_rung_zero_verifies_the_project_token_and_resumes_with_the_rest_helper(t
         [command] = commands
         assert "gh" not in command and command[0] == "env"
         assert "HARBOR_GITHUB_TOKEN_ENV=SAMPLE_GITHUB_TOKEN" in command
-        assert command[-5:] == ["-m", "harbor.github_rest", "api", "GET", "/repos/owner/repo"]
+        from harbor.github_rest import helper_command
+        assert command[3:] == [*helper_command(), "api", "GET", "/repos/owner/repo"]
+        assert "-I" in command and "-m" not in command
         assert "dummy-project-token-not-a-secret" not in " ".join(command)
         assert resumed[0][0] == "builder-session"
         assert "REST helper" in resumed[0][1] and "never the gh CLI" in resumed[0][1]

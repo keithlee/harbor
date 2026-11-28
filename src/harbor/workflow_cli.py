@@ -177,8 +177,8 @@ async def fresh_context(config, db, ticket_id, run, event):
             # The git dir, fetch URL and token come from Harbor's project config and
             # environment, never from the worktree, whose .git file and config the builder can rewrite.
             from harbor.device_proof import builder_sandbox_change, git_fetch_url, main_git_dir
-            from harbor.github_rest import token_env_name
-            token_env = token_env_name(os.environ, profile.github_token_env)
+            from harbor.github_token import preferred_token_env, token_name
+            token_env = token_name(preferred_token_env(profile))
             sandbox_change = builder_sandbox_change(
                 main_git_dir(getattr(config, "repo_path", None)), fact.get("head_sha"), fact.get("base_sha"),
                 fetch_url=git_fetch_url(profile.github_api_url, profile.repository if profile.repository_owner else None),

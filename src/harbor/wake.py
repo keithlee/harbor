@@ -882,8 +882,8 @@ def github_transport_fact(
             "delivery-transport blocker saying a GitHub token is missing. " + no_gh
         )
     common = (
-        "Never print or echo the token. Prefer this over the gh CLI, which cannot reach GitHub "
-        "from inside Claude Code's sandbox on macOS (it hangs). `git push` works as usual. "
+        "Never print or echo the token. Never use the gh CLI, not even for a read: inside Claude Code's "
+        "sandbox on macOS it hangs or fails with `x509: OSStatus -26276`. `git push` works as usual. "
         "Your child agents (planner, implementor, reviewer) inherit this environment and the same "
         "project token; have them use this helper too."
     )

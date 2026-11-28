@@ -445,6 +445,86 @@ def test_workflow_check_points_a_401_at_the_project_token(tmp_path: Path, monkey
     assert "gh auth" not in err
 
 
+def test_the_pr_merge_harbor_check_never_fetches_with_a_broader_token(monkeypatch) -> None:
+    """pr-merge's .harbor/ check (from #61) fell back to GITHUB_TOKEN past the named variable."""
+    import harbor.device_proof as device_proof
+    from harbor import github_rest
+
+    seen = []
+    monkeypatch.setattr(device_proof, "builder_sandbox_change",
+                        lambda *a, token=None, **k: seen.append(token) or False)
+
+    class Gh:
+        def request(self, method, path, payload=None):
+            return {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}}
+
+    env = {"HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_GITHUB_TOKEN", "GITHUB_TOKEN": OTHER, "HARBOR_GIT_DIR": "/nonexistent"}
+    github_rest._refuse_builder_sandbox_change(Gh(), "/repos/o/r/pulls", 1, "a" * 40, env)
+    github_rest._refuse_builder_sandbox_change(Gh(), "/repos/o/r/pulls", 1, "a" * 40,
+                                               {**env, "SAMPLE_GITHUB_TOKEN": "dummy-project-token"})
+    assert seen == [None, "dummy-project-token"]
+
+
+def test_workflow_check_pre_merge_never_fetches_with_a_broader_token(clean_env) -> None:
+    from harbor.github_token import token_name
+    clean_env.setenv("GITHUB_TOKEN", OTHER)
+    # The resolver the pre_merge check uses: strict once a variable is named.
+    assert token_name("SAMPLE_GITHUB_TOKEN") is None
+    assert token_name("") == "GITHUB_TOKEN"
+    clean_env.setenv("SAMPLE_GITHUB_TOKEN", "dummy-project-token")
+    assert token_name("SAMPLE_GITHUB_TOKEN") == "SAMPLE_GITHUB_TOKEN"
+    source = (ROOT / "src" / "harbor" / "workflow_cli.py").read_text(encoding="utf-8")
+    assert "token_env_name(" not in source
+
+
+# ------------------------------------------------ the rung-0 probe
+
+def test_the_rung_zero_probe_cannot_be_shadowed_by_the_worktree(tmp_path: Path, clean_env) -> None:
+    """The probe runs on the host, unsandboxed, with the project token in its env.
+
+    Its cwd is the builder's worktree. Under ``python -m harbor.github_rest`` the
+    cwd is sys.path[0], so a ``harbor/`` package the builder wrote there ran in
+    place of Harbor's helper. ``PYTHONPATH`` was a second way in.
+    """
+    from harbor.facts.remediation import execute_remediation
+
+    worktree = tmp_path / "wt"
+    planted = worktree / "harbor"
+    planted.mkdir(parents=True)
+    marker = tmp_path / "SHADOWED"
+    (planted / "__init__.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    (planted / "github_rest.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    clean_env.setenv("SAMPLE_GITHUB_TOKEN", "dummy-project-token-not-a-secret")
+    clean_env.setenv("PYTHONPATH", str(worktree))
+    github = SimpleNamespace(github_token_env="SAMPLE_GITHUB_TOKEN", github_api_url="https://ghe.invalid/api/graphql",
+                             repository="owner/repo", repository_owner="owner", repository_name="repo")
+    result = asyncio.run(execute_remediation({"kind": "github_transport"}, cwd=worktree, github_profile=github))
+    assert result.attempted and not result.fixed  # ghe.invalid does not resolve
+    assert not marker.exists()
+    [command] = result.plan.commands
+    assert "-I" in command and "-m" not in command
+    stderr = result.outputs[-1].stderr if result.outputs else str(result.error)
+    assert "dummy-project-token" not in stderr
+
+
+def test_the_builder_helper_command_runs_harbors_helper_from_any_cwd(tmp_path: Path) -> None:
+    import subprocess
+    from harbor.github_rest import helper_command
+
+    planted = tmp_path / "harbor"
+    planted.mkdir()
+    marker = tmp_path / "SHADOWED"
+    for name in ("__init__.py", "github_rest.py"):
+        (planted / name).write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(tmp_path),
+           "HARBOR_GITHUB_API_URL": "https://ghe.invalid/api/v3", "HARBOR_GITHUB_REPOSITORY": "o/r"}
+    result = subprocess.run([*helper_command(), "pr-view", "1"], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=60)
+    assert not marker.exists()
+    # Harbor's real helper ran, from Harbor's own source, and failed closed.
+    assert result.returncode == 1 and "harbor.github_rest: no GitHub token" in result.stderr, result.stderr
+
+
 # ------------------------------------------------ the prompt and gh
 
 def test_the_no_token_prompt_never_steers_to_gh() -> None:

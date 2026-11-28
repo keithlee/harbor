@@ -72,14 +72,20 @@ def token_env_candidates(configured: str | None) -> tuple[str, ...]:
     return (name,) if name else DEFAULT_TOKEN_ENVS
 
 
-def project_token_env(profile: Any, environ: Mapping[str, str] | None = None) -> str | None:
-    """Name of the variable holding the project's token, or ``None``. Never reads the value out."""
+def token_name(configured: Any, environ: Mapping[str, str] | None = None) -> str | None:
+    """The set variable to read for ``configured`` (see the precedence above), or ``None``."""
 
     env = os.environ if environ is None else environ
-    for name in token_env_candidates(validate_token_env(getattr(profile, "github_token_env", ""))):
+    for name in token_env_candidates(validate_token_env(configured)):
         if (env.get(name) or "").strip():
             return name
     return None
+
+
+def project_token_env(profile: Any, environ: Mapping[str, str] | None = None) -> str | None:
+    """Name of the variable holding the project's token, or ``None``. Never reads the value out."""
+
+    return token_name(getattr(profile, "github_token_env", ""), environ)
 
 
 def preferred_token_env(profile: Any, environ: Mapping[str, str] | None = None) -> str:

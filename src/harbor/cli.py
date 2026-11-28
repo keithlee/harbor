@@ -605,7 +605,7 @@ async def _doctor(project_name: str) -> int:
         print(f"GitHub transport: invalid ({exc})")
         scope_ok = False
     else:
-        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (python -m harbor.github_rest)"
+        where = github["mcp_url"] if github["transport"] == "mcp" else "REST helper (harbor/github_rest.py, run with python -I)"
         if github["token_env"]:
             print(f"GitHub transport: {github['transport']} · {where} · token from {github['token_env']}")
         else:

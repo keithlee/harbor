@@ -198,7 +198,7 @@ def test_rest_transport_passes_names_and_endpoints_never_the_token(tmp_path: Pat
         "HARBOR_GIT_FETCH_URL": "https://github.com/owner/repo.git",
     }
     assert github["mcp"] is None
-    assert "-m harbor.github_rest" in github["fact"] and "owner/repo" in github["fact"]
+    assert "-I " in github["fact"] and "harbor/github_rest.py" in github["fact"] and "owner/repo" in github["fact"]
     assert TOKEN not in json.dumps(github)
 
 
@@ -229,7 +229,8 @@ def test_without_a_token_the_builder_is_told_to_report_a_blocker(tmp_path: Path)
 
 def test_the_fact_never_advertises_gh_and_reaches_the_instruction() -> None:
     fact = github_transport_fact("rest", helper="python -m harbor.github_rest", repository="o/r")
-    assert "Prefer this over the gh CLI" in fact and "pr-create" in fact
+    assert "Never use the gh CLI, not even for a read" in fact and "pr-create" in fact
+    assert "Prefer" not in fact  # a mere preference let builders still try gh
     assert "Available and authenticated" not in fact
     text = build_instruction({"identifier": "SAMPLE-1", "title": "t", "state": "Todo"}, github_fact=fact)
     assert fact in text

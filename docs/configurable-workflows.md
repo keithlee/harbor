@@ -224,13 +224,13 @@ auto-merge.
 ### GitHub transport (`[github]`)
 
 The builder needs GitHub to open, update, comment on, check and (when the
-workflow allows) merge its PR. Harbor does not rely on the GitHub CLI for this:
-inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake and
-hangs, while plain HTTPS to the API works. The builder is told to prefer the
-configured transport; where `gh` does work (for example Codex, or Linux) it may
-still use it, and with no token in the environment it is told to try `gh` before
-reporting a blocker. Harbor tells the builder which transport it
-has in the launch prompt.
+workflow allows) merge its PR. Harbor never steers a builder to the GitHub CLI:
+inside Claude Code's macOS sandbox `gh` cannot complete a TLS handshake (it
+hangs or fails with `x509: OSStatus -26276`), while plain HTTPS to the API
+works. Harbor names the builder's transport and its exact command in the launch
+prompt, including for First Mate and quota-fallback fresh sessions, and tells it
+never to use `gh`. With no token in the environment the builder is told to
+report a delivery-transport blocker, not to try `gh`.
 
 ```toml
 [github]
@@ -239,7 +239,10 @@ transport = "rest"   # default; or "mcp" (Claude builders only)
 ```
 
 **`rest` (default, no extra setup).** The builder runs Harbor's helper,
-`python -m harbor.github_rest`, which calls the GitHub REST API through `curl`.
+`<python> -I <harbor source>/harbor/github_rest.py` (the launch prompt gives the
+exact command), which calls the GitHub REST API through `curl`. `-I` and the
+absolute path mean the cwd, `PYTHONPATH` and any `harbor/` directory in the
+worktree cannot replace Harbor's own helper.
 Operations: `pr-view`, `pr-create`, `pr-edit`, `pr-comment`, `pr-checks`,
 `pr-merge` (pinned to a head SHA) and `api METHOD /path` for anything else. It
 uses the project's GitHub token (see **The project's GitHub token** below),
@@ -675,7 +678,7 @@ commands. They do not stop a builder that means to get around them.
     runtime would follow those links to files outside `.harbor/`.
 - **Where it runs:**
   - `pre_merge` in the bundled readiness hook and in `harbor workflow check`;
-  - the builder's merge command, `python -m harbor.github_rest pr-merge N --sha SHA`.
+  - the builder's merge command, `<helper> pr-merge N --sha SHA`, where `<helper>` is the REST helper command above.
 - **The helper's `api` command is an allowlist.**
   - Reads (`GET`, `HEAD`) go through when they carry no request body, except
     on `/graphql`: GraphQL is POST only, so its mutation allowlist always
@@ -717,11 +720,6 @@ untracked `.harbor/`:
   `install_command`, git hooks), and the `ios` and `android` escapes. These
   can edit the main checkout directly, so branch protection does not stop
   them either;
-- Harbor's own owner-approved-merge instruction
-  (`src/harbor/pr_events.py`), which tells the builder to merge with
-  `gh pr merge --match-head-commit`. That command does not go through
-  `pr-merge` or its `.harbor/` check. This predates device proof and is not
-  changed here.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`

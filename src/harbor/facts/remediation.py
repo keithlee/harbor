@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import os
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +77,8 @@ class RemediationPlan:
     operator_fix: str | None = None
     # Shown to the operator when a command fails (the check ran and failed).
     failure_fix: str | None = None
+    # Run in a fresh empty directory instead of the builder's worktree.
+    neutral_cwd: bool = False
 
     @property
     def command(self) -> tuple[str, ...] | None:
@@ -129,9 +132,7 @@ def github_transport_plan(
     environment the helper inherits.
     """
 
-    import sys
-
-    from harbor.github_rest import rest_base_url
+    from harbor.github_rest import helper_command, helper_invocation, rest_base_url
     from harbor.github_token import missing_token_help, project_token_env
 
     env = os.environ if environ is None else environ
@@ -148,13 +149,15 @@ def github_transport_plan(
         fix = f"the GitHub API URL{label} is not usable ({exc}); fix github_api_url"
         return RemediationPlan(kind="github_transport", commands=(), reason=fix, operator_fix=fix)
     command = ("env", f"HARBOR_GITHUB_TOKEN_ENV={name}", f"HARBOR_GITHUB_API_URL={api}",
-               sys.executable, "-m", "harbor.github_rest", "api", "GET", path)
+               *helper_command(), "api", "GET", path)
     return RemediationPlan(
         kind="github_transport",
         commands=(command,),
+        # Runs on the host with the token in its env: never in the worktree.
+        neutral_cwd=True,
         reason=(
             f"The project's GitHub token ({name}) is set and GitHub accepts it. Use Harbor's REST helper "
-            f"(`{sys.executable} -m harbor.github_rest <op>`) for every GitHub read and write, as your "
+            f"(`{helper_invocation()} <op>`) for every GitHub read and write, as your "
             "launch prompt describes; never the gh CLI, which hangs inside Claude Code's sandbox on macOS."
         ),
         failure_fix=(
@@ -285,6 +288,9 @@ async def execute_remediation(
         return RemediationResult(plan, attempted=True, fixed=False, error=plan.operator_fix)
     workdir = Path(cwd) if cwd is not None else None
     outputs: list[Any] = []
+    neutral = tempfile.TemporaryDirectory(prefix="harbor-remediation-") if plan.neutral_cwd else None
+    if neutral is not None:
+        workdir = Path(neutral.name)
     try:
         for command in plan.commands:
             value = await _invoke_executor(executor, command, workdir)
@@ -293,6 +299,9 @@ async def execute_remediation(
                 return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error="remediation command failed")
     except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
         return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error=str(exc))
+    finally:
+        if neutral is not None:
+            neutral.cleanup()
     return RemediationResult(plan, attempted=True, fixed=True, outputs=tuple(outputs))
 
 
