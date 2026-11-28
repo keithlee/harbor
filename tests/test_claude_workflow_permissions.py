@@ -103,7 +103,13 @@ def test_the_production_claude_builder_may_run_the_invocation_its_prompt_names(t
         invocation = next(line.split(": ", 1)[1] for line in prompt.splitlines()
                           if line.startswith("Authoritative runtime invocation: "))
         package = dispatcher.workflow.package.resolve()
-        assert s["permissions"]["allow"] == [f"Edit(/{worktree.resolve()}/**)", f"Bash({invocation}:*)", f"Read(/{package}/**)"]
+        helper = built.github_helper_invocation
+        assert helper.startswith("/usr/bin/env HARBOR_GITHUB_API_URL=") and "HARBOR_GITHUB_REPOSITORY=owner/repo" in helper
+        assert s["permissions"]["allow"] == [f"Edit(/{worktree.resolve()}/**)", f"Bash({invocation}:*)",
+                                             f"Bash({helper}:*)", f"Read(/{package}/**)"]
+        # A fresh build is told that exact helper command (and every turn repeats it, see test_claude_builder_shell).
+        wake = dispatcher._initial_wake(Wake(ticket={"identifier": "SAMPLE-1"}, action="build", instruction="ticket"))
+        assert f"`{helper} <op>`" in wake.instruction
         # The full-ticket read the prompt names runs under that same prefix rule.
         show = f"`{invocation} linear show IDENTIFIER --project "
         assert show in prompt
@@ -132,7 +138,8 @@ def test_doctor_reports_the_claude_builder_permissions(tmp_path: Path) -> None:
     from test_github_transport import run_doctor
     result = run_doctor(tmp_path, "claude", None)
     package = (tmp_path / "repo" / ".harbor" / "workflow").resolve()
-    assert (f"Builder permissions: Edit and Write in the ticket worktree only · harbor runtime invocation (sandboxed) · read-only {package}"
+    assert ("Builder permissions: Edit and Write in the ticket worktree only · harbor runtime invocation "
+            f"and GitHub helper invocation (sandboxed) · read-only {package}"
             in result.stdout), result.stdout + result.stderr
 
 

@@ -198,7 +198,7 @@ def test_rest_transport_passes_names_and_endpoints_never_the_token(tmp_path: Pat
         "HARBOR_GIT_FETCH_URL": "https://github.com/owner/repo.git",
     }
     assert github["mcp"] is None
-    assert "-m harbor.github_rest" in github["fact"] and "owner/repo" in github["fact"]
+    assert f"`{github['helper']} <op>`" in github["fact"] and "owner/repo" in github["fact"]
     assert TOKEN not in json.dumps(github)
 
 

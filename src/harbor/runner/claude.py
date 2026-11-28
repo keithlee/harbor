@@ -201,13 +201,15 @@ def device_proof_report(platforms: tuple[str, ...] | list[str], system: str | No
 _RULE_UNSAFE = "*?[]\n\r"
 
 
-def workflow_permissions(invocation: str, package: str | Path | None) -> list[str]:
+def workflow_permissions(invocation: str, package: str | Path | None, helper: str = "") -> list[str]:
     """Pre-approvals a Claude builder needs to follow the delivery workflow under ``dontAsk``.
 
     Sandboxed Bash is auto-allowed, except a command that sets ``PYTHONPATH``
     or assigns a variable in front of an absolute executable path (directly or
     through ``/usr/bin/env``), which is exactly what Harbor's runtime
-    invocation does, so that one prefix is approved literally. Read, Glob and
+    invocation and its GitHub helper invocation
+    (harbor.github_rest.builder_helper_invocation) do, so those two prefixes
+    are approved literally. Read, Glob and
     Grep are limited to the working directory, and the workflow package lives
     outside the ticket worktree, so it is approved read-only. Both still run
     inside the OS sandbox: nothing becomes writable or reachable that was not
@@ -220,6 +222,11 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
         if any(char in invocation for char in _RULE_UNSAFE):
             raise ValueError("the Harbor runtime invocation contains a character a permission rule cannot express")
         allow.append(f"Bash({invocation}:*)")
+    helper = helper.strip()
+    if helper:
+        if any(char in helper for char in _RULE_UNSAFE):
+            raise ValueError("the GitHub helper invocation contains a character a permission rule cannot express")
+        allow.append(f"Bash({helper}:*)")
     if package is not None:
         resolved = Path(package).expanduser().resolve()
         if not resolved.is_dir():
@@ -269,6 +276,8 @@ class ClaudeRunner(CodexRunner):
     sandbox_hosts: tuple[str, ...] = ()
     # The exact ``harbor`` runtime prefix the builder prompt tells it to use.
     harbor_invocation: str = ""
+    # The exact GitHub REST helper invocation (harbor.github_rest.builder_helper_invocation).
+    github_helper_invocation: str = ""
     # The project's workflow package, which lives outside the ticket worktree.
     workflow_package: Path | None = None
     # Opt-in device/browser proof platforms from the project's workflow ([builder] device_proof).
@@ -297,7 +306,8 @@ class ClaudeRunner(CodexRunner):
     def _workflow_permissions(self) -> list[str]:
         try:
             return [*worktree_permissions(self.worktree),
-                    *workflow_permissions(self.harbor_invocation, self.workflow_package)]
+                    *workflow_permissions(self.harbor_invocation, self.workflow_package,
+                                          self.github_helper_invocation)]
         except ValueError as exc:
             raise RunnerError(f"refusing a builder permission: {exc}") from exc
 

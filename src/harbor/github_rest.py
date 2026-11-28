@@ -17,6 +17,19 @@ Configuration comes from the builder environment Harbor sets:
 """
 from __future__ import annotations
 
+if __name__ == "__main__" and not __package__:
+    # Run as ``python -I <this file>`` (see helper_command): -I ignores the cwd
+    # and PYTHON* variables, and sys.path[0] is this file's directory. Point it
+    # at Harbor's own source instead, before any other import, so a ``harbor``
+    # package in the worktree or on PYTHONPATH can never stand in for it.
+    import sys as _sys
+    from os import path as _path
+
+    _sys.path[0] = _path.dirname(_path.dirname(_path.abspath(__file__)))
+    from harbor.github_rest import main as _main
+
+    raise SystemExit(_main())
+
 import argparse
 import json
 import os
@@ -81,6 +94,53 @@ def require_https_api_url(graphql_url: str | None) -> str:
     if not host:
         raise ValueError("the GitHub API URL must name a host")
     return url
+
+
+def helper_command() -> list[str]:
+    """argv that runs this helper from Harbor's own source, whatever the cwd or env.
+
+    ``python -m harbor.github_rest`` puts the cwd (a builder's worktree) first
+    on sys.path and imports whichever ``harbor`` that interpreter has
+    installed; ``-I`` plus the bootstrap at the top of this file pin it to the
+    source Harbor is running from.
+    """
+
+    from pathlib import Path
+
+    return [sys.executable, "-I", str(Path(__file__).resolve())]
+
+
+def helper_invocation() -> str:
+    """``helper_command`` as one shell string."""
+
+    import shlex
+
+    return shlex.join(helper_command())
+
+
+# What the helper's invocation pins: the API, the repository and the NAME of the
+# token variable, never a secret. HARBOR_GIT_DIR and HARBOR_GIT_FETCH_URL stay in
+# the builder's environment only, so an operator's clone path never has to fit
+# in a permission rule.
+BUILDER_HELPER_ENV = ("HARBOR_GITHUB_API_URL", "HARBOR_GITHUB_REPOSITORY", "HARBOR_GITHUB_TOKEN_ENV")
+
+
+def builder_helper_invocation(env: Mapping[str, str]) -> str:
+    """The exact command a builder runs for this helper, with its configuration pinned in front.
+
+    Like Harbor's CLI runtime invocation it starts with ``/usr/bin/env K=V``,
+    so a Claude builder in ``dontAsk`` mode can run it only through the exact
+    ``Bash(<this>:*)`` rule Harbor approves (harbor.runner.claude), and shell
+    initialization cannot point it at another API, repository or token. The
+    token itself is referenced by variable name only
+    (``HARBOR_GITHUB_TOKEN_ENV``); its value stays in the builder's
+    environment and never appears in this string, argv or the prompt.
+    """
+
+    import shlex
+
+    pinned = [f"{name}={env[name]}" for name in BUILDER_HELPER_ENV if str(env.get(name) or "").strip()]
+    return shlex.join(["/usr/bin/env", *pinned, *helper_command()])
 
 
 def token_env_name(env: Mapping[str, str], preferred: str | None = None) -> str | None:
