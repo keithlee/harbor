@@ -65,6 +65,31 @@ def client_for(issue, requests=None):
     return LinearClient(token="mock", transport=httpx.MockTransport(handler))
 
 
+@pytest.mark.parametrize("field", ("labels", "attachments", "inverseRelations"))
+def test_reading_a_ticket_marks_an_incomplete_list_while_blocker_context_still_fails_closed(field):
+    """`harbor linear show` must still print a ticket with more than 100 labels, links or relations."""
+
+    def issue():
+        value = complete_issue()
+        value[field]["pageInfo"]["hasNextPage"] = True
+        value["comments"]["nodes"] = [{"id": "c1", "body": "criteria", "createdAt": "2026-11-01T00:00:00Z"}]
+        return value
+
+    async def read(method):
+        client = client_for(issue())
+        try:
+            return await getattr(client, method)("MOCK-1")
+        finally:
+            await client.close()
+
+    shown = asyncio.run(read("fetch_issue_for_reading"))
+    assert shown["incomplete"] == [field]
+    assert shown["description"] == "The button color is blue."
+    assert [c["body"] for c in shown["comments"]["nodes"]] == ["criteria"]
+    with pytest.raises(LinearClientError, match=f"incomplete blocker {field}"):
+        asyncio.run(read("fetch_blocker_context"))
+
+
 async def fetch(issue):
     client = client_for(issue)
     try:
