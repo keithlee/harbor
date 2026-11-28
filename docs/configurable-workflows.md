@@ -520,17 +520,27 @@ commands. They do not stop a builder that means to get around them.
 - **SHAs:** both come from GitHub as full SHAs, never from a local
   `origin/<base>` ref, which a builder can forge with `git tag` or
   `git update-ref`.
-- **No builder-controlled git config.** The check never runs git with
-  configuration the builder could have written:
-  - It runs in a throwaway bare repository that borrows only the object
-    directory of the main repository's git dir. Harbor resolves that git dir
-    from the project's `repo_path`, not from the worktree's `.git` file.
+- **The repository's git config is not read.**
+  - The check runs in a throwaway bare repository that borrows only the object
+    directory of the main repository's git dir. When Harbor runs `pre_merge`
+    itself, it resolves that git dir from the project's `repo_path`, not from
+    the worktree's `.git` file.
   - The throwaway repository runs no hooks and no fsmonitor, and does not use
     ssh or `ext::` transports, upload-pack hooks, replacement objects, grafts,
     commit-graphs or a shallow file.
   - A commit missing locally is fetched only from Harbor's own URL for the
     configured repository, with `--upload-pack=git-upload-pack`, into the
     throwaway repository.
+  - The fetch authenticates with Harbor's GitHub token: the same
+    `GITHUB_TOKEN`, `GH_TOKEN` or `github_token_env` variable the REST helper
+    uses. Harbor passes it to git through environment config, as an
+    `http.https://<host>/.extraheader` scoped to that host. It never appears
+    on the command line, and errors are redacted.
+  - With no token, a missing commit fails closed with "no GitHub token is
+    configured".
+  - **Run inside the builder** (`pr-merge`, or `harbor workflow check` started
+    by the builder), the check uses the builder's own environment and
+    executables. Its result is only as trustworthy as the builder.
 - **Unreadable is refused too.** Missing commits, a SHA that does not match
   the PR head, and a tracked `.harbor`, `.harbor/workflow` or `workflow.toml`
   that is a symlink or a submodule all count as unreadable.
@@ -548,9 +558,12 @@ commands. They do not stop a builder that means to get around them.
     the real field. Fragments inside a mutation, batches and anything Harbor
     cannot parse are refused.
   - A review may only `COMMENT` or `REQUEST_CHANGES`; `APPROVE` is refused.
-  - The repository is the one Harbor configured (`HARBOR_GITHUB_REPOSITORY`).
-    A different `--repo` is refused, and with none configured the helper
-    refuses to run.
+  - REST writes are limited to the repository Harbor configured
+    (`HARBOR_GITHUB_REPOSITORY`). The helper's own commands use that
+    repository, a different `--repo` is refused, and with none configured
+    the helper refuses to run. GraphQL calls name their target by node ID,
+    so this limit does not apply to them; reads go through for any
+    repository.
   - Merges, refs, contents and branch protection are refused there.
 
 **Known ways around Harbor's checks**, which only branch protection stops:
@@ -559,7 +572,10 @@ commands. They do not stop a builder that means to get around them.
 - `git push` to the base branch;
 - the repository's git directory, which the builder can write. Harbor reads
   its objects but no config, refs or hooks, so a forged object is still a way
-  around the check.
+  around the check;
+- the builder's own environment: `PATH`, `PYTHONPATH`, `HARBOR_GIT_DIR` and
+  `HOME`. Wherever the check runs inside the builder, the builder chooses
+  which `git` and which Harbor code run, and which git dir they read.
 
 **Fail-closed config.** An unknown platform (`"andriod"`), a repeated
 platform, a value that is not a list of strings, or another key in `[builder]`
