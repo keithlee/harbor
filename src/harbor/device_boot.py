@@ -159,7 +159,15 @@ WEB_NOTE = (
     "Launch Chromium with `--single-process` (for example `chromium.launch({ args: ['--single-process'] })`): "
     "a normal launch dies with `bootstrap_check_in org.chromium.Chromium.MachPortRendezvousServer...: Permission "
     "denied (1100)`, because the sandbox does not let Chromium register its Mach service. In single-process mode "
-    "use one page and resize it (`page.setViewportSize`) between screenshots; a second browser context crashes."
+    "use one page and resize it (`page.setViewportSize`) between screenshots; a second browser context crashes. "
+    # Found live in a dontAsk builder: run_in_background serves and is stoppable with TaskStop; `cmd &` and nohup
+    # leave a process that outlives the session, and pkill/lsof cannot see it from a later command.
+    "Start the dev server with the Bash tool's `run_in_background: true` parameter, bound to 127.0.0.1 (for "
+    "example `pnpm dev -H 127.0.0.1 -p 3194`; put any variables it needs in `.env.local`, see the shell note), then "
+    "poll it with `curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:3194/` until it answers. Do not start "
+    "it with `&` or `nohup`: that process outlives your session, and `pkill` or `lsof` cannot find it later. When "
+    "the screenshots are done, stop it with the TaskStop tool and its background task ID; a background command "
+    "still running keeps your turn from ending."
 )
 
 

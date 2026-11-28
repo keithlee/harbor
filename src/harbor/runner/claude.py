@@ -284,7 +284,12 @@ def builder_shell_note(helper: str = "") -> str:
 # The builder's file tools. Edit and Write run inside Claude Code, outside the
 # OS sandbox, so the ``Edit(...)`` rule below (which covers every file-editing
 # tool) is their only boundary; dontAsk refuses an edit anywhere else.
-BUILDER_TOOLS = "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent"
+# TaskStop stops a Bash command the builder started with run_in_background (a dev
+# server for web proof). Without it nothing can: pkill and lsof cannot see that
+# process from a later sandboxed command, and a ``claude -p`` session with a
+# background command still running does not end until it exits (live: about ten
+# minutes). It acts only on this session's own background tasks.
+BUILDER_TOOLS = "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent,TaskStop"
 
 
 def worktree_permissions(worktree: str | Path) -> list[str]:

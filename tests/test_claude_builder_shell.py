@@ -117,6 +117,17 @@ def test_the_shell_note_names_the_exact_helper_and_the_env_var_forms() -> None:
     assert bare.startswith("Harbor shell note") and "GitHub helper: run it exactly" not in bare
 
 
+def test_the_web_note_says_how_to_run_and_stop_a_background_dev_server() -> None:
+    from harbor.device_boot import WEB_NOTE, device_note
+    from harbor.runner.claude import BUILDER_TOOLS
+    note = device_note([], web=True)
+    assert WEB_NOTE in note
+    assert "`run_in_background: true`" in note and "127.0.0.1" in note
+    assert "TaskStop" in note and "`nohup`" in note
+    # The tool the note names must be one the builder actually has.
+    assert "TaskStop" in BUILDER_TOOLS.split(",")
+
+
 @pytest.mark.parametrize("resume", [False, True])
 def test_every_turn_fresh_or_resumed_carries_the_shell_note(tmp_path: Path, monkeypatch, resume: bool) -> None:
     import asyncio
