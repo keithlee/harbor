@@ -423,6 +423,26 @@ def record(connection: Any, worktree: str | Path, command: Sequence[str], *, sta
         )
 
 
+STALE = "stale"
+
+
+def schedule_reinstall(connection: Any, worktree: str | Path) -> None:
+    """Make the next pre-turn check reinstall ``worktree``; nothing runs now.
+
+    Rung-0 remediation calls this for a builder-reported ``Cannot find module``
+    instead of running a package manager itself, so that reinstall goes through
+    ``prepare_dependencies``: the project's install_command, its environment
+    and process group, and install scripts only on base-matching or trusted
+    inputs. The trusted inputs are kept. A worktree with no record already
+    reinstalls on its next turn.
+    """
+
+    _schema(connection)
+    with connection:
+        connection.execute("UPDATE dependency_installs SET status=?, updated_at=? WHERE worktree=?",
+                           (STALE, _now(), _key(worktree)))
+
+
 @dataclass(frozen=True)
 class DependencyCheck:
     """What the pre-turn check found and did."""
@@ -472,6 +492,8 @@ class DependencyCheck:
 def _changed_reasons(previous: InstallRecord | None, current: Mapping[str, str]) -> list[str]:
     if previous is None:
         return ["Harbor has no record of installing this worktree"]
+    if previous.status == STALE:
+        return ["the builder reported a missing module, so rung-0 remediation asked for a reinstall"]
     if previous.status != "installed":
         return ["the previous install did not succeed"]
     changed = sorted(name for name in set(previous.inputs) | set(current)
@@ -718,5 +740,5 @@ __all__ = [
     "BLOCKER_KIND", "BaseSource", "DependencyCheck", "HARBOR_SECRET_NAMES", "INPUT_NAMES", "InstallRecord",
     "base_inputs", "blocker", "builder_note", "fingerprint", "input_hashes", "install_environment",
     "missing_output", "normalize_command", "pre_turn_installer", "prepare_dependencies", "record", "recorded",
-    "run_hardened", "scan_inputs", "without_scripts",
+    "run_hardened", "scan_inputs", "schedule_reinstall", "without_scripts",
 ]

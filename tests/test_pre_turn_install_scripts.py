@@ -223,26 +223,98 @@ def test_remediation_never_acts_on_a_pre_turn_install_blocker() -> None:
     assert not result.attempted
 
 
-def test_default_remediation_runs_only_in_a_linked_worktree_without_harbor_secrets(
+def linked_base_repo(tmp_path: Path, files: dict[str, str]) -> tuple[str, Path]:
+    """Like ``base_repo``, but the worktree is a linked ``git worktree`` of a clone, as Harbor makes it."""
+
+    (tmp_path / "remote-side").mkdir()
+    url, _ = base_repo(tmp_path / "remote-side", files)
+    checkout, worktree = tmp_path / "checkout", tmp_path / "wt" / "SAMPLE-1"
+    git(tmp_path, "clone", "-q", url, str(checkout))
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(checkout, "worktree", "add", "-q", "-b", "harbor/SAMPLE-1", str(worktree), "origin/main")
+    return url, worktree
+
+
+def test_rung_zero_never_runs_a_package_manager_for_cannot_find_module(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in SECRETS.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
-    fake_manager(tmp_path)  # tmp_path/bin/pnpm, found on PATH as `pnpm`
+    fake_manager(tmp_path)  # tmp_path/bin/pnpm, first on PATH: any `pnpm` run would be logged
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
     blocker = {"kind": "env_blocker", "evidence": NODE_GYP}
-    for cwd in (None, tmp_path):  # Harbor's own directory, and a directory that is not a linked worktree
-        result = asyncio.run(execute_remediation(blocker, cwd=cwd))
-        assert result.attempted and not result.fixed and "remediation" in (result.error or "")
-    assert not (tmp_path / "events.log").exists()
+    ledger = sqlite3.connect(":memory:")
     worktree = tmp_path / "linked"
     worktree.mkdir()
     (worktree / ".git").write_text("gitdir: /elsewhere\n")
-    result = asyncio.run(execute_remediation(blocker, cwd=worktree))
-    assert result.fixed
-    env = json.loads((tmp_path / "install-env.json").read_text())
-    assert not {name for name, value in env.items() if value in SECRETS.values()}
-    assert "SSH_AUTH_SOCK" not in env
+    (worktree / "package.json").write_text("{}")
+    dependencies.record(ledger, worktree, ("pnpm", "install"), status="installed", trusted=True)
+    # No ledger, Harbor's own directory, or a directory that is not a linked worktree: refused.
+    for cwd, store in ((worktree, None), (None, ledger), (tmp_path, ledger)):
+        result = asyncio.run(execute_remediation(blocker, cwd=cwd, ledger=store))
+        assert result.attempted and not result.fixed and result.error
+    result = asyncio.run(execute_remediation(blocker, cwd=worktree, ledger=ledger))
+    assert result.fixed and result.plan.commands == (("harbor", "schedule-dependency-reinstall"),)
+    assert not (tmp_path / "events.log").exists()  # nothing was installed now
+    assert dependencies.recorded(ledger, worktree).status == "stale"  # the next turn reinstalls
+
+
+@pytest.mark.skipif(NPM is None, reason="needs npm")
+def test_a_builder_postinstall_plus_a_reported_missing_module_never_runs_the_script(
+        tmp_path: Path, npm_env: None) -> None:
+    """A builder writes a postinstall, then reports "Cannot find module" itself. Rung 0 must not run it,
+    and the reinstall it schedules must run with scripts off."""
+
+    from harbor.db import HarborDB
+    from harbor.unblock import UnblockLadder
+
+    marker, planted = tmp_path / "postinstall-ran", tmp_path / "builder-code-ran"
+    url, worktree = linked_base_repo(tmp_path, npm_project(marker))
+    command = ("npm", "install")
+    db = HarborDB(tmp_path / "harbor.db")
+    resumed: list[str] = []
+
+    async def resume(run_id: str, prompt: str) -> bool:
+        resumed.append(run_id)
+        return True
+
+    try:
+        # What WorktreeManager.create leaves: the base branch's inputs, installed and trusted.
+        dependencies.record(db.connection, worktree, command, status="installed", trusted=True)
+        (worktree / "package.json").write_text(npm_project(planted)["package.json"])
+        final = {"status": "blocked", "summary": "tests fail",
+                 "blocker": {"kind": "env_blocker", "question": "Error: Cannot find module 'left-pad'"}}
+        result = asyncio.run(UnblockLadder(db, resumer=resume, repo_path=worktree).handle(
+            {"identifier": "SAMPLE-1"}, {"id": "run-1", "worktree": str(worktree)}, final))
+        assert result.rung == 0 and result.resumed and resumed == ["run-1"]
+        assert result.citation == "deterministic:missing_module"
+        assert not planted.exists() and not marker.exists()  # rung 0 itself ran nothing
+        # The resumed turn's pre-turn install: the project's command, scripts off on builder-changed inputs.
+        manager = SimpleNamespace(install_command=command, root=worktree.parent, install_timeout_seconds=120)
+        check = asyncio.run(pre_turn_installer(manager, db, base=BaseSource(url, "main"))(worktree))
+        assert check.action == "installed", check.line()
+        assert "reported a missing module" in check.line()
+        assert check.scripts is False and check.ran_command == ("npm", "install", "--ignore-scripts")
+        assert not planted.exists() and not marker.exists()
+    finally:
+        db.close()
+
+
+def test_gh_auth_status_cannot_be_redirected_to_a_planted_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worktree = tmp_path / "wt" / "SAMPLE-1"
+    planted_bin, harbor_bin = worktree / "node_modules" / ".bin", tmp_path / "harbor-bin"
+    for directory, label in ((planted_bin, "planted"), (worktree, "planted-cwd"), (harbor_bin, "harbor")):
+        directory.mkdir(parents=True, exist_ok=True)
+        gh = directory / "gh"
+        gh.write_text(f"#!/bin/sh\necho \"$@\" > {tmp_path / label}\n")
+        gh.chmod(0o755)
+    monkeypatch.chdir(worktree)
+    # A builder-influenced PATH: a worktree entry, a relative entry and an empty entry come first.
+    monkeypatch.setenv("PATH", os.pathsep.join([str(planted_bin), ".", "", str(harbor_bin), os.environ["PATH"]]))
+    result = asyncio.run(execute_remediation({"kind": "github_transport"}, cwd=worktree))
+    assert result.fixed, result.error
+    assert (tmp_path / "harbor").read_text().strip() == "auth status --hostname github.com"
+    assert not (tmp_path / "planted").exists() and not (tmp_path / "planted-cwd").exists()
+    assert result.outputs[0].args[0] == str(harbor_bin / "gh")
 
 
 def test_a_failed_install_that_prints_cannot_find_module_does_not_run_remediation(
