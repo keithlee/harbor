@@ -501,11 +501,18 @@ def build_production_dispatcher(
             elif device_proof_settings(current.config):
                 warn_once(CODEX_DEVICE_PROOF)
             # Claude and Codex alike: reinstall outside the sandbox before each turn
-            # when the lockfile changed or node_modules is missing (HAN-94). None
-            # when the project has no install_command.
-            from harbor.dependencies import pre_turn_installer
+            # when the dependency inputs changed or node_modules is missing (HAN-94).
+            # Install scripts run only on inputs that match the base branch, read
+            # from Harbor's own GitHub remote, unless [builder] dependency_scripts
+            # says "always". None when install_command is explicitly none.
+            from harbor.config.workflow import builder_dependency_scripts
+            from harbor.dependencies import BaseSource, pre_turn_installer
+            fetch_url = github["env"].get("HARBOR_GIT_FETCH_URL")
+            base = BaseSource(fetch_url, str(getattr(manager, "base_branch", None) or "main"),
+                              github.get("token_env") or "") if fetch_url else None
             runner.dependency_preparer = pre_turn_installer(
                 manager, db, project=config.name, extra_secrets=(github.get("token_env") or "",),
+                base=base, scripts_policy=builder_dependency_scripts(current.config),
             )
             return runner
     dispatcher = WorktreeDispatcher(

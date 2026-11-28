@@ -241,6 +241,21 @@ class CodexRunner(BaseRunner):
         return "", result
 
     async def _execute(self, context, instruction, *, resume, before_spawn: Callable[[], None] | None = None):
+        if self.dependency_preparer is not None and before_spawn is not None:
+            # Authorize the launch first (a stopped ticket or a superseded recovery
+            # raises here), so a refused launch never triggers an unsandboxed install.
+            # The launch path then calls before_spawn once per spawn, as before;
+            # only the first call, made here, is not repeated.
+            before_spawn()
+            authorize = before_spawn
+            pending = True
+
+            def before_spawn() -> None:
+                nonlocal pending
+                if pending:
+                    pending = False
+                    return
+                authorize()
         note, refused = await self._prepare_dependencies(context)
         if refused is not None:
             return refused

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -18,7 +19,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-MODULE_NOT_FOUND_MARKERS = ("cannot find module", "module not found")
+DEPENDENCY_INSTALL_KIND = "dependency_install"  # harbor.dependencies.BLOCKER_KIND
+REMEDIATION_TIMEOUT_SECONDS = 15 * 60.0
+MODULE_NOT_FOUND_MARKERS =("cannot find module", "module not found")
 ADB_NOT_RUNNING_MARKERS = (
     "adb server",
     "cannot connect to adb",
@@ -113,8 +116,13 @@ def remediation_plan(blocker: Any) -> RemediationPlan | None:
     and never broadens into device selection, APK installation, or retries.
     """
 
-    text = blocker_text(blocker).casefold()
     kind = str(_value(blocker, "kind", "type", "category", default="")).casefold().replace("-", "_")
+    if kind == DEPENDENCY_INSTALL_KIND:
+        # Harbor's own pre-turn install failed. Its evidence is raw install output,
+        # which builder-edited inputs control (a postinstall can print "Cannot find
+        # module" on purpose), so it never selects a command to run.
+        return None
+    text = blocker_text(blocker).casefold()
     if kind == "github_transport" or any(marker in text for marker in GITHUB_TRANSPORT_MARKERS):
         return RemediationPlan(
             kind="github_transport",
@@ -161,20 +169,39 @@ def _successful(value: Any) -> bool:
     return True
 
 
-async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None) -> Any:
+def _confined_worktree(cwd: Path | None) -> Path:
+    """``cwd`` when it is a real linked git worktree directory; ValueError otherwise."""
+
+    if cwd is None:
+        raise ValueError("remediation needs the run's worktree; refusing to run in Harbor's own directory")
+    raw = Path(cwd).expanduser()
+    if raw.is_symlink() or not raw.is_dir():
+        raise ValueError(f"remediation worktree {raw} is not a directory")
+    if not (raw / ".git").is_file():
+        # A linked worktree's .git is a file; the main checkout's is a directory.
+        raise ValueError(f"remediation refuses {raw}: it is not a linked Harbor worktree")
+    return raw.resolve()
+
+
+async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None, *, worktree_code: bool = False) -> Any:
     target = executor
     if target is None:
         # Shell-free invocation is important: blocker text never becomes part
-        # of a shell command.  ``check=True`` turns a failed repair into a
-        # rung-1 escalation rather than claiming it was fixed.
-        return await asyncio.to_thread(
-            subprocess.run,
-            list(command),
-            cwd=str(cwd) if cwd else None,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        # of a shell command. A non-zero exit is a failed repair (rung-1 escalation).
+        from harbor.dependencies import install_environment, run_hardened
+        if worktree_code:
+            # A package install runs code from files the builder can edit, outside
+            # its sandbox: only in a linked worktree (never Harbor's own directory
+            # or the main checkout), without Harbor's credentials or the SSH agent,
+            # in its own process group that a timeout kills.
+            workdir = _confined_worktree(cwd)
+            env = install_environment()
+            env.pop("SSH_AUTH_SOCK", None)
+        else:
+            # `gh auth status` must see the credentials Harbor itself would use.
+            workdir, env = (cwd or Path.cwd()), dict(os.environ)
+        returncode, output = await asyncio.to_thread(run_hardened, command, workdir, env, REMEDIATION_TIMEOUT_SECONDS)
+        return subprocess.CompletedProcess(list(command), returncode, "", output)
     for name in ("run", "execute", "invoke"):
         candidate = getattr(target, name, None)
         if callable(candidate):
@@ -221,7 +248,7 @@ async def execute_remediation(
     outputs: list[Any] = []
     try:
         for command in plan.commands:
-            value = await _invoke_executor(executor, command, workdir)
+            value = await _invoke_executor(executor, command, workdir, worktree_code=plan.kind == "missing_module")
             outputs.append(value)
             if not _successful(value):
                 return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error="remediation command failed")

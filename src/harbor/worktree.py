@@ -280,8 +280,11 @@ class WorktreeManager:
             if self.custody is not None and self.install_command:
                 # The first builder turn's pre-turn check (harbor.dependencies)
                 # then sees these inputs as installed instead of installing twice.
+                # They come from the base branch, so they are trusted: a later
+                # reinstall of these same inputs may run install scripts.
                 from harbor.dependencies import record
-                record(self.custody, worktree.path, self.install_command, status="installed", project=self.repo_name)
+                record(self.custody, worktree.path, self.install_command, status="installed", trusted=True,
+                       project=self.repo_name)
         if self.custody is not None:
             with self.custody:
                 self.custody.execute("UPDATE worktree_setup SET status='ready' WHERE project=? AND ticket=?", (self.repo_name,ticket))

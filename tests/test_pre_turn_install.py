@@ -5,16 +5,21 @@ dependency) and ran ``CI=true pnpm install --frozen-lockfile`` itself. pnpm
 deleted node_modules and the sandbox refused to write it back
 (``ERR_PNPM_EPERM: reflink to .../resolve_tmp_13868_2/.gitmodules, Operation
 not permitted``), leaving the worktree unrunnable. Harbor now runs the
-project's install_command before the turn whenever the lockfile changed or
-node_modules is missing, and tells the builder not to install.
+project's install_command before the turn whenever the dependency inputs
+changed or node_modules is missing, and tells the builder not to install.
+
+The install scripts policy (base-identical inputs only) and the remediation
+hardening are covered in test_pre_turn_install_scripts.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,23 +41,38 @@ SECRETS = {
 }
 
 
-def _installer_script(tmp_path: Path) -> Path:
-    """A stand-in for ``pnpm install``: logs each run, dumps its env, writes node_modules."""
+def fake_manager(tmp_path: Path, name: str = "pnpm", marker: str | None = ".modules.yaml") -> Path:
+    """A stand-in package manager named ``name`` in ``tmp_path/bin``.
 
-    script = tmp_path / "fake-install.py"
+    Each run appends ``install`` to events.log and its arguments to args.log,
+    dumps its environment, and writes node_modules (and ``marker`` in it). With
+    ``tmp_path/fail-install`` present it prints that file's text (or the
+    HAN-94 EPERM) to stderr and exits 1.
+    """
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / name
     script.write_text(
+        f"#!{sys.executable}\n"
         "import json, os, pathlib, sys\n"
-        f"log = pathlib.Path({str(tmp_path / 'events.log')!r})\n"
-        "with log.open('a') as handle:\n"
+        f"tmp = pathlib.Path({str(tmp_path)!r})\n"
+        "with (tmp / 'events.log').open('a') as handle:\n"
         "    handle.write('install\\n')\n"
-        f"pathlib.Path({str(tmp_path / 'install-env.json')!r}).write_text(json.dumps(dict(os.environ)))\n"
-        f"if pathlib.Path({str(tmp_path / 'fail-install')!r}).exists():\n"
-        f"    sys.stderr.write({EPERM!r} + '\\n')\n"
+        "with (tmp / 'args.log').open('a') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "(tmp / 'install-env.json').write_text(json.dumps(dict(os.environ)))\n"
+        "fail = tmp / 'fail-install'\n"
+        "if fail.exists():\n"
+        f"    sys.stderr.write((fail.read_text() or {EPERM!r}) + '\\n')\n"
         "    raise SystemExit(1)\n"
         "modules = pathlib.Path.cwd() / 'node_modules'\n"
         "modules.mkdir(exist_ok=True)\n"
-        "(modules / '.modules.yaml').write_text('layoutVersion: 5\\n')\n"
+        f"marker = {marker!r}\n"
+        "if marker:\n"
+        "    (modules / marker).write_text('done\\n')\n"
     )
+    script.chmod(0o755)
     return script
 
 
@@ -95,20 +115,22 @@ def _ledger() -> sqlite3.Connection:
 
 
 class Setup:
-    def __init__(self, tmp_path: Path, command: str | None = None) -> None:
+    def __init__(self, tmp_path: Path, command: object = None, *, base=None, scripts_policy: str = "base") -> None:
         self.tmp = tmp_path
         self.worktree = _worktree(tmp_path)
-        self.command = (sys.executable, str(_installer_script(tmp_path))) if command is None else command
+        self.command = (str(fake_manager(tmp_path)), "install") if command is None else command
         self.ledger = _ledger()
         self.manager = SimpleNamespace(install_command=self.command, root=tmp_path / "wt", install_timeout_seconds=60)
+        self.base = base
+        self.scripts_policy = scripts_policy
 
     def installed(self) -> None:
-        """The state ``WorktreeManager.create`` leaves: installed, and recorded in Harbor's ledger."""
+        """The state ``WorktreeManager.create`` leaves: installed from the base branch, recorded as trusted."""
 
         modules = self.worktree / "node_modules"
         modules.mkdir(exist_ok=True)
         (modules / ".modules.yaml").write_text("layoutVersion: 5\n")
-        record(self.ledger, self.worktree, self.command, status="installed")
+        record(self.ledger, self.worktree, self.command, status="installed", trusted=True)
 
     def runner(self, kind: type = CodexRunner, **extra: object) -> CodexRunner:
         options = dict(db=self.ledger, ticket="SAMPLE-1", run_id="run-1", deadline_seconds=30,
@@ -116,12 +138,20 @@ class Setup:
         if kind is ClaudeRunner:
             options.update(model="claude-sonnet-5-5", reasoning_effort="medium")
         runner = kind(self.worktree, **{**options, **extra})
-        runner.dependency_preparer = pre_turn_installer(self.manager, self.ledger, project="Sample")
+        runner.dependency_preparer = pre_turn_installer(self.manager, self.ledger, project="Sample", base=self.base,
+                                                        scripts_policy=self.scripts_policy)
         return runner
 
     def events(self) -> list[str]:
         log = self.tmp / "events.log"
         return log.read_text().splitlines() if log.exists() else []
+
+    def args(self) -> list[list[str]]:
+        log = self.tmp / "args.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def prompt(self) -> str:
+        return (self.tmp / "prompt.txt").read_text()
 
     def turn(self, runner: CodexRunner | None = None):
         runner = runner or self.runner()
@@ -136,11 +166,33 @@ def test_a_changed_lockfile_reinstalls_before_the_builder_launches(tmp_path: Pat
     result = setup.turn()
     assert result.status == "completed", result.error
     assert setup.events() == ["install", "launch"]
-    prompt = (tmp_path / "prompt.txt").read_text()
-    assert "because pnpm-lock.yaml changed since Harbor's last install; it succeeded" in prompt
+    assert "because pnpm-lock.yaml changed since Harbor's last install; it succeeded" in setup.prompt()
     # The new inputs are now the recorded ones: the next turn does not reinstall.
     setup.turn()
     assert setup.events() == ["install", "launch", "launch"]
+
+
+@pytest.mark.parametrize("path", ["packages/app/package.json", "packages/app/pnpm-lock.yaml", ".npmrc",
+                                  ".pnpmfile.cjs", ".yarnrc.yml", "patches/left-pad@1.3.0.patch"])
+def test_nested_lockfiles_and_install_config_count_as_inputs(tmp_path: Path, path: str) -> None:
+    setup = Setup(tmp_path)
+    setup.installed()
+    target = setup.worktree / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("changed by the builder\n")
+    setup.turn()
+    assert setup.events() == ["install", "launch"]
+    assert f"{path} changed since Harbor's last install" in setup.prompt()
+
+
+def test_install_output_is_never_an_input(tmp_path: Path) -> None:
+    setup = Setup(tmp_path)
+    setup.installed()
+    nested = setup.worktree / "node_modules" / "left-pad"
+    nested.mkdir(parents=True)
+    (nested / "package.json").write_text("{}")
+    setup.turn()
+    assert setup.events() == ["launch"]
 
 
 def test_an_unchanged_lockfile_does_not_reinstall(tmp_path: Path) -> None:
@@ -149,7 +201,7 @@ def test_an_unchanged_lockfile_does_not_reinstall(tmp_path: Path) -> None:
     setup.turn()
     setup.turn()
     assert setup.events() == ["launch", "launch"]
-    assert "found the dependencies up to date, so no install was needed" in (tmp_path / "prompt.txt").read_text()
+    assert "found the dependencies up to date, so no install was needed" in setup.prompt()
 
 
 @pytest.mark.parametrize("damage", ["deleted", "half-written"])
@@ -168,7 +220,21 @@ def test_missing_or_incomplete_node_modules_reinstalls(tmp_path: Path, damage: s
     result = setup.turn()
     assert result.status == "completed", result.error
     assert setup.events() == ["install", "launch"]
-    assert why in (tmp_path / "prompt.txt").read_text()
+    assert why in setup.prompt()
+    # The inputs are the ones Harbor installed from the base branch, so scripts stay on.
+    assert setup.args() == [["install"]]
+    assert "install scripts on (the inputs match Harbor's last trusted install)" in setup.prompt()
+
+
+def test_a_marker_the_package_manager_never_writes_does_not_reinstall_every_turn(tmp_path: Path) -> None:
+    # npm, but the project ships no package-lock.json-producing install: no node_modules/.package-lock.json.
+    setup = Setup(tmp_path, (str(fake_manager(tmp_path, "npm", marker=None)), "install"))
+    (setup.worktree / "pnpm-lock.yaml").unlink()
+    (setup.worktree / "package-lock.json").write_text("{}")
+    setup.turn()
+    setup.turn()
+    setup.turn()
+    assert setup.events() == ["install", "launch", "launch", "launch"]
 
 
 def test_a_failed_install_blocks_with_the_literal_error_and_launches_nothing(tmp_path: Path) -> None:
@@ -184,7 +250,7 @@ def test_a_failed_install_blocks_with_the_literal_error_and_launches_nothing(tmp
     result = asyncio.run(runner.resume("run-1", "Review feedback arrived"))
     assert setup.events() == ["install"]  # the builder was never launched
     assert result.status == "blocked" and result.waiting_on == "human"
-    assert result.blocker["kind"] == "env_blocker"
+    assert result.blocker["kind"] == dependencies.BLOCKER_KIND == "dependency_install"
     assert EPERM in result.blocker["evidence"]
     assert EPERM in result.summary and "did not start this builder turn" in result.summary
     assert "answer this blocker" in result.blocker["recommendation"] and "SAMPLE-1" in result.blocker["recommendation"]
@@ -196,13 +262,41 @@ def test_a_failed_install_blocks_with_the_literal_error_and_launches_nothing(tmp
     (tmp_path / "fail-install").unlink()
     result = asyncio.run(runner.resume("run-1", "Install fixed"))
     assert setup.events() == ["install", "install", "launch"]
-    assert "because the previous install did not succeed; it succeeded" in (tmp_path / "prompt.txt").read_text()
+    assert "because the previous install did not succeed; it succeeded" in setup.prompt()
+
+
+def test_a_refused_launch_never_installs(tmp_path: Path) -> None:
+    setup = Setup(tmp_path)
+    (setup.worktree / "pnpm-lock.yaml").write_text("changed\n")
+    calls: list[str] = []
+
+    def refuse() -> None:
+        calls.append("authorize")
+        raise RuntimeError("ticket is stopped")
+
+    with pytest.raises(RuntimeError, match="ticket is stopped"):
+        asyncio.run(setup.runner().start("Build SAMPLE-1", run_id="run-1", before_spawn=refuse))
+    assert calls == ["authorize"] and setup.events() == []
+
+
+def test_an_authorized_launch_installs_after_authorizing_once(tmp_path: Path) -> None:
+    setup = Setup(tmp_path)
+    (setup.worktree / "pnpm-lock.yaml").write_text("changed\n")
+    order: list[str] = []
+
+    def authorize() -> None:
+        order.append("authorize:" + ",".join(setup.events()))
+
+    asyncio.run(setup.runner().start("Build SAMPLE-1", run_id="run-1", before_spawn=authorize))
+    assert order == ["authorize:"]  # once, and before the install
+    assert setup.events() == ["install", "launch"]
 
 
 def test_harbor_secrets_do_not_reach_the_pre_turn_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name, value in SECRETS.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("NPM_TOKEN", "the-project-registry-token")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     setup = Setup(tmp_path)
     setup.turn()
     env = json.loads((tmp_path / "install-env.json").read_text())
@@ -210,6 +304,8 @@ def test_harbor_secrets_do_not_reach_the_pre_turn_install(tmp_path: Path, monkey
     assert leaked == set()
     for name in ("GITHUB_TOKEN", "LINEAR_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "SAMPLE_GH_PAT"):
         assert name not in env
+    # Unrecorded inputs are not trusted, so the agent socket is gone and scripts are off.
+    assert "SSH_AUTH_SOCK" not in env and env["npm_config_ignore_scripts"] == "true"
     # The install's own needs stay: PATH, HOME, and the project's registry token.
     assert env["PATH"] and env["HOME"] and env["NPM_TOKEN"] == "the-project-registry-token"
 
@@ -219,19 +315,27 @@ def test_the_github_token_named_by_the_transport_is_scrubbed() -> None:
     assert env == {"PATH": "/bin", "OTHER": "kept"}
 
 
-def test_no_install_command_changes_nothing(tmp_path: Path) -> None:
+def test_an_explicit_none_install_command_changes_nothing(tmp_path: Path) -> None:
     setup = Setup(tmp_path, command="none")
     assert pre_turn_installer(setup.manager, setup.ledger) is None
     runner = setup.runner()
     assert runner.dependency_preparer is None
-    import shutil
-    shutil.rmtree(setup.worktree / "node_modules", ignore_errors=True)
     result = setup.turn(runner)
     assert result.status == "completed"
     assert setup.events() == ["launch"]
-    assert (tmp_path / "prompt.txt").read_text() == "Build SAMPLE-1"
+    assert setup.prompt() == "Build SAMPLE-1"
     tables = {row[0] for row in setup.ledger.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "dependency_installs" not in tables
+
+
+def test_an_unset_install_command_is_the_pnpm_default_not_none(tmp_path: Path) -> None:
+    """``WorktreeManager`` turns an unset install_command into ``pnpm install``; only ``none`` turns this off."""
+
+    from harbor.worktree import DEFAULT_INSTALL_COMMAND, _install_command
+
+    manager = SimpleNamespace(install_command=_install_command(None), root=tmp_path, install_timeout_seconds=60)
+    assert manager.install_command == DEFAULT_INSTALL_COMMAND == ("pnpm", "install")
+    assert pre_turn_installer(manager, sqlite3.connect(":memory:")) is not None
 
 
 def test_claude_builders_get_the_same_pre_turn_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,7 +364,7 @@ def test_the_builder_is_told_not_to_install_itself(tmp_path: Path) -> None:
     setup = Setup(tmp_path)
     setup.installed()
     setup.turn()
-    prompt = (tmp_path / "prompt.txt").read_text()
+    prompt = setup.prompt()
     assert prompt.startswith("Build SAMPLE-1\n\nHarbor dependencies: before each turn Harbor")
     assert "Do not run install or reinstall commands yourself" in prompt
     assert "deletes or rewrites node_modules" in prompt
@@ -284,14 +388,20 @@ def test_worktree_creation_records_its_install_so_the_first_turn_does_not_repeat
     git(checkout, "-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-m", "init")
     git(checkout, "push", "-u", "origin", "main")
     ledger = sqlite3.connect(":memory:")
-    command = (sys.executable, str(_installer_script(tmp_path)))
+    command = (str(fake_manager(tmp_path)), "install")
     manager = WorktreeManager(checkout, root=tmp_path / "wt", disk_usage=lambda _: 100.0,
                               install_command=list(command), custody=ledger)
     worktree = manager.create("SAMPLE-1")
     assert (tmp_path / "events.log").read_text().splitlines() == ["install"]
-    check = asyncio.run(pre_turn_installer(manager, ledger)(worktree.path))
-    assert check.action == "current"
+    prepare = pre_turn_installer(manager, ledger)
+    assert asyncio.run(prepare(worktree.path)).action == "current"
     assert (tmp_path / "events.log").read_text().splitlines() == ["install"]
+    # Creation-time inputs are trusted: rebuilding a deleted node_modules runs scripts.
+    import shutil
+    shutil.rmtree(worktree.path / "node_modules")
+    check = asyncio.run(prepare(worktree.path))
+    assert check.action == "installed" and check.scripts is True
+    assert json.loads((tmp_path / "args.log").read_text().splitlines()[-1]) == ["install"]
 
 
 def test_prepare_refuses_a_worktree_outside_harbors_root(tmp_path: Path) -> None:
@@ -301,6 +411,30 @@ def test_prepare_refuses_a_worktree_outside_harbors_root(tmp_path: Path) -> None
     check = asyncio.run(prepare_dependencies(outside, command=setup.command, connection=setup.ledger, root=tmp_path / "wt"))
     assert check.failed and "refusing to install outside" in check.error
     assert setup.events() == []
+
+
+def test_a_timed_out_install_kills_its_whole_process_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "slow-install.py"
+    script.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    started = time.monotonic()
+    code, output = dependencies.run_hardened([sys.executable, str(script)], tmp_path, dict(os.environ), timeout=2)
+    assert code == 124 and "timed out" in output and time.monotonic() - started < 30
+    child = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        pytest.fail("the install's child process survived the timeout")
 
 
 def test_a_failed_install_escalates_once_and_is_not_retried_every_poll(tmp_path: Path) -> None:
@@ -324,7 +458,7 @@ def test_a_failed_install_escalates_once_and_is_not_retried_every_poll(tmp_path:
         return {"disposition": "escalate", "reason": "A person must fix the dependency install."}
 
     runner = CodexRunner(worktree, db=db, ticket="SAMPLE-7", executable=str(_builder_script(tmp_path)), deadline_seconds=30)
-    manager = SimpleNamespace(install_command=(sys.executable, str(_installer_script(tmp_path))), root=tmp_path,
+    manager = SimpleNamespace(install_command=(str(fake_manager(tmp_path)), "install"), root=tmp_path,
                               install_timeout_seconds=60)
     runner.dependency_preparer = pre_turn_installer(manager, db, project="SampleProject")
     supervisor = Supervisor(linear, db=db, runner=runner,
@@ -335,12 +469,12 @@ def test_a_failed_install_escalates_once_and_is_not_retried_every_poll(tmp_path:
         async def scenario() -> None:
             await _poll_and_settle(supervisor)
             assert events.read_text().splitlines() == ["install"], supervisor.last_error
-            assert _escalations(db) == [("env_blocker", "open")], supervisor.last_error
+            assert _escalations(db) == [("dependency_install", "open")], supervisor.last_error
             assert len(linear.posted) == 1 and "pre-turn dependency install" in linear.posted[0]
             for _ in range(5):
                 await _poll_and_settle(supervisor)
             assert events.read_text().splitlines() == ["install"]
-            assert _escalations(db) == [("env_blocker", "open")]
+            assert _escalations(db) == [("dependency_install", "open")]
             assert len(linear.posted) == 1
             row = db.connection.execute("SELECT status, terminal_reason, final_json FROM runs WHERE id='run-7'").fetchone()
             assert (row[0], row[1]) == ("blocked", "dependency_install_failed")
