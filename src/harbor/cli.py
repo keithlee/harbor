@@ -346,6 +346,10 @@ def build_production_dispatcher(
                         "restore the project registry (HARBOR_PROJECTS_FILE) and restart Harbor"
                     ) from exc
                 runner.workflow_package = current.package
+                # Opt-in sandbox widenings, read per turn like device_proof below.
+                from harbor.config.workflow import builder_allow_tmp, builder_allowed_domains
+                runner.allowed_domains = builder_allowed_domains(current.config)
+                runner.allow_tmp = builder_allow_tmp(current.config)
             # Read per turn, like the rest of the workflow: an edit applies on the next launch.
             # The same decision harbor doctor reports (harbor.device_proof.granted_platforms).
             from harbor.config.workflow import device_proof_settings
@@ -597,8 +601,15 @@ async def _doctor(project_name: str) -> int:
             if github["repository"]:
                 scope_ok = False
         if github["sandbox_hosts"] is not None:
-            from harbor.runner.claude import sandbox_domains
-            print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts']))}")
+            from harbor.config.workflow import builder_allow_tmp, builder_allowed_domains
+            from harbor.runner.claude import sandbox_domains, tmp_write_paths
+            extra = builder_allowed_domains(workflow.config)  # load_workflow already refused a bad value
+            print(f"Builder sandbox network: {', '.join(sandbox_domains(*github['sandbox_hosts'], *extra))}")
+            if extra:
+                print(f"  includes [builder] allowed_domains: {', '.join(extra)} (Bash may reach these hosts)")
+            if builder_allow_tmp(workflow.config):
+                print(f"Builder sandbox writes: [builder] allow_tmp adds {', '.join(tmp_write_paths())} "
+                      "(Bash may write the host's shared temp directory)")
             from harbor.runner.claude import workflow_permissions
             try:
                 workflow_permissions(_runtime_invocation(config), workflow.package)
@@ -606,7 +617,8 @@ async def _doctor(project_name: str) -> int:
                 print(f"Builder permissions: invalid ({exc}); a Claude builder could not run harbor or read the workflow")
                 scope_ok = False
             else:
-                print(f"Builder permissions: harbor runtime invocation (sandboxed) · read-only {workflow.package}")
+                print(f"Builder permissions: Edit and Write in the ticket worktree only · harbor runtime invocation "
+                      f"(sandboxed) · read-only {workflow.package}")
         if github["linear_sandbox_warning"]:
             print(f"Linear sandbox access: not added ({github['linear_sandbox_warning']})")
     for line in _device_proof_doctor(config, workflow):

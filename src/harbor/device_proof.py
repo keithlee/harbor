@@ -37,7 +37,8 @@ CODEX_DEVICE_PROOF = (
 
 
 BUILDER_SANDBOX_CHANGED = (
-    "human merge required: the PR changes .harbor/, where [builder] device_proof and [quota_fallback] can "
+    "human merge required: the PR changes .harbor/, where [builder] (device_proof, allowed_domains, "
+    "allow_tmp) and [quota_fallback] can "
     "widen the builder sandbox; Harbor's readiness check and pr-merge do not merge it, whatever "
     "auto_merge_risks says"
 )

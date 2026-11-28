@@ -126,7 +126,7 @@
   "--permission-mode",
   "dontAsk",
   "--tools",
-  "Bash,Read,Glob,Grep,Skill,Agent",
+  "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent",
   "--setting-sources",
   "",
   "--strict-mcp-config",
@@ -134,6 +134,7 @@
   {
     "permissions": {
       "allow": [
+        "Edit(/<tmp>/wt/**)",
         "mcp__github"
       ]
     },

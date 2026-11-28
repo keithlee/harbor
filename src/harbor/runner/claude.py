@@ -231,6 +231,36 @@ def workflow_permissions(invocation: str, package: str | Path | None) -> list[st
     return allow
 
 
+# The builder's file tools. Edit and Write run inside Claude Code, outside the
+# OS sandbox, so the ``Edit(...)`` rule below (which covers every file-editing
+# tool) is their only boundary; dontAsk refuses an edit anywhere else.
+BUILDER_TOOLS = "Bash,Read,Glob,Grep,Edit,Write,Skill,Agent"
+
+
+def worktree_permissions(worktree: str | Path) -> list[str]:
+    """Pre-approve the Edit and Write tools for the ticket worktree, and nowhere else.
+
+    Under ``dontAsk`` an edit is refused unless a rule allows it, and so is a
+    Bash command whose output redirection or ``mkdir`` target is a path no rule
+    allows (live: ``mkdir -p tests && printf ... > tests/x.py`` was refused).
+    The worktree is the builder's cwd and is already writable to sandboxed
+    Bash, so this rule makes nothing writable that was not before.
+    """
+
+    resolved = Path(worktree).expanduser().resolve()
+    if any(char in str(resolved) for char in _RULE_UNSAFE):
+        raise ValueError(f"the worktree path {resolved} contains a character a permission rule cannot express")
+    # A leading ``//`` anchors the rule at the filesystem root, not the settings file.
+    return [f"Edit(/{resolved}/**)"]
+
+
+def tmp_write_paths(system: str | None = None) -> list[str]:
+    """``[builder] allow_tmp``: the shared temp directory, under both names on macOS (``/tmp`` -> ``/private/tmp``)."""
+
+    system = sys.platform if system is None else system
+    return ["/tmp", "/private/tmp"] if system == "darwin" else ["/tmp"]
+
+
 class ClaudeRunner(CodexRunner):
     """Reuse Harbor's retained lifecycle with Claude's native CLI protocol."""
 
@@ -245,6 +275,10 @@ class ClaudeRunner(CodexRunner):
     device_proof: tuple[str, ...] = ()
     # Boots the mobile devices outside the sandbox before each launch (harbor.device_boot.prepare_devices).
     device_preparer: Any = None
+    # Opt-in extra network hosts for the Bash sandbox ([builder] allowed_domains).
+    allowed_domains: tuple[str, ...] = ()
+    # Opt-in: let Bash write the host's shared /tmp ([builder] allow_tmp).
+    allow_tmp: bool = False
 
     async def _execute(self, context, instruction, *, resume, before_spawn=None):
         if self.device_proof:
@@ -262,16 +296,20 @@ class ClaudeRunner(CodexRunner):
 
     def _workflow_permissions(self) -> list[str]:
         try:
-            return workflow_permissions(self.harbor_invocation, self.workflow_package)
+            return [*worktree_permissions(self.worktree),
+                    *workflow_permissions(self.harbor_invocation, self.workflow_package)]
         except ValueError as exc:
             raise RunnerError(f"refusing a builder permission: {exc}") from exc
 
     def command(self, instruction: str, *, run_id: str, resume: bool = False) -> list[str]:
         del instruction
         try:
-            domains = sandbox_domains(*self.sandbox_hosts)
+            domains = sandbox_domains(*self.sandbox_hosts, *self.allowed_domains)
         except ValueError as exc:
             raise RunnerError(f"refusing a builder sandbox host: {exc}") from exc
+        writable = list(self.writable_roots)
+        if self.allow_tmp:
+            writable.extend(path for path in tmp_write_paths() if path not in writable)
         try:
             device_network = device_proof_network(self.device_proof)
         except ValueError as exc:
@@ -282,7 +320,7 @@ class ClaudeRunner(CodexRunner):
                 "failIfUnavailable": True,
                 "allowUnsandboxedCommands": False,
                 "autoAllowBashIfSandboxed": True,
-                "filesystem": {"allowWrite": list(self.writable_roots)},
+                "filesystem": {"allowWrite": writable},
                 "network": {"allowedDomains": domains, **device_network},
             },
         }
@@ -302,12 +340,13 @@ class ClaudeRunner(CodexRunner):
         schema.pop("$schema", None)
         schema.pop("$id", None)
         # Agent lets the delivery skill spawn its planner/implementor/reviewer children. They
-        # run in this process, so they get the same tools, dontAsk mode and sandbox as the builder.
+        # run in this process, so they get the same tools, permission rules, dontAsk mode and
+        # sandbox as the builder.
         command = [
             self.executable, "--print", "--verbose", "--output-format", "stream-json",
             "--json-schema", json.dumps(schema),
             "--model", self.model, "--effort", self.reasoning_effort,
-            "--permission-mode", "dontAsk", "--tools", "Bash,Read,Glob,Grep,Skill,Agent",
+            "--permission-mode", "dontAsk", "--tools", BUILDER_TOOLS,
             "--setting-sources", "", "--strict-mcp-config", "--settings", json.dumps(settings),
         ]
         if mcp:
