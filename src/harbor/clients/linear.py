@@ -223,7 +223,24 @@ class LinearClient:
     aclose = close
 
     async def fetch_blocker_context(self, identifier: str) -> dict[str, Any]:
-        """Read current AC, dependencies, PR links and comments on one issue."""
+        """Read current AC, dependencies, PR links and comments on one issue.
+
+        Fails closed when any connection is incomplete: a blocker decision
+        must not rest on a relation, PR link or label it could not see.
+        """
+        return await self._issue_context(identifier, strict=True)
+
+    async def fetch_issue_for_reading(self, identifier: str) -> dict[str, Any]:
+        """Read one issue's full description and every comment, for display only.
+
+        Read-only, like every query here. Unlike ``fetch_blocker_context`` an
+        incomplete labels, attachments or relations list does not fail the
+        read: it is named in ``incomplete`` so the reader can say so. The
+        comments are still read in full or the call fails.
+        """
+        return await self._issue_context(identifier, strict=False)
+
+    async def _issue_context(self, identifier: str, *, strict: bool) -> dict[str, Any]:
         query = """query HarborBlocker($id: String!, $after: String) {
           issue(id: $id) {
             id identifier title description url branchName updatedAt state { name type }
@@ -261,13 +278,23 @@ class LinearClient:
             issue = data.get("issue")
             if not isinstance(issue, dict) or issue.get("identifier") != identifier:
                 raise LinearClientError("cannot verify blocked ticket identity")
+            incomplete: list[str] = []
             for field in ("attachments", "inverseRelations", "labels"):
+                if not strict:
+                    try:
+                        if connection(issue, field)[1]["hasNextPage"]:
+                            incomplete.append(field)
+                    except LinearClientError:
+                        incomplete.append(field)
+                    continue
                 if connection(issue, field)[1]["hasNextPage"]:
                     raise LinearClientError(f"incomplete blocker {field}; refusing partial context")
             nodes, info = connection(issue, "comments")
             comments.extend(nodes)
             if not info["hasNextPage"]:
                 issue["comments"] = {"nodes": comments}
+                if not strict:
+                    issue["incomplete"] = incomplete
                 return issue
             after = info.get("endCursor")
             if not after or after in cursors:
