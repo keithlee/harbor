@@ -6,11 +6,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shlex
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from harbor.clients.github import GitHubClient, GitHubError
@@ -78,7 +79,73 @@ def build_parser() -> argparse.ArgumentParser:
     state.add_argument("issue", metavar="IDENTIFIER", help="Linear issue id or identifier, e.g. ABC-123")
     state.add_argument("--state", required=True, help="non-terminal Linear workflow state name or id")
     state.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
+    show = linear_commands.add_parser(
+        "show", help="print one Linear issue's full description and every comment (read-only)",
+    )
+    show.add_argument("issue", metavar="IDENTIFIER", help="Linear issue identifier, e.g. ABC-123")
+    show.add_argument("--project", help="optional Harbor project, used for its configured Linear endpoint")
+    show.add_argument("--json", action="store_true", help="print the issue as JSON")
     return parser
+
+
+# The builder prompt points here so a builder can read a ticket the launch
+# excerpt cut short: builders run with --strict-mcp-config and no Linear MCP.
+LINEAR_SHOW_COMMAND = "linear show IDENTIFIER --project PROJECT"
+
+
+def _render_linear_issue(issue: Mapping[str, Any]) -> str:
+    state = issue.get("state") if isinstance(issue.get("state"), Mapping) else {}
+    comments = sorted(
+        (c for c in ((issue.get("comments") or {}).get("nodes") or ()) if isinstance(c, Mapping)),
+        key=lambda c: str(c.get("createdAt") or ""),
+    )
+    lines = [
+        f"{issue.get('identifier')}: {issue.get('title') or ''}",
+        f"State: {state.get('name') or 'unknown'}",
+        f"URL: {issue.get('url') or ''}",
+        "",
+        "Description:",
+        str(issue.get("description") or "(empty)"),
+        "",
+        f"Comments ({len(comments)}, oldest first):",
+    ]
+    for item in comments:
+        user = item.get("user") if isinstance(item.get("user"), Mapping) else {}
+        lines.append(f"--- {item.get('createdAt') or ''} · {user.get('name') or 'unknown'} · {item.get('id') or ''}")
+        lines.append(str(item.get("body") or ""))
+    return "\n".join(lines)
+
+
+async def _linear_show(issue: str, *, project_name: str | None = None, as_json: bool = False) -> int:
+    """Print one issue's full description and all comments; never mutates Linear."""
+
+    endpoint: str | None = None
+    if project_name:
+        try:
+            endpoint = get_project(project_name).linear_api_url
+        except ValueError as exc:
+            print(f"Harbor: {exc}", file=sys.stderr)
+            return 2
+    identifier = str(issue or "").strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", identifier):
+        print("Harbor: linear show needs an issue identifier such as ABC-123", file=sys.stderr)
+        return 2
+    client = LinearClient(endpoint=endpoint or DEFAULT_LINEAR_API_URL)
+    try:
+        if not client.token:
+            print("Harbor: Linear reads require LINEAR_API_KEY or HARBOR_LINEAR_API_KEY", file=sys.stderr)
+            return 2
+        data = await client.fetch_blocker_context(identifier)
+        if as_json:
+            print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        else:
+            print(_render_linear_issue(data))
+        return 0
+    except (LinearClientError, ValueError) as exc:
+        print(f"Harbor: Linear show failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        await client.close()
 
 
 def _db_path() -> Path:
@@ -147,6 +214,10 @@ def _pipeline_text(config: Any, workflow: Any | None = None) -> str:
             + "Copy this entire runtime invocation and the supplied project/ticket into every child agent task, "
             + "including reviewers with clean context. Child agents must not infer another executable from the project clone or PATH; "
             + "shell initialization must not select another registry or ledger."
+            + "\nFull ticket: the ticket text in your instruction is a bounded excerpt, and this run has no Linear MCP. "
+            + "Read the ticket's full current description and every comment with `" + runtime + " "
+            + LINEAR_SHOW_COMMAND.replace("PROJECT", shlex.quote(config.name)) + "` (read-only). "
+            + "Never proceed on a description that is cut off; if this command fails, report a blocker."
             + "\n" + CHILD_AGENT_INSTRUCTIONS
             + " Use the role models and reasoning efforts from the policy's `roles`."
             + "\nMerge authority: the policy's delivery.merge_mode overrides any merge or auto-merge policy in the "
@@ -1188,6 +1259,8 @@ async def _async_main(args: argparse.Namespace) -> int:
         return await _facts(args.project, as_json=getattr(args, "json", True))
     if args.command == "answer":
         return await _answer(args.escalation, " ".join(args.text), project_name=args.project)
+    if args.command == "linear" and args.linear_command == "show":
+        return await _linear_show(args.issue, project_name=args.project, as_json=args.json)
     if args.command == "linear":
         return await _linear_write(
             args.linear_command,

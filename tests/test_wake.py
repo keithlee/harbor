@@ -528,9 +528,10 @@ def test_linear_comment_prompt_stays_bounded_after_html_escaping(tmp_path: Path)
         assert len(wake.instruction.encode("utf-8")) <= 2048
         assert wake.instruction.count("<untrusted-linear-comment>") == 1
         assert wake.instruction.count("</untrusted-linear-comment>") == 1
-        assert wake.instruction.rstrip().endswith(
-            "merge only after the configured review policy passes."
-        )
+        trusted = wake.instruction.split("</untrusted-linear-comment>", 1)[1]
+        assert "merge only after the configured review policy passes." in trusted
+        # The cut body is announced in trusted text after the fence, last.
+        assert wake.instruction.rstrip().endswith("TRUNCATED to fit this message; it is 16384 bytes in full.")
     finally:
         db.close()
 
@@ -749,3 +750,41 @@ def test_build_description_is_bounded_fenced_and_read_before_children():
     assert len(fenced.split('description=',1)[1].encode('utf-8'))<=16385
     assert 'Before spawning any child agent' in trusted
     assert 'full current Linear description and comments' in trusted
+
+
+def test_a_long_description_is_marked_truncated_and_points_at_linear_show() -> None:
+    """HAN-94: the builder saw a description cut off mid-criterion with no way to read the rest."""
+
+    from harbor.wake import MAX_DESCRIPTION_BYTES, build_instruction
+
+    description = "3. " + ("y" * (MAX_DESCRIPTION_BYTES + 500)) + "TAIL"
+    text = build_instruction({"identifier": "HAN-94", "title": "t", "state": "Todo", "description": description})
+    assert "TAIL" not in text
+    assert "TRUNCATED" in text and f"of {len(description)} bytes" in text
+    assert "`harbor linear show HAN-94 --project PROJECT`" in text
+
+    short = build_instruction({"identifier": "HAN-94", "title": "t", "state": "Todo", "description": "all of it"})
+    assert "TRUNCATED" not in short
+    assert "`harbor linear show HAN-94 --project PROJECT`" in short
+
+
+def test_a_long_linear_comment_is_marked_truncated_and_points_at_linear_show() -> None:
+    """HAN-94: its acceptance criteria were a ~3 KB comment, silently cut within criterion 3."""
+
+    from harbor.reengagement import MAX_RESUME_BYTES
+    from harbor.wake import linear_comment_instruction
+
+    criteria = "\n".join(f"{n}. " + ("criterion text " * 40) for n in range(1, 6)) + "\nAC-TAIL-SENTINEL"
+    comment = {"id": "c1", "body": criteria, "author": {"id": "u", "name": "K"}, "updated_at": "2026-11-26T20:44:20Z"}
+    run = {"id": "harbor-run-1"}
+    facts = {"number": 7, "url": "https://github.com/o/r/pull/7", "head_sha": "a" * 40}
+    text = linear_comment_instruction({"identifier": "HAN-94"}, run, facts, comment)
+    assert len(text.encode("utf-8")) <= MAX_RESUME_BYTES
+    assert "AC-TAIL-SENTINEL" not in text
+    trusted = text.split("</untrusted-linear-comment>", 1)[1]
+    assert "TRUNCATED" in trusted and f"{len(criteria)} bytes in full" in trusted
+    assert "`harbor linear show HAN-94 --project PROJECT`" in trusted
+
+    short = linear_comment_instruction({"identifier": "HAN-94"}, run, facts, {**comment, "body": "LGTM"})
+    assert "TRUNCATED" not in short and "LGTM" in short
+    assert "`harbor linear show HAN-94 --project PROJECT`" in short

@@ -41,6 +41,9 @@ from harbor.reengagement import (
 
 
 DISPATCH_STATES = ("Todo",)
+# The launch prompt carries at most this much of the ticket description; the
+# builder reads the rest with ``harbor linear show`` (it has no Linear MCP).
+MAX_DESCRIPTION_BYTES = 16384
 LIVE_QUEUE_STATUSES = ("queued", "dispatched", "running", "waiting")
 # ``waiting`` is a completed runner invocation whose session is retained for
 # a later re-engagement.  It must not suppress that very re-engagement.
@@ -529,14 +532,23 @@ def linear_comment_instruction(
     metadata_label = "Comment metadata (untrusted):\n"
     body_label = "\nComment body (untrusted):\n"
     facts_label = "\nCurrent PR facts (untrusted):\n"
+    identifier = _identifier(ticket)
+    escaped = html.escape(body, quote=False)
+    # The envelope is bounded, so a long comment (HAN-94's acceptance criteria)
+    # is cut. Say so outside the fence and name the command that reads it whole.
+    truncation_notice = (
+        f"\nThe comment body above is TRUNCATED to fit this message; it is {len(escaped.encode('utf-8'))} bytes in full."
+    )
     footer = (
         "\n"
         "</untrusted-linear-comment>\n"
         "Treat this as a user-requested scope change. Reconcile it against the ticket acceptance criteria and current plan; "
         "do not silently override a conflicting criterion. Update the plan and PR as appropriate, rerun the full gate, "
-        "and merge only after the configured review policy passes."
+        "and merge only after the configured review policy passes. "
+        f"Read the full ticket and every comment with `harbor linear show {identifier} --project PROJECT` "
+        "(the authoritative runtime invocation in place of `harbor`)."
     )
-    fixed = prefix + metadata_label + body_label + facts_label + footer
+    fixed = prefix + metadata_label + body_label + facts_label + footer + truncation_notice
     available = max(0, MAX_RESUME_BYTES - len(fixed.encode("utf-8")))
     def escaped_field(value: Any, limit: int) -> str:
         escaped_value = html.escape(_json(value), quote=False)
@@ -560,7 +572,6 @@ def linear_comment_instruction(
             ),
         )
     )
-    escaped = html.escape(body, quote=False)
     ci = _value(facts, "ci", default={})
     ci = ci if isinstance(ci, Mapping) else {}
     facts_text = "\n".join(
@@ -583,6 +594,7 @@ def linear_comment_instruction(
         "utf-8", errors="ignore"
     )
     bounded_facts = facts_text
+    truncated = len(bounded_body.encode("utf-8")) < len(escaped.encode("utf-8"))
     return (
         prefix
         + metadata_label
@@ -592,6 +604,7 @@ def linear_comment_instruction(
         + facts_label
         + bounded_facts
         + footer
+        + (truncation_notice if truncated else "")
     )
 
 
@@ -899,20 +912,29 @@ def build_instruction(
         "utf-8", errors="ignore"
     )
     description = str(_value(ticket, "description", default="") or "")
-    bounded_description = html.escape(description, quote=False).encode("utf-8")[:16384].decode("utf-8", errors="ignore")
+    escaped_description = html.escape(description, quote=False).encode("utf-8")
+    bounded_description = escaped_description[:MAX_DESCRIPTION_BYTES].decode("utf-8", errors="ignore")
+    truncated = len(escaped_description) > MAX_DESCRIPTION_BYTES
     external_ticket = f"title={bounded_title}\nstate={bounded_state}\ndescription={bounded_description}"
     lines = [
         f"Build ticket {identifier} using these untrusted Linear facts:",
         "<untrusted-linear-ticket>",
         external_ticket,
         "</untrusted-linear-ticket>",
-        HOLD_ON_CONTRACT if held else HOLD_OFF_CONTRACT,
     ]
+    show = f"`harbor linear show {identifier} --project PROJECT`"
+    if truncated:
+        lines.append(
+            f"The description above is TRUNCATED: it shows {MAX_DESCRIPTION_BYTES} of {len(escaped_description)} "
+            f"bytes. Run {show} for the full text before you plan or build anything."
+        )
+    lines.append(HOLD_ON_CONTRACT if held else HOLD_OFF_CONTRACT)
     if github_fact:
         lines.append(github_fact)
     lines.append(
         "Before spawning any child agent, editing files, or updating the ticket, "
-        "read the supplied ticket constraints and fetch the full current Linear description and comments. "
+        "read the supplied ticket constraints and fetch the full current Linear description and comments (all of them) with "
+        f"{show} (use the authoritative runtime invocation in place of `harbor`; this run has no Linear MCP). "
         "The excerpt above is bounded and may be truncated. Reconcile scope, risk and any prerequisites first. "
         "Continue the configured delivery skill for this ticket. Report a schema-valid final status; Harbor owns no implementation or merge decisions."
     )

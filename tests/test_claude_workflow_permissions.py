@@ -99,6 +99,11 @@ def test_the_production_claude_builder_may_run_the_invocation_its_prompt_names(t
                           if line.startswith("Authoritative runtime invocation: "))
         package = dispatcher.workflow.package.resolve()
         assert s["permissions"]["allow"] == [f"Bash({invocation}:*)", f"Read(/{package}/**)"]
+        # The full-ticket read the prompt names runs under that same prefix rule.
+        show = f"`{invocation} linear show IDENTIFIER --project "
+        assert show in prompt
+        from harbor.cli import build_parser
+        assert build_parser().parse_args(["linear", "show", "SAMPLE-1", "--project", "x"]).linear_command == "show"
         assert not worktree.resolve().is_relative_to(package)
         assert s["sandbox"]["enabled"] is True and s["sandbox"]["failIfUnavailable"] is True
         assert s["sandbox"]["filesystem"]["allowWrite"][0] == str((tmp_path / "ledger").resolve())

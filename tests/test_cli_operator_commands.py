@@ -292,3 +292,80 @@ def test_answer_records_a_cited_resolution() -> None:
         assert ledger.recorded == [("product_decision", "Who owns it?", "Keith owns it", "AGENTS.md:12")]
 
     asyncio.run(scenario())
+
+
+class ShowLinearClient:
+    """Answers the full-issue read the way Linear's GraphQL client does."""
+
+    instances: list["ShowLinearClient"] = []
+    description = ""
+
+    def __init__(self, *, endpoint: str) -> None:
+        self.endpoint = endpoint
+        self.token = "lin_api_SECRET-NEVER-PRINTED"
+        self.reads: list[str] = []
+        self.writes: list[object] = []
+        self.closed = False
+        ShowLinearClient.instances.append(self)
+
+    async def fetch_blocker_context(self, identifier: str) -> dict[str, object]:
+        self.reads.append(identifier)
+        return {
+            "identifier": identifier, "title": "Long ticket", "url": "https://linear.app/x/issue/HAN-94",
+            "state": {"name": "In Progress", "type": "started"},
+            "description": self.description,
+            "comments": {"nodes": [
+                {"id": "c2", "createdAt": "2026-11-02T00:00:00Z", "body": "SECOND-COMMENT", "user": {"name": "B"}},
+                {"id": "c1", "createdAt": "2026-11-01T00:00:00Z", "body": "FIRST-COMMENT", "user": {"name": "A"}},
+            ]},
+        }
+
+    async def create_comment(self, *args: object) -> None:
+        self.writes.append(args)
+
+    async def update_issue_state(self, *args: object) -> None:
+        self.writes.append(args)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_linear_show_prints_the_full_description_and_every_comment(monkeypatch, capsys) -> None:
+    """HAN-94: a builder could only see a truncated ticket and had no way to read the rest."""
+
+    tail = "CRITERION-3-TAIL-SENTINEL"
+    ShowLinearClient.instances = []
+    ShowLinearClient.description = "1. first\n2. second\n3. " + ("x" * 40_000) + tail
+    monkeypatch.setattr(cli, "LinearClient", ShowLinearClient)
+
+    args = build_parser().parse_args(["linear", "show", "han-94"])
+    assert asyncio.run(cli._async_main(args)) == 0
+    out, err = capsys.readouterr()
+    assert out.rstrip().endswith("SECOND-COMMENT")
+    assert tail in out and len(out) > 40_000
+    assert out.index("FIRST-COMMENT") < out.index("SECOND-COMMENT")
+    assert "Comments (2, oldest first)" in out
+    assert "SECRET-NEVER-PRINTED" not in out + err
+    client = ShowLinearClient.instances[0]
+    assert client.reads == ["HAN-94"] and client.writes == [] and client.closed
+
+
+def test_linear_show_json_and_missing_key(monkeypatch, capsys) -> None:
+    import json
+
+    ShowLinearClient.instances = []
+    ShowLinearClient.description = "body"
+    monkeypatch.setattr(cli, "LinearClient", ShowLinearClient)
+    assert asyncio.run(cli._linear_show("HAN-94", as_json=True)) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["description"] == "body" and len(data["comments"]["nodes"]) == 2
+
+    class NoKey(ShowLinearClient):
+        def __init__(self, *, endpoint: str) -> None:
+            super().__init__(endpoint=endpoint)
+            self.token = None
+
+    monkeypatch.setattr(cli, "LinearClient", NoKey)
+    assert asyncio.run(cli._linear_show("HAN-94")) == 2
+    assert "LINEAR_API_KEY" in capsys.readouterr().err
+    assert asyncio.run(cli._linear_show("not an id")) == 2
