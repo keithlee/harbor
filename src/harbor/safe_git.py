@@ -255,7 +255,32 @@ def run_worktree_git(worktree: str | Path, repo: str | Path, *args: str, timeout
     )
 
 
+def nul_paths(output: str) -> list[str]:
+    """Split ``git ... -z`` output into paths, exactly as git stored them (no C-quoting)."""
+
+    return [item for item in output.split("\0") if item]
+
+
+def hidden_index_entries(worktree: str | Path, repo: str | Path, *, timeout: float | None = None) -> list[str]:
+    """Index entries flagged ``assume-unchanged`` or ``skip-worktree`` in a builder ``worktree``.
+
+    Git does not compare such a file with the work tree, so ``diff`` and
+    ``status`` never report an edit to it.  ``ls-files -v`` tags an
+    assume-unchanged entry with a lower-case letter and a skip-worktree entry
+    with ``S`` (``s`` for both).  Raises ``CalledProcessError`` when git fails.
+    """
+
+    listed = run_worktree_git(worktree, repo, "ls-files", "-z", "-v", timeout=timeout, check=True).stdout
+    hidden = []
+    for record in nul_paths(listed):
+        tag, _, path = record.partition(" ")
+        if path and (tag.islower() or tag == "S"):
+            hidden.append(path)
+    return hidden
+
+
 __all__ = [
-    "HARDENING", "IGNORE_SUBMODULES", "LOCAL_HARDENING", "UnsafeGitDirectory", "git_argv", "git_env", "main_git_dir",
-    "run_git", "run_worktree_git", "safe_path", "worktree_git_dirs",
+    "HARDENING", "IGNORE_SUBMODULES", "LOCAL_HARDENING", "UnsafeGitDirectory", "git_argv", "git_env",
+    "hidden_index_entries", "main_git_dir", "nul_paths", "run_git", "run_worktree_git", "safe_path",
+    "worktree_git_dirs",
 ]

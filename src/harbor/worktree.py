@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from harbor.safe_git import IGNORE_SUBMODULES, UnsafeGitDirectory, run_git, run_worktree_git
+from harbor.safe_git import IGNORE_SUBMODULES, UnsafeGitDirectory, hidden_index_entries, run_git, run_worktree_git
 
 
 DEFAULT_DISK_FLOOR_GB = 5.0
@@ -391,6 +391,15 @@ class WorktreeManager:
             # ``_git`` first proves the worktree's metadata is this repository's.
             if self._git(target, ["status", "--porcelain", IGNORE_SUBMODULES, "--untracked-files=all"]).stdout:
                 raise WorktreeError("cleanup retained modified or untracked files")
+            # ``status`` never compares an assume-unchanged or skip-worktree
+            # entry with its file, so an edit to one reads as clean.  Keep the
+            # worktree rather than delete work that git was told not to see.
+            hidden = self._hidden_entries(target)
+            if hidden:
+                raise WorktreeError(
+                    f"cleanup retained a worktree with assume-unchanged or skip-worktree index entries ({hidden[0]}); "
+                    "git does not report edits to those files, so check them and remove the worktree by hand"
+                )
             for line in self._git(target, ["status", "--porcelain", IGNORE_SUBMODULES, "--ignored", "--untracked-files=all"]).stdout.splitlines():
                 if not line.startswith("!! "):
                     continue
@@ -417,6 +426,14 @@ class WorktreeManager:
                 return str(here.relative_to(target))
             dirs[:] = [name for name in dirs if name != ".git"]
         return None
+
+    def _hidden_entries(self, target: Path) -> list[str]:
+        try:
+            return hidden_index_entries(target, self.repo)
+        except UnsafeGitDirectory as exc:
+            raise WorktreeConfinementError(f"worktree repository mismatch: {exc}") from exc
+        except subprocess.CalledProcessError as exc:
+            raise WorktreeError(f"git ls-files -v failed: {(exc.stderr or '').strip() or 'unknown git error'}") from exc
 
     def _git(self, target: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         """Git in a builder worktree, refused unless its metadata belongs to this repository."""
