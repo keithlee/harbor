@@ -206,9 +206,15 @@ def _refuse_builder_sandbox_change(gh: Any, pulls: str, number: int, sha: str, e
     if not head or head != sha:
         raise GitHubRestError(f"refusing to merge PR #{number}: --sha {sha} is not the PR's current head {head or '(unknown)'}")
     git_dir = env.get("HARBOR_GIT_DIR") or main_git_dir(os.getcwd())
-    reason = builder_sandbox_refusal(builder_sandbox_change(git_dir, head, base, fetch_url=env.get("HARBOR_GIT_FETCH_URL")))
+    name = token_env_name(env, env.get("HARBOR_GITHUB_TOKEN_ENV"))
+    token = env[name].strip() if name else None
+    why: list[str] = []
+    change = builder_sandbox_change(git_dir, head, base, fetch_url=env.get("HARBOR_GIT_FETCH_URL"),
+                                    token=token, reasons=why)
+    reason = builder_sandbox_refusal(change)
     if reason:
-        raise GitHubRestError(f"refusing to merge PR #{number}: {reason}")
+        detail = f" ({'; '.join(why)})" if why else ""
+        raise GitHubRestError(f"refusing to merge PR #{number}: {reason}{detail}")
 
 
 def _guard_api_call(method: str, path: str, body: str | None, repository: str | None) -> None:

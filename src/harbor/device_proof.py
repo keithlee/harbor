@@ -12,6 +12,7 @@ review on ``/.harbor/`` is the only hard guarantee.
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import sqlite3
@@ -165,10 +166,13 @@ class _CheckRepo:
     def __exit__(self, *exc: Any) -> None:
         self._tmp.cleanup()
 
-    def run(self, *args: str, timeout: float = 30, git_dir: bool = True) -> subprocess.CompletedProcess:
+    def run(self, *args: str, timeout: float = 30, git_dir: bool = True,
+            extra_env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess:
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1",
                    GIT_CEILING_DIRECTORIES=str(Path(self._tmp.name)))
+        # Added after the scrub, so only Harbor's own values reach git (e.g. the fetch credential).
+        env.update(extra_env or {})
         location = ("--git-dir", str(self.path)) if git_dir else ()
         return subprocess.run(["git", "--no-replace-objects", *HARDENING, *location, *args],
                               capture_output=True, text=True, timeout=timeout, env=env, cwd=self._tmp.name)
@@ -225,16 +229,51 @@ def _has_commit(repo: _CheckRepo, sha: str) -> bool:
     return found.returncode == 0 and found.stdout.strip() == sha
 
 
-def _ensure_commit(repo: _CheckRepo, sha: str, fetch_url: str | None) -> bool:
-    """True when commit ``sha`` is readable, fetching it from Harbor's configured URL if needed."""
+def _auth_env(fetch_url: str, token: str | None) -> dict[str, str]:
+    """git config, passed through the environment, that sends ``token`` to ``fetch_url``'s origin only.
+
+    Never on the command line, where ``ps`` would show it. ``GIT_CONFIG_NOSYSTEM``
+    and the scrubbed environment stay in force; this is the only credential git sees.
+    """
+
+    parts = urlsplit(fetch_url)
+    if parts.scheme != "https" or not parts.hostname or not token:
+        return {}
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"http.https://{parts.netloc}/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+    }
+
+
+def redact(text: str, token: str | None) -> str:
+    """``text`` with the token, and the basic-auth form Harbor builds from it, removed."""
+
+    if token:
+        for secret in (token, base64.b64encode(f"x-access-token:{token}".encode()).decode()):
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def _ensure_commit(repo: _CheckRepo, sha: str, fetch_url: str | None, token: str | None) -> str | None:
+    """None when commit ``sha`` is readable (fetched from Harbor's URL if needed), else why not."""
 
     if _has_commit(repo, sha):
-        return True
+        return None
     if not fetch_url:
-        return False
-    repo.run("fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "--upload-pack=git-upload-pack",
-             "--end-of-options", fetch_url, f"+{sha}:{CHECK_REF_PREFIX}{sha}", timeout=120)
-    return _has_commit(repo, sha)
+        return f"commit {sha} is not in the local repository and Harbor has no fetch URL for it"
+    if urlsplit(fetch_url).scheme == "https" and not token:
+        return (f"commit {sha} is not in the local repository and no GitHub token is configured to fetch it "
+                f"from {fetch_url} (set GITHUB_TOKEN, GH_TOKEN or the variable named by github_token_env)")
+    fetched = repo.run("fetch", "--no-tags", "--no-write-fetch-head", "--quiet", "--upload-pack=git-upload-pack",
+                       "--end-of-options", fetch_url, f"+{sha}:{CHECK_REF_PREFIX}{sha}", timeout=120,
+                       extra_env=_auth_env(fetch_url, token))
+    if _has_commit(repo, sha):
+        return None
+    detail = redact((fetched.stderr or fetched.stdout or f"exit {fetched.returncode}").strip(), token)
+    last = detail.splitlines()[-1] if detail else "unknown error"
+    return f"could not fetch commit {sha} from {fetch_url}: {last}"
 
 
 def _is_harbor_path(path: str) -> bool:
@@ -256,8 +295,8 @@ def git_fetch_url(api_url: str | None, repository: str | None) -> str | None:
     return f"https://{host}/{repository}.git" if host else None
 
 
-def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *,
-                           fetch_url: str | None = None) -> bool | None:
+def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_url: str | None = None,
+                           token: str | None = None, reasons: list[str] | None = None) -> bool | None:
     """Whether the PR head changes anything under ``.harbor/`` against its merge base with the PR base.
 
     ``git_dir`` is the repository's common git directory, resolved by the
@@ -267,7 +306,10 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *,
     grafts and shallow files out of reach, so config a builder planted in the
     repository is never read or run. ``head_sha`` and ``base_sha`` must be
     full SHAs from GitHub, never local refs a builder could forge. A missing
-    commit is fetched from ``fetch_url`` (Harbor's configured remote) only.
+    commit is fetched from ``fetch_url`` (Harbor's configured remote) only,
+    authenticated with ``token`` (Harbor's GitHub token) scoped to that URL's
+    origin. When the answer is None, ``reasons`` (if given) gets why; the
+    token never appears in it.
 
     Any change under a ``.harbor`` directory, compared after Unicode NFC
     normalisation and case folding, counts: ``[builder]`` and
@@ -281,28 +323,36 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *,
     not a regular file). Callers treat None as True.
     """
 
+    def unknown(reason: str) -> None:
+        if reasons is not None:
+            reasons.append(redact(reason, token))
+        return None
+
     if not isinstance(head_sha, str) or not isinstance(base_sha, str):
-        return None
+        return unknown("GitHub did not report the PR's head and base SHAs")
     if not FULL_SHA.fullmatch(head_sha) or not FULL_SHA.fullmatch(base_sha):
-        return None
+        return unknown("the PR's head and base must be full commit SHAs")
     if not git_dir or not Path(str(git_dir)).is_dir():
-        return None
+        return unknown(f"the project's git directory {git_dir or '(unknown)'} is not available")
     try:
         with _CheckRepo(Path(str(git_dir)).resolve()) as repo:
-            if not _ensure_commit(repo, head_sha, fetch_url) or not _ensure_commit(repo, base_sha, fetch_url):
-                return None
+            for sha in (head_sha, base_sha):
+                missing = _ensure_commit(repo, sha, fetch_url, token)
+                if missing:
+                    return unknown(missing)
             merged = repo.run("merge-base", "--end-of-options", base_sha, head_sha)
             merge_base = merged.stdout.strip()
             if merged.returncode != 0 or not FULL_SHA.fullmatch(merge_base):
-                return None
+                return unknown(f"no merge base between {base_sha} and {head_sha}")
             if not _harbor_tracked(repo, merge_base) and not _harbor_tracked(repo, head_sha):
                 return False
             if not _workflow_path_is_plain(repo, merge_base) or not _workflow_path_is_plain(repo, head_sha):
-                return None
+                return unknown("a tracked .harbor, .harbor/workflow or workflow.toml is a symlink, a submodule "
+                               "or not a regular file")
             changed = repo.run("diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
                                "--end-of-options", merge_base, head_sha)
-    except (OSError, subprocess.SubprocessError):
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        return unknown(f"git failed: {exc}")
     if changed.returncode != 0:
-        return None
+        return unknown(f"git diff-tree failed: {changed.stderr.strip()}")
     return any(_is_harbor_path(path) for path in changed.stdout.split("\0") if path)

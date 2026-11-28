@@ -886,3 +886,79 @@ def test_the_web_platform_tells_the_builder_how_to_launch_chromium(tmp_path: Pat
     asyncio.run(runner._execute(runner._new_context(None), "Build SAMPLE-1", resume=False))
     assert "--single-process" in seen["instruction"] and "MachPortRendezvousServer" in seen["instruction"]
     assert "setViewportSize" in seen["instruction"]
+
+
+# --- fifth review: authenticate the missing-commit fetch with Harbor's token -------------------
+
+FAKE_TOKEN = "ghp_sampleTOKEN0123456789abcdefABCDEF"
+
+
+def _capture_fetch(monkeypatch, stderr: str = "") -> list:
+    """Record git fetch calls made by the check instead of touching the network; other git runs go through."""
+    import subprocess
+    import harbor.device_proof as dp
+    calls, real = [], subprocess.run
+
+    def fake(argv, **kwargs):
+        if "fetch" in argv:
+            calls.append((list(argv), dict(kwargs.get("env") or {})))
+            return subprocess.CompletedProcess(argv, 128, "", stderr)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(dp.subprocess, "run", fake)
+    return calls
+
+
+def test_the_fetch_sends_the_token_as_a_scoped_header_in_the_environment(tmp_path: Path, monkeypatch) -> None:
+    import base64
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    missing = "1" * 40
+    calls = _capture_fetch(monkeypatch)
+    why: list[str] = []
+    assert builder_sandbox_change(repo / ".git", base, missing, fetch_url="https://github.com/o/r.git",
+                                  token=FAKE_TOKEN, reasons=why) is None
+    [(argv, env)] = calls
+    basic = base64.b64encode(f"x-access-token:{FAKE_TOKEN}".encode()).decode()
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"  # this origin only
+    assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {basic}"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_TERMINAL_PROMPT"] == "0"
+    assert not any(FAKE_TOKEN in arg or basic in arg for arg in argv)  # never visible in ps
+    assert "--upload-pack=git-upload-pack" in argv and "https://github.com/o/r.git" in argv
+    assert why and FAKE_TOKEN not in why[0] and basic not in why[0]
+
+
+def test_fetch_errors_never_carry_the_token(tmp_path: Path, monkeypatch) -> None:
+    import base64
+    from harbor.device_proof import builder_sandbox_change
+    from harbor.github_rest import GitHubRestError, run
+    basic = base64.b64encode(f"x-access-token:{FAKE_TOKEN}".encode()).decode()
+    leak = f"fatal: unable to access 'https://x-access-token:{FAKE_TOKEN}@github.com/o/r.git/': header {basic} rejected"
+    repo, base = _repo_with_workflow(tmp_path)
+    _capture_fetch(monkeypatch, stderr=leak)
+    why: list[str] = []
+    builder_sandbox_change(repo / ".git", base, "1" * 40, fetch_url="https://github.com/o/r.git",
+                           token=FAKE_TOKEN, reasons=why)
+    assert "could not fetch commit" in why[0] and "[redacted]" in why[0]
+    assert FAKE_TOKEN not in why[0] and basic not in why[0]
+    monkeypatch.chdir(repo)
+    gh = FakeGitHub(base, "1" * 40)
+    env = {"HARBOR_GITHUB_REPOSITORY": "o/r", "HARBOR_GIT_FETCH_URL": "https://github.com/o/r.git",
+           "HARBOR_GITHUB_TOKEN_ENV": "SAMPLE_TOKEN", "SAMPLE_TOKEN": FAKE_TOKEN}
+    with pytest.raises(GitHubRestError) as caught:
+        run(["pr-merge", "4", "--sha", base], env=env, client=gh)
+    message = str(caught.value)
+    assert "could not fetch commit" in message
+    assert FAKE_TOKEN not in message and basic not in message
+
+
+def test_no_token_fails_closed_with_a_clear_reason(tmp_path: Path, monkeypatch) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    calls = _capture_fetch(monkeypatch)
+    why: list[str] = []
+    assert builder_sandbox_change(repo / ".git", base, "1" * 40, fetch_url="https://github.com/o/r.git",
+                                  token=None, reasons=why) is None
+    assert calls == []  # nothing to authenticate with, so no fetch is attempted
+    assert "no GitHub token is configured" in why[0]
