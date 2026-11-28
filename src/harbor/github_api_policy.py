@@ -55,6 +55,8 @@ def check_api_call(method: str, path: str, body: str | None, repository: str | N
     if verb in READ_METHODS:
         if body:
             raise ApiRefused(f"{verb} {path}: a read may not carry a request body")
+        if parts.path.rstrip("/") in {"/graphql", "/api/graphql"}:
+            raise ApiRefused(f"{verb} {path}: GraphQL is POST only, so its mutation allowlist always applies")
         return
     if parts.query or parts.fragment or "%2" in path.lower() or "\\" in path:
         raise ApiRefused(f"{verb} {path}: writes may not carry a query string, fragment or encoded separator")

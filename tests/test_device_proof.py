@@ -1229,3 +1229,60 @@ def test_a_pr_edit_of_title_and_body_is_allowed(tmp_path) -> None:
     run(["api", "PATCH", "/repos/o/r/pulls/4", "--input", str(tmp_path / "body.json")],
         env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
     assert gh.requests[0][:2] == ("PATCH", "/repos/o/r/pulls/4")
+
+
+# --- ninth review: case-variant symlinks anywhere under .harbor/ ------------------------------
+
+def _repo_with_links(tmp_path: Path, links: dict[str, str], files: dict[str, str]) -> tuple[Path, str]:
+    """A base that tracks ``files`` plus the given symlinks (path -> target), on a feature branch."""
+    import os
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "core.ignorecase", "false")  # keep the exact case on any filesystem
+    for path, text in files.items():
+        _write(repo, path, text)
+    for path, target in links.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, repo / path)
+    base = _commit_all(repo, "base with links")
+    for path in links:
+        assert "120000" in _git(repo, "ls-tree", base, "--", path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    return repo, base
+
+
+@pytest.mark.parametrize(("links", "files", "edit"), [
+    ({".HARBOR": "cfg"}, {"cfg/workflow/workflow.toml": NONE}, "cfg/workflow/workflow.toml"),
+    ({".harbor/WORKFLOW": "../cfg"}, {"cfg/workflow.toml": NONE, ".harbor/pipeline.md": "x\n"}, "cfg/workflow.toml"),
+    ({".harbor/workflow/config.toml": "../../cfg.toml"},
+     {".harbor/workflow/workflow.toml": "version = 1\n", "cfg.toml": "[controller]\nmodel = \"m\"\n"}, "cfg.toml"),
+])
+def test_a_case_variant_or_nested_symlink_under_harbor_refuses(tmp_path: Path, monkeypatch, links, files, edit) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    from harbor.github_rest import GitHubRestError, run
+    repo, base = _repo_with_links(tmp_path, links, files)
+    _write(repo, edit, IOS)  # the PR edits only the symlink's target, outside .harbor/
+    _git(repo, "add", edit)
+    _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "edit target")
+    head = _git(repo, "rev-parse", "HEAD")
+    why: list[str] = []
+    assert builder_sandbox_change(repo / ".git", head, base, reasons=why) is None
+    assert "symlink" in why[0]
+    monkeypatch.chdir(repo)
+    gh = FakeGitHub(head, base)
+    with pytest.raises(GitHubRestError, match="could not read the PR diff"):
+        run(["pr-merge", "4", "--sha", head], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert [m for m, _, _ in gh.requests] == ["GET"]  # squash is not PUT
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    ("GET", "/graphql"), ("GET", "/graphql?query=mutation%7BmergePullRequest%7D"), ("HEAD", "/graphql"),
+    ("GET", "/api/graphql"), ("GET", "/graphql/"),
+])
+def test_graphql_over_get_or_head_is_refused(method, path) -> None:
+    from harbor.github_rest import GitHubRestError, run
+    gh = FakeGitHub("a" * 40, "b" * 40)
+    with pytest.raises(GitHubRestError, match="GraphQL is POST only"):
+        run(["api", method, path], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert gh.requests == []

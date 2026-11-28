@@ -180,20 +180,6 @@ class _CheckRepo:
                               capture_output=True, text=True, timeout=timeout, env=env, cwd=self._tmp.name)
 
 
-def _tree_entry(repo: _CheckRepo, rev: str, path: str) -> tuple[str, str, str] | None:
-    """``(mode, type, object)`` of exactly ``path`` in ``rev``; None when absent. Raises OSError if git fails."""
-
-    listed = repo.run("ls-tree", "-z", "--end-of-options", rev, "--", path)
-    if listed.returncode != 0:
-        raise OSError(listed.stderr.strip())
-    for record in listed.stdout.split("\0"):
-        meta, _, name = record.partition("\t")
-        if name == path and len(meta.split()) == 3:
-            mode, kind, obj = meta.split()
-            return mode, kind, obj
-    return None
-
-
 def _harbor_tracked(repo: _CheckRepo, rev: str) -> bool:
     """Whether ``rev`` tracks anything at a top-level name that case-folds to ``.harbor``."""
 
@@ -203,27 +189,42 @@ def _harbor_tracked(repo: _CheckRepo, rev: str) -> bool:
     return any(_is_harbor_path(name) for name in listed.stdout.split("\0") if name)
 
 
-def _workflow_path_is_plain(repo: _CheckRepo, rev: str) -> bool:
-    """False when ``.harbor``, ``.harbor/workflow`` or workflow.toml is tracked as anything but a plain
-    directory / regular file (a symlink 120000, a submodule 160000, ...).
+def _harbor_entries_plain(repo: _CheckRepo, rev: str) -> bool:
+    """False when any tracked entry whose path case-folds to ``.harbor`` or below it is anything but a
+    plain tree (040000) or a regular blob (100644/100755): a symlink (120000), a submodule (160000), ...
 
-    ``ls-tree`` lists nothing under a symlinked directory although Harbor's
-    runtime follows the link, so such an entry must never read as "absent".
-    A component that is not tracked at all is fine: the project keeps it
-    untracked in the main checkout, where a PR cannot change it.
+    On a case-insensitive filesystem ``.HARBOR -> cfg`` or ``.harbor/WORKFLOW -> ../cfg`` makes
+    Harbor's runtime read files elsewhere in the repository, which ``ls-tree`` on the literal
+    lowercase path never shows. Every case variant is walked recursively, at every depth. A path
+    that is not tracked at all is fine: the project keeps it untracked in the main checkout.
     """
 
-    parts = WORKFLOW_FILE.split("/")
-    for depth in range(1, len(parts) + 1):
-        entry = _tree_entry(repo, rev, "/".join(parts[:depth]))
-        if entry is None:
-            return True
-        last = depth == len(parts)
-        if last and (entry[1] != "blob" or entry[0] not in REGULAR_BLOB_MODES):
+    top = repo.run("ls-tree", "-z", "--end-of-options", rev)
+    if top.returncode != 0:
+        raise OSError(top.stderr.strip())
+    for record in top.stdout.split("\0"):
+        meta, _, name = record.partition("\t")
+        if not name or not _is_harbor_path(name):
+            continue
+        if not _plain(meta):
             return False
-        if not last and (entry[1] != "tree" or entry[0] != "040000"):
-            return False
+        if meta.split()[1] == "tree":
+            below = repo.run("ls-tree", "-r", "-t", "-z", "--end-of-options", rev, "--", name)
+            if below.returncode != 0:
+                raise OSError(below.stderr.strip())
+            if not all(_plain(entry.partition("\t")[0]) for entry in below.stdout.split("\0") if entry):
+                return False
     return True
+
+
+def _plain(meta: str) -> bool:
+    """Whether an ``ls-tree`` ``<mode> <type> <object>`` field is a plain tree or a regular file."""
+
+    fields = meta.split()
+    if len(fields) != 3:
+        return False
+    mode, kind, _ = fields
+    return (kind == "tree" and mode == "040000") or (kind == "blob" and mode in REGULAR_BLOB_MODES)
 
 
 def _has_commit(repo: _CheckRepo, sha: str) -> bool:
@@ -409,8 +410,8 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
                 return True
             if not tracked_anywhere:
                 return False
-            if not all(_workflow_path_is_plain(repo, end) for end in ends):
-                return unknown("a tracked .harbor, .harbor/workflow or workflow.toml is a symlink, a submodule "
+            if not all(_harbor_entries_plain(repo, end) for end in ends):
+                return unknown("a tracked path under .harbor/ (in any letter case) is a symlink, a submodule "
                                "or not a regular file")
             for before, after in compare:
                 changed = repo.run("diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-commit-id",
