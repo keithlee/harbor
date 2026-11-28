@@ -612,7 +612,12 @@ depends on whether the project tracks `.harbor/`:
   - the project's `install_command`, which runs unsandboxed in every new
     worktree. A low-risk PR that only adds a `postinstall` to `package.json`
     can edit `<repo_path>/.harbor/workflow/workflow.toml`, auto-merge, and
-    widen the grant on the next worktree;
+    widen the grant on the next worktree. It also runs before a builder turn
+    when the dependency inputs changed (see
+    [Dependency installs](#dependency-installs-before-each-turn-install_command)).
+    On macOS that reinstall, like the creation-time install, runs in Harbor's
+    install sandbox, which cannot write the main checkout, `.harbor/` or git
+    metadata. On Linux it is refused;
   - git hooks (#59);
   - the `ios` and `android` escapes above.
 - **`.harbor/` tracked.** GitHub branch protection with required Code Owner
@@ -751,7 +756,10 @@ untracked `.harbor/`:
   `HOME`. Wherever the check runs inside the builder, the builder chooses
   which `git` and which Harbor code run, and which git dir they read;
 - anything Harbor runs outside the sandbox that a merged PR controls (the
-  `install_command`, git hooks), and the `ios` and `android` escapes. These
+  `install_command`, git hooks), or that the builder's own worktree controls
+  (the `install_command` before a turn, which on macOS runs in Harbor's
+  install sandbox and on Linux is refused), and the `ios` and `android`
+  escapes. These
   can edit the main checkout directly, so branch protection does not stop
   them either;
 - Harbor's own owner-approved-merge instruction
@@ -814,6 +822,203 @@ Editing `.harbor/workflow/` while a ticket is in flight never blocks it. The
 next builder launch reloads the copy and renders its prompt from it, so the new
 models and policy (including `merge_mode`) reach the builder, and Harbor records a `policy_change` receipt. There is no
 `reconcile` step.
+
+## Dependency installs before each turn (`install_command`)
+
+`install_command` in `pipeline.md` is the project's dependency install, for
+example `pnpm install` or `uv sync`. Harbor runs it outside the builder
+sandbox in two places, and on macOS both run in Harbor's own install sandbox:
+
+1. **When it creates a worktree** (`WorktreeManager.install`), on the base
+   branch's files. Harbor then records the worktree's dependency inputs.
+2. **Before each builder turn**, Claude and Codex alike (`harbor.dependencies`),
+   when the turn needs it. This happens only after the launch is authorized.
+   Every dispatcher launch carries an authorization that re-checks scope and,
+   for a resume, that the run is still current. A runner given no
+   authorization skips the install (fail closed).
+
+**When it reinstalls.** Harbor compares the worktree's dependency inputs with
+the hashes in its ledger (`dependency_installs`, keyed by worktree path, never
+in the worktree). The inputs are files matched by name, case-insensitively
+(macOS resolves `.NPMRC` as `.npmrc`), at any depth outside `node_modules`,
+`.git`, `.venv` and `.pnpm-store`: `package.json`, `pnpm-lock.yaml`,
+`pnpm-workspace.yaml`, `package-lock.json`, `npm-shrinkwrap.json`,
+`yarn.lock`, `bun.lock`, `bun.lockb`, `bunfig.toml`, `.npmrc`, `.pnpmfile.cjs`,
+`.pnpmfile.mjs`, `.yarnrc`, `.yarnrc.yml`, `uv.lock`, `uv.toml`,
+`pyproject.toml`, `setup.py`, `setup.cfg`, `poetry.lock`, `Pipfile`,
+`Pipfile.lock`, `requirements*.txt`, `Gemfile` and `Gemfile.lock`. The inputs
+also include every file under top-level `patches/` and under
+`.yarn/{patches,plugins,releases}`, the files that `package.json`'s
+`pnpm.patchedDependencies` names (`pnpm-workspace.yaml`'s is not parsed), and
+the command itself. Harbor also checks the install output: `node_modules`,
+`node_modules/.modules.yaml` after `pnpm`, `node_modules/.package-lock.json`
+after `npm`, `.venv` after `uv`. A marker still absent right after Harbor's own
+successful install does not cause a reinstall every turn. The input list
+decides only *when* to reinstall. It is not a security boundary: the sandbox
+below is.
+
+A worktree created before this feature has no record, so it gets one sandboxed
+reinstall on its first turn after the upgrade. Because Harbor's pnpm store is
+new, pnpm may first purge and rebuild `node_modules`
+(`npm_config_confirm_modules_purge=false`).
+
+**Why Harbor installs, not the builder.** Claude Code's sandbox protects
+`.gitmodules`, `.idea/`, `.vscode/` and similar files even deep inside
+`node_modules`. A sandboxed `CI=true pnpm install --frozen-lockfile` after a
+merge that added a dependency deleted `node_modules` and then failed with
+`ERR_PNPM_EPERM: reflink to node_modules/eslint-plugin-react/node_modules/resolve_tmp_13868_2/.gitmodules, Operation not permitted`
+(Bookgen HAN-94). An earlier attempt could not unlink `.idea/vcs.xml`.
+
+**The install sandbox.** An install runs code that the worktree chooses: lifecycle
+scripts and every file they call, `.pnpmfile.cjs`, `.npmrc` settings such as
+`git=<program>` and `node-options=--require <file>`, workspace and `file:`
+packages, `.bin` shims and registry packages. The builder can change any of
+it. An earlier design hashed the inputs and allowed scripts only when they
+matched the base branch. Review showed why that fails: a base `postinstall`
+still runs the builder's edited `scripts/setup.js`. So Harbor does not judge
+the code. It contains it. `harbor.install_sandbox.MacSandbox` writes a
+`sandbox-exec` profile for each run:
+
+- `(deny default)`, then process, signal and sysctl basics;
+- file reads everywhere, except credential locations under `$HOME`:
+  `.ssh`, `.gnupg`, `.config/gh`, `.config/git`, `.gitconfig`,
+  `.git-credentials`, `.netrc`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`, `.pypirc`,
+  `.docker`, `.kube`, `.aws`, `.azure`, `.config/gcloud`, `.config/op`,
+  `.config/hub`, `.claude*`, `.codex*`, `.harbor*`, `.anthropic`,
+  `Library/Keychains`, `Library/Cookies` and Claude's application support.
+  Reads of the operator's main checkout, Harbor's package, Harbor's
+  virtualenv and the ledger's directory are denied too;
+- file writes only to the worktree, Harbor's private package caches
+  (`~/.harbor/install-cache`, set through `npm_config_cache`,
+  `npm_config_store_dir`, `npm_config_devdir`, `XDG_CACHE_HOME`,
+  `UV_CACHE_DIR`, `YARN_CACHE_FOLDER`, `BUN_INSTALL_CACHE_DIR`,
+  `PIP_CACHE_DIR` and `COREPACK_HOME`), a private `TMPDIR`, the download caches
+  of node-gyp, Playwright, Cypress, Electron and Puppeteer, and `/dev/null`
+  and ttys;
+- no access at all, read or write, to the worktree's `.git` link or the
+  repository's git directory;
+- Mach lookups only for notification, user and group lookup, logging, DNS,
+  network configuration, preferences, FSEvents and TLS trust. That leaves no
+  keychain (`securityd`), no LaunchServices (`open`), no launchd job submission
+  and no Apple Events (`osascript`);
+- TCP and UDP to any host, and unix-domain sockets only for DNS
+  (`/private/var/run/mDNSResponder`). There is no SSH agent, Docker socket or
+  other local service.
+
+The caches are Harbor's own, never your `~/.npm` or pnpm store, because an
+install may write its cache. A cache that your own tools read later, outside
+any sandbox, would be a way out. Harbor's caches are used only by Harbor's
+sandboxed installs.
+
+Around the sandbox, Harbor also removes its credentials (see below), every
+`GIT_*` variable and `SSH_AUTH_SOCK` from the environment. It sets
+`GIT_CONFIG_GLOBAL=/dev/null` and an empty npm user config, and turns off npm's
+update notifier and fund messages. It resolves the package manager by absolute
+path from its own `PATH`, with empty, relative and worktree entries dropped
+(`harbor.safe_git.safe_path`), and refuses a configured absolute path inside
+the worktree. It pins pnpm's version with
+`--config.manage-package-manager-versions=false` and
+`npm_config_manage_package_manager_versions=false`, so a `packageManager`
+field and a builder-set registry cannot make pnpm download and run another
+version. It runs the install in its own process group, with output going to a
+file rather than a pipe, under a hard deadline. On timeout, or on operator exit,
+the whole group is killed, and a descendant that escaped the group cannot hold
+Harbor past the deadline.
+
+Proven live with real npm 10 and pnpm 10
+(`tests/test_pre_turn_install_scripts.py`). Each of these runs inside the
+sandbox and cannot read `~/.config/gh/hosts.yml`, `~/.ssh`, the ledger,
+`~/.npmrc`, `~/.git-credentials` or the main checkout. It cannot write
+`<repo>/.git/hooks`, the worktree's `.git`, `~/.zshrc`, `~/Library/LaunchAgents`
+or a file outside the worktree, and cannot run `launchctl submit` or connect to
+a local unix socket:
+
+- a base `postinstall` that runs a builder-edited `scripts/setup.js`;
+- `.NPMRC` with `node-options=--require`;
+- `.npmrc` `git=<script>` with a `git+file` dependency;
+- `.PNPMFILE.cjs`;
+- the creation-time install.
+
+`packageManager: pnpm@9…` with an unreachable registry installs with the
+current pnpm. A native-build-style `postinstall` that writes
+`build/Release/addon.node` and a temp file still succeeds.
+
+**Install scripts (`[builder] dependency_scripts`).** With the sandbox
+containing the install, scripts run: `"on"`, the default. `"off"` adds the
+package manager's switches: `--ignore-scripts --ignore-pnpmfile` for pnpm,
+`--ignore-scripts` for npm, bun and Yarn 1, and `--no-install-project
+--no-install-workspace --no-install-local --no-build` for `uv sync`. For
+installs that cannot be switched off, such as Yarn with `.yarnrc*` or `.yarn/`
+code, or `make`, it refuses. This is a project preference, not a security
+boundary. Any other value fails closed.
+
+**What the sandbox costs.**
+
+- `~/.npmrc` is unreadable, because it often holds registry tokens. For a
+  private registry, put the token in the environment Harbor runs with
+  (`NPM_TOKEN`, `NODE_AUTH_TOKEN`) and reference it from the project's `.npmrc`
+  (`//registry.example.com/:_authToken=${NPM_TOKEN}`). Such a token is visible
+  to install scripts by design.
+- `git+ssh` dependencies do not work: there is no SSH agent and no `~/.ssh`.
+  Use `git+https` for public repositories.
+- An install that runs `git` in the worktree, such as `husky install` in
+  `prepare`, fails, because git metadata is out of reach. Set hooks up another
+  way.
+- The first sandboxed install fills Harbor's own cache from the registry.
+- `HOME` is not redirected: version-manager shims (volta, asdf, mise, nvm,
+  corepack) resolve from it. The credential denials, not a private `HOME`, keep
+  secrets out of reach.
+
+**Linux and hosts without `sandbox-exec`.** There is no install sandbox, so the
+pre-turn reinstall is refused with a `dependency_install` blocker: install by
+hand outside the sandbox, then answer it, or set `install_command: none`. The
+creation-time install still runs uncontained on the base branch's files, with
+Harbor's credentials removed, as Harbor did before.
+
+**What the builder is told.** Every turn's prompt says what Harbor did before
+the turn. It says not to run install or reinstall commands. It says to change
+dependencies by editing `package.json` and updating only the lockfile
+(`pnpm install --lockfile-only`, `npm install --package-lock-only`), and to
+finish the turn if the lockfile changes. It also says that install scripts run
+without credentials or git metadata, so a script that needs more must be
+reported as a blocker.
+
+**When the install fails or is refused.** Harbor does not launch the turn. The
+run becomes `blocked` (`terminal_reason = dependency_install_failed`,
+`waiting_on = human`) with a `dependency_install` blocker. Its evidence is the
+install's literal output: the last 2000 characters, with URL credentials
+redacted. Rung-0 remediation never acts on that kind, because the output is
+under the builder's control. The ladder escalates it once. The wake's queue
+receipt closes as handled, so the input is not replayed every poll. The session
+is kept. Fix the cause, then answer the blocker (`/answer` or a ticket comment),
+and Harbor installs again before the resumed turn.
+
+**A builder-reported `Cannot find module`.** Rung-0 remediation does not run a
+package manager. In Harbor's ledger, under the ledger's own lock, it marks the
+run's worktree (a linked worktree only) as needing a reinstall, then resumes.
+The resumed turn's sandboxed pre-turn install does the reinstall with the
+project's `install_command`. With `install_command: none` nothing reinstalls,
+and the rung-0 attempt limit stops the retries. The other rung-0 commands,
+`gh auth status` and `adb start-server`, keep Harbor's environment, because
+`gh auth status` must see Harbor's credentials. Each runs by absolute path from
+Harbor's `PATH`, with empty, relative and worktree entries removed, in a private
+temporary directory.
+
+**Environment.** Both installs drop Harbor's own credentials:
+
+- `GITHUB_TOKEN`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`,
+  `GITHUB_PAT`, `LINEAR_API_KEY`, `HARBOR_LINEAR_API_KEY`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY` and
+  `CODEX_API_KEY`;
+- the variable that `HARBOR_GITHUB_TOKEN_ENV` (or `github_token_env`) names;
+- any `HARBOR_`, `LINEAR_`, `ANTHROPIC_`, `OPENAI_`, `CLAUDE_`, `CODEX_`,
+  `GITHUB_` or `GH_` variable whose name contains `TOKEN`, `KEY`, `SECRET`,
+  `PASSWORD` or `CREDENTIAL`.
+
+**Turning it off.** `install_command: none` turns off both installs and leaves
+builder turns unchanged. An unset `install_command` is not "none": `harbor
+start` refuses to run without an explicit value, and `WorktreeManager` fills in
+`pnpm install` when it is constructed without one.
 
 ## Hooks and checks
 
@@ -1081,6 +1286,7 @@ through the generated settings only.
 | Cleanup | workflow_lifecycle.py, worktree.py | test_workflow_cleanup_policy.py, test_merge_cleanup.py |
 | Device and browser proof | config/workflow.py, runner/claude.py, device_proof.py, device_boot.py, readiness.py, cli.py | test_device_proof.py |
 | Claude builder file tools, extra hosts, `/tmp` | config/workflow.py, runner/claude.py, cli.py | test_claude_builder_file_tools.py, test_claude_workflow_permissions.py |
+| Dependency installs before each turn | dependencies.py, runner/codex.py, worktree.py, cli.py, config/workflow.py, facts/remediation.py, install_sandbox.py | test_pre_turn_install.py, test_pre_turn_install_scripts.py |
 
 Run `uv run pytest`, `uv run python -m compileall -q src tests` and `uv build`.
 The tests use mock external tickets and real local subprocesses and Git

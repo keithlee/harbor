@@ -69,7 +69,7 @@ def test_rung_zero_repairs_missing_module_and_resumes_same_session(tmp_path: Pat
         )
         assert result.rung == 0
         assert result.resumed and result.same_session
-        assert commands == [["pnpm", "install"]]
+        assert commands == [["harbor", "schedule-dependency-reinstall"]]
         assert resumed[0][0] == "builder-session"
         assert linear.comments == [] and linear.states == []
         assert db.escalations()[0]["rung_resolved"] == 0

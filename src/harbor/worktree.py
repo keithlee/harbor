@@ -281,6 +281,11 @@ class WorktreeManager:
                         self.custody.execute("INSERT OR REPLACE INTO worktree_setup VALUES (?,?,?,?,?,?,?)", (self.repo_name,ticket,str(self.repo),str(target),branch,self._git(target,["rev-parse","HEAD"]).stdout.strip(),"installing"))
         if not retryable_ready:
             self.install(worktree)
+            if self.custody is not None and self.install_command:
+                # The first builder turn's pre-turn check (harbor.dependencies)
+                # then sees these inputs as installed instead of installing twice.
+                from harbor.dependencies import record
+                record(self.custody, worktree.path, self.install_command, status="installed", project=self.repo_name)
         if self.custody is not None:
             with self.custody:
                 self.custody.execute("UPDATE worktree_setup SET status='ready' WHERE project=? AND ticket=?", (self.repo_name,ticket))
@@ -310,6 +315,14 @@ class WorktreeManager:
         packages, so without this the builder's first command fails on a
         missing module -- exactly the rung-0 blocker the ladder then has to
         remediate.
+
+        It runs outside the builder sandbox, the same way as the reinstall
+        before each builder turn (``harbor.dependencies.creation_install``):
+        in Harbor's install sandbox where the host has one (macOS), with
+        Harbor's credentials and the SSH agent removed from its environment,
+        and with the package manager found by absolute path on Harbor's own
+        ``PATH``. Without an install sandbox (Linux) it runs uncontained on the
+        base branch's files.
         """
 
         if not self.install_command:
@@ -320,27 +333,12 @@ class WorktreeManager:
         if self._installer is not None:
             self._installer(target, self.install_command)
             return
-        try:
-            completed = subprocess.run(
-                list(self.install_command),
-                cwd=str(target),
-                capture_output=True,
-                text=True,
-                timeout=self.install_timeout_seconds,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise WorktreeInstallError(self.install_command, 127, str(exc)) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise WorktreeInstallError(
-                self.install_command, 124, f"timed out after {self.install_timeout_seconds:.0f}s"
-            ) from exc
-        if completed.returncode != 0:
-            raise WorktreeInstallError(
-                self.install_command,
-                completed.returncode,
-                (completed.stderr or completed.stdout or "").strip()[-2000:],
-            )
+        from harbor.dependencies import creation_install
+        from harbor.install_sandbox import default_isolation
+        code, output = creation_install(self.install_command, target, repo=self.repo,
+                                        timeout=self.install_timeout_seconds, isolation=default_isolation(self.repo))
+        if code != 0:
+            raise WorktreeInstallError(self.install_command, code, output[-2000:])
 
     def verify(self, worktree: Worktree) -> None:
         repo = Path(worktree.repo).expanduser().resolve()

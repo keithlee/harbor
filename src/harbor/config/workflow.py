@@ -27,7 +27,7 @@ SECTIONS = {
     "evidence": {"feedback", "ci"},
     "states": {"ready", "paused", "terminal"},
     "github": {"transport", "mcp_url"},
-    "builder": {"device_proof", "allowed_domains", "allow_tmp"},
+    "builder": {"device_proof", "allowed_domains", "allow_tmp", "dependency_scripts"},
 }
 DEVICE_PROOF_PLATFORMS = ("android", "ios", "web")
 
@@ -84,6 +84,23 @@ def builder_allow_tmp(data) -> bool:
     value = section.get("allow_tmp", False)
     if type(value) is not bool:
         raise ValueError("builder.allow_tmp must be true or false")
+    return value
+
+
+DEPENDENCY_SCRIPTS = ("on", "off")
+
+
+def builder_dependency_scripts(data) -> str:
+    """Whether Harbor's sandboxed installs run install scripts (harbor.dependencies).
+
+    ``"on"`` (the default) or ``"off"`` (adds ``--ignore-scripts`` and the like).
+    A project preference, not a security boundary: Harbor's install sandbox
+    (harbor.install_sandbox) contains the install either way.
+    """
+    section = dict((data or {}).get("builder") or {})
+    value = section.get("dependency_scripts", "on")
+    if value not in DEPENDENCY_SCRIPTS:
+        raise ValueError('builder.dependency_scripts must be "on" or "off"')
     return value
 GITHUB_TRANSPORTS = {"rest", "mcp"}
 DEFAULT_GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
@@ -370,6 +387,7 @@ def load_workflow(path: Path) -> Workflow:
     device_proof_settings(data)
     builder_allowed_domains(data)
     builder_allow_tmp(data)
+    builder_dependency_scripts(data)
     deadline = data.get("execution",{}).get("deadline_minutes",90)
     if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or deadline <= 0:
         raise ValueError("deadline must be positive and finite")

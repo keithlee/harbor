@@ -11,14 +11,21 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 
-MODULE_NOT_FOUND_MARKERS = ("cannot find module", "module not found")
+DEPENDENCY_INSTALL_KIND = "dependency_install"  # harbor.dependencies.BLOCKER_KIND
+# Not a program: the default executor marks the worktree's dependency install
+# stale in Harbor's ledger, so the resumed turn's pre-turn install reinstalls.
+REINSTALL_ACTION = ("harbor", "schedule-dependency-reinstall")
+REMEDIATION_TIMEOUT_SECONDS = 15 * 60.0
+MODULE_NOT_FOUND_MARKERS =("cannot find module", "module not found")
 ADB_NOT_RUNNING_MARKERS = (
     "adb server",
     "cannot connect to adb",
@@ -109,12 +116,17 @@ def remediation_plan(blocker: Any) -> RemediationPlan | None:
     """Return the one safe playbook matching ``blocker`` or ``None``.
 
     ``Cannot find module`` is intentionally matched case-insensitively and
-    maps to one package installation.  ADB startup is similarly deterministic
+    maps to scheduling Harbor's pre-turn reinstall.  ADB startup is deterministic
     and never broadens into device selection, APK installation, or retries.
     """
 
-    text = blocker_text(blocker).casefold()
     kind = str(_value(blocker, "kind", "type", "category", default="")).casefold().replace("-", "_")
+    if kind == DEPENDENCY_INSTALL_KIND:
+        # Harbor's own pre-turn install failed. Its evidence is raw install output,
+        # which builder-edited inputs control (a postinstall can print "Cannot find
+        # module" on purpose), so it never selects a command to run.
+        return None
+    text = blocker_text(blocker).casefold()
     if kind == "github_transport" or any(marker in text for marker in GITHUB_TRANSPORT_MARKERS):
         return RemediationPlan(
             kind="github_transport",
@@ -122,10 +134,16 @@ def remediation_plan(blocker: Any) -> RemediationPlan | None:
             reason="GitHub CLI authentication is verified with gh auth status; use gh for GitHub mutations.",
         )
     if any(marker in text for marker in MODULE_NOT_FOUND_MARKERS):
+        # No package manager runs here. Rung 0 only marks the worktree's install
+        # stale; the resumed turn's pre-turn install (harbor.dependencies) then
+        # reinstalls with the project's own install_command, running install
+        # scripts only on inputs that match the base branch or Harbor's last
+        # trusted install.
         return RemediationPlan(
             kind="missing_module",
-            commands=(("pnpm", "install"),),
-            reason="Cannot find module is repaired by installing the locked workspace dependencies.",
+            commands=(REINSTALL_ACTION,),
+            reason=("Cannot find module: Harbor reinstalls this worktree's dependencies outside your sandbox "
+                    "before the resumed turn, with the project's install command."),
         )
     if any(marker in text for marker in ADB_NOT_RUNNING_MARKERS):
         return RemediationPlan(
@@ -161,20 +179,70 @@ def _successful(value: Any) -> bool:
     return True
 
 
-async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None) -> Any:
+def _confined_worktree(cwd: Path | None) -> Path:
+    """``cwd`` when it is a real linked git worktree directory; ValueError otherwise."""
+
+    if cwd is None:
+        raise ValueError("remediation needs the run's worktree; refusing to run in Harbor's own directory")
+    raw = Path(cwd).expanduser()
+    if raw.is_symlink() or not raw.is_dir():
+        raise ValueError(f"remediation worktree {raw} is not a directory")
+    if not (raw / ".git").is_file():
+        # A linked worktree's .git is a file; the main checkout's is a directory.
+        raise ValueError(f"remediation refuses {raw}: it is not a linked Harbor worktree")
+    return raw.resolve()
+
+
+def _host_program(name: str, worktree: Path | None) -> tuple[str, str]:
+    """``name`` as an absolute path found on Harbor's own PATH, and that PATH.
+
+    Relative and empty PATH entries, and entries inside the run's worktree
+    (``node_modules/.bin`` for example), are dropped first, as harbor.safe_git
+    does for git, so a builder cannot plant a ``gh`` or ``adb`` that Harbor
+    then runs with its own credentials.
+    """
+
+    import shutil
+
+    from harbor.safe_git import safe_path
+
+    outside = worktree.expanduser().resolve() if worktree is not None else None
+    path = safe_path(os.environ.get("PATH", ""), outside=outside)
+    found = shutil.which(name, path=path)
+    if not found or not os.path.isabs(found):
+        raise ValueError(f"{name} is not on Harbor's PATH (outside the worktree)")
+    return found, path
+
+
+async def _default_executor(command: Sequence[str], cwd: Path | None, ledger: Any, lock: Any = None) -> Any:
+    from harbor.dependencies import run_hardened, schedule_reinstall
+
+    if tuple(command) == REINSTALL_ACTION:
+        # Never a subprocess: the worktree's install is marked stale in Harbor's
+        # ledger, and the resumed turn's pre-turn install does the work.
+        if ledger is None:
+            raise ValueError("Harbor has no ledger to schedule a dependency reinstall in")
+        schedule_reinstall(ledger, _confined_worktree(cwd), lock=lock)
+        return True
+    # A host tool (`gh auth status`, `adb start-server`): it must see the
+    # credentials Harbor itself uses, so it keeps Harbor's environment. It runs
+    # by absolute path from Harbor's PATH, never from the worktree, and in a
+    # private directory, so no repository config near it is read.
+    program, path = _host_program(command[0], cwd)
+    env = dict(os.environ, PATH=path)
+    with tempfile.TemporaryDirectory(prefix="harbor-remediation-") as neutral:
+        returncode, output = await asyncio.to_thread(
+            run_hardened, [program, *command[1:]], neutral, env, REMEDIATION_TIMEOUT_SECONDS)
+    return subprocess.CompletedProcess([program, *command[1:]], returncode, "", output)
+
+
+async def _invoke_executor(executor: Any, command: Sequence[str], cwd: Path | None, *, ledger: Any = None,
+                           ledger_lock: Any = None) -> Any:
     target = executor
     if target is None:
         # Shell-free invocation is important: blocker text never becomes part
-        # of a shell command.  ``check=True`` turns a failed repair into a
-        # rung-1 escalation rather than claiming it was fixed.
-        return await asyncio.to_thread(
-            subprocess.run,
-            list(command),
-            cwd=str(cwd) if cwd else None,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        # of a shell command. A non-zero exit is a failed repair (rung-1 escalation).
+        return await _default_executor(command, cwd, ledger, ledger_lock)
     for name in ("run", "execute", "invoke"):
         candidate = getattr(target, name, None)
         if callable(candidate):
@@ -211,8 +279,15 @@ async def execute_remediation(
     *,
     executor: Callable[..., Any] | Any | None = None,
     cwd: str | Path | None = None,
+    ledger: Any = None,
+    ledger_lock: Any = None,
 ) -> RemediationResult:
-    """Execute a known plan and report whether every command succeeded."""
+    """Execute a known plan and report whether every command succeeded.
+
+    ``ledger`` is Harbor's SQLite connection, where the default executor
+    schedules a dependency reinstall (``REINSTALL_ACTION``), under ``ledger_lock``
+    (the ledger's own lock) when given.
+    """
 
     plan = remediation_plan(blocker)
     if plan is None:
@@ -221,7 +296,7 @@ async def execute_remediation(
     outputs: list[Any] = []
     try:
         for command in plan.commands:
-            value = await _invoke_executor(executor, command, workdir)
+            value = await _invoke_executor(executor, command, workdir, ledger=ledger, ledger_lock=ledger_lock)
             outputs.append(value)
             if not _successful(value):
                 return RemediationResult(plan, attempted=True, fixed=False, outputs=tuple(outputs), error="remediation command failed")

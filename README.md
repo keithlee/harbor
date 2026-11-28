@@ -496,6 +496,100 @@ option. The browser runs in Docker with no worktree or credential mounts.
 Harbor removes it at the end of each invocation and starts a fresh browser
 when the same builder session resumes.
 
+### Dependency installs before each builder turn
+
+A builder cannot reliably install dependencies itself. Claude Code's sandbox
+refuses to write or delete the files it protects (`.gitmodules`, `.idea/`,
+`.vscode/` and so on), even deep inside `node_modules`. So a sandboxed
+`pnpm install` can delete `node_modules` and then fail to write it back
+(`ERR_PNPM_EPERM ... .gitmodules, Operation not permitted`). The worktree then
+cannot run until a person reinstalls outside the sandbox.
+
+So Harbor installs. It runs the project's `install_command` (from
+`pipeline.md`) when it creates a worktree. Before each builder turn after
+that, Claude and Codex alike and only after the launch is authorized, it runs
+the command again when either of these holds:
+
+- a dependency input changed since Harbor's last install. Inputs are matched
+  case-insensitively at any depth: `package.json`, lockfiles, `.npmrc`,
+  `.pnpmfile.cjs`, `.yarnrc(.yml)`, `pyproject.toml`, `requirements*.txt`,
+  `Gemfile(.lock)` and similar, plus `patches/`, the patch files
+  `pnpm.patchedDependencies` names, Yarn's `.yarn/{patches,plugins,releases}`
+  and the command itself;
+- the install output is missing or unfinished, for example no `node_modules`,
+  or no `node_modules/.modules.yaml` after `pnpm`.
+
+Harbor records the hashes per worktree in its own SQLite ledger
+(`dependency_installs`) and logs each check
+(`Harbor: dependencies for <ticket>: ...`). The builder's prompt says what
+Harbor did and tells the builder not to run install commands itself.
+
+**Every install runs in Harbor's install sandbox.** An install runs code that
+the worktree chooses. That includes lifecycle scripts and any file they call,
+`.pnpmfile.cjs`, `.npmrc` settings such as `git=` and `node-options=`, and
+whatever packages it fetches. The builder can edit all of it. Hashing inputs
+cannot prove that this code was reviewed, so Harbor does not try. On macOS it
+runs every install it starts, at worktree creation and before a turn, under its
+own `sandbox-exec` profile, generated per run (`harbor.install_sandbox`):
+
+- **Writes** go only to the worktree and to Harbor's private package caches
+  (`~/.harbor/install-cache`: npm cache, pnpm store, uv, Yarn, bun, node-gyp,
+  corepack). They also go to a private `TMPDIR`, and to the download caches of
+  node-gyp, Playwright, Cypress, Electron and Puppeteer. The worktree's `.git`
+  link and the repository's git directory can be neither read nor written, so
+  an install cannot plant git hooks.
+- **Reads** are denied for credentials: `~/.ssh`, `~/.gnupg`, `~/.config/gh`,
+  `~/.harbor`, `~/.claude*`, `~/.codex`, `~/Library/Keychains`, `~/.aws`,
+  `~/.azure`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, `~/.netrc`,
+  `~/.git-credentials`, `~/.gitconfig`, `~/.npmrc` and `~/.yarnrc`. Reads of
+  the operator's main checkout and of Harbor's own code, virtualenv and ledger
+  are denied too.
+- **Services**: the profile starts from `(deny default)`, and only logging,
+  user lookup, DNS, network configuration and TLS trust services can be
+  reached. So the install cannot use the keychain, `open` (LaunchServices),
+  Apple Events (`osascript`), `launchctl submit`, the SSH agent or any other
+  unix socket.
+- **Network** to any host is allowed, because registries need it. With
+  credentials unreadable and Harbor's credentials removed from the environment,
+  the install has nothing to send but the worktree, which the builder already
+  has.
+
+Harbor also removes its own credentials and `SSH_AUTH_SOCK` from the
+environment, and finds the package manager by absolute path on its own `PATH`,
+ignoring relative and worktree entries such as `node_modules/.bin`. It pins
+pnpm to the installed version (`--config.manage-package-manager-versions=false`),
+so a `packageManager` field cannot make it download and run another one.
+
+Install scripts run, because the sandbox contains them. A project can switch
+them off with `[builder] dependency_scripts = "off"` in
+`.harbor/workflow/workflow.toml`. That is a preference, not a security setting.
+
+**What the sandbox changes for installs.** Your registry tokens in `~/.npmrc`
+are not readable. A private registry needs its token in the environment
+(`NPM_TOKEN`, `NODE_AUTH_TOKEN`), referenced from the project's `.npmrc`; such
+a token is visible to install scripts. Dependencies over `git+ssh` do not work,
+because there is no SSH agent and no `~/.ssh`. An install that runs `git` in
+the worktree (`husky install`) cannot. The first sandboxed install downloads
+packages into Harbor's own cache instead of reusing yours.
+
+**Linux.** There is no install sandbox there. Harbor refuses the pre-turn
+reinstall with a `dependency_install` blocker that says to install by hand. The
+creation-time install still runs uncontained on the base branch's files, with
+Harbor's credentials removed.
+
+If the install fails or is refused, Harbor does not start the turn. The run is
+`blocked` with a `dependency_install` blocker whose evidence is the literal
+error. Rung-0 remediation never acts on that kind. The ladder escalates it
+once, and the wake is not replayed every poll. Fix the cause, then answer the
+blocker (`/answer` or a ticket comment), and Harbor installs again before the
+resumed turn. When a builder itself reports `Cannot find module`, rung 0 runs
+no package manager. It marks the worktree for a reinstall, which the resumed
+turn's sandboxed install performs.
+
+`install_command: none` turns off both installs. An unset `install_command` is
+not "none": `harbor start` requires an explicit value, and `WorktreeManager`
+fills in `pnpm install` without one.
+
 ### File edits, extra hosts and `/tmp` for Claude builders
 
 A Claude builder and its child agents have the `Edit` and `Write` tools,
@@ -642,6 +736,8 @@ needs and keeps the delivery instructions opaque.
 | `src/harbor/pr_events.py` | PR-created and external-comment event receipts, risk/comment handoff, and mandatory reply contract. |
 | `src/harbor/unblock.py` | Rung 0 remediation, deterministic capability adapters, bounded restart retry, Terra cite-or-escalate, operator parking, and same-session resume. |
 | `src/harbor/worktree.py` | Fresh `origin/main` worktrees, disk/lock safety, install, and verified-merge cleanup. |
+| `src/harbor/dependencies.py` | The pre-turn reinstall: lockfile hashes in the ledger, install-output checks, credential-free install environment, builder note and blocker. |
+| `src/harbor/install_sandbox.py` | The per-run macOS `sandbox-exec` profile every Harbor-side install runs in: credential reads denied, writes only to the worktree and Harbor's caches, no git metadata, keychain, LaunchServices or launchd. |
 | `src/harbor/runner/base.py` | Runner lifecycle, deadlines, result normalization, liveness, and orphan handling. |
 | `src/harbor/runner/codex.py` | Persistent Luna `codex exec`/`resume` in the isolated worktree. |
 | `src/harbor/runner/stream.py` | JSONL event parsing and final run-result extraction. |
@@ -673,6 +769,13 @@ needs and keeps the delivery instructions opaque.
   worktree. Its Bash sandbox reaches hosts beyond the default allowlist only
   when listed in `[builder] allowed_domains`, and writes `/tmp` only with
   `[builder] allow_tmp = true`.
+- The project's `install_command` runs outside the builder sandbox when a
+  worktree is created. It runs again before a builder turn when the dependency
+  inputs changed or `node_modules` is missing. On macOS every such install runs
+  in Harbor's own `sandbox-exec` install sandbox. That sandbox has no
+  credential reads, writes only to the worktree and Harbor's private caches,
+  no git metadata, and no keychain, LaunchServices or launchd. On Linux the
+  pre-turn reinstall is refused.
 - A Claude builder's sandbox reaches local ports or the iOS Simulator only
   when the project lists them in `[builder] device_proof`. Each of those is a
   path out of the sandbox: adb and simctl reach any host, and with `ios` the

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import time
@@ -9,7 +10,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from harbor.runner.base import BaseRunner, RunResult, _db_connection, _table_exists
+from harbor.runner.base import BaseRunner, RunResult, _db_connection, _table_exists, _update_run_sql, iso_now
 from harbor.runner.playwright import ENDPOINT_ENV, REQUIRED_ENV, browser_endpoint, validate_image
 from harbor.resources import runtime_asset
 
@@ -28,6 +29,11 @@ class CodexRunner(BaseRunner):
     Codex session id is captured from the JSONL stream when available and is
     used for subsequent ``codex exec resume`` invocations.
     """
+
+    # Reinstalls the worktree's dependencies outside the sandbox before each
+    # turn (harbor.dependencies.pre_turn_installer); None when the project has
+    # no install_command.
+    dependency_preparer: Callable[[Path], Any] | None = None
 
     def __init__(
         self,
@@ -236,7 +242,65 @@ class CodexRunner(BaseRunner):
             env[ENDPOINT_ENV] = self._playwright_endpoint
         return env
 
+    async def _prepare_dependencies(self, context, *, authorized: bool) -> tuple[str, RunResult | None]:
+        """Run the pre-turn install: the prompt note, or the result of a turn Harbor refused to start.
+
+        Only an authorized launch installs: without a launch authorization
+        (``before_spawn``) the check is skipped, never run (fail closed).
+        """
+
+        if self.dependency_preparer is None:
+            return "", None
+        from harbor import dependencies
+        if not authorized:
+            check = dependencies.DependencyCheck(
+                "skipped", (), error="this launch carried no authorization, so Harbor ran no install")
+            dependencies.log(self.ticket or context.run_id, check)
+            return "", None
+        # The preparer runs the install itself in a worker thread, keeping the loop free.
+        check = self.dependency_preparer(context.worktree)
+        if inspect.isawaitable(check):
+            check = await check
+        dependencies.log(self.ticket or context.run_id, check)
+        if not check.failed:
+            return dependencies.builder_note(check), None
+        summary = f"Harbor did not start this builder turn: before it, Harbor {check.line()}"
+        result = RunResult(
+            status="blocked", summary=summary, waiting_on="human",
+            blocker=dependencies.blocker(check, context.worktree, self.ticket),
+            run_id=context.run_id, session_id=context.session_id, error=summary,
+        )
+        # Nothing was launched: the retained session stays as it was; record why the turn stopped.
+        _update_run_sql(self.db, context.run_id, {
+            "status": "blocked", "waiting_on": "human", "final_json": result.final_json,
+            "terminal_reason": "dependency_install_failed", "finished_at": iso_now(),
+        })
+        # The wake was received and handled (the operator now owns the blocker), so
+        # its receipt closes like any blocked turn's and is not replayed every poll.
+        self._queue_transition(context, "completed", error=summary)
+        return "", result
+
     async def _execute(self, context, instruction, *, resume, before_spawn: Callable[[], None] | None = None):
+        if self.dependency_preparer is not None and before_spawn is not None:
+            # Authorize the launch first (a stopped ticket or a superseded recovery
+            # raises here), so a refused launch never triggers an unsandboxed install.
+            # The launch path then calls before_spawn once per spawn, as before;
+            # only the first call, made here, is not repeated.
+            before_spawn()
+            authorize = before_spawn
+            pending = True
+
+            def before_spawn() -> None:
+                nonlocal pending
+                if pending:
+                    pending = False
+                    return
+                authorize()
+        note, refused = await self._prepare_dependencies(context, authorized=before_spawn is not None)
+        if refused is not None:
+            return refused
+        if note:
+            instruction = f"{instruction}\n\n{note}" if instruction else note
         runtime = nullcontext(("", ""))
         if self.playwright_browser_image:
             runtime = browser_endpoint(

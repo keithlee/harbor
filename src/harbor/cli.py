@@ -502,6 +502,17 @@ def build_production_dispatcher(
                     warn_once(device_proof_platform_warning(granted))
             elif device_proof_settings(current.config):
                 warn_once(CODEX_DEVICE_PROOF)
+            # Claude and Codex alike: reinstall outside the sandbox before each turn
+            # when the dependency inputs changed or node_modules is missing (HAN-94).
+            # Every such install runs in Harbor's install sandbox (macOS); without
+            # one (Linux) a needed reinstall is refused. None when install_command
+            # is explicitly none.
+            from harbor.config.workflow import builder_dependency_scripts
+            from harbor.dependencies import pre_turn_installer
+            runner.dependency_preparer = pre_turn_installer(
+                manager, db, project=config.name, extra_secrets=(github.get("token_env") or "",),
+                scripts=builder_dependency_scripts(current.config),
+            )
             return runner
     dispatcher = WorktreeDispatcher(
         manager,

@@ -1279,6 +1279,8 @@ class UnblockLadder:
             blocker_value,
             executor=self.remediation_executor,
             cwd=run_repo_value,
+            ledger=getattr(self.db, "connection", None),
+            ledger_lock=getattr(self.db, "_lock", None),
         )
         if remediation.attempted and not remediation.fixed:
             self._record(ticket_id, run_id, kind, question, 0, status="resume_pending", reason="deterministic remediation did not clear the blocker")
