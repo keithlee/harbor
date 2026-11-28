@@ -546,7 +546,8 @@ def test_a_symlinked_workflow_dir_cannot_hide_a_builder_grant(tmp_path: Path) ->
     (repo / ".harbor" / "workflow").rmdir()
     os.symlink("../cfg", repo / ".harbor" / "workflow")
     pr1 = _commit_all(repo, "PR1: symlink the workflow dir")
-    assert builder_sandbox_change(repo / ".git", pr1, base) is None
+    # PR1 itself touches .harbor/ (True); either way it is refused, never False.
+    assert builder_sandbox_change(repo / ".git", pr1, base) is True
     # PR2, as if PR1 had merged: grant device_proof through the symlink target, outside .harbor/.
     _write(repo, "cfg/workflow.toml", 'version = 1\n[builder]\ndevice_proof = ["ios"]\n')
     pr2 = _commit_all(repo, "PR2: grant device_proof via cfg/")
@@ -562,18 +563,18 @@ def test_symlinked_harbor_dir_workflow_file_submodule_and_missing_are_unreadable
     repo, base = _repo_with_workflow(tmp_path / "harbor-link")
     shutil.move(str(repo / ".harbor"), str(repo / "elsewhere"))
     os.symlink("elsewhere", repo / ".harbor")
-    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink .harbor"), base) is None
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink .harbor"), base) is not False
     repo, base = _repo_with_workflow(tmp_path / "file-link")
     (repo / WORKFLOW).rename(repo / ".harbor" / "workflow" / "real.toml")
     os.symlink("real.toml", repo / WORKFLOW)
-    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink workflow.toml"), base) is None
+    assert builder_sandbox_change(repo / ".git", _commit_all(repo, "symlink workflow.toml"), base) is not False
     repo, base = _repo_with_workflow(tmp_path / "submodule")
     _git(repo, "rm", "-q", "-r", ".harbor/workflow")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{base},.harbor/workflow")
     _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "commit", "-q", "-m", "submodule")
     head = _git(repo, "rev-parse", "HEAD")
     assert "160000 commit" in _git(repo, "ls-tree", head, "--", ".harbor/workflow")
-    assert builder_sandbox_change(repo / ".git", head, base) is None
+    assert builder_sandbox_change(repo / ".git", head, base) is not False
     # Deleting the tracked workflow is a .harbor/ change: True, which needs a human merge just like None.
     repo, base = _repo_with_workflow(tmp_path / "missing")
     (repo / WORKFLOW).unlink()
@@ -1039,3 +1040,101 @@ def test_a_change_that_main_already_has_does_not_count(tmp_path: Path) -> None:
     _write(repo, "src/app.py", "print('feature')\n")
     head = _commit_all(repo, "app only")
     assert builder_sandbox_change(repo / ".git", head, main) is False
+
+
+# --- seventh review: rebase replay, GHES fetch host, the no-write-tree fallback ----------------
+
+IOS = 'version = 1\n[builder]\ndevice_proof = ["ios"]\n'
+NONE = 'version = 1\n[builder]\ndevice_proof = []\n'
+
+
+def test_a_rebase_cannot_replay_a_revoked_grant_back(tmp_path: Path) -> None:
+    """The reviewer's repro: the ort merge keeps main's revocation, but `git rebase` lands ios again."""
+    from harbor.device_proof import builder_sandbox_change
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _write(repo, WORKFLOW, IOS)
+    _write(repo, "app.txt", "0\n")
+    m0 = _commit_all(repo, "M0: ios")
+    _write(repo, WORKFLOW, NONE)
+    m1 = _commit_all(repo, "M1: a human revokes it")
+    _git(repo, "checkout", "-q", "-b", "pr", m0)
+    _write(repo, WORKFLOW, NONE)
+    _commit_all(repo, "c1: the same change as M1")
+    _write(repo, WORKFLOW, IOS)
+    _write(repo, "app.txt", "1\n")
+    head = _commit_all(repo, "c2: ios again, plus an app edit")
+    landed = _git(repo, "merge-tree", "--write-tree", m1, head).splitlines()[0]
+    assert _git(repo, "cat-file", "-p", f"{landed}:{WORKFLOW}") == NONE.strip()  # ort keeps the revocation
+    _git(repo, "checkout", "-q", "-b", "rebased", head)
+    _git(repo, "-c", "user.name=Sample", "-c", "user.email=sample@example.test", "rebase", "-q", m1)
+    assert (repo / WORKFLOW).read_text() == IOS  # ...but a rebase merge lands ios
+    assert builder_sandbox_change(repo / ".git", head, m1) is True
+
+
+def test_a_pr_whose_commits_never_touch_harbor_is_still_unchanged(tmp_path: Path) -> None:
+    from harbor.device_proof import builder_sandbox_change
+    repo, base = _repo_with_workflow(tmp_path)
+    for n in range(3):
+        _write(repo, "src/app.py", f"print({n})\n")
+        _commit_all(repo, f"app {n}")
+    _git(repo, "merge", "-q", "--no-edit", "main")  # a merge commit that brings nothing new
+    head = _git(repo, "rev-parse", "HEAD")
+    assert builder_sandbox_change(repo / ".git", head, base) is False
+
+
+def test_pr_merge_rebase_is_refused_when_the_per_commit_check_cannot_run(tmp_path: Path, monkeypatch) -> None:
+    import harbor.device_proof as dp
+    from harbor.github_rest import GitHubRestError, run
+    head, base = _merge_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(dp, "_commits_touching_harbor", lambda *args: None)
+    gh = FakeGitHub(head, base)
+    with pytest.raises(GitHubRestError, match="could not list the commits"):
+        run(["pr-merge", "4", "--sha", head, "--method", "rebase"], env={"HARBOR_GITHUB_REPOSITORY": "o/r"}, client=gh)
+    assert [m for m, _, _ in gh.requests] == ["GET"]
+
+
+@pytest.mark.parametrize(("api_url", "fetch_url"), [
+    (None, "https://github.com/o/r.git"),
+    ("https://api.github.com/graphql", "https://github.com/o/r.git"),
+    ("https://api.corp.example/api/graphql", "https://api.corp.example/o/r.git"),
+    ("https://ghe.corp.example/api/graphql", "https://ghe.corp.example/o/r.git"),
+    ("https://api.octo.ghe.com/graphql", "https://octo.ghe.com/o/r.git"),
+    ("https://ghe.corp.example:8443/api/graphql", "https://ghe.corp.example:8443/o/r.git"),
+])
+def test_the_fetch_url_keeps_the_configured_host(api_url, fetch_url) -> None:
+    from harbor.device_proof import git_fetch_url
+    assert git_fetch_url(api_url, "o/r") == fetch_url
+
+
+def test_a_ghes_token_goes_to_the_api_host_never_a_stripped_one(tmp_path: Path, monkeypatch) -> None:
+    from harbor.device_proof import builder_sandbox_change, git_fetch_url
+    url = git_fetch_url("https://api.corp.example/api/graphql", "o/r")
+    repo, base = _repo_with_workflow(tmp_path)
+    calls = _capture_fetch(monkeypatch)
+    builder_sandbox_change(repo / ".git", base, "1" * 40, fetch_url=url, token=FAKE_TOKEN)
+    [(argv, env)] = calls
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://api.corp.example/.extraheader"
+    assert "https://api.corp.example/o/r.git" in argv
+    assert not any("//corp.example" in value for value in [*argv, *env.values()])
+
+
+def test_without_merge_tree_write_tree_every_merge_base_is_checked(tmp_path: Path, monkeypatch) -> None:
+    """git before 2.38 exits 129 on `merge-tree --write-tree`; the check falls back to merge-base --all."""
+    import subprocess
+    import harbor.device_proof as dp
+    real = subprocess.run
+
+    def old_git(argv, **kwargs):
+        if "merge-tree" in argv:
+            return subprocess.CompletedProcess(argv, 129, "", "usage: git merge-tree <base-tree> <branch1> <branch2>\n")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(dp.subprocess, "run", old_git)
+    repo, base = _repo_with_workflow(tmp_path / "unchanged")
+    _write(repo, "src/app.py", "print('x')\n")
+    assert dp.builder_sandbox_change(repo / ".git", _commit_all(repo, "app"), base) is False
+    repo, base = _repo_with_workflow(tmp_path / "changed")
+    _write(repo, WORKFLOW, IOS)
+    assert dp.builder_sandbox_change(repo / ".git", _commit_all(repo, "grant"), base) is True

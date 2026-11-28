@@ -285,16 +285,39 @@ def _is_harbor_path(path: str) -> bool:
     return first.casefold() == WORKFLOW_DIR.parts[0].casefold()
 
 
+def _commits_touching_harbor(repo: _CheckRepo, base_sha: str, head_sha: str) -> bool | None:
+    """Whether any commit in ``base..head`` changes a path under case-folded ``.harbor/``; None if git fails.
+
+    Non-merge commits are compared with their parent; a merge commit counts
+    for paths it changes against every parent (``--cc``), the content the
+    merge itself introduced.
+    """
+
+    listed = repo.run("log", "-z", "--format=", "--name-only", "--no-renames", "--cc",
+                      "--end-of-options", f"^{base_sha}", head_sha, timeout=120)
+    if listed.returncode != 0:
+        return None
+    return any(_is_harbor_path(path.strip("\n")) for path in listed.stdout.split("\0") if path.strip("\n"))
+
+
 def git_fetch_url(api_url: str | None, repository: str | None) -> str | None:
     """Harbor's own https git URL for ``owner/name`` on the configured GitHub host, or None."""
 
     if not repository or repository.count("/") != 1:
         return None
     from harbor.github_rest import rest_base_url
-    host = urlsplit(rest_base_url(api_url)).hostname or ""
-    if host == "api.github.com" or host.startswith("api."):
-        host = host[len("api."):]
-    return f"https://{host}/{repository}.git" if host else None
+    parts = urlsplit(rest_base_url(api_url))
+    host = (parts.hostname or "").lower()
+    if not host or parts.scheme != "https":
+        return None
+    if host == "api.github.com":
+        host = "github.com"
+    elif host.startswith("api.") and host.endswith(".ghe.com") and host.count(".") == 3:
+        host = host[len("api."):]  # GHE.com: api.<sub>.ghe.com serves git at <sub>.ghe.com
+    # Anything else is GitHub Enterprise Server, which serves git on its API host
+    # (https://HOST/api/v3, https://HOST/api/graphql): use that host unchanged, never a guess.
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    return f"https://{netloc}/{repository}.git"
 
 
 def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_url: str | None = None,
@@ -305,6 +328,8 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
     merge GitHub runs, over every merge base), so a criss-cross history cannot
     hide a change behind one convenient merge base; a conflict is unknown. On a
     git without ``--write-tree`` the head is compared with every merge base.
+    Any single commit in ``base..head`` that touches ``.harbor/`` also counts,
+    because a rebase merge replays the commits one by one.
 
     ``git_dir`` is the repository's common git directory, resolved by the
     caller from Harbor's project config (``main_git_dir``). git runs in a
@@ -367,6 +392,13 @@ def builder_sandbox_change(git_dir: Any, head_sha: Any, base_sha: Any, *, fetch_
                 ends = (*merge_bases, head_sha)
             else:
                 return unknown(f"git merge-tree failed: {(merged.stderr or '').strip() or merged.returncode}")
+            # A rebase (or squash of a partial range) replays the PR's commits one by one, so a
+            # commit that touches .harbor/ counts even when the ort merge result shows no change.
+            touched = _commits_touching_harbor(repo, base_sha, head_sha)
+            if touched is None:
+                return unknown(f"could not list the commits in {base_sha}..{head_sha}")
+            if touched:
+                return True
             if not any(_harbor_tracked(repo, end) for end in ends):
                 return False
             if not all(_workflow_path_is_plain(repo, end) for end in ends):
